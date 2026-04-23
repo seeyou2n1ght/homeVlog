@@ -83,14 +83,14 @@ class DatabaseManager:
                 VALUES (?, 'processing', ?)
                 ON CONFLICT(source_path) DO UPDATE
                     SET status='processing', last_processed_at=?
-            """, (source_path, datetime.now(), datetime.now()))
+            """, (source_path, datetime.now().isoformat(), datetime.now().isoformat()))
             conn.commit()
 
     def mark_file_completed(self, source_path: str) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 "UPDATE processed_files SET status='completed', last_processed_at=? WHERE source_path=?",
-                (datetime.now(), source_path),
+                (datetime.now().isoformat(), source_path),
             )
             conn.commit()
 
@@ -98,7 +98,7 @@ class DatabaseManager:
         with self._get_connection() as conn:
             conn.execute(
                 "UPDATE processed_files SET status='failed', error_msg=?, last_processed_at=? WHERE source_path=?",
-                (error_msg, datetime.now(), source_path),
+                (error_msg, datetime.now().isoformat(), source_path),
             )
             conn.commit()
 
@@ -122,7 +122,7 @@ class DatabaseManager:
                 VALUES (?, 'pending', ?, ?)
                 ON CONFLICT(date) DO UPDATE
                     SET file_count=?, updated_at=?
-            """, (date_str, file_count, datetime.now(), file_count, datetime.now()))
+            """, (date_str, file_count, datetime.now().isoformat(), file_count, datetime.now().isoformat()))
             conn.commit()
 
     def mark_day_completed(self, date_str: str, output_path: str) -> None:
@@ -133,7 +133,7 @@ class DatabaseManager:
                 VALUES (?, 'completed', ?, ?)
                 ON CONFLICT(date) DO UPDATE
                     SET status='completed', output_path=?, updated_at=?
-            """, (date_str, output_path, datetime.now(), output_path, datetime.now()))
+            """, (date_str, output_path, datetime.now().isoformat(), output_path, datetime.now().isoformat()))
             conn.commit()
 
     def is_day_completed(self, date_str: str) -> bool:
@@ -156,5 +156,5 @@ class DatabaseManager:
                 INSERT INTO performance_metrics
                     (file_name, decode_fps, infer_fps, total_time_ms, timestamp)
                 VALUES (?, ?, ?, ?, ?)
-            """, (file_name, decode_fps, infer_fps, total_time_ms, datetime.now()))
+            """, (file_name, decode_fps, infer_fps, total_time_ms, datetime.now().isoformat()))
             conn.commit()

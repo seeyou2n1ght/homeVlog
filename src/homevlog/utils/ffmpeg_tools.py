@@ -32,7 +32,7 @@ class FFmpegToolkit:
             if duration <= 0:
                 return None
             
-            out_name = f"part_{i:04d}.mp4"
+            out_name = f"{Path(input_path).stem}_part_{i:04d}.mp4"
             out_path = os.path.join(temp_dir, out_name)
             
             cmd = [
@@ -74,7 +74,9 @@ class FFmpegToolkit:
         with open(list_file, 'w', encoding='utf-8') as f:
             for clip in clip_list:
                 abs_path = os.path.abspath(clip).replace('\\', '/')
-                f.write(f"file '{abs_path}'\n")
+                # 转义单引号，防止 ffmpeg concat 文件解析错误或注入
+                safe_path = abs_path.replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
         
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
