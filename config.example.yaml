@@ -1,37 +1,40 @@
 # ==========================================
-# HomeVlog 全局配置示例模板 (V2.1 架构版)
-# 使用说明: 请将此文件复制并重命名为 config.yaml，然后修改为您的真实环境参数。
+# HomeVlog 全局配置模板 (V2.3 异构并行版)
+# 使用说明: 复制为 config.yaml，按实际环境修改参数。
 # ==========================================
 
-# 1. 环境与路径 (推荐使用绝对路径)
+# 1. 路径配置
 paths:
-  nas_input: "\\\\NAS\\surveillance\\cam01"  # 监控素材源路径 (生产环境推荐挂载为本地盘符以提升 I/O 稳定性)
-  local_output: "D:\\vlogs\\output"          # 浓缩视频输出目录
-  sqlite_db: "./data/homevlog.db"            # 数据库存放路径 (推荐使用相对路径，便于归档)
+  nas_input: "./inputs"             # 监控素材源路径（生产环境建议挂载为本地盘符）
+  local_output: "./outputs"         # 浓缩视频输出目录
+  sqlite_db: "./data/homevlog.db"   # 数据库存放路径
 
-# 2. SMB 探测策略 (用于锁定正在写入的热文件)
+# 2. 文件扫描策略（防读取正在写入的热文件）
 scanner:
-  write_detect_interval_sec: 5               # 两次探测的间隔时长 (秒)
-  write_detect_stable_count: 2               # 连续几次采样体积和 mtime 不变视为写入完成
-  file_pattern: "*.mp4"                      # 支持扫描的文件后缀
+  write_detect_interval_sec: 5      # 两次采样间隔（秒）
+  write_detect_stable_count: 2      # 连续 N 次不变视为写入完成
+  file_pattern: "*.mp4"             # 扫描的文件后缀
 
-# 3. 动态帧检测与算法参数
+# 3. 检测与算法参数
 detection:
-  model_path: "./models/yolov11s.engine"     # TensorRT 引擎路径 (需根据您的显卡提前编译)
-  classes: ["person", "baby", "cat", "dog"]  # 感兴趣的目标类别
-  confidence_threshold: 0.50                 # YOLO 检出置信度红线
-  iou_threshold: 0.80                        # 目标追踪的 IoU 匹配阈值 (防止同一目标被误认为多个)
-  debounce_frames: 5                         # 状态防抖窗口 (如 5 帧内的瞬时消失会被平滑掉)
-  static_interval_ms: 60000                  # 脉冲抽稀间隔 (如每 60 秒静止只保留 1 秒心跳)
-  
-# 4. 视频切割与合成参数
-cutting:
-  keyframe_padding_ms: 2500                  # 切割时前后向外扩充的宽容度 (解决 ffmpeg -c copy 的关键帧对齐问题)
-  io_timeout_sec: 30                         # 管道读取超时阈值 (超出会强制杀掉 FFmpeg 僵尸进程)
+  model_path: "./models/yolo11s.engine"     # TensorRT engine 路径（需目标机器编译）
+  classes: ["person", "baby", "cat", "dog"] # 感兴趣的目标类别
+  confidence_threshold: 0.50                # YOLO 检出置信度阈值
+  iou_threshold: 0.80                       # 追踪匹配的 IoU 阈值
+  debounce_frames: 5                        # 状态防抖窗口（帧数）
+  static_interval_ms: 60000                 # 静止期脉冲采样间隔（毫秒）
+  fps: 5                                    # 解码抽帧帧率（越低越快）
+  infer_resolution: 640                     # 推理分辨率（必须与 engine 编译尺寸一致）
 
-# 5. 硬件加速调优 (生产级关键节点)
+# 4. 视频切割参数
+cutting:
+  keyframe_padding_ms: 2500                 # -c copy 关键帧宽容补偿（前后各扩充）
+  io_timeout_sec: 30                        # FFmpeg 管道超时阈值（秒）
+  parallel_jobs: 4                          # 并发切割线程数
+
+# 5. 硬件加速
 hardware:
-  use_mock: false                            # 是否开启 Mock 伪造后端 (仅开发环境为 true)
-  ffmpeg_hwaccel: "qsv"                      # FFmpeg 硬件解码器 (Intel核显为 qsv，NVIDIA为 cuvid，软解为 none)
-  batch_size: 1                              # TensorRT 推理批次大小 (目前针对单流视频推荐为 1)
-  gpu_id: 0                                  # 默认使用的 NVIDIA GPU 索引
+  use_mock: false                           # Mock 模式（仅开发机无 GPU 时为 true）
+  ffmpeg_hwaccel: "qsv"                     # 解码器：qsv(核显) / cuda(独显) / none(软解)
+  batch_size: 12                            # TRT batch（必须与 engine 编译 batch 一致）
+  gpu_id: 0                                 # NVIDIA GPU 索引
