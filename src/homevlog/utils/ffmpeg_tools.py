@@ -2,6 +2,7 @@ import subprocess
 import os
 from typing import List, Tuple
 from pathlib import Path
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class FFmpegToolkit:
@@ -10,7 +11,13 @@ class FFmpegToolkit:
     职责：并发无损切割、子片段合并。
     """
     @staticmethod
-    def cut_segments(input_path: str, segments: List[Tuple[float, float]], temp_dir: str, parallel_jobs: int = 4) -> List[str]:
+    def cut_segments(
+        input_path: str, 
+        segments: List[Tuple[float, float]], 
+        temp_dir: str, 
+        parallel_jobs: int = 4,
+        stop_event: threading.Event = None
+    ) -> List[str]:
         """
         利用线程池并发进行无损片段切割。
         """
@@ -18,6 +25,9 @@ class FFmpegToolkit:
         os.makedirs(temp_dir, exist_ok=True)
         
         def _cut_single(i, start, end):
+            if stop_event and stop_event.is_set():
+                return None
+                
             duration = end - start
             if duration <= 0:
                 return None

@@ -45,23 +45,20 @@ class Aggregator:
             self._current_segment = None
 
         raw_cuts = []
-        for seg in self.segments:
+        for i, seg in enumerate(self.segments):
             if seg.is_motion:
-                # 运动状态：全段保留
                 raw_cuts.append((seg.start_pts, seg.end_pts))
             else:
-                # 静止状态：应用脉冲抽稀 (每 static_interval_sec 保留一帧心跳)
                 curr_pts = seg.start_pts
                 while curr_pts <= seg.end_pts:
                     if curr_pts - self._last_pulse_pts >= self.static_interval_sec:
-                        # 保留一个极短的片段 (如 1s)
                         raw_cuts.append((curr_pts, min(curr_pts + 1.0, seg.end_pts)))
                         self._last_pulse_pts = curr_pts
-                        curr_pts += self.static_interval_sec  # 优化：直接跳到下一个脉冲点
+                        curr_pts += self.static_interval_sec
                     else:
                         curr_pts = self._last_pulse_pts + self.static_interval_sec
-
-        # 3. 增加 Padding 并合并重叠区间
+                    if self.static_interval_sec <= 0: break
+        
         return self._merge_intervals(raw_cuts)
 
     def _merge_intervals(self, intervals: List[Tuple[float, float]]) -> List[Tuple[float, float]]:

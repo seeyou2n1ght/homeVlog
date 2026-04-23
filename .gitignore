@@ -28,9 +28,8 @@ data/
 *.db-shm
 *.db-wal
 
-# 4. 视音频多媒体素材与输出 (Media & I/O)
-test_input/
-test_output/
+inputs/
+outputs/
 *.mp4
 *.hevc
 *.mkv

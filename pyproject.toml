@@ -5,12 +5,23 @@ description = "Automated AI pipeline to process 4K HEVC surveillance footage int
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    # 基础依赖
     "numpy",
     "opencv-python-headless",
     "pyyaml",
     "pydantic>=2.0",
     "tqdm",
     "psutil",
+    
+    # 深度学习与视觉
+    "torch>=2.2",
+    "torchvision",
+    "ultralytics",
+    
+    # GPU 加速与 TensorRT
+    "tensorrt",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12"
 ]
 
 [build-system]
@@ -20,3 +31,12 @@ build-backend = "hatchling.build"
 [tool.uv]
 managed = true
 package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
