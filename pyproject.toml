@@ -1,0 +1,22 @@
+[project]
+name = "homevlog"
+version = "0.1.0"
+description = "Automated AI pipeline to process 4K HEVC surveillance footage into daily condensed vlogs."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "pyyaml",
+    "pydantic>=2.0",
+    "tqdm",
+    "psutil",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+managed = true
+package = true

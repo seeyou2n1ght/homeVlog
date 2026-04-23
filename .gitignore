@@ -1,0 +1,51 @@
+# ==================================
+# HomeVlog V2.1 Project .gitignore
+# ==================================
+
+# 1. 环境与依赖工具 (Environment & Tooling)
+.venv/
+.uv/
+.python-version
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 2. 本地配置与状态 (Local Configuration)
+config.yaml    # 永远不要提交包含您真实 NAS 密码或绝对路径的配置文件
+!config.example.yaml # (保留一个示例配置供参考)
+.env
+.env.*
+
+# 3. 数据库与持久化层 (Database)
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# 4. 视音频多媒体素材与输出 (Media & I/O)
+test_input/
+test_output/
+*.mp4
+*.hevc
+*.mkv
+*.mov
+temp_clips/
+vlogs/
+
+# 5. 模型引擎与权重 (Models & TensorRT)
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+
+# 6. 操作系统缓存 (OS)
+.DS_Store
+Thumbs.db
