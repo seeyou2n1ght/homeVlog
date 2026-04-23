@@ -18,8 +18,8 @@ class BaseDetector(ABC):
         pass
 
     @abstractmethod
-    def infer(self, frame: np.ndarray) -> List[DetectionResult]:
-        """单帧推理"""
+    def infer_batch(self, frames: List[np.ndarray]) -> List[List[DetectionResult]]:
+        """多帧 Batch 推理"""
         pass
 
     @abstractmethod

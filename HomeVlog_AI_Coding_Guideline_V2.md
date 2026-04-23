@@ -1,6 +1,6 @@
-# HomeVlog 项目 AI Coding 开发对齐指南 (V2.1 完善版)
+# HomeVlog 项目 AI Coding 开发对齐指南 (V2.2 性能狂飙版)
 
-本指南为 HomeVlog 自动化浓缩流水线的唯一参考标准。V2.1 版本在极简解耦管道的基础上，进一步规范了网络素材读取过滤、参数化配置、无损输出约束、极致的虚拟环境隔离以及数据分析统计。
+本指南为 HomeVlog 自动化浓缩流水线的唯一参考标准。V2.2 性能狂飙版在 V2.1 的极简解耦管道的基础上，引入了降维解析管道、Batch推理缓冲池和多线程并发 I/O 切割三大核心外挂，进一步榨干了异构计算硬件的潜能。
 
 ---
 
@@ -12,9 +12,21 @@
 
 ---
 
-## 2. 核心机制与架构约定
+## 2. 核心机制与性能外挂 (Architecture & Performance Hacks)
 
-### 2.1 SMB 写入锁定与探测 (Active Write Detection)
+### 2.1 降维打击管道 (Pipe Downscaling)
+- **挑战**：4K RGB24 数据流极大消耗 Python 内存总线与 `queue` 同步时间。
+- **对策**：彻底摒弃在 Python 层接收 4K 原图。在 `Decoder` 底层强制注入 FFmpeg `scale=640:640,fps=5` 滤镜。数据量瞬间缩减 98%，同时完美规避 VFR 变帧率导致的 PTS 漂移难题。
+
+### 2.2 纯血 Batch 推理 (Batched Inference)
+- **挑战**：单帧 `for` 循环推理无法有效填饱 TensorRT 张量核心，GPU 处于饥饿状态。
+- **对策**：在主循环中引入 `batch_frames` 缓冲池，攒够 `batch_size` (如 16) 后一次性送入 TensorRT 引擎，吞吐量成倍暴增。
+
+### 2.3 并发物理切割 (Concurrent I/O Cutting)
+- **挑战**：数十个碎片切片串行切割时，CPU 绝大部分时间在阻塞等待磁盘同步。
+- **对策**：引入 `ThreadPoolExecutor` (并发度由 `parallel_jobs` 决定)，并发发起多个 `-c copy` 子进程，利用多线程压榨 NVMe SSD 的极致 IOPS。
+
+### 2.4 SMB 写入锁定与探测 (Active Write Detection)
 直接读取内网 NAS (SMB) 时，必须防止读取到摄像头正在持续写入的“热文件”。
 - **策略**：**多重采样校验**。在 `Scanner` 阶段，针对最新发现的文件，记录其最后修改时间（mtime）和文件大小（size）。间隔 N 秒（由配置决定，如 5 秒）后再次采样，只有当 `mtime` 和 `size` 均无变化时，才标记为“锁定完成”并推入处理队列。
 

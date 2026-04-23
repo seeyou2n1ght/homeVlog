@@ -20,10 +20,13 @@ class DetectionConfig(BaseModel):
     iou_threshold: float = 0.8
     debounce_frames: int = 5
     static_interval_ms: int = 60000
+    fps: int = 5
+    infer_resolution: int = 640
 
 class CuttingConfig(BaseModel):
     keyframe_padding_ms: int = 2500
     io_timeout_sec: int = 30
+    parallel_jobs: int = 4
 
 class HardwareConfig(BaseModel):
     use_mock: bool = False

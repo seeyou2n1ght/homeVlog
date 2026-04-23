@@ -29,9 +29,9 @@ class TensorRTDetector(BaseDetector):
             print(f"[TRTHAL] Error: Missing dependencies for TensorRT: {e}")
             raise
 
-    def infer(self, frame: np.ndarray) -> List[DetectionResult]:
-        # TODO: 实现预处理、执行上下文推理、后处理
-        return []
+    def infer_batch(self, frames: List[np.ndarray]) -> List[List[DetectionResult]]:
+        # TODO: 实现预处理、执行上下文 Batch 推理、后处理
+        return [[] for _ in frames]
 
     def release(self):
         print("[TRTHAL] Releasing TensorRT resources")

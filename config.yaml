@@ -20,11 +20,14 @@ detection:
   iou_threshold: 0.80
   debounce_frames: 10                  # 稍微增加去抖，观察 Mock 状态机流转
   static_interval_ms: 10000            # 静止期脉冲采样间隔缩短到 10s，便于快速观察结果
+  fps: 5                               # FFmpeg 底层强制抽帧率
+  infer_resolution: 640                # FFmpeg 底层强制缩放分辨率
   
 # 4. 视频切割与合成参数
 cutting:
   keyframe_padding_ms: 2500
   io_timeout_sec: 30
+  parallel_jobs: 4                     # 并发物理切割的线程数
 
 # 5. 硬件加速调优
 hardware:
