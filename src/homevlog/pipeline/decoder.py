@@ -66,6 +66,7 @@ class VideoDecoder:
             '-y',
             '-hwaccel', self.hwaccel,
             '-i', file_path,
+            '-map', '0:v:0',   # 明确仅提取视频流，避免音频干扰 rawvideo 和 showinfo
             '-vf', 'showinfo', # 用于输出 PTS 到 stderr
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
