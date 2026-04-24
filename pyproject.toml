@@ -1,6 +1,6 @@
 [project]
 name = "homevlog"
-version = "0.1.0"
+version = "2.4.0"
 description = "Automated AI pipeline to process 4K HEVC surveillance footage into daily condensed vlogs."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

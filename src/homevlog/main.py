@@ -1,9 +1,9 @@
 """
-HomeVlog 主入口 (V2.3 三级异步流水线版)
+HomeVlog 主入口 (V2.3 三级异步流水线 Dashboard 版)
 
 数据流:
   [Decoder Thread] ─帧队列→ [GPU Worker Thread] ─检测队列→ [Logic Thread]
-  三个硬件单元（NVDEC/QSV, CUDA, CPU）同时工作，零空闲。
+  增加富状态跟踪、阶段耗时埋点和 SQLite 指标落地。
 """
 import os
 import queue
@@ -32,30 +32,31 @@ def process_pending_files(
     config,
     db: DatabaseManager,
     detector,
+    total_files: int,
 ) -> Dict[str, List[str]]:
-    """
-    四级异步全局流水线处理所有视频：
-      [DecoderWorker] → central_frame_queue → [GPUWorker] → result_queue → [LogicWorker] → cutter_queue → [CutterWorker]
-    返回按天分组的 clip 路径列表。
-    """
     central_frame_queue: queue.Queue = queue.Queue(maxsize=128)
     result_queue: queue.Queue = queue.Queue(maxsize=128)
     cutter_queue: queue.Queue = queue.Queue(maxsize=32)
     
-    # 停止信号与资源管理器
     stop_event = threading.Event()
     active_decoders: List[VideoDecoder] = []
     decoders_lock = threading.Lock()
     
+    # 共享状态记录
+    file_ids: Dict[str, int] = {}
+    file_indices: Dict[str, int] = {}
+    start_times: Dict[str, float] = {}
+    phase_wait_ms: Dict[str, int] = defaultdict(int)
+    phase_infer_ms: Dict[str, int] = defaultdict(int)
+    queue_depths: Dict[str, List[int]] = defaultdict(list)
+    
     def cleanup_resources():
-        """强制清理所有可能运行的子进程"""
         stop_event.set()
         with decoders_lock:
             for d in active_decoders:
                 try: d.close()
                 except: pass
             active_decoders.clear()
-        # 尽量排空队列
         for q in [central_frame_queue, result_queue, cutter_queue]:
             while not q.empty():
                 try: q.get_nowait()
@@ -71,25 +72,38 @@ def process_pending_files(
 
     # ── Thread 1: Decoder Worker ──
     def decoder_worker() -> None:
-        """连续遍历文件，喂给 central_frame_queue"""
-        for fp in pending:
+        for idx, fp in enumerate(pending, 1):
             if stop_event.is_set(): break
             fname = os.path.basename(fp)
-            print(f"\n[Worker] Processing: {fname}")
-            db.mark_file_started(fp)
+            file_indices[fp] = idx
+            source_size = os.path.getsize(fp)
+            print(f"[{idx}/{total_files}] ⏳ 正在处理: {fname} (大小: {source_size/1024/1024:.1f}MB)...")
+            
+            file_id = db.mark_file_started(fname, source_size)
+            file_ids[fp] = file_id
+            start_times[fp] = time.time()
             
             decoder = VideoDecoder(hwaccel=hwaccel, io_timeout=config.cutting.io_timeout_sec)
             with decoders_lock:
                 active_decoders.append(decoder)
                 
             try:
-                pts_list = decoder._scan_pts(fp)
-                decoder.start(
-                    fp,
-                    pts_list=pts_list,
-                    fps=config.detection.fps,
-                    infer_resolution=config.detection.infer_resolution,
-                )
+                # 兼容旧代码里可能有的 _scan_pts
+                pts_list = None
+                if hasattr(decoder, '_scan_pts'):
+                    pts_list = decoder._scan_pts(fp)
+                    decoder.start(
+                        fp,
+                        pts_list=pts_list,
+                        fps=config.detection.fps,
+                        infer_resolution=config.detection.infer_resolution,
+                    )
+                else:
+                    decoder.start(
+                        fp,
+                        fps=config.detection.fps,
+                        infer_resolution=config.detection.infer_resolution,
+                    )
                 frame_count = 0
                 while not stop_event.is_set():
                     data = decoder.get_frame()
@@ -103,39 +117,51 @@ def process_pending_files(
                 with decoders_lock:
                     if decoder in active_decoders:
                         active_decoders.remove(decoder)
-            # 发送单个文件结束符
             central_frame_queue.put((fp, None, None))
             
-        # 发送全局结束符
         central_frame_queue.put((None, None, None))
 
     # ── Thread 2: GPU Worker ──
     def gpu_worker() -> None:
-        """从 central 取帧 → 攒 batch → 推理 → result_queue"""
         processed_frames = 0
         try:
             batch_frames: List = []
-            batch_meta: List = []  # (fp, pts)
+            batch_meta: List = []  
+            current_fp = None
             
             while True:
+                wait_start = time.time()
                 fp, pts, frame = central_frame_queue.get()
+                wait_end = time.time()
                 
-                if fp is None:  # 全局结束
+                if fp is not None:
+                    phase_wait_ms[fp] += int((wait_end - wait_start) * 1000)
+                    queue_depths[fp].append(central_frame_queue.qsize())
+                    current_fp = fp
+                
+                if fp is None:  
                     if batch_frames:
+                        infer_start = time.time()
                         results = detector.infer_batch(batch_frames)
+                        infer_time = int((time.time() - infer_start) * 1000)
+                        if current_fp:
+                            phase_infer_ms[current_fp] += infer_time
                         for m, d in zip(batch_meta, results):
                             result_queue.put((m[0], m[1], d))
                     break
                     
-                if pts is None:  # 单文件结束
+                if pts is None:  
                     if batch_frames:
+                        infer_start = time.time()
                         results = detector.infer_batch(batch_frames)
+                        infer_time = int((time.time() - infer_start) * 1000)
+                        phase_infer_ms[fp] += infer_time
+                        
                         for m, d in zip(batch_meta, results):
                             result_queue.put((m[0], m[1], d))
                         processed_frames += len(batch_frames)
                         batch_frames = []
                         batch_meta = []
-                    print(f"  [GPU] End of file: {os.path.basename(fp)}. Total processed in session: {processed_frames}")
                     result_queue.put((fp, None, None))
                     continue
                     
@@ -143,25 +169,23 @@ def process_pending_files(
                 batch_meta.append((fp, pts))
                 
                 if len(batch_frames) >= batch_size:
+                    infer_start = time.time()
                     results = detector.infer_batch(batch_frames)
+                    infer_time = int((time.time() - infer_start) * 1000)
+                    phase_infer_ms[fp] += infer_time
+                    
                     for m, d in zip(batch_meta, results):
                         result_queue.put((m[0], m[1], d))
                     processed_frames += len(batch_frames)
-                    # 每 500 帧打印一次全局进度
-                    if processed_frames % 504 == 0:
-                        print(f"  [GPU] Processed {processed_frames} frames (Global)")
                     batch_frames = []
                     batch_meta = []
         except Exception as e:
             print(f"  [GPU Worker] ❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
         finally:
             result_queue.put((None, None, None))
 
     # ── Thread 3: Logic Worker ──
     def logic_worker() -> None:
-        """从 result_queue 取检测结果，分别路由到对应的 Tracker 和 Aggregator"""
         trackers = {}
         aggregators = {}
         frame_counts = defaultdict(int)
@@ -170,7 +194,7 @@ def process_pending_files(
         try:
             while True:
                 fp, pts, detections = result_queue.get()
-                if fp is None:  # 全局结束
+                if fp is None:  
                     break
                     
                 if fp not in trackers:
@@ -184,9 +208,9 @@ def process_pending_files(
                     )
                     start_times[fp] = time.time()
                     
-                if pts is None:  # 单文件结束
-                    cut_segments = aggregators[fp].finalize()
-                    cutter_queue.put((fp, cut_segments, start_times[fp], frame_counts[fp]))
+                if pts is None:  
+                    cut_segments, events = aggregators[fp].finalize()
+                    cutter_queue.put((fp, cut_segments, events, start_times[fp], frame_counts[fp]))
                     
                     del trackers[fp]
                     del aggregators[fp]
@@ -194,38 +218,38 @@ def process_pending_files(
                     del start_times[fp]
                     continue
                     
-                is_active = trackers[fp].update(detections)
-                aggregators[fp].add_frame_state(pts, is_active)
+                # 富状态更新
+                state = trackers[fp].update(detections)
+                aggregators[fp].add_frame_state(pts, state)
                 frame_counts[fp] += 1
                 
         except Exception as e:
             print(f"  [Logic Worker] ❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
         finally:
             cutter_queue.put(None)
 
     # ── Thread 4: Cutter Worker ──
     def cutter_worker() -> None:
-        """异步切割文件，避免阻塞 Logic Worker 处理下一文件"""
         while True:
             job = cutter_queue.get()
             if job is None:
                 break
-            fp, cut_segments, start_time, frame_count = job
+            fp, cut_segments, events, start_time, frame_count = job
             clips = []
             fname = os.path.basename(fp)
+            file_id = file_ids.get(fp, -1)
             
             try:
                 if stop_event.is_set(): continue
-                print(f"  [Aggregator] {fname}: {len(cut_segments)} segments to keep.")
+                
+                io_cut_start = time.time()
                 if cut_segments:
                     temp_dir = os.path.join(config.paths.local_output, "temp_clips")
                     clips = FFmpegToolkit.cut_segments(
                         fp, cut_segments, temp_dir,
-                        parallel_jobs=config.cutting.parallel_jobs,
-                        stop_event=stop_event
+                        parallel_jobs=config.cutting.parallel_jobs
                     )
+                io_cut_ms = int((time.time() - io_cut_start) * 1000)
                 
                 info = parse_video_filename(fp)
                 date_key = info.date_str if info else "unknown"
@@ -233,17 +257,33 @@ def process_pending_files(
                     day_clips[date_key].extend(clips)
                     
                 elapsed = max(time.time() - start_time, 0.001)
-                db.log_performance(
-                    file_name=fname,
-                    decode_fps=frame_count / elapsed,
-                    infer_fps=frame_count / elapsed,
-                    total_time_ms=int(elapsed * 1000),
-                )
-                db.mark_file_completed(fp)
-                print(f"  [Worker] ✅ {fname}: {frame_count} frames in {elapsed:.1f}s ({frame_count/elapsed:.1f} fps). {len(clips)} clips.")
+                
+                output_size = sum(os.path.getsize(c) for c in clips if os.path.exists(c))
+                
+                depths = queue_depths.get(fp, [0])
+                avg_depth = sum(depths) / len(depths) if depths else 0.0
+                
+                # 记录 V2.3 指标
+                if file_id != -1:
+                    db.log_analytics_events(file_id, events)
+                    db.log_performance(
+                        file_id=file_id,
+                        total_time_ms=int(elapsed * 1000),
+                        phase_wait_ms=phase_wait_ms.get(fp, 0),
+                        phase_infer_ms=phase_infer_ms.get(fp, 0),
+                        phase_io_cut_ms=io_cut_ms,
+                        decode_fps=frame_count / elapsed,
+                        infer_fps=frame_count / elapsed,
+                        avg_queue_depth=avg_depth
+                    )
+                    db.mark_file_completed(file_id, output_size)
+                    
+                idx = file_indices.get(fp, "?")
+                print(f"[{idx}/{total_files}] ✅ 完成: {fname} | 耗时: {elapsed:.1f}s | 平均速度: {frame_count/elapsed:.1f} FPS | 产出片段: {len(clips)} 段")
             except Exception as e:
-                print(f"  [Cutter Worker] ❌ Error processing {fname}: {e}")
-                db.mark_file_failed(fp, str(e))
+                idx = file_indices.get(fp, "?")
+                print(f"[{idx}/{total_files}] ❌ 失败: {fname} | 错误: {e}")
+                db.mark_file_failed(fname)
 
     # ── 启动所有流水线线程 ──
     t_decoder = threading.Thread(target=decoder_worker, name="decoder-worker", daemon=True)
@@ -256,7 +296,6 @@ def process_pending_files(
     t_logic.start()
     t_cutter.start()
     
-    # 主线程等待最终的 cutter_worker 完成
     try:
         while t_cutter.is_alive():
             t_cutter.join(timeout=1.0)
@@ -279,64 +318,41 @@ def main() -> None:
 
     detector = get_detector(
         use_mock=config.hardware.use_mock,
-        gpu_id=config.hardware.gpu_id,
-        conf_threshold=config.detection.confidence_threshold,
-        target_classes=config.detection.classes,
+        gpu_id=config.hardware.gpu_id
     )
     detector.load_model(config.detection.model_path)
 
-    print("=== HomeVlog Pipeline V2.4 (Global Pipeline Edition) ===")
+    print("=== HomeVlog Pipeline V2.4 Heterogeneous Edition ===")
     print(f"[Main] Input : {config.paths.nas_input}")
     print(f"[Main] Output: {config.paths.local_output}")
 
     try:
-        # ── 扫描文件 ──
         print("\n[Scanner] Discovering files...")
         scanner.scan_once()
         time.sleep(config.scanner.write_detect_interval_sec)
         ready = scanner.scan_once()
 
-        pending = [f for f in ready if not db.is_file_processed(f)]
+        pending = [f for f in ready if not db.is_file_processed(os.path.basename(f))]
         if not pending:
             print("[Main] No new files. Exiting.")
             return
         print(f"[Main] {len(pending)} file(s) to process.\n")
 
-        # ── 按日期分组标为处理中 ──
-        day_buckets: Dict[str, List[str]] = defaultdict(list)
-        for fp in sorted(pending):
-            info = parse_video_filename(fp)
-            day_buckets[info.date_str if info else "unknown"].append(fp)
+        # 这里就不记 processed_days 了，保留精简
+        day_clips = process_pending_files(sorted(pending), config, db, detector, len(pending))
 
-        for d, files in sorted(day_buckets.items()):
-            print(f"  {d}: {len(files)} file(s)")
-            db.mark_day_processing(d, len(files))
-
-        # ── 执行全局流水线 ──
-        total_start = time.time()
-        print(f"\n{'='*50}")
-        print(f"[Pipeline] Starting Global 4-Stage Pipeline")
-        print(f"{'='*50}")
-        day_clips = process_pending_files(sorted(pending), config, db, detector)
-
-        # ── 每日合成 ──
         print(f"\n{'='*50}")
         print("[Main] Merging daily vlogs...")
         for date_key in sorted(day_clips.keys()):
             clips = day_clips[date_key]
             if not clips:
-                print(f"  [{date_key}] No clips. Skipping.")
                 continue
             output_name = f"vlog_{date_key}.mp4"
             final_path = str(Path(config.paths.local_output) / output_name)
             print(f"  [{date_key}] Merging {len(clips)} clip(s) → {output_name}")
             FFmpegToolkit.merge_videos(clips, final_path)
             FFmpegToolkit.cleanup(clips)
-            db.mark_day_completed(date_key, final_path)
             print(f"  [{date_key}] ✅ Saved: {final_path}")
-
-        total_elapsed = time.time() - total_start
-        print(f"\n[Main] Total: {total_elapsed:.1f}s")
 
     except KeyboardInterrupt:
         print("\n[Main] Shutdown by user.")
@@ -345,4 +361,6 @@ def main() -> None:
         print("\n=== HomeVlog Offline ===")
 
 if __name__ == "__main__":
+    main()
+ "__main__":
     main()

@@ -47,7 +47,6 @@ class FFmpegToolkit:
             subprocess.run(cmd, check=True)
             return out_path
 
-        print(f"[Cutter] Spawning {parallel_jobs} threads for {len(segments)} segments...")
         with ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
             futures = {executor.submit(_cut_single, i, s, e): i for i, (s, e) in enumerate(segments)}
             

@@ -1,5 +1,5 @@
 """
-FFmpeg 解码器 (V2.3 高性能版)
+FFmpeg 解码器 (V2.4 高性能版)
 改进点：
   - 移除 showinfo 滤镜，消除 stderr 管道争用
   - PTS 通过帧序号 / fps 直接计算（fps 滤镜输出为 CFR，数学精确）
@@ -48,7 +48,6 @@ class VideoDecoder:
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "packet=pts_time", "-of", "csv=p=0", file_path
         ]
-        print(f"[Decoder] Pre-scanning PTS for {file_path}...")
         try:
             output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
             # 解析为 float 列表并排序
@@ -155,7 +154,6 @@ class VideoDecoder:
         self.pts_list = pts_list if pts_list is not None else self._scan_pts(file_path)
 
         cmd = self._build_cmd(file_path)
-        print(f"[Decoder] {self.hwaccel} → {self._width}x{self._height}@{fps}fps")
 
         self.process = subprocess.Popen(
             cmd,
@@ -202,7 +200,6 @@ class VideoDecoder:
         while not self.frame_queue.empty():
             try: self.frame_queue.get_nowait()
             except: break
-        print("[Decoder] Closed.")
 
     def __del__(self):
         """析构保护：确保对象销毁时进程也退出"""

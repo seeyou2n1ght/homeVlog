@@ -8,7 +8,7 @@
 
 - **依赖同步**: 运行 `uv sync` 确保环境与 `uv.lock` 一致。
 - **添加依赖**: 使用 `uv add <package>`，严禁手动修改 `pyproject.toml`。
-- **Python 版本**: 锁定为 Python 3.10+。
+- **Python 版本**: 锁定为 Python 3.12+ (根据 `pyproject.toml` 要求)。
 
 ## 2. 核心架构守则
 
