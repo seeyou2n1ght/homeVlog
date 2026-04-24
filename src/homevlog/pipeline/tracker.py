@@ -64,17 +64,17 @@ class SimpleTracker:
                     
         return min_dist
 
-    def update(self, detections: List[DetectionResult]) -> FrameState:
+    def update(self, detections: List[DetectionResult], pixel_motion_flag: Optional[bool] = None) -> FrameState:
         """
         更新追踪状态。
         返回：富状态对象 FrameState
         """
-        raw_motion = False
+        yolo_motion = False
         
         if len(detections) == 0:
-            raw_motion = False
+            yolo_motion = False
         elif len(detections) != len(self.last_detections):
-            raw_motion = True
+            yolo_motion = True
         else:
             for curr_det in detections:
                 max_iou = 0.0
@@ -84,18 +84,35 @@ class SimpleTracker:
                         if iou > max_iou:
                             max_iou = iou
                 if max_iou < self.iou_threshold:
-                    raw_motion = True
+                    yolo_motion = True
                     break
                     
         self.last_detections = detections
         
-        if raw_motion != self.is_motion:
-            self.state_counter += 1
-            if self.state_counter >= self.debounce_frames:
-                self.is_motion = raw_motion
+        # 融合判断：YOLO发生变化，或者 YOLO有目标且像素有微动
+        raw_motion = False
+        if len(detections) > 0:
+            if yolo_motion or (pixel_motion_flag is True):
+                raw_motion = True
+        
+        if raw_motion:
+            if not self.is_motion:
+                self.state_counter += 1
+                if self.state_counter >= self.debounce_frames:
+                    self.is_motion = True
+                    self.state_counter = 0
+            else:
                 self.state_counter = 0
         else:
-            self.state_counter = 0
+            if self.is_motion:
+                self.state_counter += 1
+                # 增加运动结束的滞后：运动结束必须比触发需要更多的静止帧（例如3倍防抖，消除闪烁）
+                if self.state_counter >= self.debounce_frames * 3:
+                    self.is_motion = False
+                    self.state_counter = 0
+            else:
+                # 漏桶策略：偶尔的静止帧只让计数器递减，而不是清零，容忍断续的微动
+                self.state_counter = max(0, self.state_counter - 1)
             
         # 提取业务特征
         classes = {d.label for d in detections}

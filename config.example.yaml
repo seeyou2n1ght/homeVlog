@@ -25,6 +25,10 @@ detection:
   static_interval_ms: 60000                 # 静止期脉冲采样间隔（毫秒）
   fps: 5                                    # 解码抽帧帧率（越低越快）
   infer_resolution: 640                     # 推理分辨率（必须与 engine 编译尺寸一致）
+  enable_pixel_motion: false                # 启用自适应分块帧差法
+  pixel_motion_grid: 16                     # 宏块大小 (16x16)
+  pixel_motion_history_size: 20             # 背景建模帧数 (约 4 秒 @ 5fps)
+  pixel_motion_threshold_factor: 2.5        # 噪声阈值乘数 k
 
 # 4. 视频切割参数
 cutting:

@@ -22,6 +22,10 @@ class DetectionConfig(BaseModel):
     static_interval_ms: int = 60000
     fps: int = 5
     infer_resolution: int = 640
+    enable_pixel_motion: bool = False
+    pixel_motion_grid: int = 16
+    pixel_motion_history_size: int = 20
+    pixel_motion_threshold_factor: float = 2.5
 
 class CuttingConfig(BaseModel):
     keyframe_padding_ms: int = 2500

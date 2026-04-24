@@ -25,6 +25,7 @@ from .pipeline.tracker import SimpleTracker
 from .pipeline.aggregator import Aggregator
 from .utils.ffmpeg_tools import FFmpegToolkit
 from .utils.time_utils import parse_video_filename
+from .utils.motion_analyzer import BlockMotionDetector
 
 
 def process_pending_files(
@@ -72,6 +73,7 @@ def process_pending_files(
 
     # ── Thread 1: Decoder Worker ──
     def decoder_worker() -> None:
+        analyzers: Dict[str, BlockMotionDetector] = {}
         for idx, fp in enumerate(pending, 1):
             if stop_event.is_set(): break
             fname = os.path.basename(fp)
@@ -86,6 +88,13 @@ def process_pending_files(
             decoder = VideoDecoder(hwaccel=hwaccel, io_timeout=config.cutting.io_timeout_sec)
             with decoders_lock:
                 active_decoders.append(decoder)
+                
+            if config.detection.enable_pixel_motion:
+                analyzers[fp] = BlockMotionDetector(
+                    block_size=config.detection.pixel_motion_grid,
+                    history_size=config.detection.pixel_motion_history_size,
+                    threshold_factor=config.detection.pixel_motion_threshold_factor
+                )
                 
             try:
                 # 兼容旧代码里可能有的 _scan_pts
@@ -110,16 +119,23 @@ def process_pending_files(
                     if data is None:
                         break
                     pts, frame = data
-                    central_frame_queue.put((fp, pts, frame))
+                    
+                    pm_flag = None
+                    if config.detection.enable_pixel_motion and fp in analyzers:
+                        pm_flag = analyzers[fp].analyze(frame)
+                        
+                    central_frame_queue.put((fp, pts, frame, pm_flag))
                     frame_count += 1
             finally:
                 decoder.close()
                 with decoders_lock:
                     if decoder in active_decoders:
                         active_decoders.remove(decoder)
-            central_frame_queue.put((fp, None, None))
+                if fp in analyzers:
+                    del analyzers[fp]
+            central_frame_queue.put((fp, None, None, None))
             
-        central_frame_queue.put((None, None, None))
+        central_frame_queue.put((None, None, None, None))
 
     # ── Thread 2: GPU Worker ──
     def gpu_worker() -> None:
@@ -131,7 +147,7 @@ def process_pending_files(
             
             while True:
                 wait_start = time.time()
-                fp, pts, frame = central_frame_queue.get()
+                fp, pts, frame, pm_flag = central_frame_queue.get()
                 wait_end = time.time()
                 
                 if fp is not None:
@@ -147,7 +163,7 @@ def process_pending_files(
                         if current_fp:
                             phase_infer_ms[current_fp] += infer_time
                         for m, d in zip(batch_meta, results):
-                            result_queue.put((m[0], m[1], d))
+                            result_queue.put((m[0], m[1], d, m[2]))
                     break
                     
                 if pts is None:  
@@ -158,15 +174,15 @@ def process_pending_files(
                         phase_infer_ms[fp] += infer_time
                         
                         for m, d in zip(batch_meta, results):
-                            result_queue.put((m[0], m[1], d))
+                            result_queue.put((m[0], m[1], d, m[2]))
                         processed_frames += len(batch_frames)
                         batch_frames = []
                         batch_meta = []
-                    result_queue.put((fp, None, None))
+                    result_queue.put((fp, None, None, None))
                     continue
                     
                 batch_frames.append(frame)
-                batch_meta.append((fp, pts))
+                batch_meta.append((fp, pts, pm_flag))
                 
                 if len(batch_frames) >= batch_size:
                     infer_start = time.time()
@@ -175,14 +191,14 @@ def process_pending_files(
                     phase_infer_ms[fp] += infer_time
                     
                     for m, d in zip(batch_meta, results):
-                        result_queue.put((m[0], m[1], d))
+                        result_queue.put((m[0], m[1], d, m[2]))
                     processed_frames += len(batch_frames)
                     batch_frames = []
                     batch_meta = []
         except Exception as e:
             print(f"  [GPU Worker] ❌ Error: {e}")
         finally:
-            result_queue.put((None, None, None))
+            result_queue.put((None, None, None, None))
 
     # ── Thread 3: Logic Worker ──
     def logic_worker() -> None:
@@ -193,7 +209,7 @@ def process_pending_files(
         
         try:
             while True:
-                fp, pts, detections = result_queue.get()
+                fp, pts, detections, pixel_motion = result_queue.get()
                 if fp is None:  
                     break
                     
@@ -219,7 +235,7 @@ def process_pending_files(
                     continue
                     
                 # 富状态更新
-                state = trackers[fp].update(detections)
+                state = trackers[fp].update(detections, pixel_motion)
                 aggregators[fp].add_frame_state(pts, state)
                 frame_counts[fp] += 1
                 
@@ -361,6 +377,4 @@ def main() -> None:
         print("\n=== HomeVlog Offline ===")
 
 if __name__ == "__main__":
-    main()
- "__main__":
     main()
