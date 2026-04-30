@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Project outputs
+output/
+logs/
+data/
+inspect_out*/
+
+# Temp / test artifacts
+temp/
+test_*.mp4
+
+# OS
+Thumbs.db
+.DS_Store

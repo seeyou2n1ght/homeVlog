@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/seeyo/.claude/projects/C--Users-seeyo-code-homeVlog/**)",
+      "Read(//c/Users/seeyo/.claude/projects/**)",
+      "Bash(where ffmpeg *)",
+      "Bash(ffmpeg -version)",
+      "Bash(where ffprobe *)",
+      "Bash(ffprobe -version)",
+      "Bash(uv --version)",
+      "Bash(uv run *)",
+      "Bash(ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -ss 1 -i \"C:\\\\Users\\\\seeyo\\\\code\\\\homevlog-20260428\\\\samples\\\\00_20260424074305_20260424074845.mp4\" -vf \"scale_qsv=w=320:h=180,hwdownload,format=nv12\" -vframes 1 -f null NUL)",
+      "Bash(ffmpeg *)",
+      "Bash(python -m py_compile src/detector.py)",
+      "Bash(python -c \"from src.detector import MotionDetector; print\\('import OK'\\)\")",
+      "Bash(find \"C:\\\\\\\\Users\\\\\\\\seeyo\\\\\\\\code\\\\\\\\homevlog\" -type f -not -path \"*/.git/*\" -not -path \"*/.claude/*\" -not -path \"*/__pycache__/*\" -not -path \"*/.venv/*\" -not -path \"*/node_modules/*\")",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(nvidia-smi --query-gpu=memory.used,memory.total,processes --format=csv,noheader)",
+      "Bash(nvidia-smi *)",
+      "Bash(.venv/Scripts/python -c \"import src.database; import src.detector; import src.renderer; import src.scanner; import src.segment; import src.utils; print\\('ALL IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python -m pytest tests/ -x -q)",
+      "Bash(.venv/Scripts/python -m py_compile src/database.py)",
+      "Bash(.venv/Scripts/python -m py_compile src/detector.py)",
+      "Bash(.venv/Scripts/python -m py_compile src/renderer.py)",
+      "Bash(.venv/Scripts/python -m py_compile src/scanner.py)",
+      "Bash(.venv/Scripts/python -m py_compile src/segment.py)",
+      "Bash(.venv/Scripts/python -c \"from src.monitor import Monitor, PerfCollector, PerfRecord, get_monitor, get_perf; from src.ffmpeg import FFmpegResult; print\\('OK'\\)\")"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+[project]
+name = "homevlog"
+version = "0.1.0"
+description = "家庭监控素材智能浓缩系统 — 去静止帧、运动段原速、静止段关键帧快进"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0.0",
+    "opencv-python>=4.10.0",
+    "psutil>=7.2.2",
+    "nvidia-ml-py>=13.0.0",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
