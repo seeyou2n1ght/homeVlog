@@ -7,9 +7,8 @@ from pathlib import Path
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir))
 
-from src.config import load_config
+from src.utils import load_config, setup_logging
 from src.prescreen import prescreen_file
-from src.utils import setup_logging
 
 def main():
     setup_logging()
