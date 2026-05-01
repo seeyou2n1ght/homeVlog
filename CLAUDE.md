@@ -32,14 +32,17 @@ uv run pytest tests/test_segment.py
 
 ```
 Pass 1 (prescreen):   QSV×4 parallel, sample N frames per file at 320×180,
+                       single-process multi-seek (31 QSV inputs per ffmpeg call, 3x faster)
                        frame-diff classify -> STATIC (skip) or SUSPICIOUS
+                       early-stop: first 10 pairs all < threshold*0.5 -> STATIC immediately
 
 Pass 1.5 (detector):  NVDEC + QSV dual-GPU decode at 640×360 gray @5fps,
                        numpy frame-diff -> IQR adaptive threshold -> median filter
                        -> motion labels -> segment index (DYNAMIC/STATIC intervals)
 
 Pass 2 (renderer):    NVDEC/QSV HW decode + GPU scale + HW encode, batched (≤15 files/batch)
-                       parallel NVENC+QSV batches when multiple batches (dual-GPU utilization)
+                       work-stealing: NV/QSV workers independently pull from batch queue
+                       (NV ~2.3x faster -> naturally takes more batches, no idle waiting)
                        DYNAMIC segments at original speed, STATIC segments fast-forward
                        (setpts=PTS/SPEED), concat via filter_complex_script
 ```
@@ -89,19 +92,19 @@ SQLite DB at `data/vlog.db` tracks all state. Pipeline is idempotent: re-run ski
 
 - RTX 3060Ti (8GB VRAM): NVDEC (H.265 decode, ~36 concurrent limit) + NVENC (H.265 encode, 3 session limit)
 - UHD 770 (i5-12600K): QSV decode + QSV encode (system memory, no VRAM limit)
-- Pass1: QSV×4 parallel prescreen
-- Pass1.5: 43% NVDEC + 57% QSV split (NVDEC ~42% slower per-file)
-- Pass2: batch render (≤15 files/batch), parallel NVENC+QSV pairs when multi-batch
+- Pass1: QSV×4 parallel prescreen (multi-seek: 31 inputs/ffmpeg call)
+- Pass1.5: 40% NVDEC + 60% QSV split (NVDEC ~42% slower per-file, tuned from 43:57)
+- Pass2: batch render (≤15 files/batch), work-stealing NV+QSV dual-worker queue
 
 ### Pass2 render performance (98 files, 389 segs, ~46min footage)
 
 | Metric | Value |
 |--------|-------|
-| Total render time | ~56 min (3352s) |
+| Total render time | ~56 min (3352s) pre-optimization |
 | Batch count | 7 (15+15+15+15+15+15+8 files) |
-| Parallel pairs | 3 pairs + 1 tail |
-| NVDEC batch avg | ~234s/batch |
-| QSV batch avg | ~1050s/batch |
+| Scheduling | work-stealing (NV/QSV independent workers) |
+| NVDEC batch avg | ~275s/batch |
+| QSV batch avg | ~644s/batch |
 | Output | 1757 MB, 1080p@20fps HEVC |
 | GPU peak mem | 8052 MB |
 

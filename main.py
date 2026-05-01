@@ -44,8 +44,12 @@ def main():
         db = VlogDatabase()
         try:
             from src.pipeline import process_date_cam
+            from src.monitor import get_monitor
+            monitor = get_monitor()
+            monitor.start()
             cam = args.cam if args.cam is not None else 0
             ok = process_date_cam(db, args.date, cam, skip_render=args.no_render)
+            monitor.shutdown()
             print(f"{'OK' if ok else 'FAILED'}")
         finally:
             db.close()

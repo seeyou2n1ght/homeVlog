@@ -67,9 +67,20 @@ class Monitor:
             self._nvml = pynvml
             self._gpu_handles = []
             count = pynvml.nvmlDeviceGetCount()
+            gpu_names = []
             for i in range(count):
-                self._gpu_handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                self._gpu_handles.append(handle)
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode()
+                gpu_names.append(name)
             self._gpu_available = len(self._gpu_handles) > 0
+            if self._gpu_available:
+                logger.info("Hardware: CPU=%d cores, RAM=%.1fGB, GPU=[%s]", 
+                            psutil.cpu_count(logical=True), 
+                            psutil.virtual_memory().total / (1024**3),
+                            ", ".join(gpu_names))
         except Exception:
             self._nvml = None
             self._gpu_handles = []

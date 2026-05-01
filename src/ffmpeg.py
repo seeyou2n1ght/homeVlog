@@ -79,7 +79,7 @@ def get_duration(filepath: str) -> float | None:
     return float(dur) if dur else None
 
 
-def build_qsv_decode_args(
+def build_hw_decode_args(
     input_path: str,
     width: int = 320,
     height: int = 180,
@@ -87,18 +87,22 @@ def build_qsv_decode_args(
     start_time: float | None = None,
     duration: float | None = None,
     vframes: int | None = None,
+    gpu: str = "qsv",
 ) -> list[str]:
-    """Build QSV hardware decode args for light prescreen pass."""
-    args = [
-        "-hwaccel", "qsv",
-        "-hwaccel_output_format", "qsv",
-    ]
+    """Build hardware decode args for light prescreen pass."""
+    if gpu == "qsv":
+        args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        vf_parts = [f"scale_qsv=w={width}:h={height}", "hwdownload", "format=nv12"]
+    else:
+        args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        vf_parts = [f"scale_cuda={width}:{height}", "hwdownload", "format=nv12"]
+
     if start_time is not None:
         args += ["-ss", str(start_time)]
     args += ["-i", str(input_path)]
     if duration is not None:
         args += ["-t", str(duration)]
-    vf_parts = [f"scale_qsv=w={width}:h={height}", "hwdownload", "format=nv12"]
+        
     args += ["-vf", ",".join(vf_parts)]
     if fps:
         args += ["-r", str(fps)]
@@ -108,3 +112,30 @@ def build_qsv_decode_args(
     return args
 
 
+def build_hw_fps_extract_args(
+    input_path: str,
+    fps_rate: float,
+    width: int = 320,
+    height: int = 180,
+    gpu: str = "qsv",
+) -> list[str]:
+    """单流全速硬件解码并通过 fps 滤镜极速等距抽帧。
+    相比 multi-seek 方案，该方案只需占用 1 个硬件 session，极大保护了带宽。
+    """
+    if gpu == "qsv":
+        args = [
+            "-hwaccel", "qsv",
+            "-hwaccel_output_format", "qsv",
+            "-i", str(input_path),
+            "-vf", f"fps={fps_rate:.5f},scale_qsv=w={width}:h={height},hwdownload,format=nv12"
+        ]
+    else:
+        args = [
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-i", str(input_path),
+            "-vf", f"fps={fps_rate:.5f},scale_cuda={width}:{height},hwdownload,format=nv12"
+        ]
+        
+    args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    return args

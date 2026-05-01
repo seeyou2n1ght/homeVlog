@@ -25,7 +25,8 @@
       "Bash(.venv/Scripts/python -m py_compile src/renderer.py)",
       "Bash(.venv/Scripts/python -m py_compile src/scanner.py)",
       "Bash(.venv/Scripts/python -m py_compile src/segment.py)",
-      "Bash(.venv/Scripts/python -c \"from src.monitor import Monitor, PerfCollector, PerfRecord, get_monitor, get_perf; from src.ffmpeg import FFmpegResult; print\\('OK'\\)\")"
+      "Bash(.venv/Scripts/python -c \"from src.monitor import Monitor, PerfCollector, PerfRecord, get_monitor, get_perf; from src.ffmpeg import FFmpegResult; print\\('OK'\\)\")",
+      "Bash(python *)"
     ]
   }
 }

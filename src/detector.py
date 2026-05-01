@@ -29,7 +29,8 @@ class MotionDetector:
         self.decode_timeout = det.get("decode_timeout", 10)
         self.decode_gpu = decode_gpu
 
-    def analyze(self, filepath: str, start_offset: float = 0.0) -> list[dict]:
+    def analyze(self, filepath: str, start_offset: float = 0.0,
+                file_duration: float = 0.0) -> list[dict]:
         frame_size = self.width * self.height
         if self.decode_gpu == "qsv":
             args = [
@@ -61,13 +62,17 @@ class MotionDetector:
             bufsize=frame_size * self.pipe_buf_mult,
         )
 
-        # Watchdog: kill process if total time exceeds timeout
+        # Watchdog: 动态超时 — 基于文件时长或固定值取大
+        # 长文件（如 65min）需要更多解码时间，不能用固定值误杀
+        fixed_timeout = self.decode_timeout * 3
+        dynamic_timeout = (file_duration / max(self.fps, 1)) * 2 if file_duration > 0 else 0
+        watchdog_timeout = max(fixed_timeout, dynamic_timeout, 60.0)
         def _kill_on_timeout():
             try:
                 proc.kill()
             except OSError:
                 pass
-        watchdog = threading.Timer(self.decode_timeout * 3, _kill_on_timeout)
+        watchdog = threading.Timer(watchdog_timeout, _kill_on_timeout)
         watchdog.daemon = True
         watchdog.start()
 
@@ -235,15 +240,19 @@ def _smooth_labels(
     return smoothed
 
 
-def _analysis_worker(db, tasks: list[dict], date: str, config: dict, decode_gpu: str) -> tuple[dict, str]:
-    """Process a sub-list of SUSPICIOUS files with given decode GPU. Returns (stats, decode_gpu)."""
+def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -> tuple[dict, str]:
+    """Process SUSPICIOUS files from queue with given decode GPU (Work-Stealing)."""
     from src.segment import build_segments, segments_to_json
 
     detector = MotionDetector(config, decode_gpu=decode_gpu)
     perf = get_perf()
     stats = {"done": 0, "analyzed": 0, "failed": 0}
 
-    for task in tasks:
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+            
         filepath = task["filepath"]
         t0 = time.monotonic()
         try:
@@ -251,9 +260,12 @@ def _analysis_worker(db, tasks: list[dict], date: str, config: dict, decode_gpu:
             file_start_offset = file_start_ts - ts_to_unix(date + "000000")
             file_start_offset = max(file_start_offset, 0.0)
 
-            labels = detector.analyze(filepath, start_offset=file_start_offset)
+            labels = detector.analyze(
+                filepath, start_offset=file_start_offset,
+                file_duration=task.get("file_duration") or 300.0,
+            )
             elapsed = time.monotonic() - t0
-            lp = getattr(detector, "last_perf", {})
+            lp = detector.last_perf if hasattr(detector, "last_perf") else {}
 
             if not labels:
                 db.set_analysis_result(filepath, "FAILED", "")
@@ -305,8 +317,9 @@ def run_analysis_for_cam(
     cam_index: int,
     config: dict,
 ) -> dict:
-    """Run Pass1.5 analysis for SUSPICIOUS files of a date/cam with dual-GPU parallel decode."""
+    """Run Pass1.5 analysis using dual-GPU work-stealing queue."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from queue import Queue
 
     suspicious = db.get_suspicious_files(date, cam_index)
     if not suspicious:
@@ -315,16 +328,16 @@ def run_analysis_for_cam(
 
     logger.info("analysis: %d files for %s cam%d", len(suspicious), date, cam_index)
 
-    # Sort by file_duration desc, interleave for balanced GPU load.
-    # NVDEC is slower per-file in practice (~19.5s vs QSV ~13.7s),
-    # so QSV gets more files to equalize wall time.
+    # Sort by file_duration desc so longest files are processed first
     sorted_tasks = sorted(suspicious, key=lambda t: t.get("file_duration") or 0, reverse=True)
-    n_total = len(sorted_tasks)
-    n_nvdec = round(n_total * 0.43)  # ~43% to NVDEC (slower GPU)
-    list_nvdec = sorted_tasks[:n_nvdec]
-    list_qsv = sorted_tasks[n_nvdec:]
-
-    logger.info("analysis split: NVDEC=%d QSV=%d", len(list_nvdec), len(list_qsv))
+    
+    task_queue: Queue[dict | None] = Queue()
+    for task in sorted_tasks:
+        task_queue.put(task)
+        
+    # Sentinel values to terminate 2 workers
+    task_queue.put(None)
+    task_queue.put(None)
 
     stats = {"done": 0, "analyzed": 0, "failed": 0}
     max_workers = config.get("detection", {}).get("analysis_max_workers", 2)
@@ -332,8 +345,8 @@ def run_analysis_for_cam(
     worker_durations: dict[str, float] = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        f_nv = pool.submit(_analysis_worker, db, list_nvdec, date, config, "cuda")
-        f_qsv = pool.submit(_analysis_worker, db, list_qsv, date, config, "qsv")
+        f_nv = pool.submit(_analysis_worker, db, task_queue, date, config, "cuda")
+        f_qsv = pool.submit(_analysis_worker, db, task_queue, date, config, "qsv")
 
         for f in as_completed([f_nv, f_qsv]):
             t_done = time.monotonic()
@@ -341,8 +354,6 @@ def run_analysis_for_cam(
             worker_durations[gpu] = round(t_done - t_start, 1)
             for k in stats:
                 stats[k] += worker_stats[k]
-            logger.info("analysis worker [%s] done in %.1fs: analyzed=%d failed=%d",
-                       gpu, t_done - t_start, worker_stats["analyzed"], worker_stats["failed"])
 
     total_elapsed = time.monotonic() - t_start
     logger.info(

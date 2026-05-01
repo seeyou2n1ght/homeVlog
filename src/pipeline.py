@@ -115,8 +115,6 @@ def run_pipeline(skip_render: bool = False) -> dict:
             logger.info("no date-cam groups found")
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
 
-        logger.info("found %d date-cam groups to process", len(groups))
-
         total = 0
         ok = 0
         failed = 0

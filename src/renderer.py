@@ -128,21 +128,23 @@ def _detect_scale_mode(first_file: str, out_w: int, out_h: int) -> str:
 # Batch render with HW decode (NVDEC / QSV hwaccel)
 # ---------------------------------------------------------------------------
 
-_BATCH_MAX_FILES = 15  # NVDEC+NVENC limit: >15 inputs can OOM 8GB VRAM
+_DEFAULT_BATCH_MAX_FILES = 15  # NVDEC+NVENC 默认限制: >15 inputs 在 8GB VRAM 下可能 OOM
 
 
 def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, encoder="nv"):
     """Split timeline into batches by file count, render each with HW decode, concat.
 
-    When encoder="nv" and there are multiple batches, pairs consecutive batches
-    to run NVDEC+NVENC and QSV decode+encode in parallel, utilizing both GPUs.
+    When encoder="nv" and there are multiple batches, uses work-stealing mode:
+    NV/QSV workers independently pull batches from a shared queue.
     """
-    # Group segments into batches of ≤ _BATCH_MAX_FILES unique files
+    # batch_max_files: 可通过配置调整以适应不同 VRAM 大小
+    batch_max_files = out_cfg.get("batch_max_files", _DEFAULT_BATCH_MAX_FILES)
+    # Group segments into batches of ≤ batch_max_files unique files
     batches: list[list[TimelineSegment]] = []
     cur_batch: list[TimelineSegment] = []
     cur_files: set[str] = set()
     for seg in timeline:
-        if seg.filepath not in cur_files and len(cur_files) >= _BATCH_MAX_FILES and cur_batch:
+        if seg.filepath not in cur_files and len(cur_files) >= batch_max_files and cur_batch:
             batches.append(cur_batch)
             cur_batch = []
             cur_files = set()
@@ -154,9 +156,9 @@ def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, a
     n_batches = len(batches)
     total_files = len(set(t.filepath for t in timeline))
     logger.info("batch-render %s cam%d: %d files, %d segs -> %d batches (max %d files/batch)",
-                date, cam_index, total_files, len(timeline), n_batches, _BATCH_MAX_FILES)
+                date, cam_index, total_files, len(timeline), n_batches, batch_max_files)
 
-    # Parallel NVENC+QSV: pair consecutive batches to run on different GPUs
+    # Work-stealing: NV/QSV 双 worker 独立消费 batch 队列
     if encoder == "nv" and n_batches >= 2:
         batch_paths = _render_batches_parallel(
             batches, output_path, fps, width, height,
@@ -222,8 +224,6 @@ def _build_batch(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out
 
     batch_dur = sum(s.duration for s in batch_segs)
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
-    logger.info("batch %d [%s]: %d files, %.0fs video",
-                bi, enc_for_batch, len(files), batch_dur)
 
     result = _run_batch_render(
         files, fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,
@@ -233,83 +233,101 @@ def _build_batch(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out
 
 
 def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index):
-    """Pair consecutive batches: NVDEC+NVENC + QSV decode+encode in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Work-stealing: NV/QSV 双 worker 独立从队列取 batch，完成即取下一个。
 
-    batch_paths: list[Path] = []
+    替代原 pair 锁定模式。NV 速度 ~2.3x QSV，自然消费更多 batch，
+    两个 GPU 都不闲置。输出按 batch 序号排列保证 concat 顺序正确。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+
     n_batches = len(batches)
-    n_pairs = n_batches // 2
-
     total_dur = sum(s.duration for b in batches for s in b)
     n_files = len(set(s.filepath for b in batches for s in b))
     render_timeout = max(7200, n_files * 120 + total_dur * 4)
 
-    logger.info("parallel-render %s cam%d: %d batches -> %d pairs + %d tail, timeout=%.0fs",
-                date, cam_index, n_batches, n_pairs, n_batches % 2, render_timeout)
 
-    for pair_i in range(n_pairs):
-        bi_nv = pair_i * 2
-        bi_qsv = pair_i * 2 + 1
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_nv = pool.submit(
-                _build_batch, batches[bi_nv], bi_nv, "nv",
-                fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index,
-            )
-            f_qsv = pool.submit(
-                _build_batch, batches[bi_qsv], bi_qsv, "qsv",
-                fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index,
-            )
+    # 构建 batch 队列（带序号，保证输出顺序）
+    batch_queue: Queue[tuple[int, list] | None] = Queue()
+    for i, b in enumerate(batches):
+        batch_queue.put((i, b))
+    # 放入 2 个哨兵终止 2 个 worker
+    batch_queue.put(None)
+    batch_queue.put(None)
 
+    # 按 batch 序号收集结果
+    results: dict[int, str | None] = {}
+    results_lock = threading.Lock()
+    # 记录每个 worker 处理的 batch 数
+    worker_counts: dict[str, int] = {"nv": 0, "qsv": 0}
+
+    def _worker(enc: str) -> None:
+        """单个 GPU worker: 循环从队列取 batch 并渲染。"""
+        while True:
+            item = batch_queue.get()
+            if item is None:
+                break
+            bi, batch_segs = item
             try:
-                results = {}
-                for f in as_completed([f_nv, f_qsv], timeout=render_timeout):
-                    results[f] = f.result()
-            except TimeoutError:
-                logger.error("parallel-render pair %d timeout for %s cam%d (%.0fs limit)",
-                             pair_i, date, cam_index, render_timeout)
-                FFmpegProcessRegistry.kill_all()
-                time.sleep(1)
-                for p in batch_paths:
-                    p.unlink(missing_ok=True)
-                return None
+                result = _build_batch(
+                    batch_segs, bi, enc,
+                    fps, width, height, seg_cfg, out_cfg, audio_cfg,
+                    date, cam_index,
+                )
+                with results_lock:
+                    results[bi] = result
+                    worker_counts[enc] += 1
+                if result is None:
+                    logger.error("work-stealing batch %d [%s] failed", bi, enc)
             except Exception as e:
-                logger.error("parallel-render pair %d error for %s cam%d: %s",
-                             pair_i, date, cam_index, e)
-                FFmpegProcessRegistry.kill_all()
-                time.sleep(1)
-                for p in batch_paths:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                return None
+                logger.error("work-stealing batch %d [%s] error: %s", bi, enc, e)
+                with results_lock:
+                    results[bi] = None
+                    worker_counts[enc] += 1
 
-        r_nv = results.get(f_nv)
-        r_qsv = results.get(f_qsv)
-        if r_nv and r_qsv:
-            batch_paths.append(Path(r_nv))
-            batch_paths.append(Path(r_qsv))
-        else:
-            logger.error("parallel-render pair %d failed: nv=%s qsv=%s",
-                         pair_i, "ok" if r_nv else "FAIL", "ok" if r_qsv else "FAIL")
-            for p in batch_paths:
-                p.unlink(missing_ok=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_nv = pool.submit(_worker, "nv")
+        f_qsv = pool.submit(_worker, "qsv")
+
+        try:
+            f_nv.result(timeout=render_timeout)
+            f_qsv.result(timeout=render_timeout)
+        except TimeoutError:
+            logger.error(
+                "work-stealing render timeout for %s cam%d (%.0fs limit)",
+                date, cam_index, render_timeout,
+            )
+            FFmpegProcessRegistry.kill_all()
+            time.sleep(1)
+            return None
+        except Exception as e:
+            logger.error(
+                "work-stealing render error for %s cam%d: %s",
+                date, cam_index, e,
+            )
+            FFmpegProcessRegistry.kill_all()
+            time.sleep(1)
             return None
 
-    # Tail batch (odd count): sequential on default encoder
-    if n_batches % 2 == 1:
-        bi = n_batches - 1
-        result = _build_batch(
-            batches[bi], bi, "nv",
-            fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index,
-        )
-        if result is None:
-            logger.error("parallel-render tail batch %d failed", bi)
+    logger.info(
+        "work-stealing done: nv=%d batches, qsv=%d batches",
+        worker_counts["nv"], worker_counts["qsv"],
+    )
+
+    # 按序号组装结果，保证 concat 顺序
+    batch_paths: list[Path] = []
+    for i in range(n_batches):
+        r = results.get(i)
+        if r is None:
+            logger.error("work-stealing: batch %d missing or failed", i)
             for p in batch_paths:
-                p.unlink(missing_ok=True)
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return None
-        batch_paths.append(Path(result))
+        batch_paths.append(Path(r))
 
     return batch_paths
 
@@ -371,8 +389,16 @@ def _run_batch_render(
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     FFmpegProcessRegistry.register(str(output_path), proc)
     t0 = time.monotonic()
+    # timeout = max(7200, 所有文件总时长 * 4), 防止 ffmpeg 挂死时主线程永久阻塞
+    render_timeout = max(7200, len(input_files) * 600)
     try:
-        _, stderr = proc.communicate()
+        _, stderr = proc.communicate(timeout=render_timeout)
+    except subprocess.TimeoutExpired:
+        logger.error("batch-render cam%d batch%d communicate timeout (%ds)",
+                     cam_index, batch_idx, render_timeout)
+        proc.kill()
+        proc.wait(timeout=10)
+        return None
     finally:
         FFmpegProcessRegistry.deregister(str(output_path))
     elapsed = time.monotonic() - t0
@@ -391,9 +417,14 @@ def _run_batch_render(
         ))
         return str(output_path)
     else:
-        err = stderr.decode("utf-8", errors="replace")[-2000:]
-        logger.error("batch-render cam%d batch%d failed after %.1fs: %s",
-                     cam_index, batch_idx, elapsed, err[-500:])
+        err_full = stderr.decode("utf-8", errors="replace")
+        # 保留头尾信息以便定位根因（开头通常是核心错误，尾部是最后状态）
+        if len(err_full) > 1000:
+            err_display = err_full[:500] + "\n... [truncated] ...\n" + err_full[-500:]
+        else:
+            err_display = err_full
+        logger.error("batch-render cam%d batch%d failed after %.1fs:\n%s",
+                     cam_index, batch_idx, elapsed, err_display)
         perf.add(PerfRecord(
             stage="render", file=str(output_path), gpu=encoder,
             duration=round(elapsed, 2), extra={"batch": batch_idx, "status": "FAILED"},
@@ -416,7 +447,7 @@ def _concat_files(files: list[Path], output: Path, timeout: float = 300) -> bool
     if result.returncode != 0:
         logger.error("concat %d files failed (%.1fs): %s", len(files), result.duration, result.stderr_text[-300:])
         return False
-    logger.info("concat %d files done in %.1fs", len(files), result.duration)
+
     return True
 
 
@@ -452,13 +483,20 @@ def _run_ffmpeg_render(
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
     cmd += [str(output_path)]
 
-    logger.info("render %s cam%d (%s): %d files", date, cam_index, encoder, len(input_files))
+
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     FFmpegProcessRegistry.register(str(output_path), proc)
     t0 = time.monotonic()
+    render_timeout = max(7200, len(input_files) * 600)
     try:
-        _, stderr = proc.communicate()
+        _, stderr = proc.communicate(timeout=render_timeout)
+    except subprocess.TimeoutExpired:
+        logger.error("render %s cam%d communicate timeout (%ds)",
+                     date, cam_index, render_timeout)
+        proc.kill()
+        proc.wait(timeout=10)
+        return None
     finally:
         FFmpegProcessRegistry.deregister(str(output_path))
     elapsed = time.monotonic() - t0
@@ -478,9 +516,12 @@ def _run_ffmpeg_render(
         return str(output_path)
     else:
         err_full = stderr.decode("utf-8", errors="replace")
-        err_tail = err_full[-3000:] if len(err_full) > 3000 else err_full
-        logger.error("render %s cam%d failed after %.1fs: %s",
-                     date, cam_index, elapsed, err_tail[-500:])
+        if len(err_full) > 1000:
+            err_display = err_full[:500] + "\n... [truncated] ...\n" + err_full[-500:]
+        else:
+            err_display = err_full
+        logger.error("render %s cam%d failed after %.1fs:\n%s",
+                     date, cam_index, elapsed, err_display)
         perf.add(PerfRecord(
             stage="render", file=str(output_path), gpu=encoder,
             duration=round(elapsed, 2), extra={"status": "FAILED"},
