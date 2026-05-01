@@ -126,11 +126,27 @@ def run_pipeline(skip_render: bool = False) -> dict:
                 skipped += 1
                 continue
 
+            # 空间熔断
+            from src.utils import check_disk_space, OUTPUT_DIR, cleanup_resources
+            if not check_disk_space(OUTPUT_DIR, min_gb=20):
+                logger.error("Pipeline paused due to low disk space.")
+                break
+
             total += 1
-            if process_date_cam(db, date, cam_index, skip_render=skip_render):
-                ok += 1
-            else:
+            
+            # 全域异常装甲与故障隔离
+            try:
+                ok_flag = process_date_cam(db, date, cam_index, skip_render=skip_render)
+                if ok_flag:
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception:
+                logger.exception("CRITICAL ERROR: process_date_cam crashed for %s cam%d. Skipping to next day.", date, cam_index)
                 failed += 1
+
+            # 强制深层 GC 和僵尸进程清洗（为下一天的战役打扫战场）
+            cleanup_resources()
 
         logger.info("all done: total=%d ok=%d failed=%d skipped=%d", total, ok, failed, skipped)
         logger.info("\n%s", monitor.summary())

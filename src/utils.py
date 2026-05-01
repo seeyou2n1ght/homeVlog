@@ -80,3 +80,41 @@ def parse_res(spec: str) -> tuple[int, int]:
     """Parse 'WxH' resolution string to (width, height)."""
     parts = spec.split("x")
     return int(parts[0]), int(parts[1])
+
+
+def cleanup_resources():
+    """Deep GC and kill orphaned ffmpeg processes."""
+    import gc
+    import psutil
+    
+    # 1. Force Python GC
+    gc.collect()
+    
+    # 2. Kill orphan ffmpeg (Run ONLY between batch days)
+    killed = 0
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            name = proc.info.get('name', '')
+            if name and 'ffmpeg' in name.lower():
+                proc.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
+    if killed > 0:
+        logging.getLogger("homevlog").warning("cleanup: killed %d zombie ffmpeg processes", killed)
+
+
+def check_disk_space(path: Path, min_gb: int = 20) -> bool:
+    """Check if free disk space is above minimum threshold."""
+    import shutil
+    try:
+        total, used, free = shutil.disk_usage(path)
+        free_gb = free / (1024 ** 3)
+        if free_gb < min_gb:
+            logging.getLogger("homevlog").error("Disk space critically low on %s: %.1f GB free (< %d GB)", path, free_gb, min_gb)
+            return False
+        return True
+    except Exception as e:
+        logging.getLogger("homevlog").warning("Failed to check disk space: %s", e)
+        return True
