@@ -171,7 +171,7 @@ def build_concat_filter(
             )
             parts_a.append(
                 f"[{idx}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates={audio_sample_rate}:channel_layouts=mono[a{seg_count}]"
+                f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
             )
         else:
             dur = e - s
@@ -188,7 +188,7 @@ def build_concat_filter(
                     f"setpts=PTS/{speed_factor:.1f}[v{seg_count}]"
                 )
             parts_a.append(
-                f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur / speed_factor:.3f}[a{seg_count}]"
+                f"anullsrc=r={audio_sample_rate}:d={dur / speed_factor:.3f}[a{seg_count}]"
             )
 
         seg_count += 1
