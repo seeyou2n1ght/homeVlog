@@ -233,15 +233,12 @@ def _build_batch(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out
 
 
 def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index):
-    """Work-stealing with completion-time balancing.
+    """Work-stealing: NV/QSV 双 worker 从共享队列抢 batch，先完成先取。
 
-    每个 worker 完成一个 batch 后，在取下一个之前先估算：
-    "如果我拿了这个 batch，我的总完工时间会不会拖后全局？"
-    如果慢 worker 的预估完工时间已经超过快 worker，它主动让出剩余 batch。
-    速度比在运行中自动学习，无需硬编码。
+    使用哨兵值终止 worker。NV 天然更快，自然消费更多 batch。
     """
     from concurrent.futures import ThreadPoolExecutor
-    from queue import Queue, Empty
+    from queue import Queue
 
     n_batches = len(batches)
     total_dur = sum(s.duration for b in batches for s in b)
@@ -249,85 +246,26 @@ def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, 
     render_timeout = max(7200, n_files * 120 + total_dur * 4)
 
     # 构建 batch 队列（带序号，保证输出顺序）
-    batch_queue: Queue[tuple[int, list]] = Queue()
+    batch_queue: Queue[tuple[int, list] | None] = Queue()
     for i, b in enumerate(batches):
         batch_queue.put((i, b))
+    # 放入 2 个哨兵终止 2 个 worker
+    batch_queue.put(None)
+    batch_queue.put(None)
 
     # 按 batch 序号收集结果
     results: dict[int, str | None] = {}
     results_lock = threading.Lock()
-    # 每个 worker 的累计耗时和完成 batch 数，用于速度估算
     worker_elapsed: dict[str, float] = {"nv": 0.0, "qsv": 0.0}
     worker_counts: dict[str, int] = {"nv": 0, "qsv": 0}
-    # 标记是否有 worker 已经退出（快 worker 结束后慢 worker 不再让出）
-    workers_alive: dict[str, bool] = {"nv": True, "qsv": True}
-    stats_lock = threading.Lock()
-
-    def _estimate_batch_time(enc: str, batch_segs: list) -> float:
-        """基于该 worker 历史速度估算处理一个 batch 的耗时。"""
-        with stats_lock:
-            count = worker_counts[enc]
-            elapsed = worker_elapsed[enc]
-        if count == 0:
-            # 冷启动：用保守估计（NV ~300s, QSV ~800s）
-            return 300.0 if enc == "nv" else 800.0
-        return elapsed / count  # 均速估算
-
-    def _should_yield(enc: str, batch_segs: list) -> bool:
-        """判断慢 worker 是否应该让出当前 batch 给快 worker。"""
-        other = "qsv" if enc == "nv" else "nv"
-        with stats_lock:
-            # 如果对方已经退出，不需要让出
-            if not workers_alive[other]:
-                return False
-            my_elapsed = worker_elapsed[enc]
-            other_elapsed = worker_elapsed[other]
-            my_count = worker_counts[enc]
-            other_count = worker_counts[other]
-
-        # 至少各完成 1 个 batch 后才启动平衡逻辑
-        if my_count < 1 or other_count < 1:
-            return False
-
-        my_avg = my_elapsed / my_count
-        other_avg = other_elapsed / other_count
-        remaining = batch_queue.qsize()
-
-        # 如果剩余 batch <= 2，且我是慢 worker，让出
-        if remaining <= 2 and my_avg > other_avg * 1.5:
-            return True
-
-        # 如果我的预估完工时间比对方多出一个 batch 的时间，让出
-        my_finish = my_elapsed + my_avg
-        other_finish = other_elapsed + remaining * other_avg
-        if my_finish > other_finish + other_avg:
-            return True
-
-        return False
 
     def _worker(enc: str) -> None:
-        """单个 GPU worker: 带完成时间预估的智能抢占。"""
+        """单个 GPU worker: 循环从队列取 batch 并渲染。"""
         while True:
-            # 先判断是否应该让出
-            try:
-                item = batch_queue.get_nowait()
-            except Empty:
+            item = batch_queue.get()
+            if item is None:
                 break
-
             bi, batch_segs = item
-
-            # 完成时间预估：如果我拿了这个 batch 会拖慢全局，放回队列
-            if _should_yield(enc, batch_segs):
-                batch_queue.put((bi, batch_segs))
-                # 短暂等待，给快 worker 机会抢走
-                time.sleep(0.5)
-                # 再尝试一次，如果队列空了就退出
-                try:
-                    item = batch_queue.get_nowait()
-                except Empty:
-                    break
-                bi, batch_segs = item
-
             t0 = time.monotonic()
             try:
                 result = _build_batch(
@@ -336,25 +274,19 @@ def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, 
                     date, cam_index,
                 )
                 elapsed = time.monotonic() - t0
-                with stats_lock:
-                    worker_elapsed[enc] += elapsed
                 with results_lock:
                     results[bi] = result
                     worker_counts[enc] += 1
+                    worker_elapsed[enc] += elapsed
                 if result is None:
-                    logger.error("work-stealing batch %d [%s] failed", bi, enc)
+                    logger.error("work-stealing batch %d [%s] failed (%.0fs)", bi, enc, elapsed)
             except Exception as e:
                 elapsed = time.monotonic() - t0
-                logger.error("work-stealing batch %d [%s] error: %s", bi, enc, e)
-                with stats_lock:
-                    worker_elapsed[enc] += elapsed
+                logger.error("work-stealing batch %d [%s] error (%.0fs): %s", bi, enc, elapsed, e)
                 with results_lock:
                     results[bi] = None
                     worker_counts[enc] += 1
-
-        # 标记自己退出
-        with stats_lock:
-            workers_alive[enc] = False
+                    worker_elapsed[enc] += elapsed
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_nv = pool.submit(_worker, "nv")
