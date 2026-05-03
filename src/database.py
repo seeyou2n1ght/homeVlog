@@ -183,6 +183,16 @@ class VlogDatabase:
             ).fetchone()
             return row is not None and row["status"] == "COMPLETED"
 
+    def get_pending_file_count_for_date(self, date: str, cam_index: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) as cnt FROM file_tasks
+                   WHERE date=? AND cam_index=? AND
+                   (prescreen_status='PENDING' OR (prescreen_status='SUSPICIOUS' AND analysis_status='PENDING'))""",
+                (date, cam_index)
+            ).fetchone()
+            return row["cnt"] if row else 0
+
     def close(self):
         with self._lock:
             if self._conn:

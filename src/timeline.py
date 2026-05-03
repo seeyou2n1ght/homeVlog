@@ -82,6 +82,7 @@ def build_concat_filter(
     output_height: int = 1080,
     static_keyframe_interval: float = 30.0,
     keyframe_display_duration: float = 0.5,
+    min_static_display_duration: float = 1.5,
     audio_sample_rate: int = 48000,
     gap_tolerance: float = 0.5,
     scale_mode: str = "cpu",
@@ -97,7 +98,7 @@ def build_concat_filter(
     """
     kf_interval = max(static_keyframe_interval, 1.0)
     display_dur = max(keyframe_display_duration, 0.1)
-    speed_factor = kf_interval / display_dur
+    global_speed_factor = kf_interval / display_dur
 
     if scale_mode == "cuda":
         # CPU frames → upload to GPU → scale → download
@@ -175,20 +176,26 @@ def build_concat_filter(
             )
         else:
             dur = e - s
+            # Dynamic speed factor calculation to prevent flashes
+            target_display_dur = max(dur / global_speed_factor, min_static_display_duration)
+            target_display_dur = min(target_display_dur, dur)  # Cannot be slower than 1x
+            seg_speed_factor = dur / target_display_dur if target_display_dur > 0 else 1.0
+
             if use_keyframe_slideshow:
+                seg_kf_interval = seg_speed_factor * display_dur
                 parts_v.append(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
-                    f"fps=fps=1/{kf_interval:.1f},"
-                    f"setpts=PTS/{speed_factor:.1f},"
+                    f"fps=fps=1/{seg_kf_interval:.1f},"
+                    f"setpts=PTS/{seg_speed_factor:.1f},"
                     f"fps=fps={output_fps}[v{seg_count}]"
                 )
             else:
                 parts_v.append(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
-                    f"setpts=PTS/{speed_factor:.1f}[v{seg_count}]"
+                    f"setpts=PTS/{seg_speed_factor:.1f}[v{seg_count}]"
                 )
             parts_a.append(
-                f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur / speed_factor:.3f}[a{seg_count}]"
+                f"anullsrc=r={audio_sample_rate}:cl=mono:d={target_display_dur:.3f}[a{seg_count}]"
             )
 
         seg_count += 1

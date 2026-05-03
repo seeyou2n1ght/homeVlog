@@ -99,6 +99,7 @@ def _prepare_render(timeline, fps, width, height, seg_cfg):
         output_height=height,
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
         keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
+        min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
         gap_tolerance=seg_cfg.get("gap_tolerance", 0.5),
         scale_mode=scale_mode,
     )
@@ -128,7 +129,7 @@ def _detect_scale_mode(first_file: str, out_w: int, out_h: int) -> str:
 # Batch render with HW decode (NVDEC / QSV hwaccel)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BATCH_MAX_FILES = 20  # Per-file scale 架构下 8GB VRAM 安全上限，减少 batch 数和 concat 开销
+_DEFAULT_BATCH_MAX_FILES = 8  # 降低 Filter Complex 复杂度，提升显存周转率
 
 
 def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, encoder="nv"):
@@ -177,7 +178,7 @@ def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, a
     if len(batch_paths) == 1:
         batch_paths[0].rename(output_path)
     else:
-        ok = _concat_files(batch_paths, output_path)
+        ok = concat_output_files(batch_paths, output_path)
         for p in batch_paths:
             try:
                 p.unlink(missing_ok=True)
@@ -195,7 +196,7 @@ def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, a
     return str(output_path)
 
 
-def _build_batch(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index):
+def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index):
     """Prepare a single batch: deepcopy, reindex, build filter graph, render."""
     from copy import deepcopy
     batch_copy = deepcopy(batch_segs)
@@ -218,6 +219,7 @@ def _build_batch(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out
         output_fps=fps, output_width=width, output_height=height,
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
         keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
+        min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
         gap_tolerance=seg_cfg.get("gap_tolerance", 0.5),
         scale_mode=scale_mode,
     )
@@ -268,7 +270,7 @@ def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, 
             bi, batch_segs = item
             t0 = time.monotonic()
             try:
-                result = _build_batch(
+                result = build_batch_render(
                     batch_segs, bi, enc,
                     fps, width, height, seg_cfg, out_cfg, audio_cfg,
                     date, cam_index,
@@ -389,21 +391,28 @@ def _run_batch_render(
 
     logger.info("batch-render cam%d batch%d (%s): %d files", cam_index, batch_idx, encoder, len(input_files))
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    FFmpegProcessRegistry.register(str(output_path), proc)
-    t0 = time.monotonic()
-    # timeout = max(7200, 所有文件总时长 * 4), 防止 ffmpeg 挂死时主线程永久阻塞
-    render_timeout = max(7200, len(input_files) * 600)
+    from src.utils import get_io_semaphore
+    io_sem = get_io_semaphore()
+    io_sem.acquire()
     try:
-        _, stderr = proc.communicate(timeout=render_timeout)
-    except subprocess.TimeoutExpired:
-        logger.error("batch-render cam%d batch%d communicate timeout (%ds)",
-                     cam_index, batch_idx, render_timeout)
-        proc.kill()
-        proc.wait(timeout=10)
-        return None
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        FFmpegProcessRegistry.register(str(output_path), proc)
+        t0 = time.monotonic()
+        # timeout = max(7200, 所有文件总时长 * 4), 防止 ffmpeg 挂死时主线程永久阻塞
+        render_timeout = max(7200, len(input_files) * 600)
+        try:
+            _, stderr = proc.communicate(timeout=render_timeout)
+        except subprocess.TimeoutExpired:
+            logger.error("batch-render cam%d batch%d communicate timeout (%ds)",
+                         cam_index, batch_idx, render_timeout)
+            proc.kill()
+            proc.wait(timeout=10)
+            return None
+        finally:
+            FFmpegProcessRegistry.deregister(str(output_path))
     finally:
-        FFmpegProcessRegistry.deregister(str(output_path))
+        io_sem.release()
+        
     elapsed = time.monotonic() - t0
 
     fc_script.unlink(missing_ok=True)
@@ -435,7 +444,7 @@ def _run_batch_render(
         return None
 
 
-def _concat_files(files: list[Path], output: Path, timeout: float = 300) -> bool:
+def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -> bool:
     """Losslessly concatenate multiple MP4 files via concat demuxer."""
     concat_list = output.with_name(f".concat_{output.stem}.txt")
     lines = [f"file {str(f).replace(chr(92), '/')}" for f in files]
@@ -486,22 +495,27 @@ def _run_ffmpeg_render(
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
     cmd += [str(output_path)]
 
-
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    FFmpegProcessRegistry.register(str(output_path), proc)
-    t0 = time.monotonic()
-    render_timeout = max(7200, len(input_files) * 600)
+    from src.utils import get_io_semaphore
+    io_sem = get_io_semaphore()
+    io_sem.acquire()
     try:
-        _, stderr = proc.communicate(timeout=render_timeout)
-    except subprocess.TimeoutExpired:
-        logger.error("render %s cam%d communicate timeout (%ds)",
-                     date, cam_index, render_timeout)
-        proc.kill()
-        proc.wait(timeout=10)
-        return None
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        FFmpegProcessRegistry.register(str(output_path), proc)
+        t0 = time.monotonic()
+        render_timeout = max(7200, len(input_files) * 600)
+        try:
+            _, stderr = proc.communicate(timeout=render_timeout)
+        except subprocess.TimeoutExpired:
+            logger.error("render %s cam%d communicate timeout (%ds)",
+                         date, cam_index, render_timeout)
+            proc.kill()
+            proc.wait(timeout=10)
+            return None
+        finally:
+            FFmpegProcessRegistry.deregister(str(output_path))
     finally:
-        FFmpegProcessRegistry.deregister(str(output_path))
+        io_sem.release()
+        
     elapsed = time.monotonic() - t0
 
     perf = get_perf()

@@ -55,76 +55,82 @@ class MotionDetector:
                 "-",
             ]
 
-        proc = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=frame_size * self.pipe_buf_mult,
-        )
+        from src.utils import get_io_semaphore
+        io_sem = get_io_semaphore()
+        io_sem.acquire()
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=frame_size * self.pipe_buf_mult,
+            )
 
-        # Watchdog: 动态超时 — 基于文件时长或固定值取大
-        # 长文件（如 65min）需要更多解码时间，不能用固定值误杀
-        fixed_timeout = self.decode_timeout * 3
-        dynamic_timeout = (file_duration / max(self.fps, 1)) * 2 if file_duration > 0 else 0
-        watchdog_timeout = max(fixed_timeout, dynamic_timeout, 60.0)
-        def _kill_on_timeout():
+            # Watchdog: 动态超时 — 基于文件时长或固定值取大
+            # 长文件（如 65min）需要更多解码时间，不能用固定值误杀
+            fixed_timeout = self.decode_timeout * 3
+            dynamic_timeout = (file_duration / max(self.fps, 1)) * 2 if file_duration > 0 else 0
+            watchdog_timeout = max(fixed_timeout, dynamic_timeout, 60.0)
+            def _kill_on_timeout():
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            watchdog = threading.Timer(watchdog_timeout, _kill_on_timeout)
+            watchdog.daemon = True
+            watchdog.start()
+
+            stderr_lines: list[str] = []
+            def _read_stderr():
+                for line in proc.stderr:
+                    stderr_lines.append(line.decode("utf-8", errors="replace"))
+            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+            stderr_thread.start()
+
+            prev_gray: np.ndarray | None = None
+            energies: list[float] = []
+
+            roi_x = int(self.width * self.roi[0])
+            roi_y = int(self.height * self.roi[1])
+            roi_w = int(self.width * self.roi[2])
+            roi_h = int(self.height * self.roi[3])
+
+            t_decode_start = time.monotonic()
+            total_frames = 0
+
             try:
+                while True:
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    total_frames += 1
+
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width))
+                    roi = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].astype(np.float32)
+                    frame = None  # free
+
+                    if prev_gray is not None:
+                        diff = np.abs(roi - prev_gray)
+                        energies.append(float(np.mean(diff)))
+                    # First frame has no predecessor — excluded from energies
+
+                    prev_gray = roi
+            except Exception:
+                logger.warning("ffmpeg read interrupted for %s", Path(filepath).name)
                 proc.kill()
-            except OSError:
-                pass
-        watchdog = threading.Timer(watchdog_timeout, _kill_on_timeout)
-        watchdog.daemon = True
-        watchdog.start()
+            finally:
+                watchdog.cancel()
 
-        stderr_lines: list[str] = []
-        def _read_stderr():
-            for line in proc.stderr:
-                stderr_lines.append(line.decode("utf-8", errors="replace"))
-        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-        stderr_thread.start()
+            t_decode_end = time.monotonic()
 
-        prev_gray: np.ndarray | None = None
-        energies: list[float] = []
-
-        roi_x = int(self.width * self.roi[0])
-        roi_y = int(self.height * self.roi[1])
-        roi_w = int(self.width * self.roi[2])
-        roi_h = int(self.height * self.roi[3])
-
-        t_decode_start = time.monotonic()
-        total_frames = 0
-
-        try:
-            while True:
-                raw = proc.stdout.read(frame_size)
-                if len(raw) < frame_size:
-                    break
-                total_frames += 1
-
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width))
-                roi = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].astype(np.float32)
-                frame = None  # free
-
-                if prev_gray is not None:
-                    diff = np.abs(roi - prev_gray)
-                    energies.append(float(np.mean(diff)))
-                # First frame has no predecessor — excluded from energies
-
-                prev_gray = roi
-        except Exception:
-            logger.warning("ffmpeg read interrupted for %s", Path(filepath).name)
-            proc.kill()
+            try:
+                proc.wait(timeout=self.decode_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stderr_thread.join(timeout=2)
         finally:
-            watchdog.cancel()
-
-        t_decode_end = time.monotonic()
-
-        try:
-            proc.wait(timeout=self.decode_timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        stderr_thread.join(timeout=2)
+            io_sem.release()
 
         if proc.returncode != 0 and proc.returncode != -9:
             err = "".join(stderr_lines[-5:]) if stderr_lines else ""

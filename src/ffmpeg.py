@@ -29,17 +29,25 @@ def run_ffmpeg(
     if capture_output:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
-    proc = subprocess.Popen(cmd, **kwargs)
-    t0 = _time.monotonic()
+        
+    from src.utils import get_io_semaphore
+    io_sem = get_io_semaphore()
+    io_sem.acquire()
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        returncode = proc.returncode
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        returncode = -9
-        timed_out = True
+        proc = subprocess.Popen(cmd, **kwargs)
+        t0 = _time.monotonic()
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            returncode = -9
+            timed_out = True
+    finally:
+        io_sem.release()
+        
     elapsed = _time.monotonic() - t0
 
     return FFmpegResult(
@@ -61,7 +69,15 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
         "-show_format", "-show_streams",
         str(filepath),
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    
+    from src.utils import get_io_semaphore
+    io_sem = get_io_semaphore()
+    io_sem.acquire()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    finally:
+        io_sem.release()
+        
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     try:
