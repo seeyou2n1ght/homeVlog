@@ -27,7 +27,6 @@ def _calc_sample_timestamps(duration: float, segments: int, margin: float = 0.5)
 
 def _extract_frame(filepath: str, timestamp: float, width: int, height: int, timeout: float = 30.0, gpu: str = "qsv") -> np.ndarray | None:
     """Extract single RGB frame at given timestamp using HW decode."""
-    from src.ffmpeg import build_hw_decode_args
     args = build_hw_decode_args(
         input_path=str(filepath),
         width=width,

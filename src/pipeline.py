@@ -3,17 +3,15 @@ import time
 import threading
 import queue
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 from src.database import VlogDatabase
 from src.scanner import scan_directory, get_date_cam_groups
 from src.prescreen import prescreen_file
 from src.detector import MotionDetector
-from src.renderer import build_batch_render, concat_output_files, _reindex_timeline
-from src.scheduler import choose_encoder
-from src.utils import load_config, OUTPUT_DIR, DB_PATH, LOGS_DIR, REPORTS_DIR, cleanup_resources, check_disk_space
+from src.renderer import build_batch_render, concat_output_files
+from src.utils import load_config, OUTPUT_DIR, LOGS_DIR, REPORTS_DIR, cleanup_resources, check_disk_space
 from src.monitor import get_monitor, get_perf, PerfRecord
-from src.timeline import build_timeline, TimelineSegment
+from src.timeline import build_timeline
 
 logger = logging.getLogger("homevlog")
 
@@ -288,7 +286,7 @@ def _save_summary_report(db: VlogDatabase, date: str, cam_index: int):
         f.write(f"Total Source Duration: {total_duration:.2f}s\n")
         f.write(f"Static Duration:       {static_duration:.2f}s\n")
         f.write(f"Dynamic Duration:      {dynamic_duration:.2f}s\n")
-        f.write(f"\nSegment Details:\n")
+        f.write("\nSegment Details:\n")
         
         rows = db.get_all_file_tasks_for_date(date, cam_index)
         day_start = ts_to_unix(date + "000000")

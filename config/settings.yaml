@@ -11,7 +11,7 @@
 paths:
   # 输入目录，存放按命名规范命名的 MP4 文件
   # 命名格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
-  input_dir: "C:\\Users\\seeyo\\code\\homevlog-20260428\\input"
+  input_dir: '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD'
 
 # ---------------------------------------------------------------------------
 # Pass2 渲染控制

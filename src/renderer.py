@@ -224,7 +224,6 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         scale_mode=scale_mode,
     )
 
-    batch_dur = sum(s.duration for s in batch_segs)
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
 
     result = _run_batch_render(
@@ -341,7 +340,7 @@ def _render_batches_sequential(batches, output_path, fps, width, height, seg_cfg
     """Render batches one at a time (fallback for single-batch or non-nv encoder)."""
     batch_paths: list[Path] = []
     for bi, batch_segs in enumerate(batches):
-        result = _build_batch(
+        result = build_batch_render(
             batch_segs, bi, encoder,
             fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index,
         )
