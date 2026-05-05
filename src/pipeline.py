@@ -227,7 +227,7 @@ class StreamingOrchestrator:
         analysis_max_workers = self.config.get("detection", {}).get("analysis_max_workers", 2)
         qsv_threshold = self.config.get("detection", {}).get("qsv_fallback_threshold", 50)
         
-        if len(tasks) > qsv_threshold and analysis_max_workers >= 2:
+        if len(all_tasks) > qsv_threshold and analysis_max_workers >= 2:
             t_nv = threading.Thread(target=self._analysis_worker, args=("cuda",), daemon=True)
             t_nv.start()
             threads.append(t_nv)
