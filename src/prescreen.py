@@ -37,10 +37,12 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
     )
     result = run_ffmpeg(args, timeout=timeout)
     if result.returncode != 0:
+        logger.error("FFmpeg extract_frame failed for %s at %.1f: %s", filepath, timestamp, result.stderr_text[-500:])
         return None
     raw = result.stdout
     expected = width * height * 3
     if len(raw) < expected:
+        logger.error("FFmpeg extract_frame too small for %s at %.1f: got %d, expected %d", filepath, timestamp, len(raw), expected)
         return None
     frame = np.frombuffer(raw[:expected], dtype=np.uint8).reshape((height, width, 3))
     return frame
