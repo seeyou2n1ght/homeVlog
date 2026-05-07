@@ -148,21 +148,28 @@ class MotionDetector:
         if self.median_window >= 3:
             energies = _median_filter(energies, self.median_window)
 
-        # Adaptive threshold: IQR-based outlier detection
+        # Adaptive threshold: Robust noise floor estimation
+        # IQR fails when motion frames > 50% (Q3 becomes a motion value).
+        # Instead, we estimate the noise from the bottom 20% of frames.
         energies_arr = np.array(energies, dtype=np.float32)
-        q1 = float(np.percentile(energies_arr, 25))
-        q3 = float(np.percentile(energies_arr, 75))
-        iqr = q3 - q1
-        threshold = q3 + self.sensitivity * iqr
+        p5 = float(np.percentile(energies_arr, 5))
+        p20 = float(np.percentile(energies_arr, 20))
+        
+        # Approximate standard IQR scale from the p5-p20 spread
+        noise_spread = (p20 - p5) * 2.5
+        
+        # Absolute minimum offset prevents triggering on clean digital black
+        min_offset = 0.5
+        threshold = p5 + max(min_offset, self.sensitivity * noise_spread)
 
         raw_labels: list[bool] = [bool(e > threshold) for e in energies]
         # First frame is always False (no predecessor to compare)
         raw_labels.insert(0, False)
 
         logger.debug(
-            "adaptive threshold for %s: Q1=%.3f Q3=%.3f IQR=%.3f threshold=%.3f "
+            "adaptive threshold for %s: p5=%.3f p20=%.3f spread=%.3f threshold=%.3f "
             "motion_frames=%d/%d (%.1f%%)",
-            Path(filepath).name, q1, q3, iqr, threshold,
+            Path(filepath).name, p5, p20, noise_spread, threshold,
             sum(raw_labels), len(raw_labels), 100 * sum(raw_labels) / len(raw_labels),
         )
 
@@ -177,11 +184,16 @@ class MotionDetector:
             "motion_ratio": round(motion_count / len(smoothed), 3) if smoothed else 0,
         }
 
-        frame_interval = 1.0 / self.fps
+        # 核心优化：依据文件真实时长和解出的总帧数做等比映射，消除变帧率/丢帧引起的时钟漂移
+        actual_fps = total_frames / file_duration if file_duration > 0 and total_frames > 0 else self.fps
+        frame_interval = 1.0 / actual_fps if actual_fps > 0 else 1.0 / self.fps
+        
         results = []
         for i, is_motion in enumerate(smoothed):
+            # 防止最后的时间戳超过 file_duration
+            time_val = start_offset + min(i * frame_interval, file_duration)
             results.append({
-                "time": start_offset + i * frame_interval,
+                "time": time_val,
                 "is_motion": is_motion,
             })
         return results
@@ -290,6 +302,7 @@ def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -
                 min_static_dur=config.get("segment", {}).get("min_static_duration", 30.0),
                 file_offset=file_start_offset,
                 gap_tolerance=config.get("segment", {}).get("gap_tolerance", 0.5),
+                apply_smoothing=False, # 核心优化：延迟到全局 timeline 阶段平滑，防止边界截断
             )
             js = segments_to_json(segments)
             db.set_analysis_result(filepath, "ANALYZED", js)

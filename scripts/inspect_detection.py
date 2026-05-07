@@ -87,6 +87,7 @@ def main():
         min_motion_dur=seg_cfg.get("min_motion_duration", 2.0),
         min_static_dur=seg_cfg.get("min_static_duration", 30.0),
         file_offset=0.0,
+        apply_smoothing=True,
     )
 
     print(f"Segments (after smoothing & filtering): {len(segments)}")
@@ -118,10 +119,11 @@ def main():
             writer = csv.writer(f)
             writer.writerow(["frame_index", "time_sec", "is_motion", "formatted_time"])
             for i, label in enumerate(labels):
-                t = label["time"]
-                mm = int(t // 60)
-                ss = t % 60
-                writer.writerow([i, f"{t:.2f}", 1 if label["is_motion"] else 0, f"{mm}:{ss:05.2f}"])
+                if label["is_motion"]:
+                    t = label["time"]
+                    mm = int(t // 60)
+                    ss = t % 60
+                    writer.writerow([i, f"{t:.2f}", 1, f"{mm}:{ss:05.2f}"])
         print(f"\nCSV written: {csv_path}")
 
     # Extract frames at transition points

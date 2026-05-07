@@ -21,6 +21,7 @@ def build_segments(
     min_static_dur: float = 30.0,
     file_offset: float = 0.0,
     gap_tolerance: float = 0.5,
+    apply_smoothing: bool = False,
 ) -> list[Segment]:
     """
     Convert frame-by-frame labels to contiguous segments.
@@ -57,8 +58,9 @@ def build_segments(
     ))
 
     merged = _merge_same_state(segments, gap_tolerance)
-    filtered = _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
-    return filtered
+    if apply_smoothing:
+        return _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
+    return merged
 
 
 def _can_merge(a: Segment, b: Segment, gap_tolerance: float = 0.5) -> bool:

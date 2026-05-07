@@ -73,28 +73,41 @@ def prescreen_file(
     diffs: list[float] = []
 
     # 提取第 0 帧
-    prev_frame = _extract_frame(filepath, ts_list[0], width, height, gpu=gpu)
-    if prev_frame is None:
+    first_frame = _extract_frame(filepath, ts_list[0], width, height, gpu=gpu)
+    if first_frame is None:
         return {"status": "FAILED", "error": f"failed to extract first frame at t={ts_list[0]:.1f}s"}
+    
+    prev_frame = first_frame
 
     for i in range(1, len(ts_list)):
         curr_frame = _extract_frame(filepath, ts_list[i], width, height, gpu=gpu)
         if curr_frame is None:
             return {"status": "FAILED", "error": f"failed to extract frame at t={ts_list[i]:.1f}s"}
 
-        diff = np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32))
-        d = float(np.mean(diff))
+        # 动态环境光自适应：检测当前画面平均亮度（Luma）
+        mean_luma = float(np.mean(curr_frame))
+        # 极低对比度（红外夜视）下，动态下调阈值，防止微小动作漏报
+        current_threshold = threshold
+        if mean_luma < 50.0:
+            current_threshold = max(1.5, threshold * 0.3)
+
+        # 双重比对防盲区：与上一帧比（抓取瞬间动作），与首帧比（抓取长时间停留或场景改变）
+        diff_prev = float(np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32))))
+        diff_first = float(np.mean(np.abs(curr_frame.astype(np.float32) - first_frame.astype(np.float32))))
+        d = max(diff_prev, diff_first)
+        
         diffs.append(d)
 
-        # 【核心优化】动态判定早停：只要大于 threshold，证明有人移动，立刻中止文件处理！
-        if d > threshold:
+        # 【核心优化】动态判定早停：只要大于阈值，证明有人移动，立刻中止文件处理！
+        if d > current_threshold:
             return {
                 "status": "SUSPICIOUS",
                 "result_json": json.dumps({
                     "sample_ts": ts_list[:i + 1],
                     "diffs": diffs,
                     "max_diff": max(diffs),
-                    "threshold": threshold,
+                    "threshold": current_threshold,
+                    "mean_luma": mean_luma,
                     "early_stop": True,
                     "checked_pairs": len(diffs),
                 }),
@@ -106,7 +119,12 @@ def prescreen_file(
         return {"status": "FAILED", "error": "no frame pairs to compare"}
 
     max_diff = max(diffs)
-    status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
+    # 取最后一帧亮度作为参考
+    final_threshold = threshold
+    if prev_frame is not None and float(np.mean(prev_frame)) < 50.0:
+        final_threshold = max(1.5, threshold * 0.3)
+        
+    status = "SUSPICIOUS" if max_diff > final_threshold else "STATIC"
 
     return {
         "status": status,
@@ -114,7 +132,7 @@ def prescreen_file(
             "sample_ts": ts_list,
             "diffs": diffs,
             "max_diff": max_diff,
-            "threshold": threshold,
+            "threshold": final_threshold,
         }),
     }
 

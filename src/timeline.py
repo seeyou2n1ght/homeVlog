@@ -47,7 +47,14 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
     all_segments.sort(key=lambda s: s.start_time)
     seg_cfg = config.get("segment", {})
     gap_tolerance = seg_cfg.get("gap_tolerance", 0.5)
+    min_motion_dur = seg_cfg.get("min_motion_duration", 2.0)
+    min_static_dur = seg_cfg.get("min_static_duration", 30.0)
+    
+    # 全局跨文件平滑与合并，解决边界截断问题
     merged = merge_cross_file(all_segments, gap_tolerance)
+    from src.segment import _filter_short
+    filtered = _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
+    merged = filtered
 
     unique_files = list(dict.fromkeys(s.source_file for s in merged))
     file_to_idx = {f: i for i, f in enumerate(unique_files)}

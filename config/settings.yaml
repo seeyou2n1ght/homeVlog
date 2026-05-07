@@ -154,7 +154,7 @@ detection:
   # 调优: 中值滤波后分布紧致，k=2 约等于 3.4σ (正态假设下 false positive ~0.04%)
   # 更高=更不敏感(漏检增加)，更低=更敏感(误报增加)
   # 可选值: 1.0 ~ 8.0
-  motion_sensitivity: 2.0
+  motion_sensitivity: 1.2
 
   # ROI 裁切区域 [x, y, width, height]，归一化到 0~1
   # 裁掉画面边缘 (时间戳、遮挡物)，聚焦主要活动区域
@@ -210,11 +210,11 @@ segment:
   # 最短运动段时长 (秒)，少于此值的 DYNAMIC 段被吸收到相邻 STATIC 段
   # 调优: 中值滤波压缩运动段 duration，红外需低至 1.0s
   # 可选值: 0.5 ~ 5.0
-  min_motion_duration: 1.0
+  min_motion_duration: 2.0
 
   # 最短静态段时长 (秒)，少于此值的 STATIC 段被吸收到相邻 DYNAMIC 段
   # 可选值: 5.0 ~ 60.0
-  min_static_duration: 30.0
+  min_static_duration: 60.0
 
   # 段合并容差 (秒)，相邻同态段时间间隔小于此值视为连续
   # 可选值: 0.1 ~ 2.0
