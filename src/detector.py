@@ -261,8 +261,10 @@ def _smooth_labels(
 def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -> tuple[dict, str]:
     """Process SUSPICIOUS files from queue with given decode GPU (Work-Stealing)."""
     from src.segment import build_segments, segments_to_json
+    from src.yolo_verifier import YoloVerifier
 
     detector = MotionDetector(config, decode_gpu=decode_gpu)
+    yolo_verifier = YoloVerifier(config)
     perf = get_perf()
     stats = {"done": 0, "analyzed": 0, "failed": 0}
 
@@ -304,6 +306,10 @@ def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -
                 gap_tolerance=config.get("segment", {}).get("gap_tolerance", 0.5),
                 apply_smoothing=False, # 核心优化：延迟到全局 timeline 阶段平滑，防止边界截断
             )
+            
+            # YOLO 二次验证 (过滤掉只包含光影/风吹树叶的误报片段)
+            segments = yolo_verifier.verify(filepath, segments, gpu=decode_gpu)
+            
             js = segments_to_json(segments)
             db.set_analysis_result(filepath, "ANALYZED", js)
             stats["analyzed"] += 1
