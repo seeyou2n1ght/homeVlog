@@ -102,31 +102,46 @@ class YoloVerifier:
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
-                while True:
-                    raw = proc.stdout.read(frame_size)
-                    if len(raw) < frame_size:
-                        break
-                    
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-                    
-                    # YOLO inference
-                    results = self.model(frame, verbose=False, device=self.device)
-                    
-                    for r in results:
-                        if r.boxes is None or len(r.boxes.cls) == 0:
-                            continue
-                            
-                        classes = r.boxes.cls.cpu().numpy()
-                        confs = r.boxes.conf.cpu().numpy()
+                import threading
+                def _kill_on_timeout():
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                
+                # 动态超时: 每抽1帧给1秒余量 + 固定15秒
+                watchdog = threading.Timer(duration * self.sample_fps + 15.0, _kill_on_timeout)
+                watchdog.daemon = True
+                watchdog.start()
+                
+                try:
+                    while True:
+                        raw = proc.stdout.read(frame_size)
+                        if len(raw) < frame_size:
+                            break
                         
-                        for cls, conf in zip(classes, confs):
-                            if int(cls) in self.target_classes and conf >= self.confidence:
-                                proc.kill()
-                                proc.wait()
-                                return True
+                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+                        
+                        # YOLO inference
+                        results = self.model(frame, verbose=False, device=self.device)
+                        
+                        for r in results:
+                            if r.boxes is None or len(r.boxes.cls) == 0:
+                                continue
                                 
-                proc.stdout.close()
-                proc.wait(timeout=5)
+                            classes = r.boxes.cls.cpu().numpy()
+                            confs = r.boxes.conf.cpu().numpy()
+                            
+                            for cls, conf in zip(classes, confs):
+                                if int(cls) in self.target_classes and conf >= self.confidence:
+                                    return True
+                finally:
+                    watchdog.cancel()
+                    try:
+                        proc.kill()
+                        proc.wait()
+                    except OSError:
+                        pass
             finally:
                 io_sem.release()
                 
