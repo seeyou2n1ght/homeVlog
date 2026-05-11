@@ -59,12 +59,13 @@ def main():
 
     config = load_config()
 
+    file_dur = get_duration(str(filepath))
     print(f"Analyzing: {filepath.name}")
-    print(f"Duration: {get_duration(str(filepath)):.1f}s")
+    print(f"Duration: {file_dur:.1f}s")
     print()
 
     detector = MotionDetector(config, decode_gpu="cuda")
-    labels = detector.analyze(str(filepath), start_offset=0.0)
+    labels = detector.analyze(str(filepath), start_offset=0.0, file_duration=file_dur)
 
     if not labels:
         print("ERROR: no frames analyzed")
@@ -78,22 +79,50 @@ def main():
     print(f"Static frames:  {total_frames - motion_frames} ({100 * (total_frames - motion_frames) / total_frames:.1f}%)")
     print()
 
-    # Build segments to see the final output
-    det_cfg = config.get("detection", {})
+    # Build segments to see the final output (Before YOLO)
     seg_cfg = config.get("segment", {})
-    segments = build_segments(
+    from src.segment import _filter_short
+    
+    segments_raw = build_segments(
         labels,
         str(filepath),
         min_motion_dur=seg_cfg.get("min_motion_duration", 2.0),
         min_static_dur=seg_cfg.get("min_static_duration", 30.0),
         file_offset=0.0,
-        apply_smoothing=True,
+        apply_smoothing=False, # 延迟到 yolo 后再平滑
+    )
+    
+    segments_no_yolo = _filter_short(
+        [s for s in segments_raw], # copy
+        seg_cfg.get("min_motion_duration", 2.0),
+        seg_cfg.get("min_static_duration", 30.0),
+        seg_cfg.get("gap_tolerance", 0.5)
+    )
+    
+    print(f"--- 1. Segments (WITHOUT YOLO, Pure Frame Diff) ---")
+    print(f"Count: {len(segments_no_yolo)}")
+    print(f"{'Start':>10s} {'End':>10s} {'Dur':>8s} {'State':>10s}")
+    for s in segments_no_yolo:
+        print(f"{s.start_time:>9.1f}s {s.end_time:>9.1f}s {s.end_time - s.start_time:>7.1f}s {s.state:>10s}")
+    print()
+    
+    # Run YOLO Verifier
+    from src.yolo_verifier import YoloVerifier
+    yolo_verifier = YoloVerifier(config)
+    segments_yolo = yolo_verifier.verify(str(filepath), segments_raw, gpu="cuda")
+    
+    # Apply filtering now
+    segments_yolo_filtered = _filter_short(
+        segments_yolo,
+        seg_cfg.get("min_motion_duration", 2.0),
+        seg_cfg.get("min_static_duration", 30.0),
+        seg_cfg.get("gap_tolerance", 0.5)
     )
 
-    print(f"Segments (after smoothing & filtering): {len(segments)}")
+    print(f"--- 2. Segments (WITH YOLO Verification) ---")
+    print(f"Count: {len(segments_yolo_filtered)}")
     print(f"{'Start':>10s} {'End':>10s} {'Dur':>8s} {'State':>10s}")
-    print("-" * 42)
-    for s in segments:
+    for s in segments_yolo_filtered:
         print(f"{s.start_time:>9.1f}s {s.end_time:>9.1f}s {s.end_time - s.start_time:>7.1f}s {s.state:>10s}")
     print()
 
