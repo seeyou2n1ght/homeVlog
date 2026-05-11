@@ -152,7 +152,7 @@ def build_concat_filter(
         if n_segs > 1:
             out_labels = [f"[s{idx}_{k}]" for k in range(n_segs)]
             scale_parts.append(f"[{base_label}]split={n_segs}{''.join(out_labels)}")
-            file_split_labels[idx] = [l.strip("[]") for l in out_labels]
+            file_split_labels[idx] = [lbl.strip("[]") for lbl in out_labels]
         else:
             file_split_labels[idx] = [base_label]
 

@@ -29,34 +29,55 @@ class MotionDetector:
         self.decode_timeout = det.get("decode_timeout", 10)
         self.decode_gpu = decode_gpu
 
-    def analyze(self, filepath: str, start_offset: float = 0.0,
-                file_duration: float = 0.0) -> list[dict]:
+    def analyze(
+        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
+    ) -> list[dict]:
         frame_size = self.width * self.height
         if self.decode_gpu == "qsv":
             args = [
-                "-hwaccel", "qsv",
-                "-hwaccel_output_format", "qsv",
-                "-i", str(filepath),
-                "-vf", f"scale_qsv=w={self.width}:h={self.height},hwdownload,format=nv12,extractplanes=y",
-                "-r", str(self.fps),
-                "-f", "rawvideo",
-                "-pix_fmt", "gray",
+                "-hwaccel",
+                "qsv",
+                "-hwaccel_output_format",
+                "qsv",
+                "-i",
+                str(filepath),
+                "-vf",
+                f"scale_qsv=w={self.width}:h={self.height},hwdownload,format=nv12,extractplanes=y",
+                "-r",
+                str(self.fps),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
                 "-",
             ]
         else:
             args = [
-                "-hwaccel", "cuda",
-                "-hwaccel_output_format", "cuda",
-                "-i", str(filepath),
-                "-vf", f"scale_cuda={self.width}:{self.height},hwdownload,format=nv12,extractplanes=y",
-                "-r", str(self.fps),
-                "-f", "rawvideo",
-                "-pix_fmt", "gray",
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-i",
+                str(filepath),
+                "-vf",
+                f"scale_cuda={self.width}:{self.height},hwdownload,format=nv12,extractplanes=y",
+                "-r",
+                str(self.fps),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
                 "-",
             ]
 
-        from src.utils import get_io_semaphore
-        io_sem = get_io_semaphore()
+        if self.decode_gpu == "qsv":
+            from src.utils import get_qsv_semaphore
+
+            io_sem = get_qsv_semaphore()
+        else:
+            from src.utils import get_nv_semaphore
+
+            io_sem = get_nv_semaphore()
         io_sem.acquire()
         try:
             proc = subprocess.Popen(
@@ -69,21 +90,27 @@ class MotionDetector:
             # Watchdog: 动态超时 — 基于文件时长或固定值取大
             # 长文件（如 65min）需要更多解码时间，不能用固定值误杀
             fixed_timeout = self.decode_timeout * 3
-            dynamic_timeout = (file_duration / max(self.fps, 1)) * 2 if file_duration > 0 else 0
+            dynamic_timeout = (
+                (file_duration / max(self.fps, 1)) * 2 if file_duration > 0 else 0
+            )
             watchdog_timeout = max(fixed_timeout, dynamic_timeout, 60.0)
+
             def _kill_on_timeout():
                 try:
                     proc.kill()
                 except OSError:
                     pass
+
             watchdog = threading.Timer(watchdog_timeout, _kill_on_timeout)
             watchdog.daemon = True
             watchdog.start()
 
             stderr_lines: list[str] = []
+
             def _read_stderr():
                 for line in proc.stderr:
                     stderr_lines.append(line.decode("utf-8", errors="replace"))
+
             stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
             stderr_thread.start()
 
@@ -105,8 +132,12 @@ class MotionDetector:
                         break
                     total_frames += 1
 
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width))
-                    roi = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].astype(np.float32)
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        (self.height, self.width)
+                    )
+                    roi = frame[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w].astype(
+                        np.float32
+                    )
                     frame = None  # free
 
                     if prev_gray is not None:
@@ -128,6 +159,11 @@ class MotionDetector:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            finally:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
             stderr_thread.join(timeout=2)
         finally:
             io_sem.release()
@@ -137,8 +173,15 @@ class MotionDetector:
             logger.warning("ffmpeg warning for %s: %s", Path(filepath).name, err)
 
         if len(energies) < 2:
-            logger.warning("too few frames from %s: %d", Path(filepath).name, len(energies))
-            self.last_perf = {"decode_time": t_decode_end - t_decode_start, "analysis_time": 0, "frames": total_frames, "motion_ratio": 0}
+            logger.warning(
+                "too few frames from %s: %d", Path(filepath).name, len(energies)
+            )
+            self.last_perf = {
+                "decode_time": t_decode_end - t_decode_start,
+                "analysis_time": 0,
+                "frames": total_frames,
+                "motion_ratio": 0,
+            }
             return []
 
         t_analysis_start = time.monotonic()
@@ -154,10 +197,10 @@ class MotionDetector:
         energies_arr = np.array(energies, dtype=np.float32)
         p5 = float(np.percentile(energies_arr, 5))
         p20 = float(np.percentile(energies_arr, 20))
-        
+
         # Approximate standard IQR scale from the p5-p20 spread
         noise_spread = (p20 - p5) * 2.5
-        
+
         # Absolute minimum offset prevents triggering on clean digital black
         min_offset = 0.5
         threshold = p5 + max(min_offset, self.sensitivity * noise_spread)
@@ -169,11 +212,22 @@ class MotionDetector:
         logger.debug(
             "adaptive threshold for %s: p5=%.3f p20=%.3f spread=%.3f threshold=%.3f "
             "motion_frames=%d/%d (%.1f%%)",
-            Path(filepath).name, p5, p20, noise_spread, threshold,
-            sum(raw_labels), len(raw_labels), 100 * sum(raw_labels) / len(raw_labels),
+            Path(filepath).name,
+            p5,
+            p20,
+            noise_spread,
+            threshold,
+            sum(raw_labels),
+            len(raw_labels),
+            100 * sum(raw_labels) / len(raw_labels),
         )
 
-        smoothed = _smooth_labels(raw_labels, self.min_motion_frames, self.min_static_frames, self.noise_suppress)
+        smoothed = _smooth_labels(
+            raw_labels,
+            self.min_motion_frames,
+            self.min_static_frames,
+            self.noise_suppress,
+        )
         t_analysis_end = time.monotonic()
 
         motion_count = sum(1 for s in smoothed if s)
@@ -185,17 +239,23 @@ class MotionDetector:
         }
 
         # 核心优化：依据文件真实时长和解出的总帧数做等比映射，消除变帧率/丢帧引起的时钟漂移
-        actual_fps = total_frames / file_duration if file_duration > 0 and total_frames > 0 else self.fps
+        actual_fps = (
+            total_frames / file_duration
+            if file_duration > 0 and total_frames > 0
+            else self.fps
+        )
         frame_interval = 1.0 / actual_fps if actual_fps > 0 else 1.0 / self.fps
-        
+
         results = []
         for i, is_motion in enumerate(smoothed):
             # 防止最后的时间戳超过 file_duration
             time_val = start_offset + min(i * frame_interval, file_duration)
-            results.append({
-                "time": time_val,
-                "is_motion": is_motion,
-            })
+            results.append(
+                {
+                    "time": time_val,
+                    "is_motion": is_motion,
+                }
+            )
         return results
 
 
@@ -258,7 +318,9 @@ def _smooth_labels(
     return smoothed
 
 
-def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -> tuple[dict, str]:
+def _analysis_worker(
+    db, task_queue, date: str, config: dict, decode_gpu: str
+) -> tuple[dict, str]:
     """Process SUSPICIOUS files from queue with given decode GPU (Work-Stealing)."""
     from src.segment import build_segments, segments_to_json
     from src.yolo_verifier import YoloVerifier
@@ -272,7 +334,7 @@ def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -
         task = task_queue.get()
         if task is None:
             break
-            
+
         filepath = task["filepath"]
         t0 = time.monotonic()
         try:
@@ -281,7 +343,8 @@ def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -
             file_start_offset = max(file_start_offset, 0.0)
 
             labels = detector.analyze(
-                filepath, start_offset=file_start_offset,
+                filepath,
+                start_offset=file_start_offset,
                 file_duration=task.get("file_duration") or 300.0,
             )
             elapsed = time.monotonic() - t0
@@ -291,45 +354,65 @@ def _analysis_worker(db, task_queue, date: str, config: dict, decode_gpu: str) -
                 db.set_analysis_result(filepath, "FAILED", "")
                 stats["failed"] += 1
                 stats["done"] += 1
-                perf.add(PerfRecord(
-                    stage="analysis", file=Path(filepath).name, gpu=decode_gpu,
-                    duration=round(elapsed, 3), frames=lp.get("frames", 0),
-                    extra={"status": "FAILED", **lp},
-                ))
+                perf.add(
+                    PerfRecord(
+                        stage="analysis",
+                        file=Path(filepath).name,
+                        gpu=decode_gpu,
+                        duration=round(elapsed, 3),
+                        frames=lp.get("frames", 0),
+                        extra={"status": "FAILED", **lp},
+                    )
+                )
                 continue
 
             segments = build_segments(
-                labels, filepath,
-                min_motion_dur=config.get("segment", {}).get("min_motion_duration", 2.0),
-                min_static_dur=config.get("segment", {}).get("min_static_duration", 30.0),
+                labels,
+                filepath,
+                min_motion_dur=config.get("segment", {}).get(
+                    "min_motion_duration", 2.0
+                ),
+                min_static_dur=config.get("segment", {}).get(
+                    "min_static_duration", 30.0
+                ),
                 file_offset=file_start_offset,
                 gap_tolerance=config.get("segment", {}).get("gap_tolerance", 0.5),
-                apply_smoothing=False, # 核心优化：延迟到全局 timeline 阶段平滑，防止边界截断
+                apply_smoothing=False,  # 核心优化：延迟到全局 timeline 阶段平滑，防止边界截断
             )
-            
+
             # YOLO 二次验证 (过滤掉只包含光影/风吹树叶的误报片段)
             segments = yolo_verifier.verify(filepath, segments, gpu=decode_gpu)
-            
+
             js = segments_to_json(segments)
             db.set_analysis_result(filepath, "ANALYZED", js)
             stats["analyzed"] += 1
 
-            perf.add(PerfRecord(
-                stage="analysis", file=Path(filepath).name, gpu=decode_gpu,
-                duration=round(elapsed, 3), frames=lp.get("frames", 0),
-                fps=round(lp.get("frames", 0) / elapsed, 1) if elapsed > 0 else 0,
-                extra={"status": "ANALYZED", "n_segments": len(segments), **lp},
-            ))
+            perf.add(
+                PerfRecord(
+                    stage="analysis",
+                    file=Path(filepath).name,
+                    gpu=decode_gpu,
+                    duration=round(elapsed, 3),
+                    frames=lp.get("frames", 0),
+                    fps=round(lp.get("frames", 0) / elapsed, 1) if elapsed > 0 else 0,
+                    extra={"status": "ANALYZED", "n_segments": len(segments), **lp},
+                )
+            )
 
         except Exception:
             elapsed = time.monotonic() - t0
             logger.exception("analysis failed for %s [%s]", filepath, decode_gpu)
             db.set_analysis_result(filepath, "FAILED", "")
             stats["failed"] += 1
-            perf.add(PerfRecord(
-                stage="analysis", file=Path(filepath).name, gpu=decode_gpu,
-                duration=round(elapsed, 3), extra={"status": "ERROR"},
-            ))
+            perf.add(
+                PerfRecord(
+                    stage="analysis",
+                    file=Path(filepath).name,
+                    gpu=decode_gpu,
+                    duration=round(elapsed, 3),
+                    extra={"status": "ERROR"},
+                )
+            )
 
         stats["done"] += 1
 
@@ -348,18 +431,22 @@ def run_analysis_for_cam(
 
     suspicious = db.get_suspicious_files(date, cam_index)
     if not suspicious:
-        logger.info("analysis: no SUSPICIOUS+PENDING files for %s cam%d", date, cam_index)
+        logger.info(
+            "analysis: no SUSPICIOUS+PENDING files for %s cam%d", date, cam_index
+        )
         return {"done": 0, "analyzed": 0, "failed": 0}
 
     logger.info("analysis: %d files for %s cam%d", len(suspicious), date, cam_index)
 
     # Sort by file_duration desc so longest files are processed first
-    sorted_tasks = sorted(suspicious, key=lambda t: t.get("file_duration") or 0, reverse=True)
-    
+    sorted_tasks = sorted(
+        suspicious, key=lambda t: t.get("file_duration") or 0, reverse=True
+    )
+
     task_queue: Queue[dict | None] = Queue()
     for task in sorted_tasks:
         task_queue.put(task)
-        
+
     # Sentinel values to terminate 2 workers
     task_queue.put(None)
     task_queue.put(None)
@@ -383,7 +470,12 @@ def run_analysis_for_cam(
     total_elapsed = time.monotonic() - t_start
     logger.info(
         "analysis %s cam%d done in %.1fs: analyzed=%d failed=%d (cuda=%.1fs qsv=%.1fs)",
-        date, cam_index, total_elapsed, stats["analyzed"], stats["failed"],
-        worker_durations.get("cuda", 0), worker_durations.get("qsv", 0),
+        date,
+        cam_index,
+        total_elapsed,
+        stats["analyzed"],
+        stats["failed"],
+        worker_durations.get("cuda", 0),
+        worker_durations.get("qsv", 0),
     )
     return stats

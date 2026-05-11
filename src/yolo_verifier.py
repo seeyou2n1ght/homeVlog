@@ -1,11 +1,15 @@
 import logging
 import subprocess
 import time
+import threading
 import numpy as np
 
 logger = logging.getLogger("homevlog")
 
 class YoloVerifier:
+    _model_lock = threading.Lock()
+    _shared_model = None
+
     def __init__(self, config: dict):
         yolo_cfg = config.get("yolo", {})
         self.enabled = yolo_cfg.get("enabled", False)
@@ -30,9 +34,13 @@ class YoloVerifier:
             logger.warning("CUDA not available. Falling back to CPU for YOLO.")
             device = "cpu"
             
-        logger.info(f"Loading YOLO model {model_path} on {device}...")
-        self.model = YOLO(model_path)
         self.device = device
+        
+        with YoloVerifier._model_lock:
+            if YoloVerifier._shared_model is None:
+                logger.info(f"Loading shared YOLO model {model_path} on {device}...")
+                YoloVerifier._shared_model = YOLO(model_path)
+        self.model = YoloVerifier._shared_model
         
     def verify(self, filepath: str, segments: list, gpu: str = "qsv") -> list:
         """
@@ -77,8 +85,6 @@ class YoloVerifier:
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y"
         ]
         
-        # Optionally add HW decode if we want, but seeking with SW decode is often fine and robust.
-        # HW decode for seeking might have issues on GOP boundaries depending on exact parameters.
         if gpu == "cuda":
             args.extend(["-hwaccel", "cuda"])
         elif gpu == "qsv":
@@ -96,20 +102,22 @@ class YoloVerifier:
         ])
         
         try:
-            from src.utils import get_io_semaphore
-            io_sem = get_io_semaphore()
+            if gpu == "qsv":
+                from src.utils import get_qsv_semaphore
+                io_sem = get_qsv_semaphore()
+            else:
+                from src.utils import get_nv_semaphore
+                io_sem = get_nv_semaphore()
             io_sem.acquire()
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
-                import threading
                 def _kill_on_timeout():
                     try:
                         proc.kill()
                     except OSError:
                         pass
                 
-                # 动态超时: 每抽1帧给1秒余量 + 固定15秒
                 watchdog = threading.Timer(duration * self.sample_fps + 15.0, _kill_on_timeout)
                 watchdog.daemon = True
                 watchdog.start()
@@ -123,7 +131,9 @@ class YoloVerifier:
                         frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
                         
                         # YOLO inference
-                        results = self.model(frame, verbose=False, device=self.device)
+                        # Lock to prevent concurrent access to the same model instance, if needed by PyTorch
+                        with YoloVerifier._model_lock:
+                            results = self.model(frame, verbose=False, device=self.device)
                         
                         for r in results:
                             if r.boxes is None or len(r.boxes.cls) == 0:

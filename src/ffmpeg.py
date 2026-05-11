@@ -30,8 +30,8 @@ def run_ffmpeg(
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
         
-    from src.utils import get_io_semaphore
-    io_sem = get_io_semaphore()
+    from src.utils import get_disk_semaphore
+    io_sem = get_disk_semaphore()
     io_sem.acquire()
     try:
         proc = subprocess.Popen(cmd, **kwargs)
@@ -70,8 +70,8 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
         str(filepath),
     ]
     
-    from src.utils import get_io_semaphore
-    io_sem = get_io_semaphore()
+    from src.utils import get_disk_semaphore
+    io_sem = get_disk_semaphore()
     io_sem.acquire()
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout)

@@ -390,8 +390,12 @@ def _run_batch_render(
 
     logger.info("batch-render cam%d batch%d (%s): %d files", cam_index, batch_idx, encoder, len(input_files))
 
-    from src.utils import get_io_semaphore
-    io_sem = get_io_semaphore()
+    if encoder == "qsv":
+        from src.utils import get_qsv_semaphore
+        io_sem = get_qsv_semaphore()
+    else:
+        from src.utils import get_nv_semaphore
+        io_sem = get_nv_semaphore()
     io_sem.acquire()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -494,8 +498,12 @@ def _run_ffmpeg_render(
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
     cmd += [str(output_path)]
 
-    from src.utils import get_io_semaphore
-    io_sem = get_io_semaphore()
+    if encoder == "qsv":
+        from src.utils import get_qsv_semaphore
+        io_sem = get_qsv_semaphore()
+    else:
+        from src.utils import get_nv_semaphore
+        io_sem = get_nv_semaphore()
     io_sem.acquire()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -509,6 +517,7 @@ def _run_ffmpeg_render(
                          date, cam_index, render_timeout)
             proc.kill()
             proc.wait(timeout=10)
+            fc_script.unlink(missing_ok=True)
             return None
         finally:
             FFmpegProcessRegistry.deregister(str(output_path))

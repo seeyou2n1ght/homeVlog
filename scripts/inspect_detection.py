@@ -72,7 +72,7 @@ def main():
         sys.exit(1)
 
     # Per-frame stats
-    motion_frames = sum(1 for l in labels if l["is_motion"])
+    motion_frames = sum(1 for lbl in labels if lbl["is_motion"])
     total_frames = len(labels)
     print(f"Frames analyzed: {total_frames}")
     print(f"Motion frames:  {motion_frames} ({100 * motion_frames / total_frames:.1f}%)")
@@ -99,7 +99,7 @@ def main():
         seg_cfg.get("gap_tolerance", 0.5)
     )
     
-    print(f"--- 1. Segments (WITHOUT YOLO, Pure Frame Diff) ---")
+    print("--- 1. Segments (WITHOUT YOLO, Pure Frame Diff) ---")
     print(f"Count: {len(segments_no_yolo)}")
     print(f"{'Start':>10s} {'End':>10s} {'Dur':>8s} {'State':>10s}")
     for s in segments_no_yolo:
@@ -119,7 +119,7 @@ def main():
         seg_cfg.get("gap_tolerance", 0.5)
     )
 
-    print(f"--- 2. Segments (WITH YOLO Verification) ---")
+    print("--- 2. Segments (WITH YOLO Verification) ---")
     print(f"Count: {len(segments_yolo_filtered)}")
     print(f"{'Start':>10s} {'End':>10s} {'Dur':>8s} {'State':>10s}")
     for s in segments_yolo_filtered:
@@ -177,7 +177,7 @@ def main():
                 extract_frame(str(filepath), t_sec, fn_after)
 
         # Extract random samples from long DYNAMIC and STATIC segments
-        for i, s in enumerate(segments):
+        for i, s in enumerate(segments_yolo_filtered):
             dur = s.end_time - s.start_time
             if dur > 10:  # only for segments > 10s
                 mid = (s.start_time + s.end_time) / 2

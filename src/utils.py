@@ -11,25 +11,46 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 TEMP_DIR = PROJECT_ROOT / "temp"
 LOGS_DIR = PROJECT_ROOT / "logs"
-REPORTS_DIR = PROJECT_ROOT / "reports"
 DB_PATH = PROJECT_ROOT / "data" / "vlog.db"
 
 SETTINGS: dict = {}
 _config_lock = threading.Lock()
 
-_io_semaphore: threading.Semaphore | None = None
+_disk_semaphore: threading.Semaphore | None = None
+_nv_semaphore: threading.Semaphore | None = None
+_qsv_semaphore: threading.Semaphore | None = None
 _io_lock = threading.Lock()
 
-def get_io_semaphore() -> threading.Semaphore:
-    """Get the global IO semaphore to prevent IO storm during high concurrency."""
-    global _io_semaphore
-    if _io_semaphore is None:
+def get_disk_semaphore() -> threading.Semaphore:
+    global _disk_semaphore
+    if _disk_semaphore is None:
         with _io_lock:
-            if _io_semaphore is None:
+            if _disk_semaphore is None:
                 config = load_config()
-                limit = config.get("pipeline", {}).get("max_io_concurrency", 8)
-                _io_semaphore = threading.Semaphore(limit)
-    return _io_semaphore
+                limit = config.get("pipeline", {}).get("max_io_concurrency", 16)
+                _disk_semaphore = threading.Semaphore(limit)
+    return _disk_semaphore
+
+def get_nv_semaphore() -> threading.Semaphore:
+    global _nv_semaphore
+    if _nv_semaphore is None:
+        with _io_lock:
+            if _nv_semaphore is None:
+                config = load_config()
+                # 默认限制并发的 NVENC 会话数为 2 (消费级显卡默认限制，除非破解)
+                limit = config.get("pipeline", {}).get("max_nv_concurrency", 2)
+                _nv_semaphore = threading.Semaphore(limit)
+    return _nv_semaphore
+
+def get_qsv_semaphore() -> threading.Semaphore:
+    global _qsv_semaphore
+    if _qsv_semaphore is None:
+        with _io_lock:
+            if _qsv_semaphore is None:
+                config = load_config()
+                limit = config.get("pipeline", {}).get("max_qsv_concurrency", 4)
+                _qsv_semaphore = threading.Semaphore(limit)
+    return _qsv_semaphore
 
 def load_config() -> dict:
     global SETTINGS
@@ -43,10 +64,21 @@ def load_config() -> dict:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             SETTINGS = yaml.safe_load(f) or {}
 
-        for d in [OUTPUT_DIR, TEMP_DIR, LOGS_DIR, REPORTS_DIR, DB_PATH.parent]:
+        for d in [OUTPUT_DIR, TEMP_DIR, LOGS_DIR, DB_PATH.parent]:
             d.mkdir(parents=True, exist_ok=True)
 
         return SETTINGS
+
+
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            from tqdm import tqdm
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging() -> logging.Logger:
@@ -66,7 +98,7 @@ def setup_logging() -> logging.Logger:
 
     from logging.handlers import RotatingFileHandler
     log_cfg = config.get("logging", {})
-    # 生成带时间戳的日志文件名，例如 homevlog_20240502_232303.log
+    # 生成带时间戳的日志文件名
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_file = LOGS_DIR / f"homevlog_{timestamp}.log"
     
@@ -80,7 +112,8 @@ def setup_logging() -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    sh = logging.StreamHandler(sys.stdout)
+    # 使用 tqdm 兼容的处理器代替标准 StreamHandler
+    sh = TqdmLoggingHandler()
     sh.setLevel(level)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
@@ -101,26 +134,20 @@ def parse_res(spec: str) -> tuple[int, int]:
 
 
 def cleanup_resources():
-    """Deep GC and kill orphaned ffmpeg processes."""
+    """Deep GC and kill tracked ffmpeg processes only."""
     import gc
-    import psutil
     
     # 1. Force Python GC
     gc.collect()
     
-    # 2. Kill orphan ffmpeg (Run ONLY between batch days)
-    killed = 0
-    for proc in psutil.process_iter(['pid', 'name']):
-        try:
-            name = proc.info.get('name', '')
-            if name and 'ffmpeg' in name.lower():
-                proc.kill()
-                killed += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-            
-    if killed > 0:
-        logging.getLogger("homevlog").warning("cleanup: killed %d zombie ffmpeg processes", killed)
+    # 2. Kill registered ffmpeg (DO NOT use psutil to kill all system ffmpegs!)
+    try:
+        from src.renderer import FFmpegProcessRegistry
+        killed = FFmpegProcessRegistry.kill_all()
+        if killed:
+            logging.getLogger("homevlog").warning("cleanup: killed registered ffmpeg processes")
+    except Exception as e:
+        logging.getLogger("homevlog").warning("cleanup error: %s", e)
 
 
 def check_disk_space(path: Path, min_gb: int = 20) -> bool:

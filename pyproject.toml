@@ -10,6 +10,7 @@ dependencies = [
     "nvidia-ml-py>=13.0.0",
     "pyyaml>=6.0.3",
     "ultralytics>=8.4.48",
+    "tqdm>=4.67.3",
 ]
 
 [dependency-groups]

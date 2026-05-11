@@ -11,7 +11,7 @@ import psutil
 logger = logging.getLogger("homevlog")
 
 
-@dataclass
+@dataclass(eq=False)
 class StageStats:
     name: str
     start_ts: float
@@ -57,7 +57,8 @@ class Monitor:
             interval = load_config().get("logging", {}).get("monitor_interval", 2.0)
         self.interval = interval
         self._stages: list[StageStats] = []
-        self._active: StageStats | None = None
+        self._active_stages = set()
+        self._active_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._gpu_available = False
@@ -128,15 +129,16 @@ class Monitor:
     def _poll_loop(self):
         while not self._stop_event.is_set():
             cpu, ram, loads, mems, encs, decs = self._sample()
-            if self._active is not None:
-                self._active.cpu_pct.append(cpu)
-                self._active.ram_pct.append(ram)
-                self._ensure_gpu_lists(self._active)
-                for i in range(self._num_gpus):
-                    self._active.gpu_load[i].append(loads[i])
-                    self._active.gpu_mem[i].append(mems[i])
-                    self._active.gpu_enc_load[i].append(encs[i])
-                    self._active.gpu_dec_load[i].append(decs[i])
+            with self._active_lock:
+                for s in self._active_stages:
+                    s.cpu_pct.append(cpu)
+                    s.ram_pct.append(ram)
+                    self._ensure_gpu_lists(s)
+                    for i in range(self._num_gpus):
+                        s.gpu_load[i].append(loads[i])
+                        s.gpu_mem[i].append(mems[i])
+                        s.gpu_enc_load[i].append(encs[i])
+                        s.gpu_dec_load[i].append(decs[i])
             self._stop_event.wait(self.interval)
 
     def start(self):
@@ -162,14 +164,16 @@ class Monitor:
     @contextmanager
     def stage(self, name: str):
         s = StageStats(name=name, start_ts=time.monotonic())
-        self._active = s
-        self._stages.append(s)
+        with self._active_lock:
+            self._active_stages.add(s)
+            self._stages.append(s)
         logger.info("stage [%s] start", name)
         try:
             yield s
         finally:
             s.end_ts = time.monotonic()
-            self._active = None
+            with self._active_lock:
+                self._active_stages.discard(s)
             gpu0 = s.gpu_summary(0)
             logger.info(
                 "stage [%s] done in %.1fs, cpu=%.1f%% ram=%.1f%% gpu0: load=%d%% enc=%d%% dec=%d%% mem=%dMB",
@@ -178,9 +182,12 @@ class Monitor:
             )
 
     def summary(self) -> str:
+        with self._active_lock:
+            stages = list(self._stages)
+            
         lines = ["--- Monitor Summary ---"]
         total = 0.0
-        for s in self._stages:
+        for s in stages:
             total += s.duration
             parts = [
                 f"  [{s.name}] {s.duration:.1f}s  cpu={s.avg_cpu:.1f}%  ram={s.avg_ram:.1f}%"
@@ -197,8 +204,11 @@ class Monitor:
 
     def stages_data(self) -> list[dict]:
         """Return structured stage data for JSON serialization."""
+        with self._active_lock:
+            stages = list(self._stages)
+            
         result = []
-        for s in self._stages:
+        for s in stages:
             entry = {
                 "name": s.name,
                 "duration": round(s.duration, 2),
