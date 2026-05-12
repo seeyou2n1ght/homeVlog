@@ -124,8 +124,22 @@ def build_concat_filter(
 
     # --- Step 1: Count segments per input file ---
     segs_per_file: dict[int, int] = {}
+    input_files: dict[int, str] = {}
     for seg in timeline:
         segs_per_file[seg.input_index] = segs_per_file.get(seg.input_index, 0) + 1
+        input_files[seg.input_index] = seg.filepath
+
+    input_has_audio: dict[int, bool] = {}
+    try:
+        from src.ffmpeg import run_ffprobe
+        for idx, filepath in input_files.items():
+            info = run_ffprobe(filepath) or {}
+            input_has_audio[idx] = any(
+                s.get("codec_type") == "audio" for s in info.get("streams", [])
+            )
+    except Exception:
+        logger.exception("ffprobe audio detection failed; fallback to silent audio")
+        input_has_audio = {idx: False for idx in input_files}
 
     # --- Step 2: Per-file scale (once per input) ---
     scale_parts: list[str] = []
@@ -174,13 +188,19 @@ def build_concat_filter(
         file_split_counter[idx] = src_k + 1
 
         if seg.state == "DYNAMIC":
+            dur = e - s
             parts_v.append(
                 f"[{src_label}]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{seg_count}]"
             )
-            parts_a.append(
-                f"[{idx}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
-            )
+            if input_has_audio.get(idx, False):
+                parts_a.append(
+                    f"[{idx}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
+                )
+            else:
+                parts_a.append(
+                    f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a{seg_count}]"
+                )
         else:
             dur = e - s
             # Dynamic speed factor calculation to prevent flashes

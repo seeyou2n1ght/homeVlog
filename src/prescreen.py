@@ -1,5 +1,7 @@
 import json
 import logging
+import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -26,7 +28,7 @@ def _calc_sample_timestamps(duration: float, segments: int, margin: float = 0.5)
 
 
 def _extract_frame(filepath: str, timestamp: float, width: int, height: int, timeout: float = 30.0, gpu: str = "qsv") -> np.ndarray | None:
-    """Extract single RGB frame at given timestamp using HW decode."""
+    """使用硬件解码在指定时间点抽取单帧 RGB 图像。"""
     args = build_hw_decode_args(
         input_path=str(filepath),
         width=width,
@@ -56,6 +58,7 @@ def prescreen_file(
 ) -> dict:
     """按需逐帧提取 + 即时早停 diff: 只要发现一次动静即终止提取，极速抛弃。"""
     det_cfg = config.get("detection", {})
+    mode = det_cfg.get("prescreen_mode", "legacy_seek")
     segments = det_cfg.get("prescreen_segments", 5)
     width, height = parse_res(
         det_cfg.get("prescreen_resolution", "320x180")
@@ -66,6 +69,17 @@ def prescreen_file(
     actual_dur = get_duration(filepath)
     if actual_dur is not None and actual_dur > 0:
         duration = actual_dur
+    if mode == "stream_fps":
+        return _prescreen_stream_fps(
+            filepath,
+            duration,
+            segments,
+            width,
+            height,
+            threshold,
+            gpu,
+            timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
+        )
     ts_list = _calc_sample_timestamps(duration, segments, timestamp_margin)
 
     min(10, len(ts_list) - 1)
@@ -103,6 +117,7 @@ def prescreen_file(
             return {
                 "status": "SUSPICIOUS",
                 "result_json": json.dumps({
+                    "mode": "legacy_seek",
                     "sample_ts": ts_list[:i + 1],
                     "diffs": diffs,
                     "max_diff": max(diffs),
@@ -110,6 +125,7 @@ def prescreen_file(
                     "mean_luma": mean_luma,
                     "early_stop": True,
                     "checked_pairs": len(diffs),
+                    "ffmpeg_calls": i + 1,
                 }),
             }
 
@@ -129,14 +145,213 @@ def prescreen_file(
     return {
         "status": status,
         "result_json": json.dumps({
+            "mode": "legacy_seek",
             "sample_ts": ts_list,
             "diffs": diffs,
             "max_diff": max_diff,
             "threshold": final_threshold,
+            "early_stop": False,
+            "checked_pairs": len(diffs),
+            "ffmpeg_calls": len(ts_list),
         }),
     }
 
 
+def _build_stream_fps_args(
+    filepath: str,
+    sample_fps: float,
+    max_frames: int,
+    width: int,
+    height: int,
+    gpu: str,
+) -> list[str]:
+    if gpu == "qsv":
+        hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        vf = f"scale_qsv=w={width}:h={height},hwdownload,format=nv12,fps={sample_fps:.6f}"
+    else:
+        hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        vf = f"scale_cuda={width}:{height},hwdownload,format=nv12,fps={sample_fps:.6f}"
+
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *hw_args,
+        "-i",
+        str(filepath),
+        "-vf",
+        vf,
+        "-frames:v",
+        str(max_frames),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+
+
+def _prescreen_stream_fps(
+    filepath: str,
+    duration: float,
+    segments: int,
+    width: int,
+    height: int,
+    threshold: float,
+    gpu: str,
+    timeout: float,
+) -> dict:
+    """用单个低 FPS 解码流做预筛，避免每个采样点启动一次 seek 进程。"""
+    frame_size = width * height * 3
+    max_frames = max(2, segments + 1)
+    sample_fps = max(1.0 / max(duration, 1.0), segments / max(duration, 1.0))
+    cmd = _build_stream_fps_args(filepath, sample_fps, max_frames, width, height, gpu)
+
+    if gpu == "qsv":
+        from src.utils import get_qsv_semaphore
+        io_sem = get_qsv_semaphore()
+    else:
+        from src.utils import get_nv_semaphore
+        io_sem = get_nv_semaphore()
+
+    stderr_lines: list[str] = []
+    diffs: list[float] = []
+    sample_ts: list[float] = []
+    proc: subprocess.Popen | None = None
+    completed_read = False
+
+    io_sem.acquire()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        def _read_stderr():
+            if proc and proc.stderr:
+                for line in proc.stderr:
+                    stderr_lines.append(line.decode("utf-8", errors="replace"))
+
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+        stream_timeout = max(timeout, min(duration * 0.5, 900.0), 60.0)
+
+        def _kill_on_timeout():
+            try:
+                if proc and proc.poll() is None:
+                    proc.kill()
+            except OSError:
+                pass
+
+        watchdog = threading.Timer(stream_timeout, _kill_on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
+
+        try:
+            if proc.stdout is None:
+                return {"status": "FAILED", "error": "ffmpeg stdout unavailable"}
+                """
+                return {"status": "FAILED", "error": "ffmpeg stdout 不可用"}
+
+                """
+            first_raw = proc.stdout.read(frame_size)
+            if len(first_raw) < frame_size:
+                err = "".join(stderr_lines[-5:])
+                return {"status": "FAILED", "error": f"stream_fps 首帧读取失败: {err}"}
+
+            first_frame = np.frombuffer(first_raw, dtype=np.uint8).reshape((height, width, 3))
+            prev_frame = first_frame
+            sample_ts.append(0.0)
+
+            for i in range(1, max_frames):
+                raw = proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    break
+
+                curr_frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+                mean_luma = float(np.mean(curr_frame))
+                current_threshold = threshold
+                if mean_luma < 50.0:
+                    current_threshold = max(1.5, threshold * 0.3)
+
+                diff_prev = float(
+                    np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32)))
+                )
+                diff_first = float(
+                    np.mean(np.abs(curr_frame.astype(np.float32) - first_frame.astype(np.float32)))
+                )
+                d = max(diff_prev, diff_first)
+                diffs.append(d)
+                sample_ts.append(min(i / sample_fps, duration))
+
+                if d > current_threshold:
+                    return {
+                        "status": "SUSPICIOUS",
+                        "result_json": json.dumps({
+                            "mode": "stream_fps",
+                            "sample_ts": sample_ts,
+                            "diffs": diffs,
+                            "max_diff": max(diffs),
+                            "threshold": current_threshold,
+                            "mean_luma": mean_luma,
+                            "early_stop": True,
+                            "checked_pairs": len(diffs),
+                            "ffmpeg_calls": 1,
+                            "sample_fps": sample_fps,
+                        }),
+                    }
+
+                prev_frame = curr_frame
+            completed_read = True
+        finally:
+            watchdog.cancel()
+            if proc and proc.poll() is None:
+                try:
+                    if completed_read:
+                        proc.wait(timeout=5)
+                    else:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except OSError:
+                        pass
+            if proc and proc.stdout:
+                proc.stdout.close()
+            if proc and proc.stderr:
+                proc.stderr.close()
+            stderr_thread.join(timeout=2)
+    finally:
+        io_sem.release()
+
+    if proc and proc.returncode not in (0, None):
+        err = "".join(stderr_lines[-5:])
+        return {
+            "status": "FAILED",
+            "error": f"stream_fps ffmpeg 失败，returncode={proc.returncode}: {err}",
+        }
+
+    if not diffs:
+        err = "".join(stderr_lines[-5:])
+        return {"status": "FAILED", "error": f"stream_fps 没有可比较帧对: {err}"}
+
+    max_diff = max(diffs)
+    status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
+    return {
+        "status": status,
+        "result_json": json.dumps({
+            "mode": "stream_fps",
+            "sample_ts": sample_ts,
+            "diffs": diffs,
+            "max_diff": max_diff,
+            "threshold": threshold,
+            "early_stop": False,
+            "checked_pairs": len(diffs),
+            "ffmpeg_calls": 1,
+            "sample_fps": sample_fps,
+        }),
+    }
 
 
 def run_prescreen_for_cam(

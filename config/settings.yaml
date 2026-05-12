@@ -29,6 +29,13 @@ pass2:
   # [8, 12, 15, 20]
   batch_max_files: 8
 
+  # streaming 渲染批大小来源。
+  # true: streaming 使用 pass2.batch_max_files。
+  # false: 回退旧逻辑，读取 output.batch_max_files，缺失时默认 8。
+  # 回退建议: 如果家庭主机批处理调度异常，设为 false。
+  # [true, false]
+  use_streaming_batch_config: true
+
 # ---------------------------------------------------------------------------
 # 输出控制
 # ---------------------------------------------------------------------------
@@ -96,7 +103,15 @@ pipeline:
 
   # 渲染启动延迟 (秒)，等待分析队列积累素材
   # [30, 60, 300]
-  render_start_delay: 60
+  # 默认 5 秒用于降低每个 date-cam 的固定等待成本；需要更大 batch 预热时再调高。
+  render_start_delay: 5
+
+  # streaming 预筛 GPU 分配策略。
+  # qsv_only: 当前行为，所有 prescreen worker 使用 UHD 770 QSV。
+  # alternating: worker 在 QSV/CUDA 间交替，用于测试 RTX decode 是否有收益。
+  # 回退建议: 如果 CUDA 抢占 render 或 YOLO 资源导致变慢，设回 qsv_only。
+  # [qsv_only, alternating]
+  prescreen_gpu_policy: "qsv_only"
 
   # 全局最大 IO 并发数 (控制 FFmpeg 同时读写磁盘的数量，防止 IO 风暴)
   # 机械硬盘 (HDD) 建议 8-12，固态硬盘 (SSD) 建议 16-32
@@ -114,6 +129,14 @@ detection:
   # 46min 文件: 5段→盲区 9.3min, 30段→盲区 ~90s
   # 可选值: 5 ~ 120
   prescreen_segments: 120
+
+  # 预筛采样实现。
+  # legacy_seek: 当前行为，每个采样时间点单独执行一次 FFmpeg seek。
+  # stream_fps: 单个低 FPS FFmpeg 流式抽帧，检测到 motion 后早停。
+  # 回退建议: 如果长静态文件在家庭主机上变慢，设回 legacy_seek。
+  # [legacy_seek, stream_fps]
+  # 默认使用 legacy_seek，stream_fps 仍属实验模式，需在家庭主机 A/B 验证后启用。
+  prescreen_mode: "legacy_seek"
 
   # 预筛帧提取分辨率 (宽x高)，低分辨率 = 快速
   # 可选值: "320x180", "480x270", "640x360"
@@ -209,6 +232,13 @@ detection:
 yolo:
   # 是否开启 YOLO 验证
   enabled: true
+
+  # 是否在 streaming Pass1.5 路径执行 YOLO verification。
+  # true: 没有目标对象的 DYNAMIC segment 可转回 STATIC，降低后续 render 压力。
+  # false: 保持当前 streaming 行为，只做 frame-diff motion detection。
+  # 回退建议: 如果 YOLO 与 NVDEC/NVENC 抢占导致总耗时增加，设为 false。
+  # [true, false]
+  streaming_verify: false
   
   # YOLO 模型路径，若不存在会自动下载。推荐 YOLOv11n 或 YOLOv8n (nano模型极速)
   model_path: "yolo11n.pt"

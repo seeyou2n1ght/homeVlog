@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import threading
@@ -27,11 +28,19 @@ logger = logging.getLogger("homevlog")
 class StreamingOrchestrator:
     """终极流式管线编排器：实现预筛、分析、渲染的全重叠并发执行。"""
 
-    def __init__(self, db: VlogDatabase, date: str, cam_index: int, config: dict):
+    def __init__(
+        self,
+        db: VlogDatabase,
+        date: str,
+        cam_index: int,
+        config: dict,
+        render_enabled: bool = True,
+    ):
         self.db = db
         self.date = date
         self.cam_index = cam_index
         self.config = config
+        self.render_enabled = render_enabled
 
         # 队列定义
         self.prescreen_queue = queue.Queue()
@@ -41,20 +50,32 @@ class StreamingOrchestrator:
         # 配置提取
         pipe_cfg = config.get("pipeline", {})
         config.get("detection", {})
+        pass2_cfg = config.get("pass2", {})
         out_cfg = config.get("output", {})
 
-        self.batch_max_files = out_cfg.get("batch_max_files", 8)
+        if pass2_cfg.get("use_streaming_batch_config", True):
+            self.batch_max_files = pass2_cfg.get(
+                "batch_max_files", out_cfg.get("batch_max_files", 8)
+            )
+        else:
+            self.batch_max_files = out_cfg.get("batch_max_files", 8)
         self.render_delay = pipe_cfg.get("render_start_delay", 60)
 
         # 状态控制
         self.stop_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
+        self.error_lock = threading.Lock()
+        self.errors: list[str] = []
 
         # 进度条
         self.pbars = {}
 
-    def _prescreen_worker(self):
+    def _add_error(self, message: str):
+        with self.error_lock:
+            self.errors.append(message)
+
+    def _prescreen_worker(self, gpu: str = "qsv"):
         """预筛 Worker：将扫描到的文件进行快速筛选。"""
         while not self.stop_event.is_set() or not self.prescreen_queue.empty():
             try:
@@ -64,16 +85,39 @@ class StreamingOrchestrator:
 
             filepath = task["filepath"]
             duration = task.get("file_duration") or 300.0
+            t0 = time.monotonic()
 
             try:
-                res = prescreen_file(filepath, duration, self.config)
-                self.db.set_prescreen_result(filepath, res["status"], "")
+                res = prescreen_file(filepath, duration, self.config, gpu=gpu)
+                result_json = res.get("result_json", "")
+                self.db.set_prescreen_result(filepath, res["status"], result_json)
+
+                extra = {"status": res["status"]}
+                try:
+                    extra.update(json.loads(result_json or "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    if res.get("error"):
+                        extra["error"] = res["error"]
+                get_perf().add(
+                    PerfRecord(
+                        stage="prescreen",
+                        file=Path(filepath).name,
+                        gpu=gpu,
+                        duration=round(time.monotonic() - t0, 3),
+                        extra=extra,
+                    )
+                )
 
                 if res["status"] == "SUSPICIOUS":
                     self.analysis_queue.put(task)
                     if "analysis" in self.pbars:
                         self.pbars["analysis"].total += 1
                         self.pbars["analysis"].refresh()
+                elif res["status"] == "FAILED":
+                    self._add_error(f"prescreen returned FAILED: {Path(filepath).name}")
+                    self.render_batch_queue.put(
+                        {"filepath": filepath, "status": "FAILED"}
+                    )
                 else:
                     # STATIC 文件也需要通知 Batcher，因为它可能包含在 Timeline 中
                     self.render_batch_queue.put(
@@ -90,6 +134,16 @@ class StreamingOrchestrator:
             except Exception:
                 logger.exception("Streaming: prescreen failed for %s", filepath)
                 self.db.set_prescreen_result(filepath, "FAILED", "")
+                self._add_error(f"prescreen failed: {Path(filepath).name}")
+                get_perf().add(
+                    PerfRecord(
+                        stage="prescreen",
+                        file=Path(filepath).name,
+                        gpu=gpu,
+                        duration=round(time.monotonic() - t0, 3),
+                        extra={"status": "ERROR"},
+                    )
+                )
             finally:
                 self.prescreen_queue.task_done()
 
@@ -137,6 +191,20 @@ class StreamingOrchestrator:
                             "gap_tolerance", 0.5
                         ),
                     )
+                    yolo_cfg = self.config.get("yolo", {})
+                    yolo_before = len(segments)
+                    yolo_enabled = bool(
+                        yolo_cfg.get("enabled", False)
+                        and yolo_cfg.get("streaming_verify", False)
+                    )
+                    if yolo_enabled:
+                        from src.yolo_verifier import YoloVerifier
+
+                        segments = YoloVerifier(self.config).verify(
+                            filepath, segments, gpu=gpu
+                        )
+                    yolo_after = len(segments)
+
                     js = segments_to_json(segments)
                     self.db.set_analysis_result(filepath, "ANALYZED", js)
 
@@ -148,7 +216,13 @@ class StreamingOrchestrator:
                             gpu=gpu,
                             duration=round(time.monotonic() - t0, 3),
                             frames=lp.get("frames", 0),
-                            extra={"status": "ANALYZED", **lp},
+                            extra={
+                                "status": "ANALYZED",
+                                "segments_before_yolo": yolo_before,
+                                "segments_after_yolo": yolo_after,
+                                "yolo_streaming_verify": yolo_enabled,
+                                **lp,
+                            },
                         )
                     )
                     # 通知 Batcher
@@ -157,6 +231,7 @@ class StreamingOrchestrator:
                     )
                 else:
                     self.db.set_analysis_result(filepath, "FAILED", "")
+                    self._add_error(f"analysis produced no labels: {Path(filepath).name}")
                     self.render_batch_queue.put(
                         {"filepath": filepath, "status": "FAILED"}
                     )
@@ -172,6 +247,7 @@ class StreamingOrchestrator:
                     "Streaming: analysis failed for %s [%s]", filepath, gpu
                 )
                 self.db.set_analysis_result(filepath, "FAILED", "")
+                self._add_error(f"analysis failed: {Path(filepath).name}")
                 self.render_batch_queue.put({"filepath": filepath, "status": "FAILED"})
             finally:
                 self.analysis_queue.task_done()
@@ -190,7 +266,7 @@ class StreamingOrchestrator:
         batch_idx = 0
 
         # 等待一定时间，让流水线充盈
-        time.sleep(5)
+        time.sleep(max(0, self.render_delay))
 
         batch_queue = queue.Queue()
 
@@ -207,6 +283,7 @@ class StreamingOrchestrator:
                     ]
 
                     if not batch_segs:
+                        self._add_error(f"render batch {b_idx} has no timeline segments")
                         continue
 
                     res_path = build_batch_render(
@@ -225,17 +302,19 @@ class StreamingOrchestrator:
                     if res_path:
                         with self.batch_lock:
                             self.batch_paths.append((b_idx, Path(res_path)))
-
                         if "render" in self.pbars:
                             self.pbars["render"].update(1)
                             self.pbars["render"].set_postfix_str(
                                 f"Batch {b_idx} done on {gpu}"
                             )
+                    else:
+                        self._add_error(f"render batch {b_idx} returned no output")
 
                 except Exception:
                     logger.exception(
                         "Streaming: render batch %d failed on %s", b_idx, gpu
                     )
+                    self._add_error(f"render batch {b_idx} failed on {gpu}")
                 finally:
                     batch_queue.task_done()
 
@@ -248,6 +327,12 @@ class StreamingOrchestrator:
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
                 msg = self.render_batch_queue.get(timeout=2)
+                if msg.get("status") == "FAILED":
+                    self._add_error(
+                        f"upstream task failed before render: {Path(msg['filepath']).name}"
+                    )
+                    self.render_batch_queue.task_done()
+                    continue
                 pending_files.append(msg["filepath"])
 
                 if len(pending_files) >= self.batch_max_files:
@@ -300,13 +385,14 @@ class StreamingOrchestrator:
             leave=True,
             position=1,
         )
-        self.pbars["render"] = tqdm(
-            total=0,
-            desc=f" {self.date} Rendering",
-            unit="batch",
-            leave=True,
-            position=2,
-        )
+        if self.render_enabled:
+            self.pbars["render"] = tqdm(
+                total=0,
+                desc=f" {self.date} Rendering",
+                unit="batch",
+                leave=True,
+                position=2,
+            )
 
         for task in all_tasks:
             pre_status = task["prescreen_status"]
@@ -326,6 +412,9 @@ class StreamingOrchestrator:
                         {"filepath": task["filepath"], "status": ana_status}
                     )
             else:
+                self._add_error(
+                    f"file in failed prescreen status before render: {Path(task['filepath']).name}"
+                )
                 self.render_batch_queue.put(
                     {"filepath": task["filepath"], "status": pre_status}
                 )
@@ -336,8 +425,16 @@ class StreamingOrchestrator:
         prescreen_parallel = self.config.get("detection", {}).get(
             "prescreen_parallel", 4
         )
-        for _ in range(prescreen_parallel):
-            t = threading.Thread(target=self._prescreen_worker, daemon=True)
+        prescreen_gpu_policy = self.config.get("pipeline", {}).get(
+            "prescreen_gpu_policy", "qsv_only"
+        )
+        for i in range(prescreen_parallel):
+            gpu = "qsv"
+            if prescreen_gpu_policy == "alternating":
+                gpu = "qsv" if i % 2 == 0 else "cuda"
+            t = threading.Thread(
+                target=self._prescreen_worker, args=(gpu,), daemon=True
+            )
             t.start()
             threads.append(t)
 
@@ -374,14 +471,16 @@ class StreamingOrchestrator:
                 t.start()
                 threads.append(t)
 
-        t_rm = threading.Thread(target=self._render_manager, daemon=True)
-        t_rm.start()
-        threads.append(t_rm)
+        if self.render_enabled:
+            t_rm = threading.Thread(target=self._render_manager, daemon=True)
+            t_rm.start()
+            threads.append(t_rm)
 
         # 阻塞等待所有任务入队并处理
         self.prescreen_queue.join()
         self.analysis_queue.join()
-        self.render_batch_queue.join()
+        if self.render_enabled:
+            self.render_batch_queue.join()
 
         # 通知各线程停止
         self.stop_event.set()
@@ -395,6 +494,11 @@ class StreamingOrchestrator:
         with self.batch_lock:
             self.batch_paths.sort(key=lambda x: x[0])
             final_paths = [p for _, p in self.batch_paths]
+
+        with self.error_lock:
+            errors = list(self.errors)
+        if errors:
+            raise RuntimeError("; ".join(errors[:5]))
 
         return final_paths
 
@@ -431,11 +535,21 @@ def process_date_cam(
     output_name = output_name.replace("{date}", date).replace("{index}", str(cam_index))
     output_path = OUTPUT_DIR / output_name
 
-    orchestrator = StreamingOrchestrator(db, date, cam_index, config)
-    with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
-        batch_paths = orchestrator.run()
+    db.upsert_render_task(date, cam_index, "PENDING")
+    orchestrator = StreamingOrchestrator(
+        db, date, cam_index, config, render_enabled=not skip_render
+    )
+    try:
+        with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
+            batch_paths = orchestrator.run()
+    except Exception:
+        logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
+        db.set_render_status(date, cam_index, "FAILED")
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start)
+        return False
 
     if skip_render:
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start)
         return True
 
     if not batch_paths:
@@ -443,13 +557,19 @@ def process_date_cam(
         return False
 
     db.upsert_render_task(date, cam_index, "RENDERING")
-    if len(batch_paths) == 1:
-        batch_paths[0].rename(output_path)
-        ok = True
-    else:
-        ok = concat_output_files(batch_paths, output_path)
-        for p in batch_paths:
-            p.unlink(missing_ok=True)
+    try:
+        if len(batch_paths) == 1:
+            batch_paths[0].rename(output_path)
+            ok = True
+        else:
+            ok = concat_output_files(batch_paths, output_path)
+            for p in batch_paths:
+                p.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("finalize render output failed for %s cam%d", date, cam_index)
+        db.set_render_status(date, cam_index, "FAILED")
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start)
+        return False
 
     if ok:
         db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))

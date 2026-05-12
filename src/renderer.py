@@ -450,7 +450,12 @@ def _run_batch_render(
 def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -> bool:
     """Losslessly concatenate multiple MP4 files via concat demuxer."""
     concat_list = output.with_name(f".concat_{output.stem}.txt")
-    lines = [f"file {str(f).replace(chr(92), '/')}" for f in files]
+
+    def _concat_path(path: Path) -> str:
+        normalized = str(path).replace(chr(92), "/")
+        return normalized.replace("'", r"\'")
+
+    lines = [f"file '{_concat_path(f)}'" for f in files]
     concat_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     result = run_ffmpeg(

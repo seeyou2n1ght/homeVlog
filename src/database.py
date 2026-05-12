@@ -206,10 +206,14 @@ class VlogDatabase:
         with self._lock:
             try:
                 self.conn.execute(
-                    """UPDATE render_tasks
-                       SET status=?, output_file=?, updated_at=datetime('now')
-                       WHERE date=? AND cam_index=?""",
-                    (status, output_file, date, cam_index),
+                    """INSERT INTO render_tasks
+                       (date, cam_index, status, output_file, updated_at)
+                       VALUES (?, ?, ?, ?, datetime('now'))
+                       ON CONFLICT(date, cam_index) DO UPDATE SET
+                         status=excluded.status,
+                         output_file=excluded.output_file,
+                         updated_at=excluded.updated_at""",
+                    (date, cam_index, status, output_file),
                 )
                 self.conn.commit()
             except Exception as e:
