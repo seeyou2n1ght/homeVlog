@@ -82,8 +82,6 @@ def prescreen_file(
         )
     ts_list = _calc_sample_timestamps(duration, segments, timestamp_margin)
 
-    min(10, len(ts_list) - 1)
-    threshold * 0.5
     diffs: list[float] = []
 
     # 提取第 0 帧
