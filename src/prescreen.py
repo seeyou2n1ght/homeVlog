@@ -248,13 +248,12 @@ def _prescreen_stream_fps(
 
         try:
             if proc.stdout is None:
-                return {"status": "FAILED", "error": "ffmpeg stdout unavailable"}
-                """
                 return {"status": "FAILED", "error": "ffmpeg stdout 不可用"}
-
-                """
+            
             first_raw = proc.stdout.read(frame_size)
             if len(first_raw) < frame_size:
+                # Wait a bit for stderr to populate
+                time.sleep(0.5)
                 err = "".join(stderr_lines[-5:])
                 return {"status": "FAILED", "error": f"stream_fps 首帧读取失败: {err}"}
 

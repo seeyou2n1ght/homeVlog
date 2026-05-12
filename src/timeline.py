@@ -121,6 +121,16 @@ def build_concat_filter(
         scale_filter = f"scale={output_width}:{output_height}"
 
     use_keyframe_slideshow = (scale_mode == "cpu")
+    # --- Performance Optimization: Hybrid Keyframe Mode ---
+    # In GPU mode, using setpts (fast-forward) still decodes many frames.
+    # Hybrid mode uses the CPU-style "slideshow" approach (sparse fps) even on GPU.
+    from src.utils import load_config
+    try:
+        tmp_cfg = load_config()
+        if tmp_cfg.get("render", {}).get("static_mode") == "hybrid_keyframe":
+            use_keyframe_slideshow = True
+    except Exception:
+        pass
 
     # --- Step 1: Count segments per input file ---
     segs_per_file: dict[int, int] = {}
