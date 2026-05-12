@@ -171,32 +171,43 @@ uv run python main.py --date 20260428 --cam 0
 
 ## 性能优化与回退
 
-当前性能优化分支的详细实施方案见：
+本项目的核心瓶颈通常在于 **硬件解码器 (NVDEC/QSV)** 以及 **显存 (VRAM)**。为了在普通家庭主机（如 i5-12600K + RTX 3060Ti）上最大化吞吐，系统实施了以下极限优化策略：
 
-- [docs/PERFORMANCE_OPTIMIZATION_PLAN.md](docs/PERFORMANCE_OPTIMIZATION_PLAN.md)
+### 1. Hybrid Keyframe (静态段幻灯片化)
+- **配置**: `render.static_mode: "hybrid_keyframe"`
+- **原理**: 默认的 `setpts` 快进模式会强制显卡解码静态段的所有帧并丢弃。`hybrid_keyframe` 模式下，STATIC 片段不再被视为连续视频，而是按指定的间隔（如 60s）抽帧作为幻灯片处理。
+- **收益**: 彻底瓦解显卡解码负载，解决 `avg_dec` 接近 100% 的瓶颈，并成倍提升后续滤镜图 (Filter Complex) 的处理速度。
 
-建议家庭主机 A/B 测试固定同一天、同一 camera、同一批输入文件。最低限度测试：
+### 2. 流式预筛 (Stream FPS Prescreen)
+- **配置**: `detection.prescreen_mode: "stream_fps"`
+- **原理**: 取代旧版中每个采样点启动一次 FFmpeg 进行 `seek` 的高昂开销，使用单个低 FPS 进程流式抽帧，一旦发现可疑运动 (SUSPICIOUS) 立即早停。
+- **收益**: 消除数以千计的进程启动损耗，极大缓解对 NAS 的 SMB 随机寻址压力。若长静态文件处理反而变慢，可退回 `legacy_seek`。
 
-| 测试 | prescreen | YOLO streaming | 目的 |
-| --- | --- | --- | --- |
-| A | `legacy_seek` | `false` | 当前行为基线 |
-| B | `stream_fps` | `false` | 验证单进程预筛收益 |
-| C | `stream_fps` | `true` | 验证 YOLO 是否净收益 |
+### 3. CPU 卸载与 YOLO 并发策略
+- **配置**: `yolo.streaming_verify: true`, `yolo.device: "cpu"` (或 `openvino`)
+- **原理**: YOLO 验证对于过滤光影、树叶等“伪动态段”至关重要，但它会与 FFmpeg 争用极为有限的显存和 CUDA 队列，极易导致 OOM。
+- **实施**:
+  - 将轻量级模型 (YOLOv11n) 的计算显式移交闲置的 CPU 或 OpenVINO 处理。
+  - 由于 GPU 负荷下降，可安全调高 `detection.analysis_max_workers`（如 4）以提升多文件并发分析速度。
+  - 降低 `detection.qsv_fallback_threshold`（如 15），让 Intel QSV 核显更早加入硬件解码队列，与 NVIDIA 并肩作战。
 
-若优化不及预期，优先通过配置回退：
+### 回退方案
+
+如果在某些机器上优化效果不及预期或导致错误，请通过修改配置迅速回退到安全基线：
 
 ```yaml
 detection:
-  prescreen_mode: "legacy_seek"
+  prescreen_mode: "legacy_seek"    # 回退到单点采样
+  analysis_max_workers: 2          # 降低并发防 OOM
+
+render:
+  static_mode: "auto"              # 恢复全量快进
 
 yolo:
-  streaming_verify: false
-
-pass2:
-  use_streaming_batch_config: false
+  streaming_verify: false          # 关闭 YOLO 验证
 
 pipeline:
-  prescreen_gpu_policy: "qsv_only"
+  prescreen_gpu_policy: "qsv_only" # 回退纯核显预筛
 ```
 
 ## 上线前修复说明
