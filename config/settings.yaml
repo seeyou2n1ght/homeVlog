@@ -27,7 +27,7 @@ pass2:
 
   # 渲染批次最大文件数 (建议 8-12，降低 Filter Complex 复杂度)
   # [8, 12, 15, 20]
-  batch_max_files: 8
+  batch_max_files: 12
 
   # streaming 渲染批大小来源。
   # true: streaming 使用 pass2.batch_max_files。
@@ -136,7 +136,7 @@ detection:
   # 回退建议: 如果长静态文件在家庭主机上变慢，设回 legacy_seek。
   # [legacy_seek, stream_fps]
   # 默认使用 legacy_seek，stream_fps 仍属实验模式，需在家庭主机 A/B 验证后启用。
-  prescreen_mode: "legacy_seek"
+  prescreen_mode: "stream_fps"
 
   # 预筛帧提取分辨率 (宽x高)，低分辨率 = 快速
   # 可选值: "320x180", "480x270", "640x360"
@@ -220,7 +220,7 @@ detection:
 
   # Pass1.5 双 GPU 并行分析的最大 worker 数
   # 可选值: 1 ~ 4
-  analysis_max_workers: 2
+  analysis_max_workers: 4
 
   # GPU 分配阈值: 可疑文件数超过此值时 QSV 也参与 Pass1.5 分析
   # 可选值: 10 ~ 200
@@ -238,22 +238,22 @@ yolo:
   # false: 保持当前 streaming 行为，只做 frame-diff motion detection。
   # 回退建议: 如果 YOLO 与 NVDEC/NVENC 抢占导致总耗时增加，设为 false。
   # [true, false]
-  streaming_verify: false
-  
+  streaming_verify: true
+
   # YOLO 模型路径，若不存在会自动下载。推荐 YOLOv11n 或 YOLOv8n (nano模型极速)
   model_path: "yolo11n.pt"
-  
+
   # 需要保留的目标类别列表。例如 COCO 数据集: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
-  
+
   # 置信度阈值
   confidence: 0.25
-  
+
   # 对疑似动态段进行验证时的抽帧率 (FPS)。0.5 表示每 2 秒抽 1 帧
-  sample_fps: 1.0
+  sample_fps: 0.5
 
   # 硬件加速设备: "cuda:0", "cpu", "openvino"
-  device: "cuda:0"
+  device: "cpu"
 
 # ---------------------------------------------------------------------------
 # 段构建与合并参数
@@ -301,7 +301,7 @@ render:
   # - setpts: 全量快进, 保留运动平滑度但 decode 压力大
   # - hybrid_keyframe: 幻灯片抽帧模式, 极大降低 STATIC 片段的硬件解码压力
   # [auto, setpts, hybrid_keyframe]
-  static_mode: "auto"
+  static_mode: "hybrid_keyframe"
 
 # ---------------------------------------------------------------------------
 # 恢复与容错参数
