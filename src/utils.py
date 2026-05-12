@@ -166,15 +166,3 @@ def check_disk_space(path: Path, min_gb: int | None = None) -> bool:
     except Exception as e:
         logging.getLogger("homevlog").warning("Failed to check disk space: %s", e)
         return True
-nimum threshold."""
-    import shutil
-    try:
-        total, used, free = shutil.disk_usage(path)
-        free_gb = free / (1024 ** 3)
-        if free_gb < min_gb:
-            logging.getLogger("homevlog").error("Disk space critically low on %s: %.1f GB free (< %d GB)", path, free_gb, min_gb)
-            return False
-        return True
-    except Exception as e:
-        logging.getLogger("homevlog").warning("Failed to check disk space: %s", e)
-        return True

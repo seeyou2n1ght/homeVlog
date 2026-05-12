@@ -246,6 +246,7 @@ class MotionDetector:
         )
         frame_interval = 1.0 / actual_fps if actual_fps > 0 else 1.0 / self.fps
 
+        padded_energies = [0.0] + energies
         results = []
         for i, is_motion in enumerate(smoothed):
             # 防止最后的时间戳超过 file_duration
@@ -254,6 +255,7 @@ class MotionDetector:
                 {
                     "time": time_val,
                     "is_motion": is_motion,
+                    "energy": float(padded_energies[i]) if i < len(padded_energies) else 0.0,
                 }
             )
         return results

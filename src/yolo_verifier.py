@@ -73,6 +73,11 @@ class YoloVerifier:
                 verified_segments.append(seg)
                 continue
                 
+            if seg.max_energy >= self.skip_energy_threshold:
+                logger.debug(f"YOLO Skipped (Massive Motion, energy {seg.max_energy:.1f} >= {self.skip_energy_threshold}) for {filepath} at {local_start:.1f}s")
+                verified_segments.append(seg)
+                continue
+                
             t0 = time.monotonic()
             is_really_dynamic = self._verify_segment(filepath, local_start, duration, gpu)
             elapsed = time.monotonic() - t0

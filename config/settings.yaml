@@ -100,6 +100,8 @@ yolo:
   enabled: true
   # 是否在流式处理中实时验证 (开启可降低渲染压力，但增加 GPU 开销)
   streaming_verify: true
+  # 触发式推理: 如果动作的平均能量(像素帧差均值)超过此值，认为动作足够大，直接跳过 YOLO 验证
+  skip_energy_threshold: 15.0
   model_path: "yolo11n.pt"
   # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
@@ -159,3 +161,4 @@ logging:
   rotation_max_bytes: 10485760
   rotation_backup_count: 5
   monitor_interval: 2.0
+tor_interval: 2.0

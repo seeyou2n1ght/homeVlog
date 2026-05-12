@@ -251,5 +251,3 @@ class VlogDatabase:
             if self._conn:
                 self._conn.close()
                 self._conn = None
-f._conn.close()
-                self._conn = None

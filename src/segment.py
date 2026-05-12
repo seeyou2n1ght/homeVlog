@@ -107,6 +107,7 @@ def _filter_short(
             # Try absorb left: merge into prev segment
             if i > 0 and segments[i - 1].state != segments[i].state:
                 segments[i - 1].end_time = segments[i].end_time
+                segments[i - 1].max_energy = max(segments[i - 1].max_energy, segments[i].max_energy)
                 segments.pop(i)
                 changed = True
                 continue
@@ -114,6 +115,7 @@ def _filter_short(
             # Try absorb right
             if i + 1 < len(segments) and segments[i + 1].state != segments[i].state:
                 segments[i + 1].start_time = segments[i].start_time
+                segments[i + 1].max_energy = max(segments[i + 1].max_energy, segments[i].max_energy)
                 segments.pop(i)
                 changed = True
                 continue
@@ -128,6 +130,7 @@ def _filter_short(
                     merged.append(seg)
                 else:
                     merged[-1].end_time = seg.end_time
+                    merged[-1].max_energy = max(merged[-1].max_energy, seg.max_energy)
             segments = merged
 
     # Merge adjacent same-state segments
@@ -137,6 +140,7 @@ def _filter_short(
             filtered.append(seg)
         else:
             filtered[-1].end_time = seg.end_time
+            filtered[-1].max_energy = max(filtered[-1].max_energy, seg.max_energy)
 
     return filtered
 

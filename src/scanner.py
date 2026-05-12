@@ -101,16 +101,29 @@ def scan_directory(
                     frozen += 1
                     continue
 
+        duration = info["end_ts"] - info["start_ts"]
+        min_bitrate = config.get("detection", {}).get("min_bitrate_kbps", 0)
+        
+        prescreen_status = "PENDING"
+        if min_bitrate > 0 and duration > 0:
+            kbps = (stat.st_size * 8) / (duration * 1000)
+            if kbps < min_bitrate:
+                logger.debug("skip prescreen for %s (bitrate %.1f kbps < %d)", entry.name, kbps, min_bitrate)
+                prescreen_status = "STATIC"
+
         ok = db.add_file_task(
             filepath=entry.path,
             cam_index=info["cam_index"],
             date=info["date"],
             file_start_time=info["file_start_time"],
             file_end_time=info["file_end_time"],
-            file_duration=info["end_ts"] - info["start_ts"],
+            file_duration=duration,
         )
         if ok:
             added += 1
+            if prescreen_status != "PENDING":
+                import json
+                db.set_prescreen_result(entry.path, prescreen_status, json.dumps({"reason": "low_bitrate", "kbps": round(kbps, 1)}))
         else:
             skipped += 1
 

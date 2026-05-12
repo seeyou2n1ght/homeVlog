@@ -310,6 +310,8 @@ dependencies = [
     { name = "opencv-python" },
     { name = "psutil" },
     { name = "pyyaml" },
+    { name = "torch" },
+    { name = "torchvision" },
     { name = "tqdm" },
     { name = "ultralytics" },
 ]
@@ -326,6 +328,8 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.10.0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "torch", specifier = ">=2.0.0" },
+    { name = "torchvision", specifier = ">=0.15.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "ultralytics", specifier = ">=8.4.48" },
 ]
