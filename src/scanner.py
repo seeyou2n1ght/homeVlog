@@ -52,8 +52,10 @@ def scan_directory(
         input_dir = config["paths"]["input_dir"]
     freeze_minutes = config.get("recovery", {}).get("scanner_freeze_minutes", 10)
     stabilize_wait = config.get("recovery", {}).get("file_stabilize_wait", 1.2)
+    skip_today = config.get("recovery", {}).get("skip_today", False)
+    current_date = time.strftime("%Y%m%d")
 
-    logger.info("scanning: %s (freeze=%dmin)", input_dir, freeze_minutes)
+    logger.info("scanning: %s (freeze=%dmin, skip_today=%s)", input_dir, freeze_minutes, skip_today)
 
     if not os.path.isdir(input_dir):
         logger.error("input_dir not found: %s", input_dir)
@@ -72,25 +74,32 @@ def scan_directory(
             logger.debug("skip unrecognized filename: %s", entry.name)
             continue
 
+        if skip_today and info["date"] == current_date:
+            logger.debug("skip today's file: %s", entry.name)
+            skipped += 1
+            continue
+
         stat = entry.stat()
         age_min = (time.time() - stat.st_mtime) / 60.0
 
-        if age_min < freeze_minutes:
-            frozen += 1
-            continue
-
-        # Stabilize check: only for files near the freeze boundary.
-        # Files well past the freeze window are definitely stable.
-        if freeze_minutes > 0 and age_min < freeze_minutes + 5:
-            time.sleep(stabilize_wait)
-            try:
-                stat2 = os.stat(entry.path)
-                if stat2.st_size != stat.st_size:
-                    frozen += 1
-                    continue
-            except OSError:
+        # 如果启用了 skip_today，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
+        # 因为旧日期的素材通常已经是完整的，而今日素材已被前面逻辑跳过
+        if not skip_today:
+            if age_min < freeze_minutes:
                 frozen += 1
                 continue
+
+            # Stabilize check: only for files near the freeze boundary.
+            if freeze_minutes > 0 and age_min < freeze_minutes + 5:
+                time.sleep(stabilize_wait)
+                try:
+                    stat2 = os.stat(entry.path)
+                    if stat2.st_size != stat.st_size:
+                        frozen += 1
+                        continue
+                except OSError:
+                    frozen += 1
+                    continue
 
         ok = db.add_file_task(
             filepath=entry.path,

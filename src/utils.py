@@ -150,8 +150,23 @@ def cleanup_resources():
         logging.getLogger("homevlog").warning("cleanup error: %s", e)
 
 
-def check_disk_space(path: Path, min_gb: int = 20) -> bool:
+def check_disk_space(path: Path, min_gb: int | None = None) -> bool:
     """Check if free disk space is above minimum threshold."""
+    import shutil
+    if min_gb is None:
+        config = load_config()
+        min_gb = config.get("recovery", {}).get("min_disk_space_gb", 20)
+    try:
+        total, used, free = shutil.disk_usage(path)
+        free_gb = free / (1024 ** 3)
+        if free_gb < min_gb:
+            logging.getLogger("homevlog").error("Disk space critically low on %s: %.1f GB free (< %d GB)", path, free_gb, min_gb)
+            return False
+        return True
+    except Exception as e:
+        logging.getLogger("homevlog").warning("Failed to check disk space: %s", e)
+        return True
+nimum threshold."""
     import shutil
     try:
         total, used, free = shutil.disk_usage(path)

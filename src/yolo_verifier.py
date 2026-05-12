@@ -10,7 +10,7 @@ class YoloVerifier:
     _model_lock = threading.Lock()
     _shared_model = None
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, device: str | None = None):
         yolo_cfg = config.get("yolo", {})
         self.enabled = yolo_cfg.get("enabled", False)
         if not self.enabled:
@@ -29,7 +29,9 @@ class YoloVerifier:
         self.confidence = yolo_cfg.get("confidence", 0.25)
         self.sample_fps = yolo_cfg.get("sample_fps", 1.0)
         
-        device = yolo_cfg.get("device", "cuda:0")
+        if device is None:
+            device = yolo_cfg.get("device", config.get("hardware", {}).get("device", "cpu"))
+            
         if device.startswith("cuda") and not torch.cuda.is_available():
             logger.warning("CUDA not available. Falling back to CPU for YOLO.")
             device = "cpu"
@@ -40,14 +42,22 @@ class YoloVerifier:
             if YoloVerifier._shared_model is None:
                 logger.info(f"Loading shared YOLO model {model_path} on {device}...")
                 YoloVerifier._shared_model = YOLO(model_path)
+            elif str(YoloVerifier._shared_model.device) != device:
+                # If device changed, reload model
+                logger.info(f"Reloading YOLO model {model_path} on {device}...")
+                YoloVerifier._shared_model = YOLO(model_path)
         self.model = YoloVerifier._shared_model
         
-    def verify(self, filepath: str, segments: list, gpu: str = "qsv") -> list:
+    def verify(self, filepath: str, segments: list, gpu: str = "qsv", device: str | None = None) -> list:
         """
         验证动态片段。若片段无目标，将其状态翻转为 STATIC。
         """
         if not self.enabled:
             return segments
+        
+        if device and device != self.device:
+            # Need to re-init with correct device
+            self.__init__({"yolo": {"enabled": True}, "hardware": {"device": device}}, device=device)
             
         verified_segments = []
         for seg in segments:

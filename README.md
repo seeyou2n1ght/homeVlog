@@ -124,72 +124,45 @@ uv run python main.py --date 20260428 --cam 0
 
 ## 关键配置
 
-所有配置在 [config/settings.yaml](config/settings.yaml)。
+所有配置在 [config/settings.yaml](config/settings.yaml)。项目已对配置结构进行了全面重构，主要分为以下模块：
 
-### 路径
-
+### 1. 基础路径 (Paths)
 - `paths.input_dir`: 输入素材目录，必填。
+- `paths.temp_dir`: 临时文件目录，建议设在 SSD 以提升渲染效率。
 
-### Prescreen
+### 2. 硬件与性能 (Hardware)
+- `hardware.device`: 全局推理设备 (`cpu`, `cuda:0`)，主要影响 YOLO。
+- `hardware.max_nv_concurrency`: 并发 NVENC 会话限制（消费级显卡通常为 2-3）。
+- `hardware.max_qsv_concurrency`: QSV 并发限制。
+- `hardware.max_io_concurrency`: 全局 I/O 并发限制。
 
-- `detection.prescreen_segments`: 每文件采样密度。越高盲区越小，但成本越高。
-- `detection.prescreen_mode`: `legacy_seek` 或 `stream_fps`。
-- `detection.prescreen_resolution`: 预筛抽帧分辨率。
-- `detection.prescreen_diff_threshold`: 预筛帧差阈值。
-- `detection.prescreen_parallel`: prescreen worker 数。
+### 3. 扫描与恢复 (Recovery)
+- `recovery.skip_today`: **[新]** 是否跳过当天素材。开启后程序将不处理日期为当天的文件，且会自动跳过针对往日素材的稳定性校验，加快扫描速度。
+- `recovery.min_disk_space_gb`: **[新]** 磁盘空间保护阈值。低于此值将停止流水线。
+- `recovery.scanner_freeze_minutes`: 忽略最新素材的时长（仅在 `skip_today` 为 false 时生效）。
 
-### Analysis
+### 4. 运动检测 (Detection)
+- `detection.prescreen_mode`: `legacy_seek` (兼容性好) 或 `stream_fps` (高效流式)。
+- `detection.analysis_max_workers`: 精细分析的并发 Worker 数。系统现在支持**硬件自适应启动**：若无核显会自动降级到 CPU，避免报错。
 
-- `detection.analysis_fps`: 精细分析抽帧 FPS。
-- `detection.analysis_resolution`: 精细分析分辨率。
-- `detection.motion_sensitivity`: 自适应阈值灵敏度。
-- `detection.median_filter_window`: 时序中值滤波窗口。
-- `detection.analysis_max_workers`: analysis worker 上限。
-- `detection.qsv_fallback_threshold`: 文件数超过该阈值时启用 QSV analysis worker。
+### 5. YOLO 验证 (YOLO)
+- `yolo.enabled`: 开启 Stage 2 验证。
+- `yolo.streaming_verify`: 在流式管线中实时执行。
+- 系统现在会自动同步 `hardware.device` 设置到 YOLO 模块。
 
-### Render
+## 性能优化与安全特性
 
-- `pass2.batch_max_files`: streaming render 每个 batch 的最大文件数。
-- `pass2.use_streaming_batch_config`: 是否让 streaming 使用 `pass2.batch_max_files`。
-- `output.resolution`: 输出分辨率。
-- `output.fps`: 输出帧率。
-- `output.nv`: NVENC 编码参数。
-- `output.qsv`: QSV 编码参数。
+本项目的核心瓶颈通常在于 **硬件解码器 (NVDEC/QSV)** 以及 **显存 (VRAM)**。为了在普通家庭主机（如 i5-12600K + RTX 3060Ti）上最大化吞吐，系统实施了以下策略：
 
-### Streaming
+### 1. 硬件自适应调度 (Hardware Awareness)
+系统在启动时会自动探测 `ffmpeg` 编码器支持情况。如果机器没有 Intel 核显或 NVIDIA 显卡，相关的 Worker 会自动降级为 CPU 或跳过，确保管线在不同硬件环境下都能稳定运行。
 
-- `pipeline.render_start_delay`: render manager 启动前等待 prescreen/analysis 预热的秒数。
-- `pipeline.max_io_concurrency`: 全局 FFmpeg/ffprobe I/O 并发限制。
-- `pipeline.prescreen_gpu_policy`: `qsv_only` 或 `alternating`。
+### 2. 本地化时区与日志
+SQLite 数据库和日志系统现在统一使用本地时间 (`localtime`)，方便用户将处理记录与实际监控文件名进行快速比对。
 
-### YOLO
-
-- `yolo.enabled`: 是否加载 YOLO 验证能力。
-- `yolo.streaming_verify`: streaming 主流程是否实际执行 YOLO verification。
-- `yolo.sample_fps`: YOLO 验证抽帧 FPS。
-- `yolo.device`: YOLO 推理设备，例如 `cuda:0` 或 `cpu`。
-
-## 性能优化与回退
-
-本项目的核心瓶颈通常在于 **硬件解码器 (NVDEC/QSV)** 以及 **显存 (VRAM)**。为了在普通家庭主机（如 i5-12600K + RTX 3060Ti）上最大化吞吐，系统实施了以下极限优化策略：
-
-### 1. Hybrid Keyframe (静态段幻灯片化)
-- **配置**: `render.static_mode: "hybrid_keyframe"`
-- **原理**: 默认的 `setpts` 快进模式会强制显卡解码静态段的所有帧并丢弃。`hybrid_keyframe` 模式下，STATIC 片段不再被视为连续视频，而是按指定的间隔（如 60s）抽帧作为幻灯片处理。
-- **收益**: 彻底瓦解显卡解码负载，解决 `avg_dec` 接近 100% 的瓶颈，并成倍提升后续滤镜图 (Filter Complex) 的处理速度。
-
-### 2. 流式预筛 (Stream FPS Prescreen)
-- **配置**: `detection.prescreen_mode: "stream_fps"`
-- **原理**: 取代旧版中每个采样点启动一次 FFmpeg 进行 `seek` 的高昂开销，使用单个低 FPS 进程流式抽帧，一旦发现可疑运动 (SUSPICIOUS) 立即早停。
-- **收益**: 消除数以千计的进程启动损耗，极大缓解对 NAS 的 SMB 随机寻址压力。若长静态文件处理反而变慢，可退回 `legacy_seek`。
-
-### 3. CPU 卸载与 YOLO 并发策略
-- **配置**: `yolo.streaming_verify: true`, `yolo.device: "cpu"` (或 `openvino`)
-- **原理**: YOLO 验证对于过滤光影、树叶等“伪动态段”至关重要，但它会与 FFmpeg 争用极为有限的显存和 CUDA 队列，极易导致 OOM。
-- **实施**:
-  - 将轻量级模型 (YOLOv11n) 的计算显式移交闲置的 CPU 或 OpenVINO 处理。
-  - 由于 GPU 负荷下降，可安全调高 `detection.analysis_max_workers`（如 4）以提升多文件并发分析速度。
-  - 降低 `detection.qsv_fallback_threshold`（如 15），让 Intel QSV 核显更早加入硬件解码队列，与 NVIDIA 并肩作战。
+### 3. 磁盘与资源保护
+- **空间预检**: 每次处理新日期前都会检查磁盘空间。
+- **僵尸进程清理**: 任务结束时自动扫描并清理残留的 FFmpeg 子进程。
 
 ### 回退方案
 

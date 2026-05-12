@@ -199,9 +199,9 @@ class StreamingOrchestrator:
                     )
                     if yolo_enabled:
                         from src.yolo_verifier import YoloVerifier
-
+                        yolo_device = self.config.get("hardware", {}).get("device", "cpu")
                         segments = YoloVerifier(self.config).verify(
-                            filepath, segments, gpu=gpu
+                            filepath, segments, gpu=gpu, device=yolo_device
                         )
                     yolo_after = len(segments)
 
@@ -606,6 +606,26 @@ def run_pipeline(skip_render: bool = False) -> dict:
     try:
         scan_directory(db)
         groups = get_date_cam_groups(db)
+        if not groups:
+            return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+        ok, failed = 0, 0
+        for date, cam_index in groups:
+            if not check_disk_space(OUTPUT_DIR, min_gb=20):
+                break
+            try:
+                if process_date_cam(db, date, cam_index, skip_render=skip_render):
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception:
+                logger.exception("pipeline crash")
+                failed += 1
+            cleanup_resources()
+        return {"total": len(groups), "ok": ok, "failed": failed}
+    finally:
+        monitor.shutdown()
+        db.close()
+  groups = get_date_cam_groups(db)
         if not groups:
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
         ok, failed = 0, 0

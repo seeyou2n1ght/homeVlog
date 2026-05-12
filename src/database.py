@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS file_tasks (
 
     retry_count INTEGER DEFAULT 0,
     error_msg TEXT,
-    updated_at TEXT DEFAULT (datetime('now'))
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 
 CREATE TABLE IF NOT EXISTS render_tasks (
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS render_tasks (
     output_file TEXT,
     retry_count INTEGER DEFAULT 0,
     error_msg TEXT,
-    updated_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
     UNIQUE(date, cam_index)
 );
 
@@ -250,4 +250,6 @@ class VlogDatabase:
         with self._lock:
             if self._conn:
                 self._conn.close()
+                self._conn = None
+f._conn.close()
                 self._conn = None

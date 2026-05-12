@@ -1,346 +1,161 @@
-# HomeVlog 配置
-# =============
-# 仅 paths.input_dir 必须配置，其余可保持默认值。
-#
-# 参数说明格式：参数名: 默认值  # [可选值] 说明
-# 注释中标注 "调优" 的参数对检测效果影响最大，建议在素材上验证。
+# ===========================================================================
+# HomeVlog 核心配置文件
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
-# 路径配置
+# 1. 基础路径配置 (Essential Paths)
 # ---------------------------------------------------------------------------
 paths:
-  # 输入目录，存放按命名规范命名的 MP4 文件
-  # 命名格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
+  # 输入目录: 存放按命名规范命名的监控 MP4 文件
+  # 格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
   input_dir: '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD'
+  
+  # 输出目录: 默认为项目根目录下的 output/ (可在 utils.py 调整基准)
+  output_dir: 'output'
+  
+  # 临时目录: 用于存放渲染批次中间件，建议放在高速 SSD 上
+  temp_dir: 'temp'
 
 # ---------------------------------------------------------------------------
-# Pass2 渲染控制
+# 2. 硬件与性能调度 (Hardware & Performance)
 # ---------------------------------------------------------------------------
-pass2:
-  # 是否启用硬件解码 (cuda/qsv hwaccel per-input)
-  # [true, false]
-  hw_decode: true
+hardware:
+  # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
+  # 影响 YOLO 验证和部分图像处理
+  device: "cpu"
 
-  # 无损 concat 超时 (秒)
-  # 可选值: 30 ~ 600
-  concat_timeout: 120
-
-  # 渲染批次最大文件数 (建议 8-12，降低 Filter Complex 复杂度)
-  # [8, 12, 15, 20]
-  batch_max_files: 12
-
-  # streaming 渲染批大小来源。
-  # true: streaming 使用 pass2.batch_max_files。
-  # false: 回退旧逻辑，读取 output.batch_max_files，缺失时默认 8。
-  # 回退建议: 如果家庭主机批处理调度异常，设为 false。
-  # [true, false]
-  use_streaming_batch_config: true
-
-# ---------------------------------------------------------------------------
-# 输出控制
-# ---------------------------------------------------------------------------
-output:
-  # 是否为每个摄像头独立生成 vlog
-  # [true, false]
-  per_camera_vlog: true
-
-  # 输出文件名模板: {date}=YYYYMMDD, {index}=cam序号
-  naming: "DailyVlog_{date}_cam{index}.mp4"
-
-  # 输出分辨率 (宽x高)
-  # 可选值: "1920x1080", "1280x720", "3840x2160"
-  resolution: "1920x1080"
-
-  # 输出帧率
-  # 可选值: 15, 20, 24, 25, 30
-  fps: 20
-
-  # NVENC 编码参数 (NVIDIA GPU)
-  nv:
-    # 编码器: hevc_nvenc (HEVC) 或 h264_nvenc (AVC)
-    # [hevc_nvenc, h264_nvenc]
-    codec: "hevc_nvenc"
-    # 预设: p1(最快) ~ p7(最慢/最高质量)
-    # CQ 模式下 preset 主要影响编码速度，几乎不影响画质
-    # [p1, p2, p3, p4, p5, p6, p7]
-    preset: "p1"
-    # 恒定质量值: 1(最高) ~ 51(最低)，推荐 23~28
-    cq: 28
-    # 最大码率 (VBR 上限)
-    maxrate: "4M"
-
-  # QSV 编码参数 (Intel Quick Sync)
-  qsv:
-    # 编码器: hevc_qsv (HEVC) 或 h264_qsv (AVC)
-    # [hevc_qsv, h264_qsv]
-    codec: "hevc_qsv"
-    # 预设: fast / medium / slow
-    # [fast, medium, slow]
-    preset: "fast"
-    # 全局质量: 1(最高) ~ 51(最低)
-    global_quality: 28
-    maxrate: "4M"
-
-  # 音频编码参数
-  audio:
-    # 编码器: aac (兼容性最好)
-    # [aac, libmp3lame, copy]
-    codec: "aac"
-    # 音频码率
-    # 可选值: "64k", "96k", "128k", "192k"
-    bitrate: "96k"
-    # 声道数: 1(单声道, 文件更小) 或 2(立体声)
-    # [1, 2]
-    channels: 1
-
-# ---------------------------------------------------------------------------
-# 全局流水线控制
-# ---------------------------------------------------------------------------
-pipeline:
-  # 是否启用流式并发模式 (预筛/分析/渲染重叠运行)
-  # [true, false]
-  streaming_mode: true
-
-  # 渲染启动延迟 (秒)，等待分析队列积累素材
-  # [30, 60, 300]
-  # 默认 5 秒用于降低每个 date-cam 的固定等待成本；需要更大 batch 预热时再调高。
-  render_start_delay: 5
-
-  # streaming 预筛 GPU 分配策略。
-  # qsv_only: 当前行为，所有 prescreen worker 使用 UHD 770 QSV。
-  # alternating: worker 在 QSV/CUDA 间交替，用于测试 RTX decode 是否有收益。
-  # 回退建议: 如果 CUDA 抢占 render 或 YOLO 资源导致变慢，设回 qsv_only。
-  # [qsv_only, alternating]
-  prescreen_gpu_policy: "qsv_only"
-
-  # 全局最大 IO 并发数 (控制 FFmpeg 同时读写磁盘的数量，防止 IO 风暴)
+  # 并发控制 (信号量限制)
+  # 消费级 NVIDIA 显卡通常限制 2-3 个并发编码会话 (NVENC)
+  max_nv_concurrency: 2
+  # QSV 硬件解码/编码并发数 (UHD 770 建议 4-8)
+  max_qsv_concurrency: 4
+  # 全局最大 IO 并发数 (控制 FFmpeg 同时读写磁盘的数量)
   # 机械硬盘 (HDD) 建议 8-12，固态硬盘 (SSD) 建议 16-32
-  # [8, 12, 16, 24, 32]
   max_io_concurrency: 12
 
 # ---------------------------------------------------------------------------
-# 运动检测参数 (Pass1 预筛 + Pass1.5 精细分析)
-# ---------------------------------------------------------------------------
-detection:
-  # --- Pass1 预筛 (快速筛选可疑文件) ---
-
-  # 每文件等分采样段数，从每段的边界提取帧做帧差对比
-  # 调优: 段数越多盲区越小 (盲区 ≈ 文件时长 / 段数)，但速度线性下降
-  # 46min 文件: 5段→盲区 9.3min, 30段→盲区 ~90s
-  # 可选值: 5 ~ 120
-  prescreen_segments: 120
-
-  # 预筛采样实现。
-  # legacy_seek: 当前行为，每个采样时间点单独执行一次 FFmpeg seek。
-  # stream_fps: 单个低 FPS FFmpeg 流式抽帧，检测到 motion 后早停。
-  # 回退建议: 如果长静态文件在家庭主机上变慢，设回 legacy_seek。
-  # [legacy_seek, stream_fps]
-  # 默认使用 legacy_seek，stream_fps 仍属实验模式，需在家庭主机 A/B 验证后启用。
-  prescreen_mode: "stream_fps"
-
-  # 预筛帧提取分辨率 (宽x高)，低分辨率 = 快速
-  # 可选值: "320x180", "480x270", "640x360"
-  prescreen_resolution: "320x180"
-
-  # 预筛帧差阈值 (RGB 通道 mean_diff)
-  # 调优: 低于此值判为 STATIC (跳过 Pass1.5 分析)
-  # 日间运动: 5-15, 红外运动: 1.0-1.5
-  # 可选值: 1 ~ 20
-  prescreen_diff_threshold: 5
-
-  # 预筛并行线程数 (受 GPU decode 槽位限制)
-  # QSV decode 上限约 4 槽
-  # 可选值: 1 ~ 8
-  prescreen_parallel: 4
-
-  # 预筛帧提取超时 (秒/帧)
-  # 可选值: 5 ~ 60
-  prescreen_extract_timeout: 30.0
-
-  # 采样时间戳安全边距 (秒)，最后采样点距文件末尾的最小距离
-  # 避免 seek 出界 (文件名时长 vs 实际时长有误差)
-  # 可选值: 0.1 ~ 2.0
-  timestamp_margin: 0.5
-
-  # --- Pass1.5 精细分析 ---
-
-  # 分析帧率: 从视频中每秒抽取的帧数
-  # 调优: 更高=时间精度好但速度慢，更低=帧间差异积累更大(GOP伪影问题缓解)
-  # 可选值: 2, 3, 5, 10
-  analysis_fps: 5
-
-  # 分析分辨率 (宽x高)，gray 单通道
-  # 可选值: "640x360", "480x270", "320x180"
-  analysis_resolution: "640x360"
-
-  # 自适应运动阈值灵敏度 (IQR-based: threshold = Q3 + k*IQR)
-  # 调优: 中值滤波后分布紧致，k=2 约等于 3.4σ (正态假设下 false positive ~0.04%)
-  # 更高=更不敏感(漏检增加)，更低=更敏感(误报增加)
-  # 可选值: 1.0 ~ 8.0
-  motion_sensitivity: 1.0
-
-  # ROI 裁切区域 [x, y, width, height]，归一化到 0~1
-  # 裁掉画面边缘 (时间戳、遮挡物)，聚焦主要活动区域
-  roi_crop: [0.1, 0.12, 0.8, 0.85]
-
-  # 最短连续运动帧数 (少于此数视为噪声，会被平滑掉)
-  # 调优: 值越大误报越少，但极短动作也会丢失
-  # 可选值: 1 ~ 10
-  min_motion_frames: 3
-
-  # 最短连续静态帧数 (少于此数的静态间隔会被合并到相邻运动段)
-  # 可选值: 1 ~ 20
-  min_static_frames: 5
-
-  # 噪声抑制: 短于此帧数的静态间隔会被翻转为运动
-  # 可选值: 0 ~ 5
-  noise_suppress_frames: 2
-
-  # 时序中值滤波窗口 (帧数)，用于压制 H.265 GOP 边界孤立尖峰
-  # 调优: window 必须能覆盖 GOP 尖峰总宽度 (1 peak + 2 decay = 3 帧)
-  #       window=7: 尖峰两侧各有 ≥2 帧 baseline → 完美压制
-  #       window=5: 尖峰仅能部分抑制 (half=2 覆盖不全)
-  # 设 0 或 <3 可关闭中值滤波
-  # 可选值: 0, 3, 5, 7, 9
-  median_filter_window: 7
-
-  # 空间方差网格 (备用方案，当前使用中值滤波)
-  # ROI 切分为 grid_cols x grid_rows 的网格，计算各 cell 的 mean diff
-  # 然后取 std(cell_means) 作为运动信号，用于区分全局噪声和局部运动
-  grid_cols: 8
-  grid_rows: 8
-
-  # rawvideo pipe 缓冲区倍数 (frame_size * N)
-  # 可选值: 2 ~ 8
-  pipe_buffer_multiplier: 4
-
-  # ffmpeg decode 进程等待超时 (秒)
-  # 可选值: 5 ~ 60
-  decode_timeout: 10
-
-  # Pass1.5 双 GPU 并行分析的最大 worker 数
-  # 可选值: 1 ~ 4
-  analysis_max_workers: 4
-
-  # GPU 分配阈值: 可疑文件数超过此值时 QSV 也参与 Pass1.5 分析
-  # 可选值: 10 ~ 200
-  qsv_fallback_threshold: 50
-
-# ---------------------------------------------------------------------------
-# YOLO 级联检测验证 (Stage 2)
-# ---------------------------------------------------------------------------
-yolo:
-  # 是否开启 YOLO 验证
-  enabled: true
-
-  # 是否在 streaming Pass1.5 路径执行 YOLO verification。
-  # true: 没有目标对象的 DYNAMIC segment 可转回 STATIC，降低后续 render 压力。
-  # false: 保持当前 streaming 行为，只做 frame-diff motion detection。
-  # 回退建议: 如果 YOLO 与 NVDEC/NVENC 抢占导致总耗时增加，设为 false。
-  # [true, false]
-  streaming_verify: true
-
-  # YOLO 模型路径，若不存在会自动下载。推荐 YOLOv11n 或 YOLOv8n (nano模型极速)
-  model_path: "yolo11n.pt"
-
-  # 需要保留的目标类别列表。例如 COCO 数据集: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
-  target_classes: [0, 1, 2, 3, 15, 16]
-
-  # 置信度阈值
-  confidence: 0.25
-
-  # 对疑似动态段进行验证时的抽帧率 (FPS)。0.5 表示每 2 秒抽 1 帧
-  sample_fps: 0.5
-
-  # 硬件加速设备: "cuda:0", "cpu", "openvino"
-  device: "cpu"
-
-# ---------------------------------------------------------------------------
-# 段构建与合并参数
-# ---------------------------------------------------------------------------
-segment:
-  # 最短运动段时长 (秒)，少于此值的 DYNAMIC 段被吸收到相邻 STATIC 段
-  # 调优: 中值滤波压缩运动段 duration，红外需低至 1.0s
-  # 可选值: 0.5 ~ 5.0
-  min_motion_duration: 2.0
-
-  # 最短静态段时长 (秒)，少于此值的 STATIC 段被吸收到相邻 DYNAMIC 段
-  # 可选值: 5.0 ~ 60.0
-  min_static_duration: 60.0
-
-  # 段合并容差 (秒)，相邻同态段时间间隔小于此值视为连续
-  # 可选值: 0.1 ~ 2.0
-  gap_tolerance: 0.5
-
-  # 段最小 duration 保护 (秒)，防止零或负 duration
-  # 可选值: 0.05 ~ 0.5
-  min_segment_duration: 0.1
-
-  # 静态段关键帧提取间隔 (秒)，每隔此时间抽一帧做幻灯片
-  # 仅 CPU 渲染路径使用 (硬件路径用快进替代)
-  # 可选值: 10.0 ~ 60.0
-  static_keyframe_interval: 60.0
-
-  # 关键帧展示时长 (秒)，每张幻灯片在输出中显示的时长
-  # 可选值: 0.1 ~ 2.0
-  keyframe_display_duration: 0.2
-
-  # 静态段最低展示时长保证 (秒)，防止片段太短导致画面一闪而过
-  # 若按比例压缩后的时长低于此值，将自动放慢该段速度
-  min_static_display_duration: 1.5
-
-  # Transition duration (seconds)
-  transition_duration: 0.3
-
-# ---------------------------------------------------------------------------
-# 渲染策略配置
-# ---------------------------------------------------------------------------
-render:
-  # 静态片段处理模式:
-  # - auto: CPU 模式用幻灯片(slideshow), GPU 模式用 setpts 快进 (默认)
-  # - setpts: 全量快进, 保留运动平滑度但 decode 压力大
-  # - hybrid_keyframe: 幻灯片抽帧模式, 极大降低 STATIC 片段的硬件解码压力
-  # [auto, setpts, hybrid_keyframe]
-  static_mode: "hybrid_keyframe"
-
-# ---------------------------------------------------------------------------
-# 恢复与容错参数
+# 3. 扫描与恢复 (Scanner & Recovery)
 # ---------------------------------------------------------------------------
 recovery:
-  # Scanner 文件稳定等待 (分钟)，小于此时长的文件跳过 (防止写入中断)
-  # 开发阶段设为 0 跳过等待
-  # 可选值: 0 ~ 30
+  # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
+  skip_today: false
+
+  # 文件稳定等待 (分钟): 小于此时长的文件跳过 (防止处理正在写入的文件)
   scanner_freeze_minutes: 0
 
-  # 文件稳定性二次确认等待 (秒)，检测文件大小是否仍在变化
-  # 可选值: 0.5 ~ 5.0
+  # 磁盘空间保护 (GB): 剩余空间低于此值将停止流水线
+  min_disk_space_gb: 20
+
+  # 文件稳定性二次确认等待 (秒): 检测文件大小是否仍在变化
   file_stabilize_wait: 1.2
-
-  # 文件时间戳间隔告警阈值 (秒)，相邻文件 gap 超过此值发出警告
-  # 可选值: 30 ~ 600
-  file_gap_warn_threshold: 60
-
+  
   # 渲染失败重试最大次数
-  # 可选值: 0 ~ 5
   render_retry_max: 2
 
 # ---------------------------------------------------------------------------
-# 日志与监控
+# 4. 流水线策略 (Pipeline Strategy)
+# ---------------------------------------------------------------------------
+pipeline:
+  # 是否启用流式并发模式 (预筛/分析/渲染重叠运行)
+  streaming_mode: true
+
+  # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
+  render_start_delay: 5
+
+  # 预筛 GPU 分配策略:
+  # - qsv_only: 所有预筛 worker 使用 Intel QSV
+  # - alternating: worker 在 QSV/CUDA 间交替 (需确保机器有双显卡)
+  prescreen_gpu_policy: "qsv_only"
+
+# ---------------------------------------------------------------------------
+# 5. 运动检测参数 (Motion Detection)
+# ---------------------------------------------------------------------------
+detection:
+  # [Pass 1] 快速预筛 (Prescreen)
+  # 模式: legacy_seek (逐帧抽帧) / stream_fps (实验性流式抽帧)
+  prescreen_mode: "stream_fps"
+  prescreen_parallel: 4
+  prescreen_segments: 120
+  prescreen_resolution: "320x180"
+  prescreen_diff_threshold: 5
+  prescreen_extract_timeout: 30.0
+
+  # [Pass 1.5] 精细分析 (Detailed Analysis)
+  analysis_fps: 5
+  analysis_resolution: "640x360"
+  analysis_max_workers: 4
+  # GPU 分配阈值: 待分析文件数超过此值时，QSV 也参与分析以分担 CUDA 压力
+  qsv_fallback_threshold: 50
+  
+  # 检测算法调优
+  motion_sensitivity: 1.0
+  roi_crop: [0.1, 0.12, 0.8, 0.85]  # [x, y, w, h] 归一化
+  min_motion_frames: 3
+  median_filter_window: 7
+
+# ---------------------------------------------------------------------------
+# 6. YOLO 验证 (Stage 2 Verification)
+# ---------------------------------------------------------------------------
+yolo:
+  enabled: true
+  # 是否在流式处理中实时验证 (开启可降低渲染压力，但增加 GPU 开销)
+  streaming_verify: true
+  model_path: "yolo11n.pt"
+  # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
+  target_classes: [0, 1, 2, 3, 15, 16]
+  confidence: 0.25
+  sample_fps: 0.5
+
+# ---------------------------------------------------------------------------
+# 7. 视频渲染与合并 (Render & Join)
+# ---------------------------------------------------------------------------
+render:
+  # 静态片段处理模式:
+  # - auto: CPU 模式用幻灯片, GPU 模式用 setpts 快进
+  # - hybrid_keyframe: 幻灯片抽帧模式 (大幅降低硬件解码压力)
+  static_mode: "hybrid_keyframe"
+  
+  # 是否启用硬件解码 (NVDEC/QSV)
+  hw_decode: true
+  
+  # 渲染批次最大文件数: 建议 8-12，过大会占用极高显存
+  batch_max_files: 12
+  
+  # 无损合并 (Concat) 超时时间 (秒)
+  concat_timeout: 120
+
+# ---------------------------------------------------------------------------
+# 8. 输出格式设置 (Output Formatting)
+# ---------------------------------------------------------------------------
+output:
+  # 是否为每个摄像头独立生成 vlog
+  per_camera_vlog: true
+  # 文件名模板: {date}=YYYYMMDD, {index}=cam序号
+  naming: "DailyVlog_{date}_cam{index}.mp4"
+  resolution: "1920x1080"
+  fps: 20
+
+  # 编码参数
+  nv:
+    codec: "hevc_nvenc"
+    preset: "p1"
+    cq: 28
+    maxrate: "4M"
+  qsv:
+    codec: "hevc_qsv"
+    preset: "fast"
+    global_quality: 28
+    maxrate: "4M"
+  audio:
+    codec: "aac"
+    bitrate: "96k"
+    channels: 1
+
+# ---------------------------------------------------------------------------
+# 9. 系统日志 (Logging)
 # ---------------------------------------------------------------------------
 logging:
-  # 日志级别: DEBUG / INFO / WARNING / ERROR
-  # 调试检测参数时建议 INFO，生产环境建议 WARNING
-  # [DEBUG, INFO, WARNING, ERROR]
-  level: "INFO"
-
-  # 日志文件轮转: 单文件最大字节数
-  # 可选值: 1048576 (1MB) ~ 104857600 (100MB)
+  level: "INFO"  # DEBUG / INFO / WARNING / ERROR
   rotation_max_bytes: 10485760
-
-  # 日志文件轮转: 保留的历史文件数
-  # 可选值: 1 ~ 20
   rotation_backup_count: 5
-
-  # 性能监控采样间隔 (秒)
-  # 可选值: 0.5 ~ 10.0
   monitor_interval: 2.0
