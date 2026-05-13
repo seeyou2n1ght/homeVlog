@@ -7,14 +7,20 @@ __pycache__/
 # Project outputs
 output/
 logs/
-reports/
 data/
-input/
+temp/
+reports/
 inspect_out*/
 
+# Models (大型二进制文件，不入版本控制)
+yolo11n.pt
+yolo11n_openvino_model/
+*.onnx
+
 # Temp / test artifacts
-temp/
 test_*.mp4
+*.m4a
+pts.txt
 
 # OS
 Thumbs.db

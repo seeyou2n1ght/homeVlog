@@ -12,6 +12,7 @@ class Segment:
     state: str  # "DYNAMIC" | "STATIC"
     source_file: str
     file_start_offset: float
+    max_energy: float = 0.0
 
 
 def build_segments(
@@ -34,6 +35,7 @@ def build_segments(
     segments: list[Segment] = []
     seg_start = frame_labels[0]["time"]
     seg_state = "DYNAMIC" if frame_labels[0]["is_motion"] else "STATIC"
+    seg_max_energy = frame_labels[0].get("energy", 0.0)
 
     for i in range(1, len(frame_labels)):
         cur_state = "DYNAMIC" if frame_labels[i]["is_motion"] else "STATIC"
@@ -45,9 +47,13 @@ def build_segments(
                 state=seg_state,
                 source_file=source_file,
                 file_start_offset=file_offset,
+                max_energy=seg_max_energy,
             ))
             seg_start = frame_labels[i]["time"]
             seg_state = cur_state
+            seg_max_energy = frame_labels[i].get("energy", 0.0)
+        else:
+            seg_max_energy = max(seg_max_energy, frame_labels[i].get("energy", 0.0))
 
     segments.append(Segment(
         start_time=seg_start,
@@ -55,6 +61,7 @@ def build_segments(
         state=seg_state,
         source_file=source_file,
         file_start_offset=file_offset,
+        max_energy=seg_max_energy,
     ))
 
     merged = _merge_same_state(segments, gap_tolerance)
@@ -75,6 +82,7 @@ def _merge_same_state(segments: list[Segment], gap_tolerance: float = 0.5) -> li
     for seg in segments[1:]:
         if _can_merge(result[-1], seg, gap_tolerance):
             result[-1].end_time = seg.end_time
+            result[-1].max_energy = max(result[-1].max_energy, seg.max_energy)
         else:
             result.append(seg)
     return result
@@ -158,6 +166,7 @@ def segments_to_json(segments: list[Segment]) -> str:
             "state": s.state,
             "source_file": s.source_file,
             "file_start_offset": s.file_start_offset,
+            "max_energy": s.max_energy,
         }
         for s in segments
     ])
@@ -172,6 +181,7 @@ def segments_from_json(json_str: str) -> list[Segment]:
             state=d["state"],
             source_file=d["source_file"],
             file_start_offset=d["file_start_offset"],
+            max_energy=d.get("max_energy", 0.0),
         )
         for d in data
     ]

@@ -49,17 +49,11 @@ class StreamingOrchestrator:
 
         # 配置提取
         pipe_cfg = config.get("pipeline", {})
-        config.get("detection", {})
-        pass2_cfg = config.get("pass2", {})
-        out_cfg = config.get("output", {})
-
-        if pass2_cfg.get("use_streaming_batch_config", True):
-            self.batch_max_files = pass2_cfg.get(
-                "batch_max_files", out_cfg.get("batch_max_files", 8)
-            )
-        else:
-            self.batch_max_files = out_cfg.get("batch_max_files", 8)
-        self.render_delay = pipe_cfg.get("render_start_delay", 60)
+        render_cfg = config.get("render", {})
+        
+        # 核心优化：调小 batch_max_files 以获得更好的 GPU 负载均衡 (特别是长尾阶段)
+        self.batch_max_files = render_cfg.get("batch_max_files", 4)
+        self.render_delay = pipe_cfg.get("render_start_delay", 5)
 
         # 状态控制
         self.stop_event = threading.Event()
@@ -170,7 +164,7 @@ class StreamingOrchestrator:
                     file_start_ts - ts_to_unix(self.date + "000000"), 0.0
                 )
 
-                labels = detector.analyze(
+                labels, yolo_buffer = detector.analyze(
                     filepath,
                     start_offset=file_start_offset,
                     file_duration=task.get("file_duration") or 300.0,
@@ -201,7 +195,7 @@ class StreamingOrchestrator:
                         from src.yolo_verifier import YoloVerifier
                         yolo_device = self.config.get("hardware", {}).get("device", "cpu")
                         segments = YoloVerifier(self.config).verify(
-                            filepath, segments, gpu=gpu, device=yolo_device
+                            filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=detector.fps
                         )
                     yolo_after = len(segments)
 
@@ -447,19 +441,18 @@ class StreamingOrchestrator:
         )
 
         if len(all_tasks) > qsv_threshold and analysis_max_workers >= 2:
-            t_nv = threading.Thread(
-                target=self._analysis_worker, args=("cuda",), daemon=True
-            )
-            t_nv.start()
-            threads.append(t_nv)
-            t_qsv = threading.Thread(
-                target=self._analysis_worker, args=("qsv",), daemon=True
-            )
-            t_qsv.start()
-            threads.append(t_qsv)
-            for _ in range(analysis_max_workers - 2):
+            # 均衡分配：ceil(N/2) CUDA + floor(N/2) QSV，充分利用双路解码器
+            n_cuda = (analysis_max_workers + 1) // 2
+            n_qsv = analysis_max_workers - n_cuda
+            for _ in range(n_cuda):
                 t = threading.Thread(
                     target=self._analysis_worker, args=("cuda",), daemon=True
+                )
+                t.start()
+                threads.append(t)
+            for _ in range(n_qsv):
+                t = threading.Thread(
+                    target=self._analysis_worker, args=("qsv",), daemon=True
                 )
                 t.start()
                 threads.append(t)

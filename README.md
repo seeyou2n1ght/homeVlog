@@ -52,16 +52,18 @@ HomeVlog 是一个用于家庭主机闲时批量处理室内监控素材的 Dail
 
 `detector.py` 对 SUSPICIOUS 文件做精细帧差分析：
 
-- 硬件解码到低分辨率灰度帧。
+- **单次解码与原生绑定 (PyAV)**：彻底移除了 `subprocess.Popen`，使用 `av` 模块进行底层 C API 的原生硬件解码 (`HWAccel`)，将解码数据直接保留在内存中，消除了进程创建和管道 IPC 的开销。
 - 基于 P5/P20 噪声底估计自适应阈值。
 - 使用 median filter 抑制 H.265 GOP 边界尖峰。
-- 生成 DYNAMIC/STATIC segment。
+- **低频内存驻留**：在分析同时，按照设定采样率（如 0.5fps）将 RGB 原图直接驻留在内存中供后续 YOLO 验证使用，避免二次解码。
 
-streaming 主流程会根据文件数量启动 CUDA/QSV analysis worker。不要在开发机上用性能结果推断家庭主机吞吐，真实瓶颈可能在 NAS I/O、QSV、NVDEC、rawvideo pipe 或 CPU filtergraph。
+streaming 主流程会根据文件数量启动 CUDA/QSV analysis worker。由于彻底消除了子进程地狱，现在的吞吐量极大依赖于内存带宽和硬件解码器本身的极限。
 
 ### 4. Optional YOLO Verification
 
 `yolo_verifier.py` 可对 DYNAMIC segment 做二次目标验证，用来把“没有目标对象但帧差明显”的片段转回 STATIC。
+
+- **零拷贝纯内存推理 (Zero-IO)**：依赖于 Analysis 阶段驻留在内存中的低频 RGB 帧字典，YOLO 将直接在显存/内存中读取 NumPy 数组进行前向计算，全过程**零文件读取**、**零子进程创建**。
 
 当前 streaming 主流程通过配置控制：
 
@@ -154,13 +156,16 @@ uv run python main.py --date 20260428 --cam 0
 
 本项目的核心瓶颈通常在于 **硬件解码器 (NVDEC/QSV)** 以及 **显存 (VRAM)**。为了在普通家庭主机（如 i5-12600K + RTX 3060Ti）上最大化吞吐，系统实施了以下策略：
 
-### 1. 硬件自适应调度 (Hardware Awareness)
+### 1. 单次解码流水线 (Single-Pass Pipeline) 与 PyAV 内存绑定
+系统废弃了耗时的多重 `subprocess.Popen("ffmpeg")` 调用，引入 `av` 模块直接调用 FFmpeg C API 进行底层硬件解码。解码帧在提取灰度运动信息的同时，以极低内存开销缓存在字典中供 YOLO 使用，实现了真正的**零进程创建**、**零冗余解码**和**纯内存目标检测**。
+
+### 2. 硬件自适应调度 (Hardware Awareness)
 系统在启动时会自动探测 `ffmpeg` 编码器支持情况。如果机器没有 Intel 核显或 NVIDIA 显卡，相关的 Worker 会自动降级为 CPU 或跳过，确保管线在不同硬件环境下都能稳定运行。
 
-### 2. 本地化时区与日志
+### 3. 本地化时区与日志
 SQLite 数据库和日志系统现在统一使用本地时间 (`localtime`)，方便用户将处理记录与实际监控文件名进行快速比对。
 
-### 3. 磁盘与资源保护
+### 4. 磁盘与资源保护
 - **空间预检**: 每次处理新日期前都会检查磁盘空间。
 - **僵尸进程清理**: 任务结束时自动扫描并清理残留的 FFmpeg 子进程。
 

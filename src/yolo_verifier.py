@@ -28,6 +28,7 @@ class YoloVerifier:
         self.target_classes = set(yolo_cfg.get("target_classes", [0, 1, 2, 3, 15, 16]))
         self.confidence = yolo_cfg.get("confidence", 0.25)
         self.sample_fps = yolo_cfg.get("sample_fps", 1.0)
+        self.skip_energy_threshold = yolo_cfg.get("skip_energy_threshold", 15.0)
         
         if device is None:
             device = yolo_cfg.get("device", config.get("hardware", {}).get("device", "cpu"))
@@ -41,24 +42,17 @@ class YoloVerifier:
         with YoloVerifier._model_lock:
             if YoloVerifier._shared_model is None:
                 logger.info(f"Loading shared YOLO model {model_path} on {device}...")
-                YoloVerifier._shared_model = YOLO(model_path)
-            elif str(YoloVerifier._shared_model.device) != device:
-                # If device changed, reload model
-                logger.info(f"Reloading YOLO model {model_path} on {device}...")
-                YoloVerifier._shared_model = YOLO(model_path)
+                YoloVerifier._shared_model = YOLO(model_path, task="detect")
         self.model = YoloVerifier._shared_model
         
-    def verify(self, filepath: str, segments: list, gpu: str = "qsv", device: str | None = None) -> list:
+    def verify(self, filepath: str, segments: list, gpu: str = "qsv", device: str | None = None, frames_buffer: dict = None, analysis_fps: float = 5.0) -> list:
         """
         验证动态片段。若片段无目标，将其状态翻转为 STATIC。
+        使用内存驻留的 frames_buffer 进行推理，避免重复启动 ffmpeg。
         """
-        if not self.enabled:
+        if not self.enabled or not frames_buffer:
             return segments
         
-        if device and device != self.device:
-            # Need to re-init with correct device
-            self.__init__({"yolo": {"enabled": True}, "hardware": {"device": device}}, device=device)
-            
         verified_segments = []
         for seg in segments:
             if seg.state != "DYNAMIC":
@@ -79,7 +73,7 @@ class YoloVerifier:
                 continue
                 
             t0 = time.monotonic()
-            is_really_dynamic = self._verify_segment(filepath, local_start, duration, gpu)
+            is_really_dynamic = self._verify_segment(filepath, local_start, duration, frames_buffer, analysis_fps)
             elapsed = time.monotonic() - t0
             
             if is_really_dynamic:
@@ -92,86 +86,37 @@ class YoloVerifier:
                 
         return verified_segments
 
-    def _verify_segment(self, filepath: str, start_time: float, duration: float, gpu: str) -> bool:
-        width, height = 640, 360
-        frame_size = width * height * 3
+    def _verify_segment(self, filepath: str, start_time: float, duration: float, frames_buffer: dict, analysis_fps: float) -> bool:
+        start_frame_idx = int(start_time * analysis_fps)
+        end_frame_idx = int((start_time + duration) * analysis_fps)
         
-        args = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y"
-        ]
-        
-        if gpu == "cuda":
-            args.extend(["-hwaccel", "cuda"])
-        elif gpu == "qsv":
-            args.extend(["-hwaccel", "qsv"])
+        frames_to_check = []
+        for f_idx in range(start_frame_idx, end_frame_idx + 1):
+            if f_idx in frames_buffer:
+                frames_to_check.append(frames_buffer[f_idx])
+                
+        if not frames_to_check:
+            logger.debug(f"YOLO: No frames in buffer for {filepath} at {start_time:.1f}s")
+            return True # Fallback to original DYNAMIC state on missing frames
 
-        args.extend([
-            "-ss", str(start_time),
-            "-t", str(duration),
-            "-i", str(filepath),
-            "-vf", f"fps={self.sample_fps},scale={width}:{height}",
-            "-f", "image2pipe",
-            "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo",
-            "-"
-        ])
-        
         try:
-            if gpu == "qsv":
-                from src.utils import get_qsv_semaphore
-                io_sem = get_qsv_semaphore()
-            else:
-                from src.utils import get_nv_semaphore
-                io_sem = get_nv_semaphore()
-            io_sem.acquire()
-            try:
-                proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for frame in frames_to_check:
+                # frame 已经是 np.ndarray (H, W, 3) 的 RGB 图像
+                # OpenVINO 后端原生支持多线程推理
+                results = self.model(frame, verbose=False, device=self.device)
                 
-                def _kill_on_timeout():
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                
-                watchdog = threading.Timer(duration * self.sample_fps + 15.0, _kill_on_timeout)
-                watchdog.daemon = True
-                watchdog.start()
-                
-                try:
-                    while True:
-                        raw = proc.stdout.read(frame_size)
-                        if len(raw) < frame_size:
-                            break
+                for r in results:
+                    if r.boxes is None or len(r.boxes.cls) == 0:
+                        continue
                         
-                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-                        
-                        # YOLO inference
-                        # Lock to prevent concurrent access to the same model instance, if needed by PyTorch
-                        with YoloVerifier._model_lock:
-                            results = self.model(frame, verbose=False, device=self.device)
-                        
-                        for r in results:
-                            if r.boxes is None or len(r.boxes.cls) == 0:
-                                continue
-                                
-                            classes = r.boxes.cls.cpu().numpy()
-                            confs = r.boxes.conf.cpu().numpy()
-                            
-                            for cls, conf in zip(classes, confs):
-                                if int(cls) in self.target_classes and conf >= self.confidence:
-                                    return True
-                finally:
-                    watchdog.cancel()
-                    try:
-                        proc.kill()
-                        proc.wait()
-                    except OSError:
-                        pass
-            finally:
-                io_sem.release()
-                
+                    classes = r.boxes.cls.cpu().numpy()
+                    confs = r.boxes.conf.cpu().numpy()
+                    
+                    for cls, conf in zip(classes, confs):
+                        if int(cls) in self.target_classes and conf >= self.confidence:
+                            return True
         except Exception as e:
-            logger.error(f"YOLO verification failed for {filepath}: {e}")
+            logger.error(f"YOLO memory inference failed for {filepath}: {e}")
             return True # Fallback to original DYNAMIC state on error
             
         return False

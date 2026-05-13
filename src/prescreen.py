@@ -66,9 +66,10 @@ def prescreen_file(
     threshold = det_cfg.get("prescreen_diff_threshold", 12)
     timestamp_margin = det_cfg.get("timestamp_margin", 0.5)
 
-    actual_dur = get_duration(filepath)
-    if actual_dur is not None and actual_dur > 0:
-        duration = actual_dur
+    if duration <= 0:
+        actual_dur = get_duration(filepath)
+        if actual_dur is not None and actual_dur > 0:
+            duration = actual_dur
     if mode == "stream_fps":
         return _prescreen_stream_fps(
             filepath,

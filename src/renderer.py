@@ -360,6 +360,7 @@ def _run_batch_render(
     """Execute ffmpeg render with HW decode (NVDEC or QSV hwaccel) per input."""
     hwaccel_args = []
     for fp in input_files:
+        hwaccel_args += ["-fflags", "+genpts"]
         if encoder == "nv":
             hwaccel_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif encoder == "qsv":
@@ -383,9 +384,10 @@ def _run_batch_render(
     fc_script.write_text(filter_complex, encoding="utf-8")
     if encoder == "nv":
         cmd += ["-filter_hw_device", "gpu"]
-    cmd += ["-filter_complex_script", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
+    cmd += ["-/filter_complex", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
     cmd += enc_args
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
+    cmd += ["-tag:v", "hvc1", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
     logger.info("batch-render cam%d batch%d (%s): %d files", cam_index, batch_idx, encoder, len(input_files))
@@ -459,7 +461,7 @@ def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -
     concat_list.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     result = run_ffmpeg(
-        ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(output)],
+        ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", "-movflags", "+faststart", str(output)],
         timeout=timeout,
     )
     concat_list.unlink(missing_ok=True)
@@ -478,7 +480,7 @@ def _run_ffmpeg_render(
     """Execute ffmpeg render for CPU decode path."""
     input_args: list[str] = []
     for fp in input_files:
-        input_args += ["-i", str(fp)]
+        input_args += ["-fflags", "+genpts", "-i", str(fp)]
 
     enc_args = _build_enc_args(encoder, out_cfg)
     audio_codec = audio_cfg.get("codec", "aac")
@@ -497,10 +499,11 @@ def _run_ffmpeg_render(
     fc_script.write_text(filter_complex, encoding="utf-8")
     if encoder == "nv":
         cmd += ["-filter_hw_device", "gpu"]
-    cmd += ["-filter_complex_script", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
+    cmd += ["-/filter_complex", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
 
     cmd += enc_args
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
+    cmd += ["-tag:v", "hvc1", "-movflags", "+faststart"]
     cmd += [str(output_path)]
 
     if encoder == "qsv":
@@ -567,6 +570,8 @@ def _build_enc_args(encoder, out_cfg):
             "-preset", qsv.get("preset", "fast"),
             "-global_quality", str(qsv.get("global_quality", 28)),
             "-maxrate", qsv.get("maxrate", "4M"),
+            "-bufsize", qsv.get("bufsize", "8M"),
+            "-g", "120",
             "-pix_fmt", "nv12",
         ]
     else:
@@ -576,5 +581,7 @@ def _build_enc_args(encoder, out_cfg):
             "-preset", nv.get("preset", "p1"),
             "-cq", str(nv.get("cq", 28)),
             "-maxrate", nv.get("maxrate", "4M"),
+            "-bufsize", nv.get("bufsize", "8M"),
+            "-g", "120",
             "-pix_fmt", "yuv420p",
         ]

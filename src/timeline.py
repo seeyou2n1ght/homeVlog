@@ -222,14 +222,13 @@ def build_concat_filter(
                 seg_kf_interval = seg_speed_factor * display_dur
                 parts_v.append(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
-                    f"fps=fps=1/{seg_kf_interval:.1f},"
-                    f"setpts=PTS/{seg_speed_factor:.1f},"
+                    f"setpts=(PTS-STARTPTS)/{seg_speed_factor:.1f},"
                     f"fps=fps={output_fps}[v{seg_count}]"
                 )
             else:
                 parts_v.append(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
-                    f"setpts=PTS/{seg_speed_factor:.1f}[v{seg_count}]"
+                    f"setpts=(PTS-STARTPTS)/{seg_speed_factor:.1f}[v{seg_count}]"
                 )
             parts_a.append(
                 f"anullsrc=r={audio_sample_rate}:cl=mono:d={target_display_dur:.3f}[a{seg_count}]"
@@ -239,6 +238,6 @@ def build_concat_filter(
 
     labels = "".join(f"[v{i}][a{i}]" for i in range(seg_count))
     all_parts = scale_parts + parts_v + parts_a
-    concat = f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v][a]"
+    concat = f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v_tmp][a_tmp];[v_tmp]fps={output_fps}[v];[a_tmp]aresample={audio_sample_rate}[a]"
 
     return concat

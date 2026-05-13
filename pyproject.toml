@@ -13,6 +13,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "torch>=2.0.0",
     "torchvision>=0.15.0",
+    "av>=14.0.0",
 ]
 
 [dependency-groups]

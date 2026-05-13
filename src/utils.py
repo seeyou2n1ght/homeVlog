@@ -27,7 +27,7 @@ def get_disk_semaphore() -> threading.Semaphore:
         with _io_lock:
             if _disk_semaphore is None:
                 config = load_config()
-                limit = config.get("pipeline", {}).get("max_io_concurrency", 16)
+                limit = config.get("hardware", {}).get("max_io_concurrency", 16)
                 _disk_semaphore = threading.Semaphore(limit)
     return _disk_semaphore
 
@@ -37,8 +37,8 @@ def get_nv_semaphore() -> threading.Semaphore:
         with _io_lock:
             if _nv_semaphore is None:
                 config = load_config()
-                # 默认限制并发的 NVENC 会话数为 2 (消费级显卡默认限制，除非破解)
-                limit = config.get("pipeline", {}).get("max_nv_concurrency", 2)
+                # 默认限制并发的 NVENC 会话数为 3 (针对 3060Ti 优化)
+                limit = config.get("hardware", {}).get("max_nv_concurrency", 3)
                 _nv_semaphore = threading.Semaphore(limit)
     return _nv_semaphore
 
@@ -48,7 +48,8 @@ def get_qsv_semaphore() -> threading.Semaphore:
         with _io_lock:
             if _qsv_semaphore is None:
                 config = load_config()
-                limit = config.get("pipeline", {}).get("max_qsv_concurrency", 4)
+                # 默认 QSV 并发限制 (针对 12600K 双 VDBox 优化)
+                limit = config.get("hardware", {}).get("max_qsv_concurrency", 6)
                 _qsv_semaphore = threading.Semaphore(limit)
     return _qsv_semaphore
 
