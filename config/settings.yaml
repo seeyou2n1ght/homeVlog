@@ -1,164 +1,105 @@
 # ===========================================================================
-# HomeVlog 核心配置文件
+# HomeVlog 极限性能配置文件 (Target: 12600K + 3060Ti)
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# 1. 基础路径配置 (Essential Paths)
-# ---------------------------------------------------------------------------
 paths:
-  # 输入目录: 存放按命名规范命名的监控 MP4 文件
-  # 格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
   input_dir: '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD'
-  
-  # 输出目录: 默认为项目根目录下的 output/ (可在 utils.py 调整基准)
   output_dir: 'output'
-  
-  # 临时目录: 用于存放渲染批次中间件，建议放在高速 SSD 上
   temp_dir: 'temp'
 
-# ---------------------------------------------------------------------------
-# 2. 硬件与性能调度 (Hardware & Performance)
-# ---------------------------------------------------------------------------
 hardware:
-  # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
-  # 影响 YOLO 验证和部分图像处理
-  device: "cpu"
-
-  # 并发控制 (信号量限制)
-  # 消费级 NVIDIA 显卡通常限制 2-3 个并发编码会话 (NVENC)
+  # 3060Ti 优先，YOLO 推理与分析主路径
+  device: "cuda:0"
   max_nv_concurrency: 3
-  # QSV 硬件解码/编码并发数 (UHD 770 双 VDBox 可支撑 6 并发)
-  max_qsv_concurrency: 6
-  # 全局最大 IO 并发数 (控制 FFmpeg 同时读写磁盘的数量)
-  # NAS 千兆网+SSD 可支撑 16 并发
-  max_io_concurrency: 16
+  # UHD 770 核显辅助，支持极高并发解码
+  max_qsv_concurrency: 8
+  max_io_concurrency: 6
 
-# ---------------------------------------------------------------------------
-# 3. 扫描与恢复 (Scanner & Recovery)
-# ---------------------------------------------------------------------------
 recovery:
-  # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
   skip_today: false
-
-  # 文件稳定等待 (分钟): 小于此时长的文件跳过 (防止处理正在写入的文件)
   scanner_freeze_minutes: 0
-
-  # 磁盘空间保护 (GB): 剩余空间低于此值将停止流水线
   min_disk_space_gb: 20
-
-  # 文件稳定性二次确认等待 (秒): 检测文件大小是否仍在变化
   file_stabilize_wait: 1.2
-  
-  # 渲染失败重试最大次数
   render_retry_max: 2
 
-# ---------------------------------------------------------------------------
-# 4. 流水线策略 (Pipeline Strategy)
-# ---------------------------------------------------------------------------
 pipeline:
-  # 是否启用流式并发模式 (预筛/分析/渲染重叠运行)
   streaming_mode: true
-
-  # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
-  render_start_delay: 5
-
-  # 预筛 GPU 分配策略:
-  # - qsv_only: 所有预筛 worker 使用 Intel QSV
-  # - alternating: worker 在 QSV/CUDA 间交替 (需确保机器有双显卡)
+  render_start_delay: 2
   prescreen_gpu_policy: "alternating"
 
-# ---------------------------------------------------------------------------
-# 5. 运动检测参数 (Motion Detection)
-# ---------------------------------------------------------------------------
 detection:
-  # [Pass 1] 快速预筛 (Prescreen)
-  # 模式: legacy_seek (逐帧抽帧) / stream_fps (实验性流式抽帧)
+  # [Pass 1] 预筛：8路并发
   prescreen_mode: "stream_fps"
-  prescreen_parallel: 4
-  prescreen_segments: 120
+  prescreen_parallel: 8
+  prescreen_segments: 150
   prescreen_resolution: "320x180"
-  prescreen_diff_threshold: 5
-  prescreen_extract_timeout: 30.0
+  prescreen_diff_threshold: 6
+  prescreen_extract_timeout: 120.0
 
-  # [Pass 1.5] 精细分析 (Detailed Analysis)
+  # [Pass 1.5] 分析：10路并发 (压榨 16 线程)
   analysis_fps: 5
-  analysis_resolution: "640x360"
-  analysis_max_workers: 4
-  # GPU 分配阈值: 待分析文件数超过此值时，QSV 也参与分析以分担 CUDA 压力
-  qsv_fallback_threshold: 0
+  analysis_resolution: "416x234" # 减小 44% 像素量，完美对齐 YOLO
+  analysis_max_workers: 10
+  qsv_fallback_threshold: 10
   
-  # 检测算法调优
+  # 极限自适应：长视频 1fps 足够捕捉显著运动
+  analysis_fps_adaptive: true
+  analysis_fps_tiers:
+    short: 5
+    medium: 2
+    long: 1
+  analysis_fps_tier_thresholds:
+    short_max: 120
+    medium_max: 600
+
+  # 极限早停：缩短窗口
+  analysis_early_term_enabled: true
+  analysis_early_term_window: 20
+  analysis_early_term_threshold: 2.5
+  
   motion_sensitivity: 1.0
-  roi_crop: [0.1, 0.12, 0.8, 0.85]  # [x, y, w, h] 归一化
+  roi_crop: [0.1, 0.12, 0.8, 0.85]
   min_motion_frames: 3
   median_filter_window: 7
 
-# ---------------------------------------------------------------------------
-# 6. YOLO 验证 (Stage 2 Verification)
-# ---------------------------------------------------------------------------
 yolo:
   enabled: true
-  # 是否在流式处理中实时验证 (开启可降低渲染压力，但增加 GPU 开销)
   streaming_verify: true
-  # 触发式推理: 如果动作的平均能量(像素帧差均值)超过此值，认为动作足够大，直接跳过 YOLO 验证
-  skip_energy_threshold: 15.0
-  model_path: "yolo11n_openvino_model"
-  device: "cpu"  # Ultralytics openvino engine will automatically accelerate using available Intel hardware
-  # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
+  skip_energy_threshold: 12.0 # 能量 > 12 直接过，不进 YOLO
+  model_path: "yolo11n.pt"
+  device: "cuda:0"
   target_classes: [0, 1, 2, 3, 15, 16]
-  confidence: 0.25
+  confidence: 0.3
   sample_fps: 0.5
 
-# ---------------------------------------------------------------------------
-# 7. 视频渲染与合并 (Render & Join)
-# ---------------------------------------------------------------------------
 render:
-  # 静态片段处理模式:
-  # - auto: CPU 模式用幻灯片, GPU 模式用 setpts 快进
-  # - hybrid_keyframe: 幻灯片抽帧模式 (大幅降低硬件解码压力)
   static_mode: "hybrid_keyframe"
-  
-  # 是否启用硬件解码 (NVDEC/QSV)
   hw_decode: true
-  
-  # 渲染批次最大文件数: 4 可优化负载均衡，减少长尾等待
   batch_max_files: 4
-  
-  # 无损合并 (Concat) 超时时间 (秒)
   concat_timeout: 120
 
-# ---------------------------------------------------------------------------
-# 8. 输出格式设置 (Output Formatting)
-# ---------------------------------------------------------------------------
 output:
-  # 是否为每个摄像头独立生成 vlog
   per_camera_vlog: true
-  # 文件名模板: {date}=YYYYMMDD, {index}=cam序号
   naming: "DailyVlog_{date}_cam{index}.mp4"
   resolution: "1920x1080"
   fps: 20
-
-  # 编码参数
   nv:
     codec: "hevc_nvenc"
-    preset: "p1"
-    cq: 28
-    maxrate: "4M"
+    preset: "p1" # 极速模式
+    cq: 30
+    maxrate: "3M"
   qsv:
     codec: "hevc_qsv"
-    preset: "fast"
-    global_quality: 28
-    maxrate: "4M"
+    preset: "veryfast"
+    global_quality: 30
+    maxrate: "3M"
   audio:
     codec: "aac"
     bitrate: "96k"
     channels: 1
 
-# ---------------------------------------------------------------------------
-# 9. 系统日志 (Logging)
-# ---------------------------------------------------------------------------
 logging:
-  level: "INFO"  # DEBUG / INFO / WARNING / ERROR
+  level: "INFO"
   rotation_max_bytes: 10485760
   rotation_backup_count: 5
   monitor_interval: 2.0

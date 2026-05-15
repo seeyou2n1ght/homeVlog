@@ -27,8 +27,8 @@ class YoloVerifier:
         model_path = yolo_cfg.get("model_path", "yolo11n.pt")
         self.target_classes = set(yolo_cfg.get("target_classes", [0, 1, 2, 3, 15, 16]))
         self.confidence = yolo_cfg.get("confidence", 0.25)
-        self.sample_fps = yolo_cfg.get("sample_fps", 1.0)
-        self.skip_energy_threshold = yolo_cfg.get("skip_energy_threshold", 15.0)
+        self.sample_fps = yolo_cfg.get("sample_fps", 0.5)
+        self.skip_energy_threshold = yolo_cfg.get("skip_energy_threshold", 12.0)
         
         if device is None:
             device = yolo_cfg.get("device", config.get("hardware", {}).get("device", "cpu"))
@@ -42,16 +42,22 @@ class YoloVerifier:
         with YoloVerifier._model_lock:
             if YoloVerifier._shared_model is None:
                 logger.info(f"Loading shared YOLO model {model_path} on {device}...")
-                YoloVerifier._shared_model = YOLO(model_path, task="detect")
+                model = YOLO(model_path, task="detect")
+                try:
+                    model.to(device)
+                    model.fuse()
+                except Exception as e:
+                    logger.debug(f"YOLO model fuse failed: {e}")
+                YoloVerifier._shared_model = model
         self.model = YoloVerifier._shared_model
         
     def verify(self, filepath: str, segments: list, gpu: str = "qsv", device: str | None = None, frames_buffer: dict = None, analysis_fps: float = 5.0) -> list:
-        """
-        验证动态片段。若片段无目标，将其状态翻转为 STATIC。
-        使用内存驻留的 frames_buffer 进行推理，避免重复启动 ffmpeg。
-        """
         if not self.enabled or not frames_buffer:
             return segments
+        
+        # 统一设备检查
+        if device is None:
+            device = self.device
         
         verified_segments = []
         for seg in segments:
@@ -67,48 +73,49 @@ class YoloVerifier:
                 verified_segments.append(seg)
                 continue
                 
+            # [性能极限] 极大动作跳过
             if seg.max_energy >= self.skip_energy_threshold:
-                logger.debug(f"YOLO Skipped (Massive Motion, energy {seg.max_energy:.1f} >= {self.skip_energy_threshold}) for {filepath} at {local_start:.1f}s")
                 verified_segments.append(seg)
                 continue
                 
             t0 = time.monotonic()
-            is_really_dynamic = self._verify_segment(filepath, local_start, duration, frames_buffer, analysis_fps)
+            # [性能极限] 使用批量推理逻辑
+            is_really_dynamic = self._verify_segment_batch(filepath, local_start, duration, frames_buffer, analysis_fps)
             elapsed = time.monotonic() - t0
             
             if is_really_dynamic:
-                logger.debug(f"YOLO Confirmed DYNAMIC for {filepath} at {local_start:.1f}s, dur {duration:.1f}s (took {elapsed:.2f}s)")
+                logger.debug(f"YOLO DYNAMIC (Batch) for {Path(filepath).name} at {local_start:.1f}s (took {elapsed:.3f}s)")
                 verified_segments.append(seg)
             else:
-                logger.debug(f"YOLO Flipped to STATIC for {filepath} at {local_start:.1f}s, dur {duration:.1f}s (took {elapsed:.2f}s)")
+                logger.debug(f"YOLO STATIC (Batch) for {Path(filepath).name} at {local_start:.1f}s (took {elapsed:.3f}s)")
                 seg.state = "STATIC"
                 verified_segments.append(seg)
                 
         return verified_segments
 
-    def _verify_segment(self, filepath: str, start_time: float, duration: float, frames_buffer: dict, analysis_fps: float) -> bool:
+    def _verify_segment_batch(self, filepath: str, start_time: float, duration: float, frames_buffer: dict, analysis_fps: float) -> bool:
+        """
+        极限优化：将片段内的待检帧作为 Batch 一次性送入 GPU 推理
+        """
         start_frame_idx = int(start_time * analysis_fps)
         end_frame_idx = int((start_time + duration) * analysis_fps)
         
+        # 采样待检帧
+        sample_step = max(1, int(analysis_fps / self.sample_fps))
         frames_to_check = []
-        for f_idx in range(start_frame_idx, end_frame_idx + 1):
+        for f_idx in range(start_frame_idx, end_frame_idx + 1, sample_step):
             if f_idx in frames_buffer:
                 frames_to_check.append(frames_buffer[f_idx])
                 
         if not frames_to_check:
-            logger.debug(f"YOLO: No frames in buffer for {filepath} at {start_time:.1f}s")
-            return True # Fallback to original DYNAMIC state on missing frames
+            return True # Fallback
 
         try:
-            for frame in frames_to_check:
-                # frame 已经是 np.ndarray (H, W, 3) 的 RGB 图像
-                # OpenVINO 后端原生支持多线程推理
-                results = self.model(frame, verbose=False, device=self.device)
-                
-                for r in results:
-                    if r.boxes is None or len(r.boxes.cls) == 0:
-                        continue
-                        
+            # [性能极限] 一次性处理 List of NP Arrays，触发 Ultralytics 内部的 Batch 推理
+            results = self.model(frames_to_check, verbose=False, stream=True)
+            
+            for r in results:
+                if r.boxes is not None and len(r.boxes.cls) > 0:
                     classes = r.boxes.cls.cpu().numpy()
                     confs = r.boxes.conf.cpu().numpy()
                     
@@ -116,7 +123,8 @@ class YoloVerifier:
                         if int(cls) in self.target_classes and conf >= self.confidence:
                             return True
         except Exception as e:
-            logger.error(f"YOLO memory inference failed for {filepath}: {e}")
-            return True # Fallback to original DYNAMIC state on error
+            logger.error(f"YOLO Batch inference failed for {filepath}: {e}")
+            return True # Fallback
             
         return False
+from pathlib import Path

@@ -84,6 +84,7 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
 
 def build_concat_filter(
     timeline: list[TimelineSegment],
+    rows: list[dict],
     output_fps: int = 20,
     output_width: int = 1920,
     output_height: int = 1080,
@@ -96,22 +97,14 @@ def build_concat_filter(
 ) -> str:
     """
     Build a complex FFmpeg filtergraph string for the entire timeline.
-
-    Dynamic segments play at original speed with audio.
-    Static segments: fast-forward via setpts (GPU path) or keyframe slideshow (CPU path).
-
-    GPU scale is done ONCE per input file (not per segment) to avoid CUDA OOM
-    with large segment counts. Per-file scaled streams are split+trimmed per segment.
     """
     kf_interval = max(static_keyframe_interval, 1.0)
     display_dur = max(keyframe_display_duration, 0.1)
     global_speed_factor = kf_interval / display_dur
 
     if scale_mode == "cuda":
-        # CPU frames → upload to GPU → scale → download
         scale_filter = f"hwupload_cuda,scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
     elif scale_mode == "cuda_passthrough":
-        # NVDEC frames (already CUDA) → scale on GPU → download (no hwupload needed)
         scale_filter = f"scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
     elif scale_mode == "qsv":
         scale_filter = f"scale_qsv=w={output_width}:h={output_height},hwdownload,format=nv12"
@@ -121,9 +114,6 @@ def build_concat_filter(
         scale_filter = f"scale={output_width}:{output_height}"
 
     use_keyframe_slideshow = (scale_mode == "cpu")
-    # --- Performance Optimization: Hybrid Keyframe Mode ---
-    # In GPU mode, using setpts (fast-forward) still decodes many frames.
-    # Hybrid mode uses the CPU-style "slideshow" approach (sparse fps) even on GPU.
     from src.utils import load_config
     try:
         tmp_cfg = load_config()
@@ -143,7 +133,12 @@ def build_concat_filter(
     try:
         from src.ffmpeg import run_ffprobe
         for idx, filepath in input_files.items():
-            info = run_ffprobe(filepath) or {}
+            row = next((r for r in rows if r["filepath"] == filepath), None)
+            if row and row.get("has_audio") is not None:
+                input_has_audio[idx] = bool(row["has_audio"])
+                continue
+
+            info = run_ffprobe(filepath, timeout=120.0) or {}
             input_has_audio[idx] = any(
                 s.get("codec_type") == "audio" for s in info.get("streams", [])
             )
@@ -153,9 +148,7 @@ def build_concat_filter(
 
     # --- Step 2: Per-file scale (once per input) ---
     scale_parts: list[str] = []
-    # Track which split output label to use for each file
     file_split_labels: dict[int, list[str]] = {}
-    # Running counter for split output labels per file
     file_split_counter: dict[int, int] = {}
 
     for idx in sorted(segs_per_file):
@@ -164,12 +157,7 @@ def build_concat_filter(
         if scale_filter is not None:
             scale_parts.append(f"[{idx}:v]{scale_filter}[scaled_{idx}]")
             base_label = f"scaled_{idx}"
-        elif n_segs > 1:
-            # skip mode + multiple segs: need split, so create a pass-through label
-            scale_parts.append(f"[{idx}:v]null[skip_{idx}]")
-            base_label = f"skip_{idx}"
         else:
-            # skip mode + single seg: null pass-through to produce a label for trim
             scale_parts.append(f"[{idx}:v]null[skip_{idx}]")
             base_label = f"skip_{idx}"
 
@@ -192,34 +180,27 @@ def build_concat_filter(
         s = seg.start_in_file
         e = seg.end_in_file
 
-        # Pick the correct source label for this segment
         src_k = file_split_counter[idx]
         src_label = file_split_labels[idx][src_k]
         file_split_counter[idx] = src_k + 1
 
         if seg.state == "DYNAMIC":
             dur = e - s
-            parts_v.append(
-                f"[{src_label}]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{seg_count}]"
-            )
+            parts_v.append(f"[{src_label}]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{seg_count}]")
             if input_has_audio.get(idx, False):
                 parts_a.append(
                     f"[{idx}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS,"
                     f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
                 )
             else:
-                parts_a.append(
-                    f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a{seg_count}]"
-                )
+                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a{seg_count}]")
         else:
             dur = e - s
-            # Dynamic speed factor calculation to prevent flashes
             target_display_dur = max(dur / global_speed_factor, min_static_display_duration)
-            target_display_dur = min(target_display_dur, dur)  # Cannot be slower than 1x
+            target_display_dur = min(target_display_dur, dur)
             seg_speed_factor = dur / target_display_dur if target_display_dur > 0 else 1.0
 
             if use_keyframe_slideshow:
-                seg_kf_interval = seg_speed_factor * display_dur
                 parts_v.append(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
                     f"setpts=(PTS-STARTPTS)/{seg_speed_factor:.1f},"
@@ -230,9 +211,7 @@ def build_concat_filter(
                     f"[{src_label}]trim=start={s:.3f}:end={e:.3f},"
                     f"setpts=(PTS-STARTPTS)/{seg_speed_factor:.1f}[v{seg_count}]"
                 )
-            parts_a.append(
-                f"anullsrc=r={audio_sample_rate}:cl=mono:d={target_display_dur:.3f}[a{seg_count}]"
-            )
+            parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={target_display_dur:.3f}[a{seg_count}]")
 
         seg_count += 1
 

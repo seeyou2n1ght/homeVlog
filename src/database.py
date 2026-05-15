@@ -58,10 +58,31 @@ class VlogDatabase:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
+
+    def _migrate(self):
+        with self._lock:
+            cursor = self.conn.execute("PRAGMA table_info(file_tasks)")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "has_audio" not in columns:
+                self.conn.execute("ALTER TABLE file_tasks ADD COLUMN has_audio INTEGER DEFAULT 0")
+            self.conn.commit()
 
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn
+
+    def set_file_metadata(self, filepath: str, has_audio: int):
+        with self._lock:
+            try:
+                self.conn.execute(
+                    "UPDATE file_tasks SET has_audio=? WHERE filepath=?",
+                    (has_audio, str(filepath))
+                )
+                self.conn.commit()
+            except Exception as e:
+                logger.error("DB error in set_file_metadata: %s", e)
+                self.conn.rollback()
 
     def add_file_task(
         self,

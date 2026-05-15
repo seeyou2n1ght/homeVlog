@@ -28,8 +28,18 @@ class MotionDetector:
         self.grid_rows = det.get("grid_rows", 8)
         self.median_window = det.get("median_filter_window", 7)
         self.pipe_buf_mult = det.get("pipe_buffer_multiplier", 4)
-        self.decode_timeout = det.get("decode_timeout", 10)
+        self.decode_timeout = det.get("decode_timeout", 30)
         self.decode_gpu = decode_gpu
+
+        # 核心性能开关
+        self.adaptive_fps_enabled = det.get("analysis_fps_adaptive", True)
+        self.fps_tiers = det.get("analysis_fps_tiers", {"short": 5, "medium": 3, "long": 2})
+        self.fps_tier_thresholds = det.get(
+            "analysis_fps_tier_thresholds", {"short_max": 120, "medium_max": 600}
+        )
+        self.early_term_enabled = det.get("analysis_early_term_enabled", True)
+        self.early_term_window = det.get("analysis_early_term_window", 30)
+        self.early_term_threshold = det.get("analysis_early_term_threshold", 2.0)
 
     def analyze(
         self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
@@ -49,19 +59,20 @@ class MotionDetector:
         
         energies: list[float] = []
         prev_gray: np.ndarray | None = None
-        
+
         roi_x = int(self.width * self.roi[0])
         roi_y = int(self.height * self.roi[1])
         roi_w = int(self.width * self.roi[2])
         roi_h = int(self.height * self.roi[3])
-        
+
         yolo_sample_interval = max(1, int(self.fps / max(0.1, getattr(self, 'yolo_sample_fps', 0.5))))
 
-        t_decode_start = time.monotonic()
         total_frames = 0
+        early_terminated = False
+        effective_fps = self.fps
+        t_decode_start = 0.0
 
         try:
-            import av
             hw = None
             try:
                 from av.codec.hwaccel import HWAccel
@@ -75,42 +86,98 @@ class MotionDetector:
 
             with av.open(str(filepath), **kwargs) as container:
                 stream = container.streams.video[0]
+                
+                # Lazy Metadata: Detect audio and update DB
+                has_audio = 1 if any(s.type == 'audio' for s in container.streams) else 0
+                try:
+                    from src.database import VlogDatabase
+                    # We can't easily get the shared DB here without passing it, 
+                    # but we can open a temporary one or rely on the orchestrator to do it.
+                    # For now, let's just log it and we'll fix the DB update in the orchestrator.
+                    self.has_audio_detected = has_audio
+                except Exception:
+                    pass
+
                 if not hw:
                     stream.thread_type = "AUTO"
 
                 video_fps = float(stream.average_rate) if stream.average_rate else 30.0
                 if video_fps <= 0:
                     video_fps = 30.0
-                
-                frame_step = max(1, int(round(video_fps / self.fps)))
-                
+
+                if self.adaptive_fps_enabled and file_duration > 0:
+                    if file_duration <= self.fps_tier_thresholds["short_max"]:
+                        effective_fps = self.fps_tiers["short"]
+                    elif file_duration <= self.fps_tier_thresholds["medium_max"]:
+                        effective_fps = self.fps_tiers["medium"]
+                    else:
+                        effective_fps = self.fps_tiers["long"]
+                else:
+                    effective_fps = self.fps
+
+                frame_step = max(1, int(round(video_fps / effective_fps)))
+
+                # 增加对长文件和网络路径的超时容忍
+                watchdog_timeout = max(self.decode_timeout * 3, 60.0)
+                if file_duration > 0:
+                    watchdog_timeout = max(watchdog_timeout, (file_duration / effective_fps) * 4)
+
+                t_decode_start = time.monotonic()
                 for i, frame in enumerate(container.decode(stream)):
                     if i % frame_step != 0:
                         continue
-                        
+
                     total_frames += 1
-                    
-                    frame_rgb = frame.to_ndarray(format='rgb24')
-                    
-                    if frame_rgb.shape[1] != self.width or frame_rgb.shape[0] != self.height:
-                        frame_rgb = cv2.resize(frame_rgb, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
 
                     if getattr(self, 'yolo_enabled', False) and (total_frames - 1) % yolo_sample_interval == 0:
-                        yolo_frames_buffer[total_frames - 1] = frame_rgb.copy()
+                        try:
+                            yolo_frames_buffer[total_frames - 1] = frame.reformat(
+                                width=self.width, height=self.height, format='rgb24'
+                            ).to_ndarray()
+                        except Exception:
+                            yolo_frames_buffer[total_frames - 1] = cv2.resize(
+                                frame.to_ndarray(format='rgb24'),
+                                (self.width, self.height),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
 
-                    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-                    roi = gray[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w].astype(np.float32)
-                    frame_rgb = None
+                    # Analysis 灰度图处理（GPU Reformat 优先）
+                    try:
+                        # 性能优化：直接提取 Y 通道（如果是 NV12/YUV）避免全彩色重格式化
+                        # PyAV 的 'gray' 格式在 GPU 路径通常就是提取 Y 平面，速度最快
+                        tmp_frame = frame.reformat(width=self.width, height=self.height, format='gray')
+                        gray = tmp_frame.to_ndarray()
+                    except Exception:
+                        # 降级到 OpenCV，但使用 INTER_NEAREST 换取极致速度
+                        gray = cv2.cvtColor(
+                            cv2.resize(
+                                frame.to_ndarray(format='rgb24'),
+                                (self.width, self.height),
+                                interpolation=cv2.INTER_NEAREST,
+                            ),
+                            cv2.COLOR_RGB2GRAY,
+                        )
+
+                    # 性能极限：在 uint8 空间直接计算，减少 float32 转换开销
+                    roi = gray[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
                     gray = None
 
                     if prev_gray is not None:
-                        diff = np.abs(roi - prev_gray)
-                        energies.append(float(np.mean(diff)))
+                        # 使用 NumPy 向量化指令加速帧差计算
+                        # .mean() 会隐式转 float，但在大量像素下 uint8 减法更快
+                        diff_sum = np.sum(cv2.absdiff(roi, prev_gray))
+                        energy = float(diff_sum / (roi_w * roi_h))
+                        energies.append(energy)
+
+                        if self.early_term_enabled and len(energies) >= self.early_term_window:
+                            if max(energies[-self.early_term_window:]) < self.early_term_threshold:
+                                early_terminated = True
+                                break
 
                     prev_gray = roi
-                    
-                    if time.monotonic() - t_decode_start > self.decode_timeout * 5:
-                        logger.warning("PyAV decode timeout for %s", Path(filepath).name)
+
+                    if time.monotonic() - t_decode_start > watchdog_timeout:
+                        logger.warning("PyAV decode timeout for %s (dur=%.1f, elapsed=%.1f)", Path(filepath).name, file_duration, time.monotonic() - t_decode_start)
                         break
 
         except Exception as e:
@@ -119,6 +186,9 @@ class MotionDetector:
             io_sem.release()
 
         t_decode_end = time.monotonic()
+
+        if early_terminated and file_duration > 0 and energies:
+            energies.append(0.0)
 
         if len(energies) < 2:
             logger.warning(
@@ -129,53 +199,24 @@ class MotionDetector:
                 "analysis_time": 0,
                 "frames": total_frames,
                 "motion_ratio": 0,
+                "early_term": early_terminated,
             }
             return []
 
         t_analysis_start = time.monotonic()
-
-        # Temporal median filter to suppress isolated GOP boundary spikes
-        # (1-2 frame artifacts) while preserving sustained motion (3+ frames).
         if self.median_window >= 3:
             energies = _median_filter(energies, self.median_window)
 
-        # Adaptive threshold: Robust noise floor estimation
-        # IQR fails when motion frames > 50% (Q3 becomes a motion value).
-        # Instead, we estimate the noise from the bottom 20% of frames.
         energies_arr = np.array(energies, dtype=np.float32)
         p5 = float(np.percentile(energies_arr, 5))
         p20 = float(np.percentile(energies_arr, 20))
-
-        # Approximate standard IQR scale from the p5-p20 spread
         noise_spread = (p20 - p5) * 2.5
-
-        # Absolute minimum offset prevents triggering on clean digital black
-        min_offset = 0.5
-        threshold = p5 + max(min_offset, self.sensitivity * noise_spread)
+        threshold = p5 + max(0.5, self.sensitivity * noise_spread)
 
         raw_labels: list[bool] = [bool(e > threshold) for e in energies]
-        # First frame is always False (no predecessor to compare)
         raw_labels.insert(0, False)
 
-        logger.debug(
-            "adaptive threshold for %s: p5=%.3f p20=%.3f spread=%.3f threshold=%.3f "
-            "motion_frames=%d/%d (%.1f%%)",
-            Path(filepath).name,
-            p5,
-            p20,
-            noise_spread,
-            threshold,
-            sum(raw_labels),
-            len(raw_labels),
-            100 * sum(raw_labels) / len(raw_labels),
-        )
-
-        smoothed = _smooth_labels(
-            raw_labels,
-            self.min_motion_frames,
-            self.min_static_frames,
-            self.noise_suppress,
-        )
+        smoothed = _smooth_labels(raw_labels, self.min_motion_frames, self.min_static_frames, self.noise_suppress)
         t_analysis_end = time.monotonic()
 
         motion_count = sum(1 for s in smoothed if s)
@@ -184,46 +225,40 @@ class MotionDetector:
             "analysis_time": round(t_analysis_end - t_analysis_start, 3),
             "frames": total_frames,
             "motion_ratio": round(motion_count / len(smoothed), 3) if smoothed else 0,
+            "early_term": early_terminated,
+            "effective_fps": effective_fps,
         }
 
-        # 核心优化：依据文件真实时长和解出的总帧数做等比映射，消除变帧率/丢帧引起的时钟漂移
-        actual_fps = (
-            total_frames / file_duration
-            if file_duration > 0 and total_frames > 0
-            else self.fps
-        )
-        frame_interval = 1.0 / actual_fps if actual_fps > 0 else 1.0 / self.fps
+        actual_fps = total_frames / file_duration if file_duration > 0 and total_frames > 0 else effective_fps
+        frame_interval = 1.0 / actual_fps
 
         padded_energies = [0.0] + energies
         results = []
         for i, is_motion in enumerate(smoothed):
-            # 防止最后的时间戳超过 file_duration
-            time_val = start_offset + min(i * frame_interval, file_duration)
-            results.append(
-                {
-                    "time": time_val,
-                    "is_motion": is_motion,
-                    "energy": float(padded_energies[i]) if i < len(padded_energies) else 0.0,
-                }
-            )
+            if early_terminated and i == len(smoothed) - 1:
+                time_val = start_offset + file_duration
+            else:
+                time_val = start_offset + min(i * frame_interval, file_duration)
+                
+            results.append({
+                "time": time_val,
+                "is_motion": is_motion,
+                "energy": float(padded_energies[i]) if i < len(padded_energies) else 0.0,
+            })
         return results, yolo_frames_buffer
 
 
 def _median_filter(signal: list[float], window: int) -> list[float]:
-    """1D median filter using NumPy vectorized operations (O(N) instead of Python loop)."""
     if window < 3:
         return signal
     arr = np.array(signal, dtype=np.float32)
     pad_width = window // 2
-    # 使用 'edge' 填充保证边界平滑
     padded = np.pad(arr, pad_width, mode='edge')
     try:
-        # NumPy 1.20+ sliding_window_view
         from numpy.lib.stride_tricks import sliding_window_view
         windows = sliding_window_view(padded, window)
         return np.median(windows, axis=1).tolist()
     except ImportError:
-        # Fallback for very old numpy versions
         n = len(arr)
         result = np.empty_like(arr)
         for i in range(n):
@@ -277,6 +312,3 @@ def _smooth_labels(
             i += 1
 
     return smoothed
-
-
-
