@@ -32,10 +32,17 @@ HomeVlog 是一个用于家庭主机闲时批量处理室内监控素材的 Dail
 
 ### 3. 单次解码流水线 (Single-Pass Pipeline)
 - 彻底废弃子进程 `subprocess.Popen("ffmpeg")` 模式。
-- 使用 **PyAV (FFmpeg C API)** 原生硬件解码，解码帧在内存中同时完成：
-    1. **NumPy 向量化运动分析** (uint8 空间极致计算)
-    2. **YOLO 零拷贝目标验证** (Zero-IO)
+- 使用 **PyAV (FFmpeg C API)** 原生硬件解码，解码帧在内存中以 NumPy 数组形式存在。
+- **数据流向**：
+    1.  **解码帧** → **NumPy 向量化运动分析** (uint8 空间计算帧差能量)。
+    2.  **关键帧采样** → **驻留内存字典** (frames_buffer)。
+    3.  **YOLO 验证器** → 从字典读取帧进行 **Batch 推理** (Zero-IO)。
 - 极大地减少了 CPU 负载、PCIe 带宽占用以及内存拷贝开销。
+
+### 4. 数据库与持久化 (Persistence)
+- **SQLite 核心作用**：不仅记录任务状态，还作为元数据缓存中心。
+- **自动迁移**：系统启动时会自动检测并补全 `has_audio` 等字段，确保版本平滑升级。
+- **断点续传**：基于数据库状态，支持随时中断并从上次进度恢复，且不会重复探测已完成的文件。
 
 ### 4. 硬件自适应调度 (Smart Scheduling)
 - **算力最大化**: 系统根据 `max_nv_concurrency` 智能限制分析 Worker，为 NVENC 渲染预留空间，并自动切换核显 (QSV) 处理剩余分析任务。
