@@ -1,10 +1,31 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
+*.egg
 .venv/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Project outputs
+# Project outputs & Local Data
 output/
 logs/
 data/
@@ -12,10 +33,24 @@ temp/
 reports/
 inspect_out*/
 
-# Models (大型二进制文件，不入版本控制)
+# Models (大型二进制文件/自动生成权重)
 yolo11n.pt
 yolo11n_openvino_model/
 *.onnx
+*.engine
+
+# Environment / Secrets
+.env
+.venv
+.python-version
+
+# IDEs & Tools
+.vscode/
+.idea/
+.claude/
+.cursor/
+*.swp
+*.swo
 
 # Temp / test artifacts
 test_*.mp4
@@ -25,3 +60,4 @@ pts.txt
 # OS
 Thumbs.db
 .DS_Store
+desktop.ini
