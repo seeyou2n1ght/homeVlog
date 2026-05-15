@@ -3,32 +3,52 @@
 # ===========================================================================
 
 paths:
+  # 输入目录: 存放按命名规范命名的监控 MP4 文件
+  # 格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
   input_dir: '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD'
+  
+  # 输出目录: 默认为项目根目录下的 output/
   output_dir: 'output'
+  
+  # 临时目录: 用于存放渲染批次中间件，建议放在高速 SSD 上
   temp_dir: 'temp'
 
 hardware:
+  # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
   # 3060Ti 优先，YOLO 推理与分析主路径
   device: "cuda:0"
+
+  # 并发控制 (信号量限制)
+  # 消费级 NVIDIA 显卡通常限制 2-3 个并发编码会话 (NVENC)
   max_nv_concurrency: 3
-  # UHD 770 核显辅助，支持极高并发解码
+  # QSV 硬件解码/编码并发数 (UHD 770 双 VDBox 可支撑 8 并发)
   max_qsv_concurrency: 8
-  max_io_concurrency: 6
+  # 全局最大 IO 并发数 (控制同时打开的远程文件句柄)
+  # NAS 环境建议设为 6-8 以免引起 SMB 响应抖动
+  max_io_concurrency: 8
 
 recovery:
+  # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
   skip_today: false
+  # 文件稳定等待 (分钟): 0 表示不等待 (对于已完成的往日素材建议设为 0)
   scanner_freeze_minutes: 0
+  # 磁盘空间保护 (GB): 剩余空间低于此值将停止流水线
   min_disk_space_gb: 20
+  # 文件稳定性二次确认等待 (秒)
   file_stabilize_wait: 1.2
+  # 渲染失败重试最大次数
   render_retry_max: 2
 
 pipeline:
+  # 是否启用流式并发模式 (预筛/分析/渲染重叠运行)
   streaming_mode: true
+  # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
   render_start_delay: 2
+  # 预筛 GPU 分配策略: alternating (QSV/CUDA 交替)
   prescreen_gpu_policy: "alternating"
 
 detection:
-  # [Pass 1] 预筛：8路并发
+  # [Pass 1] 快速预筛 (Prescreen)
   prescreen_mode: "stream_fps"
   prescreen_parallel: 8
   prescreen_segments: 150
@@ -36,13 +56,14 @@ detection:
   prescreen_diff_threshold: 6
   prescreen_extract_timeout: 120.0
 
-  # [Pass 1.5] 分析：10路并发 (压榨 16 线程)
+  # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
-  analysis_resolution: "416x234" # 减小 44% 像素量，完美对齐 YOLO
+  analysis_resolution: "416x234" # 完美对齐 YOLO 推理尺寸
   analysis_max_workers: 10
+  # GPU 分配阈值: 待分析文件数超过此值时，QSV 也参与分析以分担 CUDA 压力
   qsv_fallback_threshold: 10
   
-  # 极限自适应：长视频 1fps 足够捕捉显著运动
+  # 自适应 FPS: 长文件降低采样率以减少解码开销
   analysis_fps_adaptive: true
   analysis_fps_tiers:
     short: 5
@@ -52,11 +73,12 @@ detection:
     short_max: 120
     medium_max: 600
 
-  # 极限早停：缩短窗口
+  # 早停: 连续静态 N 帧后终止解码
   analysis_early_term_enabled: true
   analysis_early_term_window: 20
   analysis_early_term_threshold: 2.5
   
+  # 检测算法调优
   motion_sensitivity: 1.0
   roi_crop: [0.1, 0.12, 0.8, 0.85]
   min_motion_frames: 3
@@ -65,14 +87,17 @@ detection:
 yolo:
   enabled: true
   streaming_verify: true
-  skip_energy_threshold: 12.0 # 能量 > 12 直接过，不进 YOLO
+  # 触发式推理: 如果动作能量超过此值，认为显著运动，直接跳过 YOLO 推理
+  skip_energy_threshold: 12.0
   model_path: "yolo11n.pt"
   device: "cuda:0"
+  # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
   confidence: 0.3
   sample_fps: 0.5
 
 render:
+  # 静态片段处理模式: hybrid_keyframe (幻灯片抽帧，极低解码压力)
   static_mode: "hybrid_keyframe"
   hw_decode: true
   batch_max_files: 4
@@ -83,9 +108,11 @@ output:
   naming: "DailyVlog_{date}_cam{index}.mp4"
   resolution: "1920x1080"
   fps: 20
+
+  # 极限性能编码参数
   nv:
     codec: "hevc_nvenc"
-    preset: "p1" # 极速模式
+    preset: "p1"
     cq: 30
     maxrate: "3M"
   qsv:
