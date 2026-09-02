@@ -9,10 +9,15 @@ logger = logging.getLogger("homevlog")
 class Segment:
     start_time: float
     end_time: float
-    state: str  # "DYNAMIC" | "STATIC"
+    state: str  # "DYNAMIC" | "STATIC" | "DYNAMIC_AUDIO"
     source_file: str
     file_start_offset: float
     max_energy: float = 0.0
+
+    @property
+    def is_dynamic(self) -> bool:
+        """Returns True if segment represents active dynamic motion or audio event."""
+        return self.state in ("DYNAMIC", "DYNAMIC_AUDIO")
 
 
 def build_segments(
@@ -26,19 +31,25 @@ def build_segments(
 ) -> list[Segment]:
     """
     Convert frame-by-frame labels to contiguous segments.
-    frame_labels: [{time, is_motion}, ...]
+    frame_labels: [{time, is_motion, state, energy, ...}, ...]
     file_offset: absolute time offset of the source file (day-relative seconds)
     """
     if not frame_labels:
         return []
 
+    def _resolve_state(lbl: dict) -> str:
+        s = lbl.get("state")
+        if s in ("DYNAMIC", "DYNAMIC_AUDIO", "STATIC"):
+            return s
+        return "DYNAMIC" if lbl.get("is_motion", False) else "STATIC"
+
     segments: list[Segment] = []
     seg_start = frame_labels[0]["time"]
-    seg_state = "DYNAMIC" if frame_labels[0]["is_motion"] else "STATIC"
+    seg_state = _resolve_state(frame_labels[0])
     seg_max_energy = frame_labels[0].get("energy", 0.0)
 
     for i in range(1, len(frame_labels)):
-        cur_state = "DYNAMIC" if frame_labels[i]["is_motion"] else "STATIC"
+        cur_state = _resolve_state(frame_labels[i])
         if cur_state != seg_state:
             seg_end = frame_labels[i - 1]["time"]
             segments.append(Segment(
@@ -107,7 +118,8 @@ def _filter_short(
         i = 0
         while i < len(segments):
             dur = segments[i].end_time - segments[i].start_time
-            threshold = min_motion if segments[i].state == "DYNAMIC" else min_static
+            is_dynamic = segments[i].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+            threshold = min_motion if is_dynamic else min_static
             if dur >= threshold:
                 i += 1
                 continue
@@ -173,15 +185,86 @@ def segments_to_json(segments: list[Segment]) -> str:
 
 
 def segments_from_json(json_str: str) -> list[Segment]:
-    data = json.loads(json_str)
-    return [
-        Segment(
-            start_time=d["start_time"],
-            end_time=d["end_time"],
-            state=d["state"],
-            source_file=d["source_file"],
-            file_start_offset=d["file_start_offset"],
-            max_energy=d.get("max_energy", 0.0),
-        )
-        for d in data
-    ]
+    if not json_str:
+        return []
+    try:
+        data = json.loads(json_str)
+        if not isinstance(data, list):
+            return []
+        return [
+            Segment(
+                start_time=d["start_time"],
+                end_time=d["end_time"],
+                state=d["state"],
+                source_file=d.get("source_file"),
+                file_start_offset=d.get("file_start_offset"),
+                max_energy=d.get("max_energy", 0.0),
+            )
+            for d in data
+            if isinstance(d, dict) and "start_time" in d and "end_time" in d and "state" in d
+        ]
+    except Exception:
+        return []
+
+
+def split_segments_at_file_boundaries(
+    segments: list[Segment],
+    files_info: list[dict] | dict[str, tuple[float, float]] | None,
+) -> list[Segment]:
+    """
+    Split multi-file segments strictly at physical file boundaries.
+    Ensures every segment's start_time and end_time fall within the physical
+    bounds of its source file, preventing out-of-bounds frame trimming in batch renders.
+    """
+    if not segments or not files_info:
+        return segments
+
+    # Normalize files_info into sorted list of (filepath, start_offset, end_offset)
+    file_ranges: list[tuple[str, float, float]] = []
+    if isinstance(files_info, dict):
+        for fp, val in files_info.items():
+            if isinstance(val, (tuple, list)) and len(val) >= 2:
+                file_ranges.append((fp, float(val[0]), float(val[1])))
+            elif isinstance(val, dict):
+                s_off = float(val.get("file_start_offset", val.get("start_offset", 0.0)))
+                e_off = float(val.get("file_end_offset", val.get("end_offset", s_off + val.get("duration", 0.0))))
+                file_ranges.append((fp, s_off, e_off))
+    elif isinstance(files_info, list):
+        for item in files_info:
+            if isinstance(item, dict):
+                fp = item["filepath"]
+                s_off = float(item.get("file_start_offset", item.get("start_offset", 0.0)))
+                e_off = float(item.get("file_end_offset", item.get("end_offset", s_off + item.get("duration", 0.0))))
+                file_ranges.append((fp, s_off, e_off))
+            elif isinstance(item, (tuple, list)) and len(item) >= 3:
+                file_ranges.append((str(item[0]), float(item[1]), float(item[2])))
+
+    file_ranges.sort(key=lambda x: x[1])
+
+    split_result: list[Segment] = []
+    for seg in segments:
+        overlapping_files = [
+            (fp, f_start, f_end)
+            for fp, f_start, f_end in file_ranges
+            if f_start < seg.end_time and f_end > seg.start_time
+        ]
+
+        if not overlapping_files:
+            split_result.append(seg)
+            continue
+
+        for fp, f_start, f_end in overlapping_files:
+            piece_start = max(seg.start_time, f_start)
+            piece_end = min(seg.end_time, f_end)
+            if piece_end > piece_start:
+                split_result.append(Segment(
+                    start_time=piece_start,
+                    end_time=piece_end,
+                    state=seg.state,
+                    source_file=fp,
+                    file_start_offset=f_start,
+                    max_energy=seg.max_energy,
+                ))
+
+    return split_result
+

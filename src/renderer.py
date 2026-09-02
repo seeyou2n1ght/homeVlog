@@ -6,7 +6,13 @@ from pathlib import Path
 
 from src.utils import parse_res, OUTPUT_DIR, TEMP_DIR
 from src.ffmpeg import run_ffmpeg
-from src.timeline import TimelineSegment, build_concat_filter, build_timeline
+from src.timeline import (
+    TimelineSegment,
+    build_concat_filter,
+    build_timeline,
+    partition_timeline_by_batches,
+    save_timecode_subtitles,
+)
 from src.monitor import get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
@@ -71,7 +77,7 @@ def render_vlog(db, date: str, cam_index: int, encoder: str = "nv") -> str | Non
 
     # CPU decode path (single render)
     files, filter_complex = _prepare_render(
-        timeline, fps, width, height, seg_cfg, all_rows
+        timeline, fps, width, height, seg_cfg, all_rows, date=date
     )
 
     logger.info("render %s cam%d start: %d files, %d segments",
@@ -82,8 +88,16 @@ def render_vlog(db, date: str, cam_index: int, encoder: str = "nv") -> str | Non
     )
 
 
-def _prepare_render(timeline, fps, width, height, seg_cfg, rows):
+def _prepare_render(timeline, fps, width, height, seg_cfg, rows, date=None):
     """Build file list (reindexed) and filter_complex for CPU decode path."""
+    from src.utils import load_config
+    cfg = {}
+    try:
+        cfg = load_config()
+    except Exception:
+        pass
+    render_cfg = cfg.get("render", {})
+
     files = list(dict.fromkeys(t.filepath for t in timeline))
     _reindex_timeline(timeline, files)
 
@@ -100,6 +114,11 @@ def _prepare_render(timeline, fps, width, height, seg_cfg, rows):
         min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
         gap_tolerance=seg_cfg.get("gap_tolerance", 0.5),
         scale_mode=scale_mode,
+        speed_ramping=render_cfg.get("speed_ramping_enabled", seg_cfg.get("speed_ramping_enabled", True)),
+        ramp_duration_s=render_cfg.get("ramp_duration_s", seg_cfg.get("ramp_duration_s", 1.0)),
+        audio_fade_duration_s=render_cfg.get("audio_fade_duration_s", seg_cfg.get("audio_fade_duration_s", 0.15)),
+        timecode_osd=render_cfg.get("timecode_osd_enabled", False),
+        base_date=date,
     )
     return files, filter_complex
 
@@ -127,19 +146,20 @@ _DEFAULT_BATCH_MAX_FILES = 8
 
 
 def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, encoder="nv", rows=None):
-    batch_max_files = out_cfg.get("batch_max_files", _DEFAULT_BATCH_MAX_FILES)
-    batches: list[list[TimelineSegment]] = []
-    cur_batch: list[TimelineSegment] = []
-    cur_files: set[str] = set()
-    for seg in timeline:
-        if seg.filepath not in cur_files and len(cur_files) >= batch_max_files and cur_batch:
-            batches.append(cur_batch)
-            cur_batch = []
-            cur_files = set()
-        cur_batch.append(seg)
-        cur_files.add(seg.filepath)
-    if cur_batch:
-        batches.append(cur_batch)
+    from src.utils import load_config
+    cfg = {}
+    try:
+        cfg = load_config()
+    except Exception:
+        pass
+    render_cfg = cfg.get("render", {})
+    batch_max_files = (
+        render_cfg.get("batch_max_files")
+        or out_cfg.get("batch_max_files")
+        or seg_cfg.get("batch_max_files")
+        or _DEFAULT_BATCH_MAX_FILES
+    )
+    batches = partition_timeline_by_batches(timeline, batch_max_files=batch_max_files)
 
     n_batches = len(batches)
     total_files = len(set(t.filepath for t in timeline))
@@ -176,6 +196,15 @@ def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, a
     if not output_path.exists():
         logger.error("batch-render %s cam%d: output file missing after concat", date, cam_index)
         return None
+
+    # Save real-world timecode subtitles (.srt) if requested or configured
+    if render_cfg.get("generate_subtitles", True) or out_cfg.get("generate_subtitles", False):
+        try:
+            srt_path = output_path.with_suffix(".srt")
+            save_timecode_subtitles(timeline, srt_path, rows=rows, base_date=date)
+        except Exception as e:
+            logger.warning("save_timecode_subtitles failed: %s", e)
+
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
     logger.info("batch-render %s cam%d done: %s (%.1f MB)", date, cam_index, output_path.name, file_size_mb)
     return str(output_path)
@@ -183,6 +212,14 @@ def _batch_render(timeline, output_path, fps, width, height, seg_cfg, out_cfg, a
 
 def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows):
     from copy import deepcopy
+    from src.utils import load_config
+    cfg = {}
+    try:
+        cfg = load_config()
+    except Exception:
+        pass
+    render_cfg = cfg.get("render", {})
+
     batch_copy = deepcopy(batch_segs)
     files = list(dict.fromkeys(s.filepath for s in batch_copy))
     _reindex_timeline(batch_copy, files)
@@ -203,6 +240,11 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
         gap_tolerance=seg_cfg.get("gap_tolerance", 0.5),
         scale_mode=scale_mode,
+        speed_ramping=render_cfg.get("speed_ramping_enabled", seg_cfg.get("speed_ramping_enabled", True)),
+        ramp_duration_s=render_cfg.get("ramp_duration_s", seg_cfg.get("ramp_duration_s", 1.0)),
+        audio_fade_duration_s=render_cfg.get("audio_fade_duration_s", seg_cfg.get("audio_fade_duration_s", 0.15)),
+        timecode_osd=render_cfg.get("timecode_osd_enabled", False),
+        base_date=date,
     )
 
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
@@ -226,8 +268,20 @@ def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, 
     batch_queue: Queue[tuple[int, list] | None] = Queue()
     for i, b in enumerate(batches):
         batch_queue.put((i, b))
-    batch_queue.put(None)
-    batch_queue.put(None)
+
+    from src.utils import load_config
+    cfg = load_config()
+    hw_cfg = cfg.get("hardware", {})
+    max_nv = hw_cfg.get("max_nv_concurrency", 3)
+    max_qsv = hw_cfg.get("max_qsv_concurrency", 8)
+
+    # 启用 2 个 NVENC worker + 1 个 QSV worker 组成多卡多会话并发渲染阵列
+    nv_workers = min(max_nv, 2)
+    qsv_workers = min(max_qsv, 1)
+    total_workers = max(2, nv_workers + qsv_workers)
+
+    for _ in range(total_workers):
+        batch_queue.put(None)
 
     results: dict[int, str | None] = {}
     results_lock = threading.Lock()
@@ -258,12 +312,15 @@ def _render_batches_parallel(batches, output_path, fps, width, height, seg_cfg, 
                 with results_lock:
                     results[bi] = None
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_nv = pool.submit(_worker, "nv")
-        f_qsv = pool.submit(_worker, "qsv")
+    with ThreadPoolExecutor(max_workers=total_workers) as pool:
+        futures = []
+        for _ in range(nv_workers):
+            futures.append(pool.submit(_worker, "nv"))
+        for _ in range(qsv_workers):
+            futures.append(pool.submit(_worker, "qsv"))
         try:
-            f_nv.result(timeout=render_timeout)
-            f_qsv.result(timeout=render_timeout)
+            for f in futures:
+                f.result(timeout=render_timeout)
         except Exception as e:
             logger.error("work-stealing render error: %s", e)
             return None

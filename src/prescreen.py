@@ -50,6 +50,106 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
     return frame
 
 
+def _prescreen_keyframes(
+    filepath: str,
+    duration: float,
+    max_keyframes: int,
+    threshold: float,
+    gpu: str = "qsv",
+) -> dict:
+    """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带即时早停机制。"""
+    import av
+    diffs: list[float] = []
+    sample_ts: list[float] = []
+
+    if gpu == "qsv":
+        from src.utils import get_qsv_semaphore
+        io_sem = get_qsv_semaphore()
+    else:
+        from src.utils import get_nv_semaphore
+        io_sem = get_nv_semaphore()
+
+    io_sem.acquire()
+    try:
+        with av.open(str(filepath)) as container:
+            if not container.streams.video:
+                return {"status": "FAILED", "error": "No video stream"}
+            stream = container.streams.video[0]
+            stream.codec_context.skip_frame = "NONKEY"
+
+            first_frame: np.ndarray | None = None
+            prev_frame: np.ndarray | None = None
+            k = 0
+            for frame in container.decode(stream):
+                # 提取 Y 平面并快速切片下采样
+                y_raw = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape((frame.height, frame.width))
+                curr_frame = y_raw[::8, ::8]
+
+                t_frame = float(frame.pts * stream.time_base) if (frame.pts is not None and stream.time_base) else float(k)
+                sample_ts.append(t_frame)
+
+                if first_frame is None:
+                    first_frame = curr_frame
+                    prev_frame = curr_frame
+                    k += 1
+                    continue
+
+                # 动态环境光自适应
+                mean_luma = float(np.mean(curr_frame))
+                current_threshold = threshold
+                if mean_luma < 50.0:
+                    current_threshold = max(1.5, threshold * 0.3)
+
+                diff_prev = float(np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32))))
+                diff_first = float(np.mean(np.abs(curr_frame.astype(np.float32) - first_frame.astype(np.float32))))
+                d = max(diff_prev, diff_first)
+                diffs.append(d)
+
+                # 即时早停：一旦发现动作，立即标记为 SUSPICIOUS 返回
+                if d > current_threshold:
+                    return {
+                        "status": "SUSPICIOUS",
+                        "result_json": json.dumps({
+                            "mode": "keyframes",
+                            "sample_ts": sample_ts,
+                            "diffs": diffs,
+                            "max_diff": max(diffs),
+                            "threshold": current_threshold,
+                            "mean_luma": mean_luma,
+                            "early_stop": True,
+                            "checked_pairs": len(diffs),
+                        }),
+                    }
+
+                prev_frame = curr_frame
+                k += 1
+                if k >= max_keyframes:
+                    break
+    except Exception as e:
+        logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
+        return {"status": "FALLBACK", "error": str(e)}
+    finally:
+        io_sem.release()
+
+    if not diffs:
+        return {"status": "STATIC", "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False})}
+
+    max_diff = max(diffs)
+    status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
+    return {
+        "status": status,
+        "result_json": json.dumps({
+            "mode": "keyframes",
+            "sample_ts": sample_ts,
+            "diffs": diffs,
+            "max_diff": max_diff,
+            "threshold": threshold,
+            "early_stop": False,
+            "checked_pairs": len(diffs),
+        }),
+    }
+
+
 def prescreen_file(
     filepath: str,
     duration: float,
@@ -70,7 +170,28 @@ def prescreen_file(
         actual_dur = get_duration(filepath)
         if actual_dur is not None and actual_dur > 0:
             duration = actual_dur
-    if mode == "stream_fps":
+    if mode in ("keyframes", "stream_fps", "auto"):
+        kf_res = _prescreen_keyframes(
+            filepath=filepath,
+            duration=duration,
+            max_keyframes=min(segments, 15),
+            threshold=threshold,
+            gpu=gpu,
+        )
+        if kf_res.get("status") != "FALLBACK":
+            return kf_res
+        if mode == "stream_fps":
+            return _prescreen_stream_fps(
+                filepath,
+                duration,
+                segments,
+                width,
+                height,
+                threshold,
+                gpu,
+                timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
+            )
+    elif mode == "stream_fps":
         return _prescreen_stream_fps(
             filepath,
             duration,
@@ -380,11 +501,19 @@ def run_prescreen_for_cam(
     stats = {"done": 0, "static": 0, "suspicious": 0, "failed": 0}
     t0 = time.monotonic()
 
+    prescreen_gpu_policy = config.get("pipeline", {}).get("prescreen_gpu_policy", "qsv_only")
+
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         futures = []
         for i in range(parallel):
-            # Alternating GPUs for workers: qsv, cuda, qsv, cuda...
-            gpu = "qsv" if i % 2 == 0 else "cuda"
+            if prescreen_gpu_policy == "qsv_only":
+                gpu = "qsv"
+            elif prescreen_gpu_policy == "cuda_only":
+                gpu = "cuda"
+            elif prescreen_gpu_policy == "alternating":
+                gpu = "qsv" if i % 2 == 0 else "cuda"
+            else:
+                gpu = "qsv"
             futures.append(pool.submit(_prescreen_worker, db, task_queue, config, gpu))
             
         for f in as_completed(futures):

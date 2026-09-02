@@ -18,6 +18,7 @@ from src.utils import (
     LOGS_DIR,
     cleanup_resources,
     check_disk_space,
+    WorkStealingManager,
 )
 from src.monitor import get_monitor, get_perf, PerfRecord
 from src.timeline import build_timeline
@@ -26,7 +27,7 @@ logger = logging.getLogger("homevlog")
 
 
 class StreamingOrchestrator:
-    """终极流式管线编排器：实现预筛、分析、渲染的全重叠并发执行。"""
+    """终极流式管线编排器：实现预筛、分析、渲染的全重叠并发执行与自适应硬件调度。"""
 
     def __init__(
         self,
@@ -41,6 +42,9 @@ class StreamingOrchestrator:
         self.cam_index = cam_index
         self.config = config
         self.render_enabled = render_enabled
+
+        # 异构硬件自适应调度器
+        self.work_stealing = WorkStealingManager(config=self.config)
 
         # 队列定义
         self.prescreen_queue = queue.Queue()
@@ -118,10 +122,13 @@ class StreamingOrchestrator:
 
                 if "prescreen" in self.pbars:
                     self.pbars["prescreen"].update(1)
-                    if res["status"] == "SUSPICIOUS":
-                        self.pbars["prescreen"].set_postfix_str(
-                            f"Latest: {Path(filepath).name} (SUSPICIOUS)"
-                        )
+                    el_s = max(0.1, time.monotonic() - getattr(self, "_prescreen_t0", t0))
+                    n_done = self.pbars["prescreen"].n
+                    fps_val = n_done / el_s
+                    el_m, el_sec = divmod(int(el_s), 60)
+                    self.pbars["prescreen"].set_postfix_str(
+                        f"实耗 {el_m:02d}:{el_sec:02d} | 速率 {fps_val:.1f}文件/s (Latest: {Path(filepath).name[:22]}..)"
+                    )
 
             except Exception:
                 logger.exception("Streaming: prescreen failed for %s", filepath)
@@ -139,9 +146,103 @@ class StreamingOrchestrator:
             finally:
                 self.prescreen_queue.task_done()
 
-    def _analysis_worker(self, gpu: str):
-        """分析 Worker：对 SUSPICIOUS 文件进行运动检测。"""
-        detector = MotionDetector(self.config, decode_gpu=gpu)
+    def _execute_analysis_task(
+        self,
+        task: dict,
+        filepath: str,
+        file_start_offset: float,
+        detector: MotionDetector,
+        yolo_verifier,
+        gpu: str,
+        perf,
+        t0: float,
+    ):
+        from src.segment import build_segments, segments_to_json
+
+        labels, yolo_buffer = detector.analyze(
+            filepath,
+            start_offset=file_start_offset,
+            file_duration=task.get("file_duration") or 300.0,
+        )
+        
+        if hasattr(detector, 'has_audio_detected'):
+            self.db.set_file_metadata(filepath, detector.has_audio_detected)
+
+        if labels:
+            segments = build_segments(
+                labels,
+                filepath,
+                min_motion_dur=self.config.get("segment", {}).get(
+                    "min_motion_duration", 1.0
+                ),
+                min_static_dur=self.config.get("segment", {}).get(
+                    "min_static_duration", 30.0
+                ),
+                file_offset=file_start_offset,
+                gap_tolerance=self.config.get("segment", {}).get(
+                    "gap_tolerance", 0.5
+                ),
+            )
+            
+            yolo_before = len(segments)
+            is_yolo_active = False
+            if yolo_verifier:
+                is_yolo_active = True
+                yolo_device = self.config.get("hardware", {}).get("device", "cpu")
+                segments = yolo_verifier.verify(
+                    filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=detector.fps
+                )
+            yolo_after = len(segments)
+
+            js = segments_to_json(segments)
+            self.db.set_analysis_result(filepath, "ANALYZED", js)
+
+            lp = detector.last_perf if hasattr(detector, "last_perf") else {}
+            perf.add(
+                PerfRecord(
+                    stage="analysis",
+                    file=Path(filepath).name,
+                    gpu=gpu,
+                    duration=round(time.monotonic() - t0, 3),
+                    frames=lp.get("frames", 0),
+                    extra={
+                        "status": "ANALYZED",
+                        "segments_before_yolo": yolo_before,
+                        "segments_after_yolo": yolo_after,
+                        "yolo_streaming_verify": is_yolo_active,
+                        **lp,
+                    },
+                )
+            )
+            self.render_batch_queue.put(
+                {"filepath": filepath, "status": "ANALYZED"}
+            )
+        else:
+            self.db.set_analysis_result(filepath, "FAILED", "")
+            self._add_error(f"analysis produced no labels: {Path(filepath).name}")
+            self.render_batch_queue.put(
+                {"filepath": filepath, "status": "FAILED"}
+            )
+
+        if "analysis" in self.pbars:
+            self.pbars["analysis"].update(1)
+            el_s = max(0.1, time.monotonic() - getattr(self, "_analysis_t0", t0))
+            n_done = self.pbars["analysis"].n
+            n_tot = max(n_done, self.pbars["analysis"].total)
+            avg_s = el_s / max(1, n_done)
+            rem_s = max(0, (n_tot - n_done) * avg_s)
+            el_m, el_sec = divmod(int(el_s), 60)
+            rm_m, rm_sec = divmod(int(rem_s), 60)
+            self.pbars["analysis"].set_postfix_str(
+                f"实耗 {el_m:02d}:{el_sec:02d} | 预估余 {rm_m:02d}:{rm_sec:02d} | 均速 {avg_s:.1f}s/文件 ({gpu.upper()})"
+            )
+
+    def _analysis_worker(self, fixed_gpu: str | None = None):
+        """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
+        detectors: dict[str, MotionDetector] = {
+            "qsv": MotionDetector(self.config, decode_gpu="qsv"),
+        }
+        detector_cuda: MotionDetector | None = None
         
         # [性能极限] 在线程生命周期内复用验证器实例，避免重复初始化开销
         yolo_verifier = None
@@ -163,88 +264,38 @@ class StreamingOrchestrator:
 
             try:
                 from src.utils import ts_to_unix
-                from src.segment import build_segments, segments_to_json
 
                 file_start_ts = ts_to_unix(task["file_start_time"])
                 file_start_offset = max(
                     file_start_ts - ts_to_unix(self.date + "000000"), 0.0
                 )
 
-                labels, yolo_buffer = detector.analyze(
-                    filepath,
-                    start_offset=file_start_offset,
-                    file_duration=task.get("file_duration") or 300.0,
-                )
-                
-                if hasattr(detector, 'has_audio_detected'):
-                    self.db.set_file_metadata(filepath, detector.has_audio_detected)
-
-                if labels:
-                    segments = build_segments(
-                        labels,
-                        filepath,
-                        min_motion_dur=self.config.get("segment", {}).get(
-                            "min_motion_duration", 1.0
-                        ),
-                        min_static_dur=self.config.get("segment", {}).get(
-                            "min_static_duration", 30.0
-                        ),
-                        file_offset=file_start_offset,
-                        gap_tolerance=self.config.get("segment", {}).get(
-                            "gap_tolerance", 0.5
-                        ),
-                    )
-                    
-                    yolo_before = len(segments)
-                    is_yolo_active = False
-                    if yolo_verifier:
-                        is_yolo_active = True
-                        yolo_device = self.config.get("hardware", {}).get("device", "cpu")
-                        segments = yolo_verifier.verify(
-                            filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=detector.fps
-                        )
-                    yolo_after = len(segments)
-
-                    js = segments_to_json(segments)
-                    self.db.set_analysis_result(filepath, "ANALYZED", js)
-
-                    lp = detector.last_perf if hasattr(detector, "last_perf") else {}
-                    perf.add(
-                        PerfRecord(
-                            stage="analysis",
-                            file=Path(filepath).name,
-                            gpu=gpu,
-                            duration=round(time.monotonic() - t0, 3),
-                            frames=lp.get("frames", 0),
-                            extra={
-                                "status": "ANALYZED",
-                                "segments_before_yolo": yolo_before,
-                                "segments_after_yolo": yolo_after,
-                                "yolo_streaming_verify": is_yolo_active,
-                                **lp,
-                            },
-                        )
-                    )
-                    self.render_batch_queue.put(
-                        {"filepath": filepath, "status": "ANALYZED"}
+                if fixed_gpu is not None:
+                    gpu = fixed_gpu
+                    if gpu == "cuda":
+                        if detector_cuda is None:
+                            detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
+                        detector = detector_cuda
+                    else:
+                        detector = detectors["qsv"]
+                    self._execute_analysis_task(
+                        task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0
                     )
                 else:
-                    self.db.set_analysis_result(filepath, "FAILED", "")
-                    self._add_error(f"analysis produced no labels: {Path(filepath).name}")
-                    self.render_batch_queue.put(
-                        {"filepath": filepath, "status": "FAILED"}
-                    )
-
-                if "analysis" in self.pbars:
-                    self.pbars["analysis"].update(1)
-                    self.pbars["analysis"].set_postfix_str(
-                        f"Latest: {Path(filepath).name} ({gpu})"
-                    )
+                    q_size = self.analysis_queue.qsize()
+                    with self.work_stealing.lease_device(q_size) as gpu:
+                        if gpu == "cuda":
+                            if detector_cuda is None:
+                                detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
+                            detector = detector_cuda
+                        else:
+                            detector = detectors["qsv"]
+                        self._execute_analysis_task(
+                            task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0
+                        )
 
             except Exception:
-                logger.exception(
-                    "Streaming: analysis failed for %s [%s]", filepath, gpu
-                )
+                logger.exception("Streaming: analysis failed for %s", filepath)
                 self.db.set_analysis_result(filepath, "FAILED", "")
                 self._add_error(f"analysis failed: {Path(filepath).name}")
                 self.render_batch_queue.put({"filepath": filepath, "status": "FAILED"})
@@ -265,6 +316,7 @@ class StreamingOrchestrator:
         batch_idx = 0
         time.sleep(max(0, self.render_delay))
         batch_queue = queue.Queue()
+        render_start_t: list[float] = []
 
         def _render_worker(gpu: str):
             while True:
@@ -272,6 +324,11 @@ class StreamingOrchestrator:
                 if item is None:
                     break
                 b_idx, files_to_batch = item
+                if not render_start_t:
+                    render_start_t.append(time.monotonic())
+                t_r0 = time.monotonic()
+                if gpu == "nv":
+                    self.work_stealing.register_render_start()
                 try:
                     all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
                     full_timeline = build_timeline(self.db, self.date, self.cam_index)
@@ -288,22 +345,46 @@ class StreamingOrchestrator:
                         seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
                         all_rows
                     )
+                    r_dur = round(time.monotonic() - t_r0, 3)
                     if res_path:
                         with self.batch_lock:
                             self.batch_paths.append((b_idx, Path(res_path)))
+                        get_perf().add(
+                            PerfRecord(
+                                stage="render",
+                                file=f"batch_{b_idx}.mp4",
+                                gpu=gpu,
+                                duration=r_dur,
+                                extra={"batch_files": len(files_to_batch), "segments": len(batch_segs)},
+                            )
+                        )
                         if "render" in self.pbars:
                             self.pbars["render"].update(1)
-                            self.pbars["render"].set_postfix_str(f"Batch {b_idx} done on {gpu}")
+                            # 精准渲染阶段自身计时与剩余预估
+                            t_start = render_start_t[0] if render_start_t else t_r0
+                            el_sec = max(0.1, time.monotonic() - t_start)
+                            n_done = self.pbars["render"].n
+                            n_total = max(n_done, self.pbars["render"].total)
+                            avg_s = el_sec / max(1, n_done)
+                            rem_s = max(0, (n_total - n_done) * avg_s)
+                            el_m, el_s = divmod(int(el_sec), 60)
+                            rm_m, rm_s = divmod(int(rem_s), 60)
+                            self.pbars["render"].set_postfix_str(
+                                f"渲染实耗: {el_m:02d}:{el_s:02d} | 预估余时: {rm_m:02d}:{rm_s:02d} | 均速 {avg_s:.1f}s/批 (Batch {b_idx} on {gpu.upper()})"
+                            )
                     else:
                         self._add_error(f"render batch {b_idx} returned no output")
                 except Exception:
                     logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
                     self._add_error(f"render batch {b_idx} failed on {gpu}")
                 finally:
+                    if gpu == "nv":
+                        self.work_stealing.register_render_end()
                     batch_queue.task_done()
 
+        # 启动 2 个 NVENC 独立主力 Worker (3060Ti 高吞吐) + 1 个 QSV 辅助 Worker
         render_threads = []
-        for gpu in ["nv", "qsv"]:
+        for gpu in ["nv", "nv"]:
             t = threading.Thread(target=_render_worker, args=(gpu,), daemon=True)
             t.start()
             render_threads.append(t)
@@ -362,28 +443,21 @@ class StreamingOrchestrator:
                 self.render_batch_queue.put({"filepath": task["filepath"], "status": "FAILED"})
 
         threads = []
-        prescreen_parallel = self.config.get("detection", {}).get("prescreen_parallel", 4)
+        prescreen_parallel = self.config.get("detection", {}).get("prescreen_parallel", 8)
         prescreen_gpu_policy = self.config.get("pipeline", {}).get("prescreen_gpu_policy", "qsv_only")
         for i in range(prescreen_parallel):
             gpu = "qsv"
             if prescreen_gpu_policy == "alternating":
                 gpu = "qsv" if i % 2 == 0 else "cuda"
+            elif prescreen_gpu_policy == "cuda_only":
+                gpu = "cuda"
             t = threading.Thread(target=self._prescreen_worker, args=(gpu,), daemon=True)
             t.start()
             threads.append(t)
 
-        analysis_max_workers = self.config.get("detection", {}).get("analysis_max_workers", 4)
-        max_nv = self.config.get("hardware", {}).get("max_nv_concurrency", 3)
-        n_cuda = min(analysis_max_workers, max_nv - 1) if self.render_enabled else min(analysis_max_workers, max_nv)
-        n_cuda = max(1, n_cuda)
-        n_qsv = max(0, analysis_max_workers - n_cuda)
-
-        for _ in range(n_cuda):
-            t = threading.Thread(target=self._analysis_worker, args=("cuda",), daemon=True)
-            t.start()
-            threads.append(t)
-        for _ in range(n_qsv):
-            t = threading.Thread(target=self._analysis_worker, args=("qsv",), daemon=True)
+        analysis_max_workers = self.config.get("detection", {}).get("analysis_max_workers", 8)
+        for _ in range(analysis_max_workers):
+            t = threading.Thread(target=self._analysis_worker, daemon=True)
             t.start()
             threads.append(t)
 
@@ -427,7 +501,23 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
             return True
         db.upsert_render_task(date, cam_index, "PENDING")
 
-    logger.info("=== STREAMING pipeline %s cam%d start ===", date, cam_index)
+    all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
+    total_files = len(all_tasks)
+    total_input_dur = sum(float(t.get("file_duration") or 300.0) for t in all_tasks)
+
+    # 终端启动 Banner
+    banner = [
+        "",
+        "╔" + "═" * 68 + "╗",
+        f"║  HomeVlog 智能视频浓缩流水线 | 日期: {date} | 机位: Cam {cam_index:<16}║",
+        f"║  • 输入素材: {total_files:>3} 个监控切片 (总时长: {total_input_dur/3600:>5.2f} 小时 / {total_input_dur:>7.1f} 秒){' '*7}║",
+        f"║  • 硬件协同: Intel UHD 770 (QSV 粗筛/解码) + RTX 3060Ti (NVENC 渲染){' '*4}║",
+        "╚" + "═" * 68 + "╝",
+        "",
+    ]
+    print("\n".join(banner))
+    logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
+
     out_cfg = config.get("output", {})
     output_name = out_cfg.get("naming", "DailyVlog_{date}_cam{index}.mp4").replace("{date}", date).replace("{index}", str(cam_index))
     output_path = OUTPUT_DIR / output_name
@@ -461,12 +551,33 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         db.set_render_status(date, cam_index, "FAILED")
         return False
 
+    elapsed_wall = time.monotonic() - t_start
     if ok:
         db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
+        file_sz_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
+        speedup = (total_input_dur / elapsed_wall) if elapsed_wall > 0 else 0
+        el_m, el_s = divmod(int(elapsed_wall), 60)
+
+        # 终端完成摘要卡片
+        summary_card = [
+            "",
+            "=" * 70,
+            f"🎯 HomeVlog 流水线处理完成 | {date} cam{cam_index}",
+            "-" * 70,
+            f"• 原始素材规模 : {total_files} 个文件 ({total_input_dur/3600:.2f} 小时 / {total_input_dur:.1f} 秒)",
+            f"• 浓缩生成成片 : {output_path.name} ({file_sz_mb:.1f} MB)",
+            f"• 全流程总耗时 : {el_m:02d} 分 {el_s:02d} 秒 ({elapsed_wall:.1f}s)",
+            f"• 等效处理倍速 : {speedup:.2f}x 实时加速",
+            f"• 产物存储路径 : {output_path}",
+            "=" * 70,
+            "",
+        ]
+        print("\n".join(summary_card))
+        logger.info("Pipeline %s cam%d finished in %.1fs (%.2fx real-time)", date, cam_index, elapsed_wall, speedup)
     else:
         db.set_render_status(date, cam_index, "FAILED")
 
-    _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start)
+    _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
     return ok
 
 
@@ -480,12 +591,12 @@ def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: floa
         pass
 
 
-def run_pipeline(skip_render: bool = False) -> dict:
+def run_pipeline(skip_render: bool = False, input_dir: str | None = None) -> dict:
     db = VlogDatabase()
     monitor = get_monitor()
     monitor.start()
     try:
-        scan_directory(db)
+        scan_directory(db, input_dir=input_dir)
         groups = get_date_cam_groups(db)
         if not groups:
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
@@ -506,3 +617,12 @@ def run_pipeline(skip_render: bool = False) -> dict:
     finally:
         monitor.shutdown()
         db.close()
+
+
+__all__ = [
+    "StreamingOrchestrator",
+    "WorkStealingManager",
+    "process_date_cam",
+    "run_pipeline",
+]
+

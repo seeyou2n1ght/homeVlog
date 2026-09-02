@@ -1,11 +1,12 @@
 # ===========================================================================
-# HomeVlog 极限性能配置文件 (Target: 12600K + 3060Ti)
+# HomeVlog 极限性能配置文件 (Target: Intel i5-12600K + NVIDIA RTX 3060Ti)
 # ===========================================================================
 
 paths:
   # 输入目录: 存放按命名规范命名的监控 MP4 文件
   # 格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
-  input_dir: '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD'
+  # 本地压测默认使用 testsample/，NAS 部署可修改为 SMB UNC 路径 (如 '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD')
+  input_dir: '\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD'
   
   # 输出目录: 默认为项目根目录下的 output/
   output_dir: 'output'
@@ -15,17 +16,36 @@ paths:
 
 hardware:
   # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
-  # 3060Ti 优先，YOLO 推理与分析主路径
+  # RTX 3060Ti 专职负责 YOLO 张量批推理与 Pass 2 (NVENC) 硬件视频编码
   device: "cuda:0"
 
-  # 并发控制 (信号量限制)
-  # 消费级 NVIDIA 显卡通常限制 2-3 个并发编码会话 (NVENC)
+  # 并发控制 (信号量隔离)
+  # 消费级 NVIDIA 显卡限制并发 NVENC/NVDEC 硬件会话 (RTX 3060Ti 优化设为 3)
   max_nv_concurrency: 3
-  # QSV 硬件解码/编码并发数 (UHD 770 双 VDBox 可支撑 8 并发)
+  # QSV 硬件解码并发数 (Intel UHD 770 双 Gen12 VDBox 支撑 8 并发解码)
   max_qsv_concurrency: 8
-  # 全局最大 IO 并发数 (控制同时打开的远程文件句柄)
-  # NAS 环境建议设为 6-8 以免引起 SMB 响应抖动
+  # 全局最大 IO 并发数 (控制同时打开的远程 SMB/本地文件句柄数)
   max_io_concurrency: 8
+
+pipeline:
+  # 是否启用流式并发模式 (预筛/分析/渲染全重叠运行)
+  streaming_mode: true
+  # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
+  render_start_delay: 2
+  # 预筛 GPU 分配策略: ["qsv_only", "alternating", "cuda_only"]
+  # 默认 qsv_only: 预筛 100% 走 UHD 770，完全释放 RTX 3060Ti
+  prescreen_gpu_policy: "qsv_only"
+
+scheduler:
+  # 自适应工作窃取水位线 (Adaptive Work-Stealing Watermarks)
+  # 队列积压高水位线: 当待分析文件数 >= 该值且无渲染任务时，允许 NVDEC 协同加速
+  watermark_high: 10
+  # 队列积压低水位线: 当待分析文件数 <= 该值时，NVDEC 退出协同，回归 QSV 独占解码
+  watermark_low: 3
+  # 是否启用 NVDEC 协同解码 (与 QSV 协同抽干积压队列)
+  nvdec_cooperative: true
+  # NVDEC 最大协同解码并发数 (建议 1，避免争用显存与 PCIe 带宽)
+  max_nv_decoders: 1
 
 recovery:
   # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
@@ -39,19 +59,11 @@ recovery:
   # 渲染失败重试最大次数
   render_retry_max: 2
 
-pipeline:
-  # 是否启用流式并发模式 (预筛/分析/渲染重叠运行)
-  streaming_mode: true
-  # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
-  render_start_delay: 2
-  # 预筛 GPU 分配策略: alternating (QSV/CUDA 交替)
-  prescreen_gpu_policy: "alternating"
-
 detection:
   # [Pass 1] 快速预筛 (Prescreen)
-  prescreen_mode: "stream_fps"
+  prescreen_mode: "keyframes"
   prescreen_parallel: 8
-  prescreen_segments: 150
+  prescreen_segments: 15
   prescreen_resolution: "320x180"
   prescreen_diff_threshold: 6
   prescreen_extract_timeout: 120.0
@@ -59,8 +71,8 @@ detection:
   # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
   analysis_resolution: "416x234" # 完美对齐 YOLO 推理尺寸
-  analysis_max_workers: 10
-  # GPU 分配阈值: 待分析文件数超过此值时，QSV 也参与分析以分担 CUDA 压力
+  analysis_max_workers: 8
+  # 兼容旧配置项: GPU 分配阈值 (对齐 scheduler.watermark_high)
   qsv_fallback_threshold: 10
   
   # 自适应 FPS: 长文件降低采样率以减少解码开销
@@ -73,16 +85,72 @@ detection:
     short_max: 120
     medium_max: 600
 
-  # 早停: 连续静态 N 帧后终止解码
+  # 早停与时空置信度衰减 (Anti-Miss Early Termination)
   analysis_early_term_enabled: true
   analysis_early_term_window: 20
   analysis_early_term_threshold: 2.5
+  early_term_cooldown_guard: true
   
+  # R2: 时域滑动背景模型 (EMA Background)
+  ema_background_enabled: true
+  ema_alpha_bg: 0.05
+  ema_alpha_fg: 0.005
+  bg_diff_weight: 0.6
+  fg_threshold: 12.0
+
+  # R2: 动态空间网格 (8x8) 与抗噪过滤
+  grid_rows: 8
+  grid_cols: 8
+  cooldown_half_life: 15.0
+  min_connected_cells: 2
+  cell_noise_alpha: 0.02
+  base_noise_thresh: 1.5
+  cluster_boost: 1.2
+
   # 检测算法调优
   motion_sensitivity: 1.0
   roi_crop: [0.1, 0.12, 0.8, 0.85]
   min_motion_frames: 3
+  min_static_frames: 5
+  noise_suppress_frames: 2
   median_filter_window: 7
+  min_bitrate_kbps: 0
+
+  # R3: 音频 VAD 多模态事件唤醒 (Audio-Assisted Activity Detection)
+  audio_vad_enabled: true
+  vad_noise_margin_db: 12.0
+  vad_min_dbfs: -42.0
+  vad_window_ms: 50
+  vad_min_speech_duration: 0.3
+
+audio_vad:
+  # R3: 音频 VAD 多模态配置 (Voice Activity Detection & Multimodal Decision)
+  enabled: true
+  energy_threshold_db: 12.0  # 相对稳态底噪的唤醒门限 (dB)
+  noise_margin_db: 12.0      # 相对底噪容限 (dB)
+  min_dbfs: -42.0            # 绝对最低激活能量 (dBFS)
+  min_absolute_dbfs: -42.0   # 绝对最低激活能量 (dBFS)
+  window_ms: 50              # 短时 RMS 能量分帧窗口 (ms)
+  speech_min_dur: 0.3        # 声音事件最小有效持续时间 (s)
+  vad_override_motion: true  # 声音事件强制标记为 DYNAMIC_AUDIO 并保留原速原声
+
+segment:
+  # 最小运动片段时长 (秒): 短于此值的动作片段将被平滑吸收
+  min_motion_duration: 1.0
+  # 最小静止片段时长 (秒)
+  min_static_duration: 30.0
+  # 允许的静止间隙容差 (秒): 两个相邻运动片段间隔小于此值时直接连接
+  gap_tolerance: 0.5
+  # 静态片段抽帧基准与过渡参数
+  static_keyframe_interval: 30.0
+  keyframe_display_duration: 0.5
+  min_static_display_duration: 1.5
+  min_segment_duration: 0.1
+  # R4: 平滑变速与过渡配置
+  speed_ramping_enabled: true
+  ramp_duration_s: 1.0
+  audio_fade_duration_s: 0.15
+  timecode_osd_enabled: true
 
 yolo:
   enabled: true
@@ -96,12 +164,24 @@ yolo:
   confidence: 0.3
   sample_fps: 0.5
 
+pass2:
+  # 是否使用硬件解码渲染中间件
+  hw_decode: true
+
 render:
   # 静态片段处理模式: hybrid_keyframe (幻灯片抽帧，极低解码压力)
   static_mode: "hybrid_keyframe"
   hw_decode: true
-  batch_max_files: 4
+  batch_max_files: 8
   concat_timeout: 120
+  # R4: 动态变速过渡 (Speed Ramping)
+  speed_ramping_enabled: true
+  ramp_duration_s: 1.0
+  # R4: 音频线性淡入淡出 (Linear Audio Cross-Fade)
+  audio_fade_duration_s: 0.15
+  # R4: 真实墙钟时间码 OSD 烧录与字幕生成
+  timecode_osd_enabled: true
+  generate_subtitles: true
 
 output:
   per_camera_vlog: true

@@ -1,10 +1,14 @@
-# Python
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 env/
+venv/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -20,44 +24,82 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.venv/
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Project outputs & Local Data
+# ==========================================
+# Sensitive Information & Credentials
+# ==========================================
+.env
+.env.*
+*.key
+*.pem
+*.cert
+*.crt
+*.secret
+*.pfx
+*.p12
+*.kdbx
+credentials*
+secrets*
+
+# ==========================================
+# Project Runtime Outputs & Local Databases
+# ==========================================
 output/
 logs/
 data/
 temp/
 reports/
 inspect_out*/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
-# Models (大型二进制文件/自动生成权重)
-yolo11n.pt
-yolo11n_openvino_model/
+# ==========================================
+# Large Binary Models & Weights
+# ==========================================
+*.pt
+*.pth
 *.onnx
 *.engine
+*.bin
+*.safetensors
+yolo11n_openvino_model/
 
-# Environment / Secrets
-.env
-.venv
-.python-version
+# ==========================================
+# Large Video Test Datasets & Media Artifacts
+# ==========================================
+testsample/
+test_*.mp4
+*.mp4
+*.m4a
+*.mkv
+*.avi
+*.ts
+*.hevc
+*.264
+*.265
+pts.txt
 
-# IDEs & Tools
+# ==========================================
+# IDEs, Tools & Multi-Agent Metadata
+# ==========================================
 .vscode/
 .idea/
 .claude/
 .cursor/
+.gemini/
+.agents/
 *.swp
 *.swo
 
-# Temp / test artifacts
-test_*.mp4
-*.m4a
-pts.txt
-
-# OS
+# ==========================================
+# Operating System Artifacts
+# ==========================================
 Thumbs.db
 .DS_Store
 desktop.ini

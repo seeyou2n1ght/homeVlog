@@ -61,6 +61,16 @@ class YoloVerifier:
         
         verified_segments = []
         for seg in segments:
+            if seg.state == "DYNAMIC_AUDIO":
+                # R3 Invariant: DYNAMIC_AUDIO segments are exempted from YOLO visual demotion.
+                # Strictly preserve dynamic status and bypass visual bounding box inference.
+                logger.debug(
+                    f"YOLO EXEMPT (DYNAMIC_AUDIO) for {Path(filepath).name} at "
+                    f"{seg.start_time - seg.file_start_offset:.1f}s"
+                )
+                verified_segments.append(seg)
+                continue
+
             if seg.state != "DYNAMIC":
                 verified_segments.append(seg)
                 continue
