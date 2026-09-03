@@ -28,9 +28,11 @@ def build_segments(
     file_offset: float = 0.0,
     gap_tolerance: float = 0.5,
     apply_smoothing: bool = False,
+    pre_roll: float = 0.0,
+    post_roll: float = 0.0,
 ) -> list[Segment]:
     """
-    Convert frame-by-frame labels to contiguous segments.
+    Convert frame-by-frame labels to contiguous segments with optional pre-roll/post-roll expansion.
     frame_labels: [{time, is_motion, state, energy, ...}, ...]
     file_offset: absolute time offset of the source file (day-relative seconds)
     """
@@ -74,6 +76,48 @@ def build_segments(
         file_start_offset=file_offset,
         max_energy=seg_max_energy,
     ))
+
+    # Apply pre-roll and post-roll to dynamic segments for natural transition
+    if pre_roll > 0 or post_roll > 0:
+        total_max_t = frame_labels[-1]["time"]
+        dyn_spans = []
+        for s in segments:
+            if s.is_dynamic:
+                st = max(0.0, s.start_time - pre_roll)
+                et = min(total_max_t, s.end_time + post_roll)
+                dyn_spans.append((st, et, s.state, s.max_energy))
+
+        if dyn_spans:
+            # Merge overlapping dynamic spans
+            merged_dyn = [dyn_spans[0]]
+            for st, et, state, energy in dyn_spans[1:]:
+                last_st, last_et, last_state, last_energy = merged_dyn[-1]
+                if st <= last_et + gap_tolerance:
+                    resolved_state = "DYNAMIC" if (last_state == "DYNAMIC" or state == "DYNAMIC") else state
+                    merged_dyn[-1] = (last_st, max(last_et, et), resolved_state, max(last_energy, energy))
+                else:
+                    merged_dyn.append((st, et, state, energy))
+
+            # Reconstruct complete segment sequence with static spans in between
+            new_segments = []
+            curr_t = 0.0
+            for st, et, state, energy in merged_dyn:
+                if st > curr_t:
+                    new_segments.append(Segment(
+                        start_time=curr_t, end_time=st, state="STATIC",
+                        source_file=source_file, file_start_offset=file_offset,
+                    ))
+                new_segments.append(Segment(
+                    start_time=st, end_time=et, state=state,
+                    source_file=source_file, file_start_offset=file_offset, max_energy=energy,
+                ))
+                curr_t = et
+            if curr_t < total_max_t:
+                new_segments.append(Segment(
+                    start_time=curr_t, end_time=total_max_t, state="STATIC",
+                    source_file=source_file, file_start_offset=file_offset,
+                ))
+            segments = new_segments
 
     merged = _merge_same_state(segments, gap_tolerance)
     if apply_smoothing:

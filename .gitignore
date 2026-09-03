@@ -98,8 +98,9 @@ pts.txt
 *.swo
 
 # ==========================================
-# Operating System Artifacts
+# Operating System Artifacts & Local Backups
 # ==========================================
 Thumbs.db
 .DS_Store
 desktop.ini
+backup/

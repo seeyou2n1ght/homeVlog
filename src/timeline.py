@@ -448,14 +448,40 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
 
     all_segments.sort(key=lambda s: s.start_time)
     seg_cfg = config.get("segment", {})
-    gap_tolerance = seg_cfg.get("gap_tolerance", 0.5)
+    gap_tolerance = seg_cfg.get("gap_tolerance", 1.5)
     min_motion_dur = seg_cfg.get("min_motion_duration", 2.0)
-    min_static_dur = seg_cfg.get("min_static_duration", 30.0)
+    min_static_dur = seg_cfg.get("min_static_duration", 8.0)
 
     # 全局跨文件平滑与合并，解决边界截断问题
     merged = merge_cross_file(all_segments, gap_tolerance)
     from src.segment import _filter_short
     filtered = _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
+
+    # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
+    macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True)
+    if macro_collapse_enabled:
+        collapsed_filtered = []
+        for s in filtered:
+            if s.state == "STATIC":
+                overlapping = [
+                    fm for fm in files_meta 
+                    if fm["file_end_offset"] > s.start_time and fm["file_start_offset"] < s.end_time
+                ]
+                if len(overlapping) > 3:
+                    step = max(2, len(overlapping) // 4)
+                    selected_indices = set([0, len(overlapping) - 1] + list(range(0, len(overlapping), step)))
+                    for idx, fm in enumerate(overlapping):
+                        if idx in selected_indices:
+                            st = max(s.start_time, fm["file_start_offset"])
+                            et = min(s.end_time, fm["file_end_offset"])
+                            if et > st:
+                                collapsed_filtered.append(Segment(
+                                    start_time=st, end_time=et, state="STATIC",
+                                    source_file=fm["filepath"], file_start_offset=fm["file_start_offset"]
+                                ))
+                    continue
+            collapsed_filtered.append(s)
+        filtered = collapsed_filtered
 
     # 严格按物理文件边界切分，防止跨文件批次渲染时超出物理文件时长
     split_segs = split_segments_at_file_boundaries(filtered, files_meta)
@@ -558,21 +584,12 @@ def build_concat_filter(
         input_files[seg.input_index] = seg.filepath
 
     input_has_audio: dict[int, bool] = {}
-    try:
-        from src.ffmpeg import run_ffprobe
-        for idx, filepath in input_files.items():
-            row = next((r for r in rows if r["filepath"] == filepath), None)
-            if row and row.get("has_audio") is not None:
-                input_has_audio[idx] = bool(row["has_audio"])
-                continue
-
-            info = run_ffprobe(filepath, timeout=120.0) or {}
-            input_has_audio[idx] = any(
-                s.get("codec_type") == "audio" for s in info.get("streams", [])
-            )
-    except Exception:
-        logger.exception("ffprobe audio detection failed; fallback to silent audio")
-        input_has_audio = {idx: False for idx in input_files}
+    for idx, filepath in input_files.items():
+        row = next((r for r in rows if r["filepath"] == filepath), None)
+        if row and row.get("has_audio") is not None:
+            input_has_audio[idx] = bool(row["has_audio"])
+        else:
+            input_has_audio[idx] = False
 
     # --- Step 2: Per-file scale (once per input) ---
     scale_parts: list[str] = []

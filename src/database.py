@@ -108,15 +108,23 @@ class VlogDatabase:
                 self.conn.rollback()
                 return False
 
-    def set_prescreen_result(self, filepath: str, status: str, result_json: str = ""):
+    def set_prescreen_result(self, filepath: str, status: str, result_json: str = "", has_audio: int | None = None):
         with self._lock:
             try:
-                self.conn.execute(
-                    """UPDATE file_tasks
-                       SET prescreen_status=?, prescreen_result=?, updated_at=datetime('now')
-                       WHERE filepath=?""",
-                    (status, result_json, str(filepath)),
-                )
+                if has_audio is not None:
+                    self.conn.execute(
+                        """UPDATE file_tasks
+                           SET prescreen_status=?, prescreen_result=?, has_audio=?, updated_at=datetime('now')
+                           WHERE filepath=?""",
+                        (status, result_json, has_audio, str(filepath)),
+                    )
+                else:
+                    self.conn.execute(
+                        """UPDATE file_tasks
+                           SET prescreen_status=?, prescreen_result=?, updated_at=datetime('now')
+                           WHERE filepath=?""",
+                        (status, result_json, str(filepath)),
+                    )
                 self.conn.commit()
             except Exception as e:
                 logger.error("DB error in set_prescreen_result for %s: %s", filepath, e)

@@ -10,6 +10,12 @@ import argparse
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.utils import setup_logging, load_config, reset_semaphores

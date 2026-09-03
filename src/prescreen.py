@@ -59,8 +59,10 @@ def _prescreen_keyframes(
 ) -> dict:
     """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带即时早停机制。"""
     import av
+    import cv2
     diffs: list[float] = []
     sample_ts: list[float] = []
+    has_audio = 0
 
     if gpu == "qsv":
         from src.utils import get_qsv_semaphore
@@ -71,9 +73,10 @@ def _prescreen_keyframes(
 
     io_sem.acquire()
     try:
-        with av.open(str(filepath)) as container:
+        with av.open(str(filepath), options={"buffer_size": "2097152"}) as container:
             if not container.streams.video:
-                return {"status": "FAILED", "error": "No video stream"}
+                return {"status": "FAILED", "error": "No video stream", "has_audio": 0}
+            has_audio = 1 if len(container.streams.audio) > 0 else 0
             stream = container.streams.video[0]
             stream.codec_context.skip_frame = "NONKEY"
 
@@ -100,8 +103,8 @@ def _prescreen_keyframes(
                 if mean_luma < 50.0:
                     current_threshold = max(1.5, threshold * 0.3)
 
-                diff_prev = float(np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32))))
-                diff_first = float(np.mean(np.abs(curr_frame.astype(np.float32) - first_frame.astype(np.float32))))
+                diff_prev = float(cv2.norm(curr_frame, prev_frame, cv2.NORM_L1) / curr_frame.size)
+                diff_first = float(cv2.norm(curr_frame, first_frame, cv2.NORM_L1) / curr_frame.size)
                 d = max(diff_prev, diff_first)
                 diffs.append(d)
 
@@ -109,6 +112,7 @@ def _prescreen_keyframes(
                 if d > current_threshold:
                     return {
                         "status": "SUSPICIOUS",
+                        "has_audio": has_audio,
                         "result_json": json.dumps({
                             "mode": "keyframes",
                             "sample_ts": sample_ts,
@@ -127,17 +131,18 @@ def _prescreen_keyframes(
                     break
     except Exception as e:
         logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
-        return {"status": "FALLBACK", "error": str(e)}
+        return {"status": "FALLBACK", "error": str(e), "has_audio": has_audio}
     finally:
         io_sem.release()
 
     if not diffs:
-        return {"status": "STATIC", "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False})}
+        return {"status": "STATIC", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False})}
 
     max_diff = max(diffs)
     status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
     return {
         "status": status,
+        "has_audio": has_audio,
         "result_json": json.dumps({
             "mode": "keyframes",
             "sample_ts": sample_ts,
@@ -564,11 +569,12 @@ def _prescreen_worker(db: VlogDatabase, task_queue, config: dict, gpu: str) -> d
         ))
 
         local["done"] += 1
+        has_audio = result.get("has_audio")
         if result["status"] == "FAILED":
-            db.set_prescreen_result(filepath, "FAILED", result.get("result_json", ""))
+            db.set_prescreen_result(filepath, "FAILED", result.get("result_json", ""), has_audio=has_audio)
             local["failed"] += 1
         else:
-            db.set_prescreen_result(filepath, result["status"], result.get("result_json", ""))
+            db.set_prescreen_result(filepath, result["status"], result.get("result_json", ""), has_audio=has_audio)
             if result["status"] == "STATIC":
                 local["static"] += 1
             else:

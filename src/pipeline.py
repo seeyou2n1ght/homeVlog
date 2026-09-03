@@ -169,19 +169,17 @@ class StreamingOrchestrator:
             self.db.set_file_metadata(filepath, detector.has_audio_detected)
 
         if labels:
+            seg_cfg = self.config.get("segment", {})
             segments = build_segments(
                 labels,
                 filepath,
-                min_motion_dur=self.config.get("segment", {}).get(
-                    "min_motion_duration", 1.0
-                ),
-                min_static_dur=self.config.get("segment", {}).get(
-                    "min_static_duration", 30.0
-                ),
+                min_motion_dur=seg_cfg.get("min_motion_duration", 2.0),
+                min_static_dur=seg_cfg.get("min_static_duration", 8.0),
                 file_offset=file_start_offset,
-                gap_tolerance=self.config.get("segment", {}).get(
-                    "gap_tolerance", 0.5
-                ),
+                gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+                apply_smoothing=seg_cfg.get("apply_smoothing", False),
+                pre_roll=seg_cfg.get("pre_roll", 1.0),
+                post_roll=seg_cfg.get("post_roll", 1.5),
             )
             
             yolo_before = len(segments)
@@ -382,9 +380,9 @@ class StreamingOrchestrator:
                         self.work_stealing.register_render_end()
                     batch_queue.task_done()
 
-        # 启动 2 个 NVENC 独立主力 Worker (3060Ti 高吞吐) + 1 个 QSV 辅助 Worker
+        # 启动 1 个 NVENC 主力 Worker + 1 个 QSV 辅助 Worker (防锁争抢与饥饿)
         render_threads = []
-        for gpu in ["nv", "nv"]:
+        for gpu in ["nv", "qsv"]:
             t = threading.Thread(target=_render_worker, args=(gpu,), daemon=True)
             t.start()
             render_threads.append(t)
@@ -414,8 +412,8 @@ class StreamingOrchestrator:
                 self.pbars["render"].total += 1
                 self.pbars["render"].refresh()
 
-        batch_queue.put(None)
-        batch_queue.put(None)
+        for _ in render_threads:
+            batch_queue.put(None)
         for t in render_threads:
             t.join()
 

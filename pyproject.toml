@@ -32,3 +32,5 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
+norecursedirs = ["backup", ".venv", "venv", ".git", "temp", "output"]
