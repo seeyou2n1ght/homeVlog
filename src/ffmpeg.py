@@ -126,32 +126,3 @@ def build_hw_decode_args(
         args += ["-vframes", str(vframes)]
     args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     return args
-
-
-def build_hw_fps_extract_args(
-    input_path: str,
-    fps_rate: float,
-    width: int = 320,
-    height: int = 180,
-    gpu: str = "qsv",
-) -> list[str]:
-    """单流全速硬件解码并通过 fps 滤镜极速等距抽帧。
-    相比 multi-seek 方案，该方案只需占用 1 个硬件 session，极大保护了带宽。
-    """
-    if gpu == "qsv":
-        args = [
-            "-hwaccel", "qsv",
-            "-hwaccel_output_format", "qsv",
-            "-i", str(input_path),
-            "-vf", f"fps={fps_rate:.5f},scale_qsv=w={width}:h={height},hwdownload,format=nv12"
-        ]
-    else:
-        args = [
-            "-hwaccel", "cuda",
-            "-hwaccel_output_format", "cuda",
-            "-i", str(input_path),
-            "-vf", f"fps={fps_rate:.5f},scale_cuda={width}:{height},hwdownload,format=nv12"
-        ]
-        
-    args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-    return args

@@ -36,6 +36,7 @@ class StreamingOrchestrator:
         cam_index: int,
         config: dict,
         render_enabled: bool = True,
+        dashboard_enabled: bool = True,
     ):
         self.db = db
         self.date = date
@@ -549,7 +550,7 @@ class StreamingOrchestrator:
         return final_paths
 
 
-def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: bool = False) -> bool:
+def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: bool = False, dashboard_enabled: bool = True) -> bool:
     config = load_config()
     monitor = get_monitor()
     t_start = time.monotonic()
@@ -581,7 +582,7 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     output_name = out_cfg.get("naming", "DailyVlog_{date}_cam{index}.mp4").replace("{date}", date).replace("{index}", str(cam_index))
     output_path = OUTPUT_DIR / output_name
 
-    orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render)
+    orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render, dashboard_enabled=dashboard_enabled)
     try:
         with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
             batch_paths = orchestrator.run()
@@ -650,7 +651,7 @@ def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: floa
         pass
 
 
-def run_pipeline(skip_render: bool = False, input_dir: str | None = None) -> dict:
+def run_pipeline(skip_render: bool = False, input_dir: str | None = None, dashboard_enabled: bool = True) -> dict:
     db = VlogDatabase()
     monitor = get_monitor()
     monitor.start()
@@ -664,7 +665,7 @@ def run_pipeline(skip_render: bool = False, input_dir: str | None = None) -> dic
             if not check_disk_space(OUTPUT_DIR, min_gb=20):
                 break
             try:
-                if process_date_cam(db, date, cam_index, skip_render=skip_render):
+                if process_date_cam(db, date, cam_index, skip_render=skip_render, dashboard_enabled=dashboard_enabled):
                     ok += 1
                 else:
                     failed += 1

@@ -1,7 +1,9 @@
 import logging
-import subprocess
 import time
 import threading
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 
 logger = logging.getLogger("homevlog")
@@ -24,8 +26,24 @@ class YoloVerifier:
             self.enabled = False
             return
             
-        model_path = yolo_cfg.get("model_path", "yolo11n.pt")
+        raw_path = yolo_cfg.get("model_path", "models/yolo11n.pt")
+        from src.utils import PROJECT_ROOT
+        p = Path(raw_path)
+        if not p.is_absolute():
+            # 依次探测: 相对当前工作目录 -> 相对 PROJECT_ROOT -> 相对 PROJECT_ROOT/models
+            if p.exists():
+                model_path = str(p)
+            elif (PROJECT_ROOT / p).exists():
+                model_path = str(PROJECT_ROOT / p)
+            elif (PROJECT_ROOT / "models" / p.name).exists():
+                model_path = str(PROJECT_ROOT / "models" / p.name)
+            else:
+                model_path = str(PROJECT_ROOT / p)
+        else:
+            model_path = str(p)
+
         self.target_classes = set(yolo_cfg.get("target_classes", [0, 1, 2, 3, 15, 16]))
+
         self.confidence = yolo_cfg.get("confidence", 0.25)
         self.sample_fps = yolo_cfg.get("sample_fps", 0.5)
         self.skip_energy_threshold = yolo_cfg.get("skip_energy_threshold", 12.0)
@@ -113,9 +131,9 @@ class YoloVerifier:
                     if isinstance(buf_item, (bytes, bytearray, np.ndarray)) and getattr(buf_item, "ndim", 0) == 1:
                         img = cv2.imdecode(np.frombuffer(buf_item, dtype=np.uint8), cv2.IMREAD_COLOR)
                         if img is not None:
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                             all_frames.append(img)
                             frame_to_seg_idx.append(seg_idx)
+
                     elif isinstance(buf_item, np.ndarray):
                         all_frames.append(buf_item)
                         frame_to_seg_idx.append(seg_idx)
@@ -126,6 +144,10 @@ class YoloVerifier:
 
         # 3. 在 torch.inference_mode() 保护下执行全局单次 Batch 前向推理
         seg_has_target: dict[int, bool] = {s_idx: False for s_idx, _, _, _ in segs_to_verify}
+        # 暗光/红外微光场景自适应检测：若样本帧平均灰度 < 50，调低 person 判定门槛至 0.15，防婴儿被误杀
+        is_night_scene = bool(np.mean([np.mean(f) for f in all_frames[:min(5, len(all_frames))]]) < 50.0)
+        target_conf = 0.15 if is_night_scene else self.confidence
+
         t0 = time.monotonic()
         try:
             import torch
@@ -137,9 +159,10 @@ class YoloVerifier:
                         confs = r.boxes.conf.cpu().numpy()
                         s_idx = frame_to_seg_idx[frame_i]
                         for cls, conf in zip(classes, confs):
-                            if int(cls) in self.target_classes and conf >= self.confidence:
+                            if int(cls) in self.target_classes and conf >= target_conf:
                                 seg_has_target[s_idx] = True
                                 break
+
             elapsed = time.monotonic() - t0
             logger.debug(
                 f"YOLO Global Batch inference for {Path(filepath).name}: "
@@ -197,7 +220,4 @@ class YoloVerifier:
             logger.error(f"YOLO single batch failed: {e}")
             return True
         return False
-
-from pathlib import Path
-from typing import Any
 

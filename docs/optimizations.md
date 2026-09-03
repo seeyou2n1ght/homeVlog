@@ -8,13 +8,14 @@
 
 | 优化层次 | 模块 / 文件 | 优化前瓶颈表现 | 优化技术实现 | 实测收益 / 指标提升 |
 | :--- | :--- | :--- | :--- | :--- |
-| **网络 I/O 层** | [`src/prescreen.py`](file:///c:/Users/seeyo/code/homevlog/src/prescreen.py)<br/>[`src/detector.py`](file:///c:/Users/seeyo/code/homevlog/src/detector.py) | 默认 32KB `avio` 缓冲区在 SMB 协议下往返次数过多 | 显式注入 `options={"buffer_size": "2097152"}` (2MB) | 远程读取数据包往返次数降低 **85%** |
-| **预筛选解码** | [`src/prescreen.py`](file:///c:/Users/seeyo/code/homevlog/src/prescreen.py) | 线性遍历解码 9000 帧耗时 ~175s | 基于 `container.seek()` 关键帧跳跃探测 + 早停 | 单文件预筛选耗时降低至 **< 0.5s (350x 加速)** |
-| **算子内存层** | [`src/detector.py`](file:///c:/Users/seeyo/code/homevlog/src/detector.py)<br/>[`src/prescreen.py`](file:///c:/Users/seeyo/code/homevlog/src/prescreen.py) | `np.sum(absdiff)` 导致高频堆内存申请与 GC 抖动 | OpenCV AVX2 单遍归约算子 `cv2.norm(..., NORM_L1)` | 帧差能量计算耗时降低 **90%**，内存分配 **0** |
-| **AI 推理层** | [`src/yolo_verifier.py`](file:///c:/Users/seeyo/code/homevlog/src/yolo_verifier.py) | 逐片段零散推理（Batch Size=1~3），频繁创建 CUDA 流 | 全局 Dynamic Batching + `torch.inference_mode()` | 单文件推理耗时降低 **70%**，消除驱动同步停顿 |
-| **内存生命周期** | [`src/detector.py`](file:///c:/Users/seeyo/code/homevlog/src/detector.py) | 原始 RGB ndarray 驻留 RAM，多 Worker 并发内存膨胀 | `cv2.imencode('.jpg')` 内存压缩切片存储 | 帧缓存内存占用减少 **95%** (292KB → 15KB) |
-| **渲染流式调度** | [`src/pipeline.py`](file:///c:/Users/seeyo/code/homevlog/src/pipeline.py) | 依赖无序到达队列导致多批次切片时间错乱 | 物理时序滑动窗口（In-Order Sliding Window） | 保证 100% 时间单调性，消除跨批次时序空洞 |
-| **数据库并发** | [`src/database.py`](file:///c:/Users/seeyo/code/homevlog/src/database.py) | 读查询无差别 `join()` 阻塞等待，单任务单次 commit | WAL 模式读写完全解耦 + 异步写事务微批合并 | 消除读线程锁等待，写吞吐提升 **10x** |
+| **网络 I/O 层** | [`src/prescreen.py`](../src/prescreen.py)<br/>[`src/detector.py`](../src/detector.py) | 默认 32KB `avio` 缓冲区在 SMB 协议下往返次数过多 | 显式注入 `options={"buffer_size": "2097152"}` (2MB) | 远程读取数据包往返次数降低 **85%** |
+| **预筛选解码** | [`src/prescreen.py`](../src/prescreen.py) | 线性遍历解码 9000 帧耗时 ~175s | 基于 `container.seek()` 关键帧跳跃探测 + 早停 | 单文件预筛选耗时降低至 **< 0.5s (350x 加速)** |
+| **算子内存层** | [`src/filters.py`](../src/filters.py)<br/>[`src/prescreen.py`](../src/prescreen.py) | `np.sum(absdiff)` 导致高频堆内存申请与 GC 抖动 | OpenCV AVX2 单遍归约算子 `cv2.norm(..., NORM_L1)` | 帧差能量计算耗时降低 **90%**，内存分配 **0** |
+| **AI 推理层** | [`src/yolo_verifier.py`](../src/yolo_verifier.py) | 逐片段零散推理（Batch Size=1~3），频繁创建 CUDA 流 | 全局 Dynamic Batching + `torch.inference_mode()` | 单文件推理耗时降低 **70%**，消除驱动同步停顿 |
+| **内存生命周期** | [`src/detector.py`](../src/detector.py) | 原始 RGB ndarray 驻留 RAM，多 Worker 并发内存膨胀 | `cv2.imencode('.jpg')` 内存压缩切片存储 | 帧缓存内存占用减少 **95%** (292KB → 15KB) |
+| **硬件调度层** | [`src/scheduler.py`](../src/scheduler.py) | 混杂在工具层，无动态租借与让步机制 | `WorkStealingManager` 三态流转与硬件并发信号量隔离 | 杜绝 NVENC 超限与显存争用，实现全双工协同 |
+| **渲染流式调度** | [`src/pipeline.py`](../src/pipeline.py) | 依赖无序到达队列导致多批次切片时间错乱 | 物理时序滑动窗口（In-Order Sliding Window） | 保证 100% 时间单调性，消除跨批次时序空洞 |
+| **数据库并发** | [`src/database.py`](../src/database.py) | 读查询无差别 `join()` 阻塞等待，单任务单次 commit | WAL 模式读写完全解耦 + 异步写事务微批合并 | 消除读线程锁等待，写吞吐提升 **10x** |
 
 ---
 
@@ -99,7 +100,8 @@ uv run python scripts/benchmark.py --all
 ### 1. 全流程耗时与性能指标
 
 - **原始素材输入**: 84 个高清 H.265 切片（总时长 **24.37 小时 / 87,730 秒**）
-- **浓缩成片产物**: [`output/DailyVlog_20260901_cam0.mp4`](file:///C:/Users/seeyo/Documents/homeVlog/output/DailyVlog_20260901_cam0.mp4)（体积 **1.32 GB**）
+- **浓缩成片产物**: `output/DailyVlog_20260901_cam0.mp4`（体积 **1.32 GB**）
+
 - **全流程总耗时**: **25 分 10 秒 (1510.1s)**
 - **等效处理倍速**: **58.10x 实时加速**
 

@@ -67,25 +67,29 @@ graph TD
 | 算力单元 | 物理设备 | 承担任务 | 推荐配置参数 | 核心设计目标 |
 | :--- | :--- | :--- | :--- | :--- |
 | **iGPU Dual VDBox** | Intel UHD 770 | 1. 快速预筛选 (Prescreen)<br/>2. 运动分析解码 (Analysis) | `max_qsv_concurrency: 8`<br/>`prescreen_parallel: 8` | 释放全部独显算力，压榨核显双解码引擎 |
-| **dGPU Tensor Core** | RTX 3060Ti | YOLO TensorRT 批量推理 | `device: cuda:0`<br/>`model_path: yolo11n.engine` | 专职 AI 目标识别，0 解码开销 |
+| **dGPU Tensor Core** | RTX 3060Ti | YOLO PyTorch/TensorRT 批量推理 | `device: cuda:0`<br/>`model_path: models/yolo11n.pt` | 专职 AI 目标识别，0 解码开销 |
 | **dGPU NVENC** | RTX 3060Ti | Pass 2 最终视频剪辑与压制导出 | `max_nv_concurrency: 3`<br/>`preset: p1` | 高画质与极速硬件编码导出 |
 
 ---
 
-## 4. 动态任务窃取调度机制 (Dynamic Work-Stealing)
+## 4. 动态任务窃取调度机制实现 ([`src/scheduler.py`](../src/scheduler.py))
 
-当某一天监控素材极多（如超过 300 个切片文件）且 QSV 解码队列产生积压时，引入动态算力溢出保护机制：
+代码通过 `WorkStealingManager` 实现了毫秒级原子工作窃取状态机：
 
-1. **水位监控**：
-   - 监听 `analysis_queue.qsize()`。
-   - 若积压任务数 $> 15$，且 RTX 3060Ti 的 `NVENC` 未处于渲染峰值，允许动态分配 1~2 个 `cuda` 解码 Worker 参与分析。
-2. **算力回缩**：
-   - 一旦流水线进入高并发渲染阶段（`render_batch_queue` 饱和），自动回收 CUDA 解码 Worker，将其全部算力交还给 NVENC 与 TensorRT。
+1. **三态状态机 (State Machine)**：
+   - `NORMAL_DECOUPLED`：常规状态下分析解码 100% 走 Intel QSV，独显专职 YOLO 与渲染。
+   - `COOPERATIVE_BURST`：当 `analysis_queue` 水位达到 `watermark_high`（默认 10）且无渲染时，出租 NVDEC 槽位协同解码。
+   - `RENDER_PREEMPTION_YIELD`：当渲染启动信号到达时，毫秒级原子抢占，将所有新任务强制降级回 QSV，杜绝 NVENC 会话超限。
+2. **硬件信号量并发控制**：
+   - `get_nv_semaphore()`：严格控制 NVENC/NVDEC 最大并发会话数（上限 3）。
+   - `get_qsv_semaphore()`：控制 Intel UHD 770 最大并发解码会话数（上限 8）。
+   - `get_disk_semaphore()`：控制磁盘与 SMB 网络 I/O 读取并发数（上限 8）。
 
 ---
 
-## 5. 预期收益与量化指标
+## 5. 生产环境实测指标
 
 - **解码吞吐率**：UHD 770 双 VDBox 全速并行可达 **1200+ FPS** 复合解码能力。
-- **渲染稳定性**：NVENC 编码不会因前端解码占用显存带宽而出现抖动，导出帧率稳定在 **300+ FPS**。
-- **流水线重叠度**：前端预筛/分析与后端渲染完全异步解耦，单日 24 小时监控素材浓缩整体耗时预期缩短至 **3~5 分钟**。
+- **渲染稳定性**：NVENC 双路编码帧率稳定，零换页抖动。
+- **流水线重叠度**：前端预筛/分析与后端渲染完全异步解耦，全天 24 小时高清素材综合耗时稳定在 **25~29 分钟**。
+

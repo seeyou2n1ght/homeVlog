@@ -3,16 +3,21 @@
 # ===========================================================================
 
 paths:
-  # 输入目录: 存放按命名规范命名的监控 MP4 文件
-  # 格式: {cam_index:02d}_{YYYYMMDDHHMMSS}_{YYYYMMDDHHMMSS}.mp4
-  # 本地压测默认使用 testsample/，NAS 部署可修改为 SMB UNC 路径 (如 '\\192.168.5.8\homelab\XiaomiCamera_00_B888805AA3CD')
-  input_dir: '\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD'
-  
-  # 输出目录: 默认为项目根目录下的 output/
-  output_dir: 'output'
-  
-  # 临时目录: 用于存放渲染批次中间件，建议放在高速 SSD 上
-  temp_dir: 'temp'
+  # 输入目录: 存放监控 MP4 素材文件 (可配置单路径字符串，或多路径列表)
+  # 支持跨 NAS 共享目录与本地磁盘同时配置，系统按顺序逐一精准扫描
+  input_dirs:
+    - '\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD'
+    # - '\\192.168.5.8\LyuShare\XiaomiCamera_02_6490C12345EF' # 多机位示例
+    # - 'D:\LocalFootage\FrontDoor_Camera'                  # 本地机位示例
+
+
+# 机位识别与人类友好别名映射
+# 系统自动根据素材目录名解析小米摄像头 MAC 地址 (如 XiaomiCamera_01_B888805AA3CD 提取出 B888805AA3CD)
+# 可以在此处将 MAC 地址映射为人类可读的机位名称，成片将自动命名为 DailyVlog_{date}_{camera}.mp4
+cameras:
+  B888805AA3CD: "baby_room"       # 婴儿房机位 (红外微光夜视敏感模式)
+  # 6490C12345EF: "living_room"   # 客厅机位示例
+  # 7811DC654321: "front_door"    # 门口机位示例
 
 hardware:
   # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
@@ -20,16 +25,15 @@ hardware:
   device: "cuda:0"
 
   # 并发控制 (信号量隔离)
-  # 消费级 NVIDIA 显卡限制并发 NVENC/NVDEC 硬件会话 (RTX 3060Ti 优化设为 3)
-  max_nv_concurrency: 3
+  # 消费级 NVIDIA 显卡限制并发会话: 设为 2 (3060Ti 8GB 显存黄金并发，留出 2GB 安全空间，杜绝换页)
+  max_nv_concurrency: 2
   # QSV 硬件解码并发数 (Intel UHD 770 双 Gen12 VDBox 支撑 8 并发解码)
   max_qsv_concurrency: 8
   # 全局最大 IO 并发数 (控制同时打开的远程 SMB/本地文件句柄数)
   max_io_concurrency: 8
 
+
 pipeline:
-  # 是否启用流式并发模式 (预筛/分析/渲染全重叠运行)
-  streaming_mode: true
   # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
   render_start_delay: 2
   # 预筛 GPU 分配策略: ["qsv_only", "alternating", "cuda_only"]
@@ -46,6 +50,8 @@ scheduler:
   nvdec_cooperative: true
   # NVDEC 最大协同解码并发数 (建议 1，避免争用显存与 PCIe 带宽)
   max_nv_decoders: 1
+  # 冷启动破冰: 渲染任务就绪前优先用 NVDEC 加速分析队列消费 (实测 NVDEC 解码速度是 QSV 的 2-3 倍)
+  cold_start_burst: true
 
 recovery:
   # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
@@ -63,27 +69,36 @@ detection:
   # [Pass 1] 快速预筛 (Prescreen)
   prescreen_mode: "keyframes"
   prescreen_parallel: 8
-  prescreen_segments: 15
+  prescreen_segments: 10
   prescreen_resolution: "320x180"
-  prescreen_diff_threshold: 6
+  prescreen_diff_threshold: 8.0
+
   prescreen_extract_timeout: 120.0
+
+  # 预筛选阈值自适应标定: 首次运行对少量文件做全量分析，自动计算最优阈值分界点
+  # 后续文件使用标定后的阈值，避免固定阈值在不同光照条件下误判
+  prescreen_auto_calibrate: true
+  prescreen_calibrate_samples: 6
+
 
   # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
   analysis_resolution: "416x234" # 完美对齐 YOLO 推理尺寸
   analysis_max_workers: 8
-  # 兼容旧配置项: GPU 分配阈值 (对齐 scheduler.watermark_high)
-  qsv_fallback_threshold: 10
+
   
   # 自适应 FPS: 长文件降低采样率以减少解码开销
+  # 超长静止文件 (夜间) 降至 0.5fps 可再省 30-40% 解码时间，室内监控动作速度下不会漏检
   analysis_fps_adaptive: true
   analysis_fps_tiers:
     short: 5
     medium: 2
     long: 1
+    ultra_long: 0.5
   analysis_fps_tier_thresholds:
     short_max: 120
     medium_max: 600
+    long_max: 1800
 
   # 早停与时空置信度衰减 (Anti-Miss Early Termination)
   analysis_early_term_enabled: true
@@ -114,25 +129,15 @@ detection:
   min_static_frames: 5
   noise_suppress_frames: 2
   median_filter_window: 7
-  min_bitrate_kbps: 0
 
-  # R3: 音频 VAD 多模态事件唤醒 (Audio-Assisted Activity Detection)
-  audio_vad_enabled: true
-  vad_noise_margin_db: 12.0
-  vad_min_dbfs: -42.0
-  vad_window_ms: 50
-  vad_min_speech_duration: 0.3
 
 audio_vad:
   # R3: 音频 VAD 多模态配置 (Voice Activity Detection & Multimodal Decision)
   enabled: true
-  energy_threshold_db: 12.0  # 相对稳态底噪的唤醒门限 (dB)
   noise_margin_db: 12.0      # 相对底噪容限 (dB)
   min_dbfs: -42.0            # 绝对最低激活能量 (dBFS)
-  min_absolute_dbfs: -42.0   # 绝对最低激活能量 (dBFS)
   window_ms: 50              # 短时 RMS 能量分帧窗口 (ms)
   speech_min_dur: 0.3        # 声音事件最小有效持续时间 (s)
-  vad_override_motion: true  # 声音事件强制标记为 DYNAMIC_AUDIO 并保留原速原声
 
 segment:
   # 最小运动片段时长 (秒): 短于此值的动作片段将被平滑吸收
@@ -149,34 +154,28 @@ segment:
   keyframe_display_duration: 0.5
   min_static_display_duration: 1.5
   min_segment_duration: 0.1
-  # R4: 平滑变速与过渡配置
-  speed_ramping_enabled: true
-  ramp_duration_s: 1.0
-  audio_fade_duration_s: 0.25
-  timecode_osd_enabled: false
 
 yolo:
   enabled: true
   streaming_verify: true
   # 触发式推理: 如果动作能量超过此值，认为显著运动，直接跳过 YOLO 推理
   skip_energy_threshold: 12.0
-  model_path: "yolo11n.pt"
+  model_path: "models/yolo11n.pt"
   device: "cuda:0"
   # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
   confidence: 0.3
   sample_fps: 0.5
 
-pass2:
-  # 是否使用硬件解码渲染中间件
-  hw_decode: true
-
 render:
+
   # 静态片段处理模式: hybrid_keyframe (幻灯片抽帧，极低解码压力)
   static_mode: "hybrid_keyframe"
-  hw_decode: true
   batch_max_files: 8
-  concat_timeout: 120
+  # 输出 QC 校验门: 渲染完成后自动校验帧数/时长与预期匹配度，不匹配则标记告警
+  qc_validate: true
+  # 动态批次大小: 根据批次内 DYNAMIC segment 比例自适应调整批次大小
+  dynamic_batch_sizing: true
   # R4: 动态变速过渡 (Speed Ramping)
   speed_ramping_enabled: true
   ramp_duration_s: 1.0
@@ -184,24 +183,25 @@ render:
   audio_fade_duration_s: 0.25
   # R4: 真实墙钟时间码 OSD 烧录与字幕生成 (视频左上角已有自带水印，默认关闭)
   timecode_osd_enabled: false
-  generate_subtitles: false
+  # 生成 SRT 字幕文件: 将播放时间戳映射回真实监控墙钟时间，方便定位事件
+  generate_subtitles: true
 
 output:
-  per_camera_vlog: true
   naming: "DailyVlog_{date}_cam{index}.mp4"
   resolution: "1920x1080"
   fps: 20
 
   # 极限性能编码参数
+  # cq 32: 在 1080p DailyVlog 浓缩场景下画质足够，比 cq 30 编码速度快 10-15%
   nv:
     codec: "hevc_nvenc"
     preset: "p1"
-    cq: 30
+    cq: 32
     maxrate: "3M"
   qsv:
     codec: "hevc_qsv"
     preset: "veryfast"
-    global_quality: 30
+    global_quality: 32
     maxrate: "3M"
   audio:
     codec: "aac"

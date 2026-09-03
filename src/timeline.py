@@ -135,51 +135,6 @@ def calculate_speed_ramping_curve(
     )
 
 
-def evaluate_pts_easing(
-    t: float,
-    dur: float,
-    v_fast: float,
-    has_ramp_in: bool,
-    has_ramp_out: bool,
-    ramp_duration_s: float = 1.0,
-) -> tuple[float, float]:
-    """
-    Evaluate output display PTS P(t) and instantaneous speed v(t) for given source time t in [0, dur].
-    Returns (display_pts, instantaneous_speed).
-    """
-    v_fast = max(1.0, float(v_fast))
-    ramp_info = calculate_speed_ramping_curve(dur, v_fast, has_ramp_in, has_ramp_out, ramp_duration_s)
-    v_fast = ramp_info.v_fast
-    s_in = ramp_info.ramp_in_src_dur
-    s_cruise = ramp_info.cruise_src_dur
-    s_out = ramp_info.ramp_out_src_dur
-    s_mid = s_in + s_cruise
-
-    disp_in = s_in * (1.0 + 1.0 / v_fast) / 2.0 if s_in > 0 else 0.0
-    disp_cruise = s_cruise / v_fast if s_cruise > 0 else 0.0
-
-    t = max(0.0, min(dur, t))
-
-    if s_in > 0 and t < s_in:
-        # Ramp-in zone: accelerating from 1.0 to v_fast
-        inv_speed = 1.0 - (1.0 - 1.0 / v_fast) * (t / s_in)
-        pts = t * (1.0 - (1.0 - 1.0 / v_fast) * (t / (2.0 * s_in)))
-        speed = 1.0 / inv_speed if inv_speed > 0 else 1.0
-        return pts, speed
-    elif t <= s_mid:
-        # Cruising zone: constant v_fast
-        delta = t - s_in
-        pts = disp_in + delta / v_fast
-        return pts, v_fast
-    else:
-        # Ramp-out zone: decelerating from v_fast to 1.0
-        delta = t - s_mid
-        inv_speed = (1.0 / v_fast) + (1.0 - 1.0 / v_fast) * (delta / s_out) if s_out > 0 else 1.0
-        pts = disp_in + disp_cruise + delta * ((1.0 / v_fast) + (1.0 - 1.0 / v_fast) * (delta / (2.0 * s_out)))
-        speed = 1.0 / inv_speed if inv_speed > 0 else 1.0
-        return pts, speed
-
-
 def build_timecode_drawtext_filter(
     start_unix: float,
     speed_factor: float = 1.0,
@@ -583,15 +538,16 @@ def build_concat_filter(
         timecode_osd = False
 
     if scale_mode == "cuda":
-        scale_filter = f"hwupload_cuda,scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
+        scale_filter = f"hwupload_cuda,scale_cuda={output_width}:{output_height},hwdownload,format=nv12,fps={output_fps}"
     elif scale_mode == "cuda_passthrough":
-        scale_filter = f"scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
+        scale_filter = f"scale_cuda={output_width}:{output_height},hwdownload,format=nv12,fps={output_fps}"
     elif scale_mode == "qsv":
-        scale_filter = f"scale_qsv=w={output_width}:h={output_height},hwdownload,format=nv12"
+        scale_filter = f"scale_qsv=w={output_width}:h={output_height},hwdownload,format=nv12,fps={output_fps}"
     elif scale_mode == "skip":
-        scale_filter = None
+        scale_filter = f"fps={output_fps}"
     else:
-        scale_filter = f"scale={output_width}:{output_height}"
+        scale_filter = f"scale={output_width}:{output_height},fps={output_fps}"
+
 
     use_keyframe_slideshow = (scale_mode == "cpu")
     if render_cfg.get("static_mode") == "hybrid_keyframe":

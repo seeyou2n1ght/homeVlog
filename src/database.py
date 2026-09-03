@@ -131,18 +131,17 @@ class VlogDatabase:
                 self.conn.rollback()
 
     def get_prescreen_pending(self, date: str, cam_index: int) -> list[dict]:
-        with self._lock:
-            try:
-                rows = self.conn.execute(
-                    """SELECT * FROM file_tasks
-                       WHERE date=? AND cam_index=? AND prescreen_status='PENDING'
-                       ORDER BY file_start_time""",
-                    (date, cam_index),
-                ).fetchall()
-                return [dict(r) for r in rows]
-            except Exception as e:
-                logger.error("DB error in get_prescreen_pending: %s", e)
-                return []
+        try:
+            rows = self.conn.execute(
+                """SELECT * FROM file_tasks
+                   WHERE date=? AND cam_index=? AND prescreen_status='PENDING'
+                   ORDER BY file_start_time""",
+                (date, cam_index),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error("DB error in get_prescreen_pending: %s", e)
+            return []
 
     def set_analysis_result(self, filepath: str, status: str, segments_json: str = ""):
         with self._lock:
@@ -274,6 +273,8 @@ class VlogDatabase:
             except Exception as e:
                 logger.error("DB error in get_pending_file_count_for_date: %s", e)
                 return 0
+
+
 
     def close(self):
         with self._lock:

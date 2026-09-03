@@ -17,206 +17,14 @@ DB_PATH = PROJECT_ROOT / "data" / "vlog.db"
 SETTINGS: dict = {}
 _config_lock = threading.Lock()
 
-_disk_semaphore: threading.Semaphore | None = None
-_nv_semaphore: threading.Semaphore | None = None
-_qsv_semaphore: threading.Semaphore | None = None
-_io_lock = threading.Lock()
+from src.scheduler import (
+    reset_semaphores,
+    get_disk_semaphore,
+    get_nv_semaphore,
+    get_qsv_semaphore,
+    WorkStealingManager,
+)
 
-def reset_semaphores() -> None:
-    """Reset cached semaphores to allow reloading configuration or clean testing."""
-    global _disk_semaphore, _nv_semaphore, _qsv_semaphore
-    with _io_lock:
-        _disk_semaphore = None
-        _nv_semaphore = None
-        _qsv_semaphore = None
-
-def get_disk_semaphore() -> threading.Semaphore:
-    global _disk_semaphore
-    if _disk_semaphore is None:
-        with _io_lock:
-            if _disk_semaphore is None:
-                config = load_config()
-                limit = config.get("hardware", {}).get("max_io_concurrency", 8)
-                _disk_semaphore = threading.Semaphore(limit)
-    return _disk_semaphore
-
-def get_nv_semaphore() -> threading.Semaphore:
-    global _nv_semaphore
-    if _nv_semaphore is None:
-        with _io_lock:
-            if _nv_semaphore is None:
-                config = load_config()
-                # 默认限制并发的 NVENC/NVDEC 会话数为 3 (针对 3060Ti 优化)
-                limit = config.get("hardware", {}).get("max_nv_concurrency", 3)
-                _nv_semaphore = threading.Semaphore(limit)
-    return _nv_semaphore
-
-def get_qsv_semaphore() -> threading.Semaphore:
-    global _qsv_semaphore
-    if _qsv_semaphore is None:
-        with _io_lock:
-            if _qsv_semaphore is None:
-                config = load_config()
-                # 默认 QSV 并发限制 (针对 12600K 双 VDBox 优化)
-                limit = config.get("hardware", {}).get("max_qsv_concurrency", 8)
-                _qsv_semaphore = threading.Semaphore(limit)
-    return _qsv_semaphore
-
-
-class WorkStealingManager:
-    """
-    异构硬件自适应工作窃取调度器 (Heterogeneous Adaptive Work-Stealing Scheduler)
-    
-    协调 Intel UHD 770 (QSV) 与 NVIDIA RTX 3060Ti (NVDEC/NVENC/Tensor Core) 的算力解耦与动态协同：
-    - NORMAL_DECOUPLED: Prescreen & Analysis 默认 100% 走 QSV，3060Ti 专职 YOLO 与 NVENC 渲染。
-    - COOPERATIVE_BURST: 当 analysis_queue 积压超过高水位 (watermark_high) 且 3060Ti 未渲染时，
-      动态调度 NVDEC ("cuda") 协同解码抽干队列。
-    - RENDER_PREEMPTION_YIELD: 当 Pass 2 NVENC 批次渲染启动时，强制让步 NVDEC，
-      所有新增分析任务降级回 QSV，杜绝 NVENC 会话超限与显存/PCIe带宽争用。
-    """
-
-    def __init__(self, config: dict | None = None):
-        if config is None:
-            config = load_config()
-        self.config = config
-
-        sched_cfg = config.get("scheduler", {})
-        pipe_cfg = config.get("pipeline", {})
-        det_cfg = config.get("detection", {})
-        hw_cfg = config.get("hardware", {})
-
-        self.watermark_high: int = sched_cfg.get(
-            "watermark_high",
-            pipe_cfg.get("watermark_high", det_cfg.get("qsv_fallback_threshold", 10)),
-        )
-        self.watermark_low: int = sched_cfg.get(
-            "watermark_low",
-            pipe_cfg.get("watermark_low", 3),
-        )
-        self.nvdec_cooperative: bool = sched_cfg.get(
-            "nvdec_cooperative",
-            pipe_cfg.get("nvdec_cooperative", True),
-        )
-        self.max_nv_decoders: int = sched_cfg.get(
-            "max_nv_decoders",
-            hw_cfg.get("max_nv_decoders", 1),
-        )
-        self.device: str = hw_cfg.get("device", "cuda:0")
-        self.cold_start_burst: bool = sched_cfg.get("cold_start_burst", False)
-
-        self._lock = threading.Lock()
-        self._render_active_count = 0
-        self._active_nv_decoders = 0
-        self._state = "NORMAL_DECOUPLED"
-
-    def enable_cold_start_burst(self) -> None:
-        """激活冷启动破冰模式：在渲染任务就绪前优先调用 NVDEC 协同解码冲刷队列。"""
-        with self._lock:
-            self.cold_start_burst = True
-
-    def disable_cold_start_burst(self) -> None:
-        """停用冷启动破冰模式，回归常规水位线管控。"""
-        with self._lock:
-            self.cold_start_burst = False
-
-    def register_render_start(self) -> None:
-        """Pass 2 NVENC 渲染批次开始信号：阻断 NVDEC 工作窃取，优先保证 NVENC 编码会话与带宽。"""
-        with self._lock:
-            self._render_active_count += 1
-            self.cold_start_burst = False
-            self._state = "RENDER_PREEMPTION_YIELD"
-
-    def register_render_end(self) -> None:
-        """Pass 2 NVENC 渲染批次结束信号：恢复 NVDEC 工作窃取能力。"""
-        with self._lock:
-            self._render_active_count = max(0, self._render_active_count - 1)
-            if self._render_active_count == 0:
-                self._state = "NORMAL_DECOUPLED"
-
-    @property
-    def is_render_active(self) -> bool:
-        with self._lock:
-            return self._render_active_count > 0
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return self._state
-
-    @property
-    def active_nv_decoders(self) -> int:
-        with self._lock:
-            return self._active_nv_decoders
-
-    def get_analysis_device(self, queue_size: int, is_render_active: bool | None = None) -> str:
-        """
-        根据队列水位与渲染状态决策当前分析任务的解码硬件设备。
-        
-        返回值: "qsv" | "cuda"
-        """
-        with self._lock:
-            render_active = (
-                is_render_active if is_render_active is not None else (self._render_active_count > 0)
-            )
-
-            if render_active:
-                self._state = "RENDER_PREEMPTION_YIELD"
-                return "qsv"
-
-            if not self.nvdec_cooperative or "cuda" not in self.device.lower():
-                self._state = "NORMAL_DECOUPLED"
-                return "qsv"
-
-            # 冷启动破冰协同条件：显式启用了 cold_start_burst 且队列非空且无渲染运行
-            is_cold_burst = (self.cold_start_burst and self._render_active_count == 0 and queue_size >= 1)
-            is_queue_backlog = (queue_size >= self.watermark_high)
-
-            if is_cold_burst or is_queue_backlog:
-                if self._active_nv_decoders < self.max_nv_decoders:
-                    self._state = "COOPERATIVE_BURST"
-                    return "cuda"
-                else:
-                    return "qsv"
-            elif queue_size <= self.watermark_low:
-                self._state = "NORMAL_DECOUPLED"
-                return "qsv"
-            else:
-                if self._state == "COOPERATIVE_BURST" and self._active_nv_decoders < self.max_nv_decoders:
-                    return "cuda"
-                return "qsv"
-
-
-
-    def acquire_nvdec_slot(self) -> bool:
-        """尝试占用一个 NVDEC 解码协同槽位。"""
-        with self._lock:
-            if self._render_active_count > 0:
-                return False
-            if self._active_nv_decoders < self.max_nv_decoders:
-                self._active_nv_decoders += 1
-                return True
-            return False
-
-    def release_nvdec_slot(self) -> None:
-        """释放 NVDEC 解码协同槽位。"""
-        with self._lock:
-            self._active_nv_decoders = max(0, self._active_nv_decoders - 1)
-
-    @contextmanager
-    def lease_device(self, queue_size: int):
-        """上下文管理器：自动决策解码设备并在使用 CUDA 时安全管理 NVDEC 槽位生命周期。"""
-        device = self.get_analysis_device(queue_size)
-        acquired_slot = False
-        if device == "cuda":
-            if self.acquire_nvdec_slot():
-                acquired_slot = True
-            else:
-                device = "qsv"
-        try:
-            yield device
-        finally:
-            if acquired_slot:
-                self.release_nvdec_slot()
 
 def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:
     global SETTINGS, CONFIG_PATH
@@ -237,55 +45,174 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
         return SETTINGS
 
 
-class TqdmLoggingHandler(logging.Handler):
-    def emit(self, record):
+_active_dashboard = None
+_dashboard_lock = threading.Lock()
+
+
+def register_dashboard(dashboard) -> None:
+    """注册活跃的终端仪表盘实例，用于实时告警联动。"""
+    global _active_dashboard
+    with _dashboard_lock:
+        _active_dashboard = dashboard
+
+
+def unregister_dashboard() -> None:
+    """注销终端仪表盘实例。"""
+    global _active_dashboard
+    with _dashboard_lock:
+        _active_dashboard = None
+
+
+class ContextualFormatter(logging.Formatter):
+    """支持自动回退的子系统上下文日志格式化器。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "subsystem"):
+            # 若未注入 subsystem，从 logger name 提取或默认为 core
+            name_parts = record.name.split(".")
+            record.subsystem = name_parts[-1] if len(name_parts) > 1 else "core"
+        return super().format(record)
+
+
+class JsonLinesFormatter(logging.Formatter):
+    """结构化 JSONL 日志格式化器。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        log_obj = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created)) + f".{int(record.msecs):03d}",
+            "level": record.levelname,
+            "subsystem": getattr(record, "subsystem", "core"),
+            "logger": record.name,
+            "message": record.getMessage(),
+            "caller": f"{record.filename}:{record.lineno}",
+        }
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_obj, ensure_ascii=False)
+
+
+class RichConsoleBridgeHandler(logging.Handler):
+    """
+    智能富文本控制台日志桥接器：
+    - 当 Live 仪表盘激活时：将 WARNING/ERROR 汇流到仪表盘告警面板，避免破坏终端布局；
+    - 当无 Live 仪表盘时：通过 Rich 格式化输出彩色控制台日志。
+    """
+
+    def __init__(self, level=logging.WARNING):
+        super().__init__(level=level)
+        from rich.console import Console
+        self._console = Console(stderr=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            from tqdm import tqdm
             msg = self.format(record)
-            tqdm.write(msg)
-            self.flush()
+            with _dashboard_lock:
+                dash = _active_dashboard
+
+            if dash is not None:
+                # 仪表盘处于激活态：仅将告警与异常送入跑马灯
+                if record.levelno >= logging.WARNING:
+                    brief = f"[{record.levelname}] {record.getMessage()}"
+                    dash.add_alert(brief)
+            else:
+                # 仪表盘未激活：直接着色输出到终端
+                color = "white"
+                if record.levelno >= logging.ERROR:
+                    color = "bold red"
+                elif record.levelno >= logging.WARNING:
+                    color = "yellow"
+                elif record.levelno == logging.INFO:
+                    color = "cyan"
+
+                sub = getattr(record, "subsystem", "core")
+                self._console.print(f"[{color}][{record.levelname:<5}][/{color}] [dim]\\[{sub}][/dim] {record.getMessage()}")
         except Exception:
             self.handleError(record)
 
 
-def setup_logging() -> logging.Logger:
+class SubsystemAdapter(logging.LoggerAdapter):
+    """自动绑定子系统名称的 Logger 适配器。"""
+
+    def process(self, msg, kwargs):
+        extra = kwargs.get("extra", {})
+        if "subsystem" not in extra:
+            extra["subsystem"] = self.extra.get("subsystem", "core")
+        kwargs["extra"] = extra
+        return msg, kwargs
+
+
+def get_logger(subsystem: str = "core") -> logging.LoggerAdapter:
+    """获取绑定了指定子系统上下文的 Logger 适配器。"""
+    base_logger = logging.getLogger("homevlog")
+    if not base_logger.handlers:
+        setup_logging()
+    return SubsystemAdapter(base_logger, {"subsystem": subsystem})
+
+
+def setup_logging(level_override: int | None = None) -> logging.Logger:
+    """
+    初始化全新的多目标分流日志体系：
+    1. 主运行日志：logs/homevlog_{timestamp}.log (默认 INFO)
+    2. 独立错误排错日志：logs/error_{timestamp}.log (仅 WARNING/ERROR/CRITICAL)
+    3. 结构化 JSONL 事件流：logs/events_{timestamp}.jsonl
+    4. 智能富文本终端桥接器 (RichConsoleBridgeHandler)
+    """
     config = load_config()
-    level = getattr(logging, config.get("logging", {}).get("level", "INFO").upper(), logging.INFO)
+    log_cfg = config.get("logging", {})
+
+    level = level_override
+    if level is None:
+        level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
 
     logger = logging.getLogger("homevlog")
-    logger.setLevel(level)
+    logger.setLevel(logging.DEBUG)  # 允许底层捕获全级别，具体级别由 Handler 自行把控
 
     if logger.handlers:
         return logger
 
-    fmt = logging.Formatter(
-        "[%(asctime)s.%(msecs)03d] [%(levelname)-5s] [%(name)s] %(message)s",
+    for d in [LOGS_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file = LOGS_DIR / f"homevlog_{timestamp}.log"
+    err_file = LOGS_DIR / f"error_{timestamp}.log"
+    jsonl_file = LOGS_DIR / f"events_{timestamp}.jsonl"
+
+    from logging.handlers import RotatingFileHandler
+    max_bytes = log_cfg.get("rotation_max_bytes", 10485760)
+    backup_count = log_cfg.get("rotation_backup_count", 5)
+
+    human_fmt = ContextualFormatter(
+        "[%(asctime)s.%(msecs)03d] [%(levelname)-5s] [%(subsystem)-10s] %(message)s (%(filename)s:%(lineno)d)",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    from logging.handlers import RotatingFileHandler
-    log_cfg = config.get("logging", {})
-    # 生成带时间戳的日志文件名
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_file = LOGS_DIR / f"homevlog_{timestamp}.log"
-    
-    fh = RotatingFileHandler(
-        log_file,
-        maxBytes=log_cfg.get("rotation_max_bytes", 10485760),
-        backupCount=log_cfg.get("rotation_backup_count", 5),
-        encoding="utf-8",
-    )
-    fh.setLevel(level)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    # 1. 主日志 (INFO 及以上)
+    fh_main = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    fh_main.setLevel(level)
+    fh_main.setFormatter(human_fmt)
+    logger.addHandler(fh_main)
 
-    # 控制台日志：仅在 WARNING/ERROR 或未启用进度条时输出，避免打乱 tqdm 终端 UI
-    sh = TqdmLoggingHandler()
-    sh.setLevel(max(level, logging.WARNING))
-    sh.setFormatter(fmt)
+    # 2. 独立错误排错日志 (WARNING 及以上)
+    fh_err = RotatingFileHandler(err_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    fh_err.setLevel(logging.WARNING)
+    fh_err.setFormatter(human_fmt)
+    logger.addHandler(fh_err)
+
+    # 3. 结构化 JSONL 日志流 (记录 INFO 及以上事件)
+    fh_jsonl = RotatingFileHandler(jsonl_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    fh_jsonl.setLevel(level)
+    fh_jsonl.setFormatter(JsonLinesFormatter())
+    logger.addHandler(fh_jsonl)
+
+    # 4. 控制台桥接 Handler (WARNING/ERROR 或交互式通知)
+    sh = RichConsoleBridgeHandler(level=max(level, logging.WARNING))
+    sh.setFormatter(human_fmt)
     logger.addHandler(sh)
 
     return logger
+
 
 
 def ts_to_unix(ts_str: str) -> float:
@@ -300,21 +227,30 @@ def parse_res(spec: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-def cleanup_resources():
-    """Deep GC and kill tracked ffmpeg processes only."""
+def cleanup_resources(db=None):
+    """Deep GC, clear CUDA cache, truncate SQLite WAL, and kill tracked ffmpeg processes."""
     import gc
-    
-    # 1. Force Python GC
     gc.collect()
     
-    # 2. Kill registered ffmpeg (DO NOT use psutil to kill all system ffmpegs!)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    if db is not None:
+        try:
+            db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
     try:
         from src.renderer import FFmpegProcessRegistry
-        killed = FFmpegProcessRegistry.kill_all()
-        if killed:
-            logging.getLogger("homevlog").warning("cleanup: killed registered ffmpeg processes")
+        FFmpegProcessRegistry.kill_all()
     except Exception as e:
         logging.getLogger("homevlog").warning("cleanup error: %s", e)
+
 
 
 def check_disk_space(path: Path, min_gb: int | None = None) -> bool:
@@ -333,3 +269,26 @@ def check_disk_space(path: Path, min_gb: int | None = None) -> bool:
     except Exception as e:
         logging.getLogger("homevlog").warning("Failed to check disk space: %s", e)
         return True
+
+
+def get_input_dirs(config: dict | None = None) -> list[str]:
+    """
+    解析配置中的监控素材输入路径，支持多态格式：
+    1. paths.input_dirs: ["path1", "path2", ...]
+    2. paths.input_dirs: "single_path"
+    3. paths.input_dir: "legacy_single_path"
+    返回规整后的有效路径字符串列表。
+    """
+    if config is None:
+        config = load_config()
+    paths_cfg = config.get("paths", {})
+    raw_dirs = paths_cfg.get("input_dirs")
+    if raw_dirs is None:
+        raw_dirs = paths_cfg.get("input_dir", "")
+
+    if isinstance(raw_dirs, str):
+        return [raw_dirs.strip()] if raw_dirs.strip() else []
+    elif isinstance(raw_dirs, list):
+        return [str(p).strip() for p in raw_dirs if str(p).strip()]
+    return []
+

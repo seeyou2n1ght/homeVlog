@@ -1,8 +1,5 @@
 import json
-import logging
 from dataclasses import dataclass
-
-logger = logging.getLogger("homevlog")
 
 
 @dataclass
@@ -13,6 +10,7 @@ class Segment:
     source_file: str
     file_start_offset: float
     max_energy: float = 0.0
+    avg_confidence: float = 0.0
 
     @property
     def is_dynamic(self) -> bool:
@@ -49,6 +47,8 @@ def build_segments(
     seg_start = frame_labels[0]["time"]
     seg_state = _resolve_state(frame_labels[0])
     seg_max_energy = frame_labels[0].get("energy", 0.0)
+    seg_conf_sum = frame_labels[0].get("confidence", 0.0)
+    seg_conf_count = 1
 
     for i in range(1, len(frame_labels)):
         cur_state = _resolve_state(frame_labels[i])
@@ -61,12 +61,17 @@ def build_segments(
                 source_file=source_file,
                 file_start_offset=file_offset,
                 max_energy=seg_max_energy,
+                avg_confidence=seg_conf_sum / max(1, seg_conf_count),
             ))
             seg_start = frame_labels[i]["time"]
             seg_state = cur_state
             seg_max_energy = frame_labels[i].get("energy", 0.0)
+            seg_conf_sum = frame_labels[i].get("confidence", 0.0)
+            seg_conf_count = 1
         else:
             seg_max_energy = max(seg_max_energy, frame_labels[i].get("energy", 0.0))
+            seg_conf_sum += frame_labels[i].get("confidence", 0.0)
+            seg_conf_count += 1
 
     segments.append(Segment(
         start_time=seg_start,
@@ -75,6 +80,7 @@ def build_segments(
         source_file=source_file,
         file_start_offset=file_offset,
         max_energy=seg_max_energy,
+        avg_confidence=seg_conf_sum / max(1, seg_conf_count),
     ))
 
     # Apply pre-roll and post-roll to dynamic segments for natural transition
@@ -223,6 +229,7 @@ def segments_to_json(segments: list[Segment]) -> str:
             "source_file": s.source_file,
             "file_start_offset": s.file_start_offset,
             "max_energy": s.max_energy,
+            "avg_confidence": s.avg_confidence,
         }
         for s in segments
     ])
@@ -243,6 +250,7 @@ def segments_from_json(json_str: str) -> list[Segment]:
                 source_file=d.get("source_file"),
                 file_start_offset=d.get("file_start_offset"),
                 max_energy=d.get("max_energy", 0.0),
+                avg_confidence=d.get("avg_confidence", 0.0),
             )
             for d in data
             if isinstance(d, dict) and "start_time" in d and "end_time" in d and "state" in d

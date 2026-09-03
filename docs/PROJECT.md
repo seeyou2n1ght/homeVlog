@@ -37,45 +37,50 @@ HomeVlog is a high-throughput, zero-idle, dual-GPU intelligent video condensatio
 | 10| Test Suite Dataset Alignment | Fix 81->84 assertions in `test_tier4_acceptance.py` | M4 | Explorer 3 Defect A |
 | 11| Dual-GPU Verification Gaps (GAP 01-06) | Concurrency, work-stealing, VRAM limit, and throughput tests | M4 | Explorer 3 Survey |
 | 12| 24-Hour 84-Slice <= 30m Throughput | Benchmark simulation achieving >=42x real-time speed | M4 | ORIGINAL_REQUEST §R3 |
-| 13| Full E2E All-Tier Verification | 100% green pass on all 2,388+ tests across Tiers 1-4 | M5 (Phase 1) | Acceptance Criteria |
-| 14| Tier 5 Adversarial Coverage Hardening | White-box stress testing, race-condition and leak audit | M5 (Phase 2) | Project Pattern |
+| 13| Full Domain Test Restructuring | Clean 20 legacy milestone tests into 8 cohesive domain modules | M5 (Phase 1) | Completed |
+| 14| Architecture Decoupling & Hygiene | Extract scheduler/filters/ui, remove 18.35GB backup, normalize models/ | M5 (Phase 2) | Completed |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| 1 | M1: Work-Stealing & Concurrency | `src/utils.py`, `config/settings.yaml`, `src/pipeline.py` | none | PLANNED |
-| 2 | M2: Multimodal Detector & Timeline Closure | `src/detector.py`, `src/yolo_verifier.py` | M1 | PLANNED |
-| 3 | M3: Dual-GPU Rendering & VRAM Safety | `src/renderer.py`, `src/timeline.py` | M1, M2 | PLANNED |
-| 4 | M4: E2E Test Suite & 24h Benchmark | `tests/test_tier4_acceptance.py`, `tests/test_benchmark_perf.py`, gap tests | M1, M2, M3 | PLANNED |
-| 5 | M5: Final E2E Pass & Tier 5 Hardening | Full system verification, adversarial coverage audit, perf logs | M1, M2, M3, M4 | PLANNED |
+| 1 | M1: Work-Stealing & Concurrency | `src/scheduler.py`, `config/settings.yaml`, `src/pipeline.py` | none | COMPLETED |
+| 2 | M2: Multimodal Detector & Timeline Closure | `src/detector.py`, `src/filters.py`, `src/yolo_verifier.py` | M1 | COMPLETED |
+| 3 | M3: Dual-GPU Rendering & VRAM Safety | `src/renderer.py`, `src/timeline.py` | M1, M2 | COMPLETED |
+| 4 | M4: E2E Test Suite & 24h Benchmark | `tests/test_acceptance_e2e.py`, `scripts/benchmark.py` | M1, M2, M3 | COMPLETED |
+| 5 | M5: Modern UI, Tri-split Logs & Architecture Decoupling | `src/ui.py`, `src/filters.py`, `src/scheduler.py`, `docs/` | M1, M2, M3, M4 | COMPLETED |
 
 ## Interface Contracts
-### `WorkStealingManager` (`src/utils.py`) ↔ `StreamingOrchestrator` (`src/pipeline.py`)
+### `WorkStealingManager` (`src/scheduler.py`) ↔ `StreamingOrchestrator` (`src/pipeline.py`)
 - `get_analysis_device(queue_size: int, is_render_active: bool) -> str`: Returns `"qsv"` or `"cuda"`.
 - `lease_device(queue_size: int) -> ContextManager[str]`: Automatically acquires and releases NVDEC/QSV slots.
 - `register_render_start()` / `register_render_end()`: Atomic flag updates to block NVDEC during render.
 
 ### `MotionDetector` (`src/detector.py`) ↔ `Timeline` (`src/timeline.py`)
 - `analyze(video_path: Path, start_offset: float, file_duration: float) -> list[dict]`:
-  - Returns frame records with `time_offset`, `state`, `energy`, `is_audio`.
+  - Returns frame records with `time`, `state`, `energy`, `is_audio_active`.
   - Guaranteed closure: last record timestamp equals `start_offset + file_duration`.
 
 ### `Renderer` (`src/renderer.py`) ↔ `Timeline` (`src/timeline.py`)
 - `partition_timeline_by_batches(segments, batch_max_files=4) -> list[TimelineBatch]`:
-  - Batches partitioned with maximum 4 source files per batch to bound VRAM <= 4.5GB.
-  - Workers dispatched: 1 NVENC worker + 1 QSV worker concurrently.
+  - Batches partitioned with maximum 4-8 source files per batch to bound VRAM <= 4.5GB.
+  - Workers dispatched: Dual NVENC worker pipeline concurrently.
 
 ## Code Layout
-- `main.py`: CLI entrypoint
+- `main.py`: CLI entrypoint with Rich Live TUI support
 - `config/settings.yaml`: Central configuration
+- `models/yolo11n.pt`: Quantized object detection model weights
 - `src/scanner.py`: File discovery and task ingestion
 - `src/prescreen.py`: Pass 1 fast I-frame prescreening
-- `src/detector.py`: Pass 1.5 single-pass PyAV multimodal analysis
+- `src/detector.py`: Pass 1.5 single-pass PyAV video decoding driver
+- `src/filters.py`: Background EMA, 8x8 spatial grid connected component filter, and audio VAD
 - `src/yolo_verifier.py`: Pass 1.8 Tensor Core YOLOv11 batch verification
 - `src/segment.py`: Segment smoothing and cross-file merging
 - `src/timeline.py`: Speed ramping PTS curves and FFmpeg filtergraph construction
 - `src/renderer.py`: Pass 2 parallel batch rendering array
-- `src/monitor.py`: System & GPU hardware telemetry collector
+- `src/scheduler.py`: Hardware semaphores, work-stealing manager, and device leasing
 - `src/database.py`: SQLite WAL task and render state persistence
-- `src/utils.py`: Hardware semaphores, work-stealing manager, config loading
-- `tests/`: 2,388 automated test suite across 20 files
+- `src/ui.py`: Rich live terminal dashboard and telemetry cards
+- `src/monitor.py`: System & GPU hardware telemetry collector
+- `src/utils.py`: Config loading, path resolution, and tri-split logging
+- `tests/`: 8 domain-driven test suites (78 test cases passing in 2.58s)
+

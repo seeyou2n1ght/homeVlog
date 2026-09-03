@@ -149,10 +149,13 @@ def benchmark_yolo():
 
     from ultralytics import YOLO
 
-    model_path = PROJECT_ROOT / "yolo11n.pt"
+    model_path = PROJECT_ROOT / "models" / "yolo11n.pt"
+    if not model_path.exists():
+        model_path = PROJECT_ROOT / "yolo11n.pt"
     if not model_path.exists():
         print(f"模型文件 {model_path} 不存在，跳过 YOLO 基准测试。")
         return
+
 
     model = YOLO(str(model_path))
     model.to(device_str)

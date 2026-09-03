@@ -752,10 +752,17 @@ class MotionDetector:
         }
         return results, meta
 
-    def analyze(
-        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
-    ) -> tuple[list[dict], dict]:
-        yolo_frames_buffer: dict[int, np.ndarray] = {}
+    # ---- 解耦解码与分析：信号量只保护硬件解码阶段 ----
+
+    def _decode_file(
+        self, filepath: str, file_duration: float = 0.0
+    ) -> tuple[list, dict, object, dict]:
+        """
+        Phase 1 (信号量保护): 硬件解码全部帧到内存缓冲区。
+        返回 (grayscale_frames, yolo_buffer, audio_samples, metadata)。
+        """
+        decoded_frames: list[np.ndarray] = []
+        yolo_buffer: dict[int, np.ndarray] = {}
 
         if self.decode_gpu == "qsv":
             from src.utils import get_qsv_semaphore
@@ -768,35 +775,16 @@ class MotionDetector:
 
         io_sem.acquire()
 
-        energies: list[float] = []
-        ema_model = self.create_ema_model()
-        grid_filter = self.create_grid_filter()
-        prev_gray: np.ndarray | None = None
-        consecutive_static = 0
-
-        roi_x = int(self.width * self.roi[0])
-        roi_y = int(self.height * self.roi[1])
-        roi_w = int(self.width * self.roi[2])
-        roi_h = int(self.height * self.roi[3])
+        audio_samples_list: list[np.ndarray] = []
+        audio_resampler = None
+        has_audio = 0
+        effective_fps = self.fps
+        total_frames = 0
+        video_frame_count = 0
 
         yolo_sample_interval = max(
             1, int(self.fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))
         )
-
-        total_frames = 0
-        video_frame_count = 0
-        early_terminated = False
-        effective_fps = self.fps
-        t_decode_start = 0.0
-
-        # R3: In-Memory Audio Extraction Buffer & Online VAD state
-        audio_samples_list: list[np.ndarray] = []
-        audio_resampler = None
-        has_audio = 0
-        recent_audio_active = False
-        running_audio_noise_floor = -60.0
-        audio_active_until_time = -1.0
-        total_audio_samples_decoded = 0
 
         try:
             from av.audio.resampler import AudioResampler
@@ -804,6 +792,7 @@ class MotionDetector:
         except Exception as e:
             logger.debug(f"PyAV AudioResampler init: {e}")
 
+        t_decode_start = time.monotonic()
         try:
             hw = None
             try:
@@ -828,8 +817,10 @@ class MotionDetector:
 
                 if video_stream is None:
                     logger.warning("No video stream found in %s", Path(filepath).name)
-                    io_sem.release()
-                    return [], yolo_frames_buffer
+                    return decoded_frames, yolo_buffer, np.array([], dtype=np.float32), {
+                        "has_audio": 0, "effective_fps": effective_fps,
+                        "decode_time": time.monotonic() - t_decode_start, "frames": 0,
+                    }
 
                 if not hw:
                     video_stream.thread_type = "AUTO"
@@ -849,82 +840,32 @@ class MotionDetector:
                     effective_fps = self.fps
 
                 frame_step = max(1, int(round(video_fps / effective_fps)))
-                dt = 1.0 / effective_fps
 
-                # 增加对长文件和网络路径的超时容忍
                 watchdog_timeout = max(self.decode_timeout * 3, 60.0)
                 if file_duration > 0:
                     watchdog_timeout = max(watchdog_timeout, (file_duration / effective_fps) * 4)
 
-                t_decode_start = time.monotonic()
-
-                # Single-pass concurrent stream decoding
                 streams_to_decode = [video_stream]
                 if self.audio_vad_enabled and audio_stream is not None:
                     streams_to_decode.append(audio_stream)
 
                 for frame in container.decode(*streams_to_decode):
-                    # Handle Audio Frame
                     if isinstance(frame, av.AudioFrame) or getattr(frame, "type", "") == "audio":
                         try:
                             if audio_resampler:
                                 resampled_frames = audio_resampler.resample(frame)
                                 if resampled_frames:
                                     for rf in resampled_frames:
-                                        arr = rf.to_ndarray().flatten().astype(np.float32)
-                                        audio_samples_list.append(arr)
-                                        total_audio_samples_decoded += len(arr)
+                                        audio_samples_list.append(rf.to_ndarray().flatten().astype(np.float32))
                             else:
                                 raw = frame.to_ndarray()
                                 if raw.ndim > 1:
                                     raw = np.mean(raw, axis=0)
-                                raw_f32 = raw.flatten().astype(np.float32)
-                                if getattr(frame, "rate", 0) != self.vad_sample_rate and getattr(frame, "rate", 0) > 0:
-                                    target_len = int(len(raw_f32) * self.vad_sample_rate / frame.rate)
-                                    if target_len > 0:
-                                        raw_f32 = np.interp(
-                                            np.linspace(0, len(raw_f32), target_len, endpoint=False),
-                                            np.arange(len(raw_f32)),
-                                            raw_f32,
-                                        ).astype(np.float32)
-                                audio_samples_list.append(raw_f32)
-                                total_audio_samples_decoded += len(raw_f32)
-
-                            # Online audio activity tracking on recent samples with adaptive background noise baseline
-                            if len(audio_samples_list) > 0:
-                                last_chunk = audio_samples_list[-1]
-                                check_len = min(len(last_chunk), 1600)
-                                if check_len >= 400:
-                                    rms_val = float(np.sqrt(np.mean(last_chunk[-check_len:] ** 2)))
-                                    dbfs_val = float(20.0 * np.log10(rms_val + 1e-7))
-
-                                    if running_audio_noise_floor < -59.0:
-                                        running_audio_noise_floor = min(dbfs_val, -38.0)
-                                    else:
-                                        if dbfs_val < running_audio_noise_floor:
-                                            running_audio_noise_floor = running_audio_noise_floor * 0.9 + dbfs_val * 0.1
-                                        else:
-                                            running_audio_noise_floor = (
-                                                running_audio_noise_floor * 0.995 + min(dbfs_val, -38.0) * 0.005
-                                            )
-                                        running_audio_noise_floor = min(running_audio_noise_floor, -38.0)
-
-                                    is_chunk_speech = (
-                                        (dbfs_val >= (running_audio_noise_floor + self.vad_noise_margin_db))
-                                        and (dbfs_val >= self.vad_min_dbfs)
-                                    ) or (dbfs_val >= -28.0)
-
-                                    current_audio_time = total_audio_samples_decoded / self.vad_sample_rate
-                                    if is_chunk_speech:
-                                        audio_active_until_time = current_audio_time + 0.5
-                                        recent_audio_active = True
-                                    else:
-                                        recent_audio_active = bool(current_audio_time < audio_active_until_time)
+                                audio_samples_list.append(raw.flatten().astype(np.float32))
                         except Exception as e:
                             logger.debug("Audio decode chunk failed: %s", e)
                         continue
 
-                    # Handle Video Frame
                     video_frame_count += 1
                     if (video_frame_count - 1) % frame_step != 0:
                         continue
@@ -942,16 +883,10 @@ class MotionDetector:
                                 (self.width, self.height),
                                 interpolation=cv2.INTER_LINEAR,
                             )
-                        # 内存切片压缩为 JPEG 字节，单帧从 292KB 降至约 15KB
                         bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
                         ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        if ok_enc:
-                            yolo_frames_buffer[total_frames - 1] = buf_jpg
-                        else:
-                            yolo_frames_buffer[total_frames - 1] = rgb_raw
+                        yolo_buffer[total_frames - 1] = buf_jpg if ok_enc else rgb_raw
 
-
-                    # Analysis 灰度图极速提取 (直接提取 YUV420p 的 Y 平面，零色彩空间转换开销)
                     try:
                         if frame.planes:
                             y_raw = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape((frame.height, frame.width))
@@ -975,63 +910,22 @@ class MotionDetector:
                                 cv2.COLOR_RGB2GRAY,
                             )
 
-                    roi = gray[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
-                    gray = None
-
-                    if self.ema_enabled:
-                        saliency, _, _ = ema_model.update(roi)
-                    else:
-                        if prev_gray is not None:
-                            saliency = cv2.absdiff(roi, prev_gray).astype(np.float32)
-                        else:
-                            saliency = np.zeros_like(roi, dtype=np.float32)
-                        prev_gray = roi
-
-                    eff_energy, is_grid_motion, _ = grid_filter.process_frame(saliency, dt)
-                    energies.append(eff_energy)
-
-                    if is_grid_motion:
-                        consecutive_static = 0
-                    else:
-                        consecutive_static += 1
-
-                    # Early termination check with Audio VAD VETO
-                    if self.early_term_enabled and len(energies) >= self.early_term_window:
-                        current_video_time = (total_frames - 1) * dt
-                        is_audio_veto = recent_audio_active or (current_video_time < audio_active_until_time)
-                        if is_audio_veto:
-                            can_term = False
-                        elif self.early_term_cooldown_guard:
-                            can_term = grid_filter.can_early_terminate(
-                                consecutive_static=consecutive_static,
-                                term_window=self.early_term_window,
-                                current_energy=eff_energy,
-                                term_threshold=self.early_term_threshold,
-                            )
-                        else:
-                            can_term = max(energies[-self.early_term_window:]) < self.early_term_threshold
-
-                        if can_term:
-                            early_terminated = True
-                            break
+                    decoded_frames.append(gray)
 
                     if time.monotonic() - t_decode_start > watchdog_timeout:
                         logger.warning(
                             "PyAV decode timeout for %s (dur=%.1f, elapsed=%.1f)",
-                            Path(filepath).name,
-                            file_duration,
+                            Path(filepath).name, file_duration,
                             time.monotonic() - t_decode_start,
                         )
                         break
 
-                # Flush audio resampler buffer
                 if audio_resampler:
                     try:
                         flushed = audio_resampler.resample(None)
                         if flushed:
                             for rf in flushed:
-                                arr = rf.to_ndarray().flatten().astype(np.float32)
-                                audio_samples_list.append(arr)
+                                audio_samples_list.append(rf.to_ndarray().flatten().astype(np.float32))
                     except Exception:
                         pass
 
@@ -1042,99 +936,106 @@ class MotionDetector:
 
         t_decode_end = time.monotonic()
 
-        # Combine in-memory audio chunks
-        if audio_samples_list:
-            full_audio = np.concatenate(audio_samples_list, axis=0)
-        else:
-            full_audio = np.array([], dtype=np.float32)
+        full_audio = np.concatenate(audio_samples_list, axis=0) if audio_samples_list else np.array([], dtype=np.float32)
 
-        # Execute full-file Audio VAD event extraction
+        meta = {
+            "has_audio": has_audio,
+            "effective_fps": effective_fps,
+            "decode_time": round(t_decode_end - t_decode_start, 3),
+            "frames": total_frames,
+        }
+        return decoded_frames, yolo_buffer, full_audio, meta
+
+    def analyze(
+        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
+    ) -> tuple[list[dict], dict]:
+        """
+        全文件分析入口。
+        Phase 1: 硬件解码到内存 (信号量保护，单槽位)
+        Phase 2: CPU 运动分析 (无信号量，长文件自动分片并行)
+        """
+        # Phase 1: 解码
+        decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
+        has_audio = decode_meta["has_audio"]
+        effective_fps = decode_meta["effective_fps"]
+        t_decode_end = time.monotonic()
+
+        if not decoded_frames:
+            self.last_perf = {
+                "decode_time": decode_meta["decode_time"],
+                "analysis_time": 0,
+                "frames": decode_meta["frames"],
+                "motion_ratio": 0,
+                "early_term": False,
+                "has_audio": has_audio,
+                "audio_events": 0,
+            }
+            return [], yolo_buffer
+
+        # Audio VAD (全局音频事件检测)
         audio_events: list[tuple[float, float, str]] = []
         vad_stats: dict = {}
         if self.audio_vad_enabled and full_audio.size > 0:
-            audio_events, vad_stats = self.vad.detect_events(
-                full_audio, start_offset=start_offset
+            audio_events, vad_stats = self.vad.detect_events(full_audio, start_offset=start_offset)
+
+        # Phase 2: CPU 分析 — 长文件分片并行，短文件直通
+        CHUNK_THRESHOLD = 300.0
+        n_frames = len(decoded_frames)
+
+        if file_duration > CHUNK_THRESHOLD and n_frames > 100:
+            n_chunks = max(2, min(4, int(np.ceil(file_duration / CHUNK_THRESHOLD))))
+            chunk_size = n_frames // n_chunks
+            logger.info("Intra-File Chunking: %s (%.1fs, %d frames) -> %d chunks",
+                        Path(filepath).name, file_duration, n_frames, n_chunks)
+
+            from concurrent.futures import ThreadPoolExecutor
+            all_results: list[list[dict]] = [[] for _ in range(n_chunks)]
+            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+                futures = {}
+                for c_idx in range(n_chunks):
+                    f_start = c_idx * chunk_size
+                    f_end = (c_idx + 1) * chunk_size if c_idx < n_chunks - 1 else n_frames
+                    chunk_offset = start_offset + (f_start / n_frames) * file_duration if n_frames > 0 else start_offset
+                    chunk_dur = ((f_end - f_start) / n_frames) * file_duration if n_frames > 0 else file_duration
+                    chunk_frames = decoded_frames[f_start:f_end]
+                    futures[pool.submit(
+                        self.analyze_frames, chunk_frames,
+                        start_offset=chunk_offset, file_duration=chunk_dur,
+                        fps=effective_fps, audio_data=full_audio
+                    )] = c_idx
+
+                for f in futures:
+                    c_idx = futures[f]
+                    try:
+                        chunk_results, _ = f.result()
+                        all_results[c_idx] = chunk_results
+                    except Exception as e:
+                        logger.error("Chunk %d analysis failed for %s: %s", c_idx, filepath, e)
+
+            results = []
+            for chunk_res in all_results:
+                results.extend(chunk_res)
+        else:
+            results, _ = self.analyze_frames(
+                decoded_frames, start_offset=start_offset, file_duration=file_duration,
+                fps=effective_fps, audio_data=full_audio,
             )
 
-        if early_terminated and file_duration > 0 and energies:
-            energies.append(0.0)
-
-        if len(energies) < 2:
-            logger.warning("too few frames from %s: %d", Path(filepath).name, len(energies))
-            self.last_perf = {
-                "decode_time": t_decode_end - t_decode_start,
-                "analysis_time": 0,
-                "frames": total_frames,
-                "motion_ratio": 0,
-                "early_term": early_terminated,
-                "has_audio": has_audio,
-                "audio_events": len(audio_events),
-            }
-            return [], yolo_frames_buffer
-
-        t_analysis_start = time.monotonic()
-        if self.median_window >= 3:
-            energies = _median_filter(energies, self.median_window)
-
-        energies_arr = np.array(energies, dtype=np.float32)
-        p5 = float(np.percentile(energies_arr, 5))
-        p20 = float(np.percentile(energies_arr, 20))
-        noise_spread = (p20 - p5) * 2.5
-        threshold = p5 + max(0.5, self.sensitivity * noise_spread)
-
-        raw_labels: list[bool] = [bool(e > threshold) for e in energies]
-        smoothed = _smooth_labels(
-            raw_labels, self.min_motion_frames, self.min_static_frames, self.noise_suppress
-        )
         t_analysis_end = time.monotonic()
 
-        motion_count = sum(1 for s in smoothed if s)
+        motion_count = sum(1 for r in results if r.get("is_motion"))
         self.last_perf = {
-            "decode_time": round(t_decode_end - t_decode_start, 3),
-            "analysis_time": round(t_analysis_end - t_analysis_start, 3),
-            "frames": total_frames,
-            "motion_ratio": round(motion_count / len(smoothed), 3) if smoothed else 0,
-            "early_term": early_terminated,
+            "decode_time": decode_meta["decode_time"],
+            "analysis_time": round(t_analysis_end - t_decode_end, 3),
+            "frames": decode_meta["frames"],
+            "motion_ratio": round(motion_count / len(results), 3) if results else 0,
+            "early_term": False,
             "effective_fps": effective_fps,
             "has_audio": has_audio,
             "audio_events": len(audio_events),
             "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
         }
-
-        actual_fps = (
-            total_frames / file_duration
-            if file_duration > 0 and total_frames > 0
-            else effective_fps
-        )
-        frame_interval = 1.0 / actual_fps
-
-        results = []
-        for i, is_visual_motion in enumerate(smoothed):
-            if early_terminated and i == len(smoothed) - 1:
-                time_val = start_offset + file_duration
-            else:
-                time_val = start_offset + min(i * frame_interval, file_duration if file_duration > 0 else (len(smoothed) * frame_interval))
-
-            # Multimodal Fusion Decision Matrix
-            is_audio_active = self.vad.is_active_at(time_val, audio_events) if audio_events else False
-            if is_visual_motion:
-                state = "DYNAMIC"
-                is_motion = True
-            elif is_audio_active:
-                state = "DYNAMIC_AUDIO"
-                is_motion = True
-            else:
-                state = "STATIC"
-                is_motion = False
-
-            results.append({
-                "time": time_val,
-                "is_motion": is_motion,
-                "state": state,
-                "energy": float(energies[i]) if i < len(energies) else 0.0,
-                "is_audio_active": is_audio_active,
-            })
-        return results, yolo_frames_buffer
+        return results, yolo_buffer
 
 
 def _median_filter(signal: list[float], window: int) -> list[float]:
