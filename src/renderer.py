@@ -387,18 +387,25 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         from src.utils import get_nv_semaphore
         io_sem = get_nv_semaphore()
     io_sem.acquire()
+    err_log = TEMP_DIR / f"_stderr_batch{batch_idx}_{date}_cam{cam_index}.log"
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        FFmpegProcessRegistry.register(str(output_path), proc)
-        t0 = time.monotonic()
-        render_timeout = max(7200, len(input_files) * 600)
-        try:
-            _, stderr = proc.communicate(timeout=render_timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return None
-        finally:
-            FFmpegProcessRegistry.deregister(str(output_path))
+
+        with open(err_log, "wb") as f_err:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=f_err)
+            FFmpegProcessRegistry.register(str(output_path), proc)
+            t0 = time.monotonic()
+            if encoder == "qsv":
+                render_timeout = 360
+            else:
+                render_timeout = max(7200, len(input_files) * 600)
+            try:
+                proc.wait(timeout=render_timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("Render timeout expired on %s for %s, killing process", encoder, output_path)
+                proc.kill()
+                return None
+            finally:
+                FFmpegProcessRegistry.deregister(str(output_path))
     finally:
         io_sem.release()
         
@@ -406,10 +413,19 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     fc_script.unlink(missing_ok=True)
 
     if proc.returncode == 0:
+        err_log.unlink(missing_ok=True)
         return str(output_path)
     else:
-        logger.error("batch-render cam%d batch%d failed:\n%s", cam_index, batch_idx, stderr.decode("utf-8", errors="replace")[-1000:])
+        err_tail = ""
+        if err_log.exists():
+            try:
+                err_tail = err_log.read_bytes()[-1000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            err_log.unlink(missing_ok=True)
+        logger.error("batch-render cam%d batch%d failed:\n%s", cam_index, batch_idx, err_tail)
         return None
+
 
 
 def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -> bool:

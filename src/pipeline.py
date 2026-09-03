@@ -315,14 +315,57 @@ class StreamingOrchestrator:
         pending_files = []
         batch_idx = 0
         time.sleep(max(0, self.render_delay))
-        batch_queue = queue.Queue()
+        heavy_queue = queue.Queue()
+        light_queue = queue.Queue()
+        all_dispatched_event = threading.Event()
         render_start_t: list[float] = []
+
+        def _is_heavy_batch(files_to_batch: list[str]) -> bool:
+            """检查批次中是否包含需复杂处理的 DYNAMIC 动作片段。"""
+            try:
+                rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+                rows_map = {r["filepath"]: r for r in rows}
+                for fp in files_to_batch:
+                    r = rows_map.get(fp)
+                    if not r:
+                        continue
+                    if r.get("prescreen_status") == "SUSPICIOUS":
+                        raw_segs = r.get("analysis_segments")
+                        if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
+                            return True
+            except Exception:
+                pass
+            return False
 
         def _render_worker(gpu: str):
             while True:
-                item = batch_queue.get()
+                item = None
+                if gpu == "nv":
+                    # NVENC 优先取 heavy 任务，其次协助消费 light 任务
+                    try:
+                        item = heavy_queue.get_nowait()
+                    except queue.Empty:
+                        try:
+                            item = light_queue.get(timeout=0.5)
+                        except queue.Empty:
+                            if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                                break
+                            continue
+                elif gpu == "qsv":
+                    # QSV 严禁处理 heavy 任务，仅协助处理 light 任务
+                    # 收尾防拖尾保护：当分发完毕且剩余轻任务 <= 1 时，QSV 主动退出让位 NVENC
+                    if all_dispatched_event.is_set() and light_queue.qsize() <= 1:
+                        break
+                    try:
+                        item = light_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        if all_dispatched_event.is_set() and light_queue.empty():
+                            break
+                        continue
+
                 if item is None:
                     break
+
                 b_idx, files_to_batch = item
                 if not render_start_t:
                     render_start_t.append(time.monotonic())
@@ -373,23 +416,39 @@ class StreamingOrchestrator:
                                 f"渲染实耗: {el_m:02d}:{el_s:02d} | 预估余时: {rm_m:02d}:{rm_s:02d} | 均速 {avg_s:.1f}s/批 (Batch {b_idx} on {gpu.upper()})"
                             )
                     else:
-                        self._add_error(f"render batch {b_idx} returned no output")
+                        if gpu == "qsv":
+                            # QSV 编码失败或异常，自动 failover 回退到 NVENC 重试
+                            logger.warning("Streaming: QSV batch %d failed, falling back to NVENC", b_idx)
+                            heavy_queue.put((b_idx, files_to_batch))
+                        else:
+                            self._add_error(f"render batch {b_idx} returned no output")
                 except Exception:
                     logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
-                    self._add_error(f"render batch {b_idx} failed on {gpu}")
+                    if gpu == "qsv":
+                        heavy_queue.put((b_idx, files_to_batch))
+                    else:
+                        self._add_error(f"render batch {b_idx} failed on {gpu}")
                 finally:
                     if gpu == "nv":
                         self.work_stealing.register_render_end()
-                    batch_queue.task_done()
 
-        # 启动 2 个 NVENC 主力 Worker (压榨 3060Ti 双编引擎) + 1 个 QSV 辅助 Worker
+        # 启动 2 个 NVENC 主力 Worker (压榨 3060Ti 双编引擎，UHD 770 专职 100% 解码)
         render_threads = []
-        render_gpus = ["nv", "nv", "qsv"]
+        render_gpus = ["nv", "nv"]
         for gpu in render_gpus:
             t = threading.Thread(target=_render_worker, args=(gpu,), daemon=True)
             t.start()
             render_threads.append(t)
 
+
+        def _enqueue_batch(b_idx: int, files: list[str]):
+            if _is_heavy_batch(files):
+                heavy_queue.put((b_idx, files))
+            else:
+                light_queue.put((b_idx, files))
+            if "render" in self.pbars:
+                self.pbars["render"].total += 1
+                self.pbars["render"].refresh()
 
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
@@ -400,10 +459,7 @@ class StreamingOrchestrator:
                 pending_files.append(msg["filepath"])
 
                 if len(pending_files) >= self.batch_max_files:
-                    batch_queue.put((batch_idx, list(pending_files)))
-                    if "render" in self.pbars:
-                        self.pbars["render"].total += 1
-                        self.pbars["render"].refresh()
+                    _enqueue_batch(batch_idx, list(pending_files))
                     pending_files = []
                     batch_idx += 1
                 self.render_batch_queue.task_done()
@@ -411,15 +467,16 @@ class StreamingOrchestrator:
                 continue
 
         if pending_files:
-            batch_queue.put((batch_idx, list(pending_files)))
-            if "render" in self.pbars:
-                self.pbars["render"].total += 1
-                self.pbars["render"].refresh()
+            _enqueue_batch(batch_idx, list(pending_files))
+
+        all_dispatched_event.set()
 
         for _ in render_threads:
-            batch_queue.put(None)
+            heavy_queue.put(None)
+            light_queue.put(None)
         for t in render_threads:
             t.join()
+
 
     def run(self):
         all_tasks = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
