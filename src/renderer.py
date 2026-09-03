@@ -180,6 +180,8 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
                     proc.wait(timeout=10)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
+                # 删除残缺产物，防止断点续渲复用损坏批次
+                output_path.unlink(missing_ok=True)
                 return None
             finally:
                 FFmpegProcessRegistry.deregister(str(output_path))
@@ -204,6 +206,11 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         except Exception:
             pass
         err_log.unlink(missing_ok=True)
+    # 删除残缺产物，防止断点续渲复用损坏批次（如 OOM -12 部分写出的 mp4）
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError:
+        pass
     logger.error(
         "batch-render cam%d batch%d failed after %.1fs:\n%s",
         cam_index, batch_idx, elapsed, err_tail,

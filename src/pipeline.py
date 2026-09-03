@@ -736,7 +736,7 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
                 save_timecode_subtitles(
                     full_timeline,
                     output_path.with_suffix(".srt"),
-                    rows=all_rows,
+                    rows=all_tasks,
                     base_date=date,
                 )
             except Exception as e:

@@ -101,6 +101,47 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
+    def test_subtitle_wiring_after_render(self, tmp_path):
+        """集成回归: 成片成功后必须生成 .srt 字幕（此前 rows 变量名错误导致全量静默失败）。"""
+        db_path = tmp_path / "test_srt.db"
+        db = VlogDatabase(db_path=db_path)
+        fname = "00_20260901100000_20260901100500.mp4"
+        db.add_file_task(fname, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+        db.set_prescreen_result(fname, "STATIC")
+
+        fake_batch = tmp_path / "_batch0.mp4"
+        fake_batch.write_bytes(b"0" * (600 * 1024))
+        out_dir = tmp_path / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        mock_orch = MagicMock()
+        mock_orch.run.return_value = [fake_batch]
+        mock_orch.errors = []
+
+        cfg_patch = {
+            "render": {"generate_subtitles": True, "batch_max_files": 4},
+            "output": {"naming": "DailyVlog_{date}_cam{index}.mp4", "fps": 20},
+            "segment": {},
+        }
+        try:
+            with patch("src.pipeline.StreamingOrchestrator", return_value=mock_orch), \
+                 patch("src.pipeline.load_config", return_value=cfg_patch), \
+                 patch("src.pipeline.get_monitor"), \
+                 patch("src.pipeline.OUTPUT_DIR", out_dir), \
+                 patch("src.pipeline._dump_perf"), \
+                 patch("src.pipeline.print_startup_banner"), \
+                 patch("src.pipeline.print_summary_card"):
+                ok = process_date_cam(db, "20260901", 0, skip_render=False, dashboard_enabled=False)
+
+            assert ok is True
+            assert (out_dir / "DailyVlog_20260901_cam0.mp4").exists()
+            srt = out_dir / "DailyVlog_20260901_cam0.srt"
+            assert srt.exists(), "SRT subtitle was not generated"
+            content = srt.read_text(encoding="utf-8")
+            assert "2026-09-01 10:00:00" in content
+        finally:
+            db.close()
+
     def test_in_order_sliding_window_dispatch(self, tmp_path):
         """验证即使文件分析以乱序完成，渲染管理器仍按物理录制时间严格保序打包批次。"""
         db_path = tmp_path / "test_in_order.db"
