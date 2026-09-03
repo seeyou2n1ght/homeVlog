@@ -27,12 +27,12 @@ HomeVlog is a high-throughput, zero-idle, dual-GPU intelligent video condensatio
 |---|---------|-------------|-----------|--------|
 | 1 | Dual-GPU Workload Decoupling | UHD 770 primary QSV decode + RTX 3060Ti tensor/NVENC render | M1 | ORIGINAL_REQUEST §R1 |
 | 2 | Adaptive Work-Stealing | Load-aware device leasing with instant render preemption yield | M1 | ORIGINAL_REQUEST §R1 |
-| 3 | Hardware Semaphore Isolation | Safe concurrency controls for NV (3), QSV (8), and Disk (8) | M1 | AGENTS.md |
+| 3 | Hardware Semaphore Isolation | Safe concurrency controls for NV (2), QSV (8), and Disk (8) with 30s-timeout retry | M1 | AGENTS.md |
 | 4 | Single-Pass PyAV Multimodal Analysis | Synchronized video frame diff + audio energy VAD | M2 | AGENTS.md |
 | 5 | Timeline Closure & Early-Term Sync | Fix audio timestamp sync and exact duration alignment | M2 | Explorer 3 Defect B |
 | 6 | YOLO Multimodal Audio Exemption | DYNAMIC_AUDIO segments exempted from visual demotion | M2 | Codebase Survey |
 | 7 | Dual-GPU Parallel Render Array | 1 NVENC + 1 QSV worker with complexity-based dispatch | M3 | ORIGINAL_REQUEST §R1, §R2 |
-| 8 | VRAM Peak Protection (<=4.5GB) | `batch_max_files: 4`, zero-copy flow, eliminate bus congestion | M3 | ORIGINAL_REQUEST §R2 |
+| 8 | VRAM Peak Protection (<=4.5GB) | `batch_max_files: 8`, zero-copy flow, eliminate bus congestion | M3 | ORIGINAL_REQUEST §R2 |
 | 9 | Speed Ramping & Wall-Clock OSD | Smooth PTS curves (60x -> 1x), audio afade, timecode burn-in | M3 | Codebase Survey |
 | 10| Test Suite Dataset Alignment | Fix 81->84 assertions in `test_tier4_acceptance.py` | M4 | Explorer 3 Defect A |
 | 11| Dual-GPU Verification Gaps (GAP 01-06) | Concurrency, work-stealing, VRAM limit, and throughput tests | M4 | Explorer 3 Survey |
@@ -56,13 +56,13 @@ HomeVlog is a high-throughput, zero-idle, dual-GPU intelligent video condensatio
 - `register_render_start()` / `register_render_end()`: Atomic flag updates to block NVDEC during render.
 
 ### `MotionDetector` (`src/detector.py`) ↔ `Timeline` (`src/timeline.py`)
-- `analyze(video_path: Path, start_offset: float, file_duration: float) -> list[dict]`:
-  - Returns frame records with `time`, `state`, `energy`, `is_audio_active`.
+- `analyze(video_path, start_offset, file_duration) -> tuple[list[dict], dict[int, bytes]]`:
+  - Returns (frame records with `time`, `state`, `energy`, `is_audio_active`, YOLO JPEG frame buffer).
   - Guaranteed closure: last record timestamp equals `start_offset + file_duration`.
 
 ### `Renderer` (`src/renderer.py`) ↔ `Timeline` (`src/timeline.py`)
-- `partition_timeline_by_batches(segments, batch_max_files=4) -> list[TimelineBatch]`:
-  - Batches partitioned with maximum 4-8 source files per batch to bound VRAM <= 4.5GB.
+- `partition_timeline_by_batches(segments, batch_max_files=8) -> list[TimelineBatch]`:
+  - Batches partitioned with maximum 8 source files per batch to bound VRAM <= 4.5GB.
   - Workers dispatched: Dual NVENC worker pipeline concurrently.
 
 ## Code Layout
@@ -82,5 +82,5 @@ HomeVlog is a high-throughput, zero-idle, dual-GPU intelligent video condensatio
 - `src/ui.py`: Rich live terminal dashboard and telemetry cards
 - `src/monitor.py`: System & GPU hardware telemetry collector
 - `src/utils.py`: Config loading, path resolution, and tri-split logging
-- `tests/`: 8 domain-driven test suites (78 test cases passing in 2.58s)
+- `tests/`: 8 domain-driven test suites (86 passed + 1 skipped in ~4.4s)
 

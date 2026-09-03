@@ -73,8 +73,8 @@ graph TD
 ### 2. 快速预筛选 ([`src/prescreen.py`](../src/prescreen.py))
 - **设计职责**：以极低算力快速过滤全天绝大部分无运动的静态文件（如夜间静止画面）。
 - **关键帧跳跃探测 (Keyframe-Seeking)**：
-  - 基于文件时长计算 $N$ 个均分关键帧时间戳（$N \approx 8 \sim 12$）。
-  - 调用 PyAV 的 `container.seek()` 直接跳跃至最近 I 帧，仅解码关键帧并使用 OpenCV AVX2 优化的 `cv2.norm(gray, prev_gray, cv2.NORM_L1)` 计算帧差。
+  - 基于文件时长设定最大关键帧抽样数（`prescreen_segments`，默认 10）。
+  - 通过 PyAV 设置 `skip_frame = "NONKEY"` 仅解码 I 帧，提取 Y 平面 8 倍下采样后使用 OpenCV AVX2 优化的 `cv2.norm(gray, prev_gray, cv2.NORM_L1)` 计算帧差。
   - 发现单对关键帧差异超过自适应阈值 `current_threshold` 时，触发即时早停（Early-Stop）并标记为 `SUSPICIOUS`，移交下一阶段。
   - 全量抽样差异均低于阈值时直接标记为 `STATIC`。
 
@@ -115,11 +115,12 @@ graph TD
   - 多批次通过 FFmpeg 并发编码生成中间片段，最后通过 `-f concat -c copy` 实现无损零重编码最终拼接。
 
 ### 7. 数据库并发与持久化 ([`src/database.py`](../src/database.py))
-- **读写完全解耦**：采用 SQLite WAL 模式（`PRAGMA journal_mode=WAL`），所有查询方法无阻塞并发读取。
-- **批量事务提交**：后台批量事务提交（Batch Commit），大幅降低磁盘同步 `fsync` 频率。
+- **读写完全解耦**：采用 SQLite WAL 模式（`PRAGMA journal_mode=WAL`），读查询无阻塞并发。
+- **单写锁串行化**：所有写操作经 `threading.Lock` 串行提交，规避多线程并发写冲突；数据库以 filepath 唯一约束保证断点续跑幂等。
 
 ### 8. 现代交互与三路分流日志 ([`src/ui.py`](../src/ui.py), [`src/utils.py`](../src/utils.py))
-- **Rich 动态控制台终端**：提供进度条、积压深度、硬件调度状态徽标与实时跑马灯日志桥接。
+- **Rich 动态控制台终端**：`PipelineDashboard` 提供三阶段进度、积压水位、硬件调度状态徽标、全天素材工序堆叠分布条与实时告警跑马灯；日志桥接器（`RichConsoleBridgeHandler` + `register_dashboard`）在 Live 模式下将 WARNING/ERROR 自动汇入告警区。tqdm 已完全移除，终端输出统一由 Rich 呈现；非 TTY/无头环境自动降级为纯日志输出。
+- **信号量超时防护**：所有硬件/IO 信号量经 `acquire_with_retry()`（30s 超时 + 最多 3 次重试）获取，杜绝 QSV 争用死锁。
 - **三路日志分流架构**：
   - 主运行追踪日志：`logs/homevlog_*.log`；
   - 异常告警日志：`logs/error_*.log`；

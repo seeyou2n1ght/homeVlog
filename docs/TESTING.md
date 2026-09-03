@@ -6,7 +6,7 @@
 
 ## 一、 测试架构与设计方法学
 
-测试套件采用**高内聚业务领域驱动**架构，彻底摒弃了碎片化的里程碑用例，划分为 8 个核心业务测试模块，共收敛为 84 个高价值测试用例，全套回归耗时约 **4.11 秒**。
+测试套件采用**高内聚业务领域驱动**架构，彻底摒弃了碎片化的里程碑用例，划分为 8 个核心业务测试模块，共收敛为 **87 个高价值测试用例（86 passed + 1 skipped）**，全套回归耗时约 **4.4 秒**。
 
 ### 1. 测试方法学
 - **等价类划分与格式覆盖**：覆盖 H.264、H.265 (HEVC)、单声道/双声道 AAC 与完全静音音轨的自适应探测。
@@ -28,7 +28,7 @@
 
 | 测试模块文件 | 包含用例数 | 覆盖业务范围与关键断言 |
 | :--- | :--- | :--- |
-| [`tests/test_database_and_scanner.py`](../tests/test_database_and_scanner.py) | 6 passed | SQLite WAL 读写解耦、批量事务提交、NAS 小米摄像头 MAC 解析与目录提取、时间戳解析 |
+| [`tests/test_database_and_scanner.py`](../tests/test_database_and_scanner.py) | 9 passed | SQLite WAL 读写解耦、信号量超时重试、NAS 小米摄像头 MAC 解析与目录提取、时间戳解析、多目录扫描 |
 | [`tests/test_motion_and_vad.py`](../tests/test_motion_and_vad.py) | 14 passed | `EmaBackgroundModel` 双差分、`SpatialGridMotionFilter` 8x8 空间连通域、暗光婴儿微动敏感度、IR-Cut 全局闪光抑制、`AudioEnergyVAD` 50ms RMS 分帧 |
 | [`tests/test_timeline_and_ramping.py`](../tests/test_timeline_and_ramping.py) | 39 passed | $C^1$ 连续平滑非线性变速过渡 PTS 曲线、动态段 1.0s/1.5s 前后延展、外挂 SRT/ASS 与硬字幕滤镜 |
 | [`tests/test_scheduler_and_hardware.py`](../tests/test_scheduler_and_hardware.py) | 7 passed | `WorkStealingManager` 三态流转（NORMAL / BURST / PREEMPTION）、硬件信号量争用与重置 |
@@ -73,6 +73,6 @@ uv run pytest --cov=src tests/ --cov-report=term-missing
 
 ## 四、 持续集成与准入基线
 
-1. **零破坏性回归 (Zero-Regression)**：任何新增功能或重构提交，必须保证上述 78 项核心用例 100% 绿灯。
+1. **零破坏性回归 (Zero-Regression)**：任何新增功能或重构提交，必须保证上述 **86 项核心用例 100% 绿灯**（1 项 E2E 用例按硬件条件跳过）。
 2. **执行时效基线**：全套单元与集成测试在现代 8 核心 CPU 上的运行时间不得超过 **5 秒**。
 3. **代码静态检查**：代码在提交前必须通过 `python -m compileall main.py src` 语法校验。

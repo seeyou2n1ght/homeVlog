@@ -68,7 +68,7 @@ graph TD
 | :--- | :--- | :--- | :--- | :--- |
 | **iGPU Dual VDBox** | Intel UHD 770 | 1. 快速预筛选 (Prescreen)<br/>2. 运动分析解码 (Analysis) | `max_qsv_concurrency: 8`<br/>`prescreen_parallel: 8` | 释放全部独显算力，压榨核显双解码引擎 |
 | **dGPU Tensor Core** | RTX 3060Ti | YOLO PyTorch/TensorRT 批量推理 | `device: cuda:0`<br/>`model_path: models/yolo11n.pt` | 专职 AI 目标识别，0 解码开销 |
-| **dGPU NVENC** | RTX 3060Ti | Pass 2 最终视频剪辑与压制导出 | `max_nv_concurrency: 3`<br/>`preset: p1` | 高画质与极速硬件编码导出 |
+| **dGPU NVENC** | RTX 3060Ti | Pass 2 最终视频剪辑与压制导出 | `max_nv_concurrency: 2`<br/>`preset: p1` | 高画质与极速硬件编码导出（8GB 显存安全留白） |
 
 ---
 
@@ -81,7 +81,7 @@ graph TD
    - `COOPERATIVE_BURST`：当 `analysis_queue` 水位达到 `watermark_high`（默认 10）且无渲染时，出租 NVDEC 槽位协同解码。
    - `RENDER_PREEMPTION_YIELD`：当渲染启动信号到达时，毫秒级原子抢占，将所有新任务强制降级回 QSV，杜绝 NVENC 会话超限。
 2. **硬件信号量并发控制**：
-   - `get_nv_semaphore()`：严格控制 NVENC/NVDEC 最大并发会话数（上限 3）。
+   - `get_nv_semaphore()`：严格控制 NVENC/NVDEC 最大并发会话数（上限 2，8GB 显存安全上限）。
    - `get_qsv_semaphore()`：控制 Intel UHD 770 最大并发解码会话数（上限 8）。
    - `get_disk_semaphore()`：控制磁盘与 SMB 网络 I/O 读取并发数（上限 8）。
 

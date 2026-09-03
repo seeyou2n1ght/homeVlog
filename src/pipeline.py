@@ -5,8 +5,13 @@ import threading
 import queue
 from pathlib import Path
 
-from tqdm import tqdm
-
+from src.ui import (
+    PipelineDashboard,
+    print_batch_startup_banner,
+    print_error_summary,
+    print_startup_banner,
+    print_summary_card,
+)
 from src.database import VlogDatabase
 from src.scanner import scan_directory, get_date_cam_groups
 from src.prescreen import prescreen_file
@@ -18,6 +23,8 @@ from src.utils import (
     LOGS_DIR,
     cleanup_resources,
     check_disk_space,
+    register_dashboard,
+    unregister_dashboard,
     WorkStealingManager,
 )
 from src.monitor import get_monitor, get_perf, PerfRecord
@@ -68,12 +75,32 @@ class StreamingOrchestrator:
         self.error_lock = threading.Lock()
         self.errors: list[str] = []
 
-        # 进度条
-        self.pbars = {}
+        # Rich 仪表盘 (tqdm 已下线，统一由 PipelineDashboard 呈现)
+        self.dashboard_enabled = dashboard_enabled
+        self.dashboard: PipelineDashboard | None = None
+        self._prescreen_t0 = 0.0
+        self._analysis_t0 = 0.0
 
     def _add_error(self, message: str):
         with self.error_lock:
             self.errors.append(message)
+        if self.dashboard is not None:
+            self.dashboard.add_alert(message)
+
+    def _sync_queue_levels(self) -> None:
+        """同步三阶段积压水位与调度器状态到仪表盘。"""
+        if self.dashboard is None:
+            return
+        self.dashboard.set_queue_status(
+            prescreen_q=self.prescreen_queue.qsize(),
+            analysis_q=self.analysis_queue.qsize(),
+            render_q=self.render_batch_queue.qsize(),
+        )
+        self.dashboard.set_scheduler_state(
+            self.work_stealing.state,
+            self.work_stealing.active_nv_decoders,
+            self.work_stealing.max_nv_decoders,
+        )
 
     def _prescreen_worker(self, gpu: str = "qsv"):
         """预筛 Worker：将扫描到的文件进行快速筛选。"""
@@ -110,9 +137,11 @@ class StreamingOrchestrator:
 
                 if res["status"] == "SUSPICIOUS":
                     self.analysis_queue.put(task)
-                    if "analysis" in self.pbars:
-                        self.pbars["analysis"].total += 1
-                        self.pbars["analysis"].refresh()
+                    if self.dashboard is not None:
+                        self.dashboard.update_analysis(
+                            completed=self.dashboard.analysis_done,
+                            total=self.dashboard.analysis_total + 1,
+                        )
                 elif res["status"] == "FAILED":
                     self._add_error(f"prescreen returned FAILED: {Path(filepath).name}")
                     self.render_batch_queue.put(
@@ -123,15 +152,16 @@ class StreamingOrchestrator:
                         {"filepath": filepath, "status": "STATIC"}
                     )
 
-                if "prescreen" in self.pbars:
-                    self.pbars["prescreen"].update(1)
-                    el_s = max(0.1, time.monotonic() - getattr(self, "_prescreen_t0", t0))
-                    n_done = self.pbars["prescreen"].n
-                    fps_val = n_done / el_s
-                    el_m, el_sec = divmod(int(el_s), 60)
-                    self.pbars["prescreen"].set_postfix_str(
-                        f"实耗 {el_m:02d}:{el_sec:02d} | 速率 {fps_val:.1f}文件/s (Latest: {Path(filepath).name[:22]}..)"
+                if self.dashboard is not None:
+                    el_s = max(0.1, time.monotonic() - self._prescreen_t0)
+                    n_done = self.dashboard.prescreen_done + 1
+                    avg_s = el_s / max(1, n_done)
+                    self.dashboard.update_prescreen(
+                        completed=n_done,
+                        latest_file=Path(filepath).name,
+                        speed_str=f"均速 {avg_s:.1f}s/个",
                     )
+                    self._sync_queue_levels()
 
             except Exception:
                 logger.exception("Streaming: prescreen failed for %s", filepath)
@@ -225,18 +255,19 @@ class StreamingOrchestrator:
                 {"filepath": filepath, "status": "FAILED"}
             )
 
-        if "analysis" in self.pbars:
-            self.pbars["analysis"].update(1)
-            el_s = max(0.1, time.monotonic() - getattr(self, "_analysis_t0", t0))
-            n_done = self.pbars["analysis"].n
-            n_tot = max(n_done, self.pbars["analysis"].total)
-            avg_s = el_s / max(1, n_done)
-            rem_s = max(0, (n_tot - n_done) * avg_s)
-            el_m, el_sec = divmod(int(el_s), 60)
-            rm_m, rm_sec = divmod(int(rem_s), 60)
-            self.pbars["analysis"].set_postfix_str(
-                f"实耗 {el_m:02d}:{el_sec:02d} | 预估余 {rm_m:02d}:{rm_sec:02d} | 均速 {avg_s:.1f}s/文件 ({gpu.upper()})"
+        if self.dashboard is not None:
+            el_s = max(0.1, time.monotonic() - self._analysis_t0)
+            n_done = self.dashboard.analysis_done + 1
+            task_el = max(0.1, time.monotonic() - t0)
+            frames_done = getattr(detector, "last_perf", {}).get("frames", 0)
+            fps_val = frames_done / task_el if frames_done else 0.0
+            speed_str = f"{fps_val:.1f} fps" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
+            self.dashboard.update_analysis(
+                completed=n_done,
+                latest_file=Path(filepath).name,
+                speed_str=f"{speed_str} ({gpu.upper()})",
             )
+            self._sync_queue_levels()
 
     def _analysis_worker(self, fixed_gpu: str | None = None):
         """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
@@ -414,19 +445,17 @@ class StreamingOrchestrator:
                                 extra={"batch_files": len(files_to_batch), "segments": len(batch_segs)},
                             )
                         )
-                        if "render" in self.pbars:
-                            self.pbars["render"].update(1)
+                        if self.dashboard is not None:
                             # 精准渲染阶段自身计时与剩余预估
                             t_start = render_start_t[0] if render_start_t else t_r0
                             el_sec = max(0.1, time.monotonic() - t_start)
-                            n_done = self.pbars["render"].n
-                            n_total = max(n_done, self.pbars["render"].total)
+                            n_done = self.dashboard.render_done + 1
+                            n_total = max(n_done, self.dashboard.render_total)
                             avg_s = el_sec / max(1, n_done)
-                            rem_s = max(0, (n_total - n_done) * avg_s)
-                            el_m, el_s = divmod(int(el_sec), 60)
-                            rm_m, rm_s = divmod(int(rem_s), 60)
-                            self.pbars["render"].set_postfix_str(
-                                f"渲染实耗: {el_m:02d}:{el_s:02d} | 预估余时: {rm_m:02d}:{rm_s:02d} | 均速 {avg_s:.1f}s/批 (Batch {b_idx} on {gpu.upper()})"
+                            self.dashboard.update_render(
+                                completed=n_done,
+                                latest_batch=f"Batch {b_idx} on {gpu.upper()}",
+                                speed_str=f"均速 {avg_s:.1f}s/批",
                             )
                     else:
                         if gpu == "qsv":
@@ -459,9 +488,11 @@ class StreamingOrchestrator:
                 heavy_queue.put((b_idx, files))
             else:
                 light_queue.put((b_idx, files))
-            if "render" in self.pbars:
-                self.pbars["render"].total += 1
-                self.pbars["render"].refresh()
+            if self.dashboard is not None:
+                self.dashboard.update_render(
+                    completed=self.dashboard.render_done,
+                    total=self.dashboard.render_total + 1,
+                )
 
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
@@ -513,10 +544,26 @@ class StreamingOrchestrator:
         pending_prescreen = [t for t in all_tasks if t["prescreen_status"] == "PENDING"]
         pending_analysis = [t for t in all_tasks if t["prescreen_status"] == "SUSPICIOUS" and t["analysis_status"] == "PENDING"]
 
-        self.pbars["prescreen"] = tqdm(total=len(pending_prescreen), desc=f" {self.date} Prescreen", unit="file", position=0)
-        self.pbars["analysis"] = tqdm(total=len(pending_analysis), desc=f" {self.date} Analysis ", unit="file", position=1)
-        if self.render_enabled:
-            self.pbars["render"] = tqdm(total=0, desc=f" {self.date} Rendering", unit="batch", position=2)
+        # Rich 实时仪表盘启动 (支持断点续跑的进度种子回填)
+        self.dashboard = PipelineDashboard(
+            date=self.date,
+            cam_index=self.cam_index,
+            total_prescreen=max(1, len(all_tasks)),
+            render_enabled=self.render_enabled,
+            enabled=self.dashboard_enabled,
+        )
+        self.dashboard.start()
+        if self.dashboard.enabled:
+            register_dashboard(self.dashboard)
+        self._prescreen_t0 = time.monotonic()
+        self._analysis_t0 = time.monotonic()
+
+        prescreen_done_pre = len(all_tasks) - len(pending_prescreen)
+        analysis_done_pre = len(
+            [t for t in all_tasks if t["prescreen_status"] == "SUSPICIOUS" and t["analysis_status"] != "PENDING"]
+        )
+        self.dashboard.update_prescreen(completed=prescreen_done_pre, total=len(all_tasks))
+        self.dashboard.update_analysis(completed=analysis_done_pre, total=len(pending_analysis) + analysis_done_pre)
 
         for task in all_tasks:
             if task["prescreen_status"] == "PENDING":
@@ -564,8 +611,10 @@ class StreamingOrchestrator:
         for t in threads:
             t.join(timeout=3600)
 
-        for p in self.pbars.values():
-            p.close()
+        if self.dashboard is not None:
+            self.dashboard.stop()
+            self.dashboard = None
+        unregister_dashboard()
 
         with self.batch_lock:
             self.batch_paths.sort(key=lambda x: x[0])
@@ -594,21 +643,26 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     total_files = len(all_tasks)
     total_input_dur = sum(float(t.get("file_duration") or 300.0) for t in all_tasks)
 
-    # 终端启动 Banner
-    banner = [
-        "",
-        "╔" + "═" * 68 + "╗",
-        f"║  HomeVlog 智能视频浓缩流水线 | 日期: {date} | 机位: Cam {cam_index:<16}║",
-        f"║  • 输入素材: {total_files:>3} 个监控切片 (总时长: {total_input_dur/3600:>5.2f} 小时 / {total_input_dur:>7.1f} 秒){' '*7}║",
-        f"║  • 硬件协同: Intel UHD 770 (QSV 粗筛/解码) + RTX 3060Ti (NVENC 渲染){' '*4}║",
-        "╚" + "═" * 68 + "╝",
-        "",
-    ]
-    print("\n".join(banner))
-    logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
-
+    # Rich 启动 Banner (含机位别名解析)
     out_cfg = config.get("output", {})
     output_name = out_cfg.get("naming", "DailyVlog_{date}_cam{index}.mp4").replace("{date}", date).replace("{index}", str(cam_index))
+    cam_display = None
+    try:
+        from src.scanner import resolve_camera_identity
+        sample_dir = str(Path(all_tasks[0]["filepath"]).parent) if all_tasks else ""
+        cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=config)
+    except Exception:
+        cam_display = None
+
+    print_startup_banner(
+        date=date,
+        cam_index=cam_index,
+        total_files=total_files,
+        total_duration_s=total_input_dur,
+        output_path=str(OUTPUT_DIR / output_name),
+        cam_name=cam_display,
+    )
+    logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
     output_path = OUTPUT_DIR / output_name
 
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render, dashboard_enabled=dashboard_enabled)
@@ -641,28 +695,24 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         return False
 
     elapsed_wall = time.monotonic() - t_start
+    # 运行期间的告警与异常汇总 (含管线内部错误)
+    with orchestrator.error_lock:
+        run_errors = list(orchestrator.errors)
+    if run_errors:
+        print_error_summary(run_errors)
+
     if ok:
         db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
-        file_sz_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
-        speedup = (total_input_dur / elapsed_wall) if elapsed_wall > 0 else 0
-        el_m, el_s = divmod(int(elapsed_wall), 60)
-
-        # 终端完成摘要卡片
-        summary_card = [
-            "",
-            "=" * 70,
-            f"🎯 HomeVlog 流水线处理完成 | {date} cam{cam_index}",
-            "-" * 70,
-            f"• 原始素材规模 : {total_files} 个文件 ({total_input_dur/3600:.2f} 小时 / {total_input_dur:.1f} 秒)",
-            f"• 浓缩生成成片 : {output_path.name} ({file_sz_mb:.1f} MB)",
-            f"• 全流程总耗时 : {el_m:02d} 分 {el_s:02d} 秒 ({elapsed_wall:.1f}s)",
-            f"• 等效处理倍速 : {speedup:.2f}x 实时加速",
-            f"• 产物存储路径 : {output_path}",
-            "=" * 70,
-            "",
-        ]
-        print("\n".join(summary_card))
-        logger.info("Pipeline %s cam%d finished in %.1fs (%.2fx real-time)", date, cam_index, elapsed_wall, speedup)
+        print_summary_card(
+            date=date,
+            cam_index=cam_index,
+            total_files=total_files,
+            total_input_dur=total_input_dur,
+            output_path=output_path,
+            elapsed_wall=elapsed_wall,
+            cam_name=cam_display,
+        )
+        logger.info("Pipeline %s cam%d finished in %.1fs", date, cam_index, elapsed_wall)
     else:
         db.set_render_status(date, cam_index, "FAILED")
 
@@ -689,6 +739,17 @@ def run_pipeline(skip_render: bool = False, input_dir: str | None = None, dashbo
         groups = get_date_cam_groups(db)
         if not groups:
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+
+        # Rich 批量任务启动 Banner
+        dates = sorted(d for d, _ in groups)
+        cam_labels = sorted({f"Cam {c}" for _, c in groups})
+        print_batch_startup_banner(
+            total_groups=len(groups),
+            date_range=(dates[0], dates[-1]),
+            cameras=cam_labels,
+            output_dir=str(OUTPUT_DIR),
+        )
+
         ok, failed = 0, 0
         for date, cam_index in groups:
             if not check_disk_space(OUTPUT_DIR, min_gb=20):
