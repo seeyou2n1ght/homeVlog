@@ -78,8 +78,17 @@ graph TD
   - 静态片段通过 `setpts` 与 `fps` 滤镜进行幻灯片极速压缩（如 60x 浓缩）并填充无源音频。
   - 多批次通过 FFmpeg 并发编码生成中间片段，最后通过 `-f concat -c copy` 实现无损零重编码最终拼接。
 
-### 5. 数据库并发与持久化 ([`src/database.py`](file:///c:/Users/seeyo/code/homevlog/src/database.py))
+### 5. 数据库并发与持久化 ([`src/database.py`](file:///c:/Users/seeyo/Documents/homeVlog/src/database.py))
 - **设计职责**：管理任务状态机（PENDING → SUSPICIOUS/STATIC → ANALYZED → COMPLETED）与元数据持久化。
 - **读写完全解耦**：
   - 采用 SQLite WAL 模式（`PRAGMA journal_mode=WAL`），所有查询方法无阻塞并发读取。
   - 后台写入线程 `_async_writer` 采用批量事务提交（Batch Commit，每次聚合至多 50 条写入操作），大幅降低磁盘同步 `fsync` 频率。
+
+### 6. 异构算力全双工物理解耦与防死锁设计 ([`src/pipeline.py`](file:///c:/Users/seeyo/Documents/homeVlog/src/pipeline.py), [`src/renderer.py`](file:///c:/Users/seeyo/Documents/homeVlog/src/renderer.py))
+- **全双工芯片级分工 (Full-Duplex Decoupling)**：
+  - **Intel UHD 770 (Decode-Only)**：专职 100% 硬件解码。双 Gen12 VDBox 负责 Pass 1 预筛选（8路并发）与 Pass 1.5 密集多模态分析解码，彻底规避核显媒体总线与 CPU 共享系统内存带宽的争抢。
+  - **NVIDIA RTX 3060Ti (Inference & Encode-Only)**：专职 Tensor Core YOLOv11 批前向推理与 Pass 2 双路 NVENC 满血硬件编码。
+- **管道写死锁物理根除 (Deadlock Elimination)**：
+  - 在包含数十个输入流与复杂多项式变速滤镜的超大批次（如包含 66 个输入切片的 FilterComplex）中，FFmpeg 子进程输出的日志迅速突破操作系统内核匿名管道（64KB）上限。
+  - 架构将 `stdout` 设为 `subprocess.DEVNULL`，并将 `stderr` 异步重定向至 SSD 上的临时日志文件，彻底物理性清除了操作系统的写挂起死锁（Block on Write）。
+
