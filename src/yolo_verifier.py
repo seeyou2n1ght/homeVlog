@@ -56,7 +56,10 @@ class YoloVerifier:
             device = "cpu"
             
         self.device = device
-        
+
+        # 抑制 ultralytics 模型加载/fuse 的 stdout 摘要噪音，保持终端仪表盘版面整洁
+        logging.getLogger("ultralytics").setLevel(logging.WARNING)
+
         with YoloVerifier._model_lock:
             if YoloVerifier._shared_model is None:
                 logger.info(f"Loading shared YOLO model {model_path} on {device}...")

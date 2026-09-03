@@ -16,17 +16,6 @@ from typing import Any, Optional
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskID,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from rich.table import Table
 from rich.text import Text
 
@@ -276,61 +265,51 @@ class PipelineDashboard:
         self.last_render_batch = ""
         self.recent_alerts: list[str] = []
 
-        # 保持对底层 Progress 实例的兼容维护 (用于历史接口或单测)
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]{task.description:<16}[/bold cyan]"),
-            BarColumn(bar_width=28, style="dim", complete_style="green", finished_style="bold green"),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("• ETA:"),
-            TimeRemainingColumn(),
-            TextColumn("{task.fields[status]}"),
-            console=console,
-            expand=False,
-        )
+        # 渲染批次文件级真实计数 (驱动堆叠分布条，杜绝比率推算失真)
+        self.render_done_files = 0
+        self.render_inflight_files = 0
 
-        self.task_prescreen: TaskID = self.progress.add_task(
-            "Pass 1 粗筛",
-            total=total_prescreen,
-            status="[dim]准备就绪[/dim]",
-        )
-        self.task_analysis: TaskID = self.progress.add_task(
-            "Pass 1.5 精析",
-            total=0,
-            status="[dim]等待疑点入队[/dim]",
-        )
-        self.task_render: Optional[TaskID] = None
-        if self.render_enabled:
-            self.task_render = self.progress.add_task(
-                "Pass 2 渲染",
-                total=0,
-                status="[dim]等待批次合成[/dim]",
-            )
+        # 视图刷新节流与脉冲定时器
+        self._cached_view: Optional[Panel] = None
+        self._last_view_build = 0.0
+        self._view_min_interval = 0.12
+        self._pulse_stop = threading.Event()
+        self._pulse_thread: Optional[threading.Thread] = None
 
         self.live: Optional[Live] = None
         if self.enabled:
+            self._cached_view = self._generate_view()
             self.live = Live(
-                self._generate_view(),
+                self._cached_view,
                 console=console,
-                refresh_per_second=6,
+                refresh_per_second=5,
                 transient=False,
-                auto_refresh=False,
+                auto_refresh=True,
             )
 
     def start(self) -> None:
-        """启动实时仪表盘。"""
+        """启动实时仪表盘与 0.5s 脉冲刷新线程。"""
         if self.live:
             self.live.start()
+            self._pulse_stop.clear()
+            self._pulse_thread = threading.Thread(target=self._pulse_loop, daemon=True)
+            self._pulse_thread.start()
 
     def stop(self) -> None:
-        """安全停止并关闭仪表盘。"""
+        """安全停止脉冲线程并关闭仪表盘。"""
+        self._pulse_stop.set()
+        if self._pulse_thread:
+            self._pulse_thread.join(timeout=1.0)
+            self._pulse_thread = None
         if self.live:
-            self.update_view()
+            self.update_view(force=True)
             self.live.stop()
             self.live = None
+
+    def _pulse_loop(self) -> None:
+        """周期性强制重建视图：保证耗时钟走字与节流期内的脏状态最终落屏。"""
+        while not self._pulse_stop.wait(0.5):
+            self.update_view(force=True)
 
     def update_prescreen(self, completed: int, total: Optional[int] = None, latest_file: str = "", speed_str: str = "") -> None:
         """更新预筛阶段进度。"""
@@ -343,16 +322,6 @@ class PipelineDashboard:
                 self.last_prescreen_file = latest_file
             if speed_str:
                 self.last_prescreen_speed = speed_str
-
-            status_text = f"[dim]{speed_str}[/dim]" if speed_str else ""
-            if self.last_prescreen_file:
-                status_text += f" [cyan]({Path(self.last_prescreen_file).name[:20]})[/cyan]"
-
-            fields = {"status": status_text}
-            kwargs: dict[str, Any] = {"completed": completed, "fields": fields}
-            if total is not None:
-                kwargs["total"] = total
-            self.progress.update(self.task_prescreen, **kwargs)
         self.update_view()
 
     def update_analysis(self, completed: int, total: Optional[int] = None, latest_file: str = "", speed_str: str = "") -> None:
@@ -365,21 +334,11 @@ class PipelineDashboard:
                 self.last_analysis_file = latest_file
             if speed_str:
                 self.last_analysis_speed = speed_str
-
-            status_text = f"[dim]{speed_str}[/dim]" if speed_str else ""
-            if self.last_analysis_file:
-                status_text += f" [yellow]({Path(self.last_analysis_file).name[:20]})[/yellow]"
-
-            fields = {"status": status_text}
-            kwargs: dict[str, Any] = {"completed": completed, "fields": fields}
-            if total is not None:
-                kwargs["total"] = total
-            self.progress.update(self.task_analysis, **kwargs)
         self.update_view()
 
     def update_render(self, completed: int, total: Optional[int] = None, latest_batch: str = "", speed_str: str = "") -> None:
         """更新渲染阶段进度。"""
-        if not self.render_enabled or self.task_render is None:
+        if not self.render_enabled:
             return
         with self._lock:
             self.render_done = completed
@@ -389,16 +348,20 @@ class PipelineDashboard:
                 self.last_render_batch = latest_batch
             if speed_str:
                 self.last_render_speed = speed_str
+        self.update_view()
 
-            status_text = f"[dim]{speed_str}[/dim]" if speed_str else ""
-            if self.last_render_batch:
-                status_text += f" [magenta]({self.last_render_batch})[/magenta]"
+    def render_batch_dispatched(self, n_files: int) -> None:
+        """批次投递渲染队列：在飞渲染文件数增加。"""
+        with self._lock:
+            self.render_inflight_files += max(0, n_files)
+        self.update_view()
 
-            fields = {"status": status_text}
-            kwargs: dict[str, Any] = {"completed": completed, "fields": fields}
-            if total is not None:
-                kwargs["total"] = total
-            self.progress.update(self.task_render, **kwargs)
+    def render_batch_finished(self, n_files: int) -> None:
+        """批次渲染终结（成功/空批次/最终失败）：在飞转已成片计数。"""
+        with self._lock:
+            n = max(0, n_files)
+            self.render_inflight_files = max(0, self.render_inflight_files - n)
+            self.render_done_files += n
         self.update_view()
 
     def set_queue_status(self, prescreen_q: int, analysis_q: int, render_q: int) -> None:
@@ -426,30 +389,36 @@ class PipelineDashboard:
                 self.recent_alerts.pop(0)
         self.update_view()
 
-    def update_view(self) -> None:
-        """触发界面即时刷新。"""
-        if self.live:
-            try:
-                self.live.update(self._generate_view(), refresh=True)
-            except Exception:
-                pass
+    def update_view(self, force: bool = False) -> None:
+        """触发界面刷新（0.12s 节流，force 强制重建）。"""
+        if not self.live:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_view_build) < self._view_min_interval:
+            return
+        try:
+            self._cached_view = self._generate_view()
+            self._last_view_build = now
+            self.live.update(self._cached_view, refresh=False)
+        except Exception:
+            pass
 
     def _generate_view(self) -> Panel:
         """组合并渲染符合方案 A (全生命周期堆叠状态条) 的现代仪表盘。"""
         with self._lock:
-            # 1. 顶部硬件调度与队列监控表
+            # 1. 顶部硬件调度与队列监控表 (2:2:3 配比防折行)
             hw_table = Table.grid(padding=(0, 2), expand=True)
-            hw_table.add_column("Col1", ratio=1)
-            hw_table.add_column("Col2", ratio=1)
-            hw_table.add_column("Col3", ratio=1)
+            hw_table.add_column("Col1", ratio=2)
+            hw_table.add_column("Col2", ratio=2)
+            hw_table.add_column("Col3", ratio=3)
 
-            # 格式化调度器状态徽标
+            # 格式化调度器状态徽标 (短文本防折行)
             if self.scheduler_state == "COOPERATIVE_BURST":
-                sched_badge = f"[bold yellow on black] ⚡ BURST (NVDEC {self.active_nv_decoders}/{self.max_nv_decoders} + QSV) [/]"
+                sched_badge = f"[bold yellow on black] ⚡ BURST (NVDEC {self.active_nv_decoders}/{self.max_nv_decoders}+QSV) [/]"
             elif self.scheduler_state == "RENDER_PREEMPTION_YIELD":
-                sched_badge = "[bold magenta on black] 🎬 RENDER PREEMPTION (NVENC Priority) [/]"
+                sched_badge = "[bold magenta on black] 🎬 RENDER PREEMPT [/]"
             else:
-                sched_badge = "[bold green on black] 🍃 NORMAL (100% QSV Decoupled) [/]"
+                sched_badge = "[bold green on black] 🍃 NORMAL (QSV) [/]"
 
             elapsed_s = int(time.monotonic() - self._start_time)
             mins, secs = divmod(elapsed_s, 60)
@@ -467,37 +436,29 @@ class PipelineDashboard:
                 f"[bold cyan]队列水位:[/] {q_info} [dim](耗时 {time_str})[/dim]",
             )
 
-            # 2. 方案 A: 计算各工序的切片分布数量 (守恒归一化)
+            # 2. 方案 A: 各工序切片分布 (文件级真实计数，守恒归一化)
+            #    桶定义严格互斥且总和 = total，杜绝比率推算造成的开局虚报
             total = max(1, self.total_files)
 
-            # (1) 已成片 (Done)
-            if self.render_total > 0 and self.render_done > 0:
-                done = int(round(total * (self.render_done / self.render_total)))
-                if self.render_done == self.render_total:
-                    done = total
-            else:
-                done = 0
+            # (1) 已成片: 已完成渲染批次覆盖的真实文件数
+            done = min(total, max(0, self.render_done_files))
 
-            # (2) 渲染中 (Rendering)
-            if self.render_total > 0 and self.render_done < self.render_total and self.render_queue_size >= 0:
-                files_per_batch = max(1, total // max(1, self.render_total))
-                rendering = min(total - done, files_per_batch)
-            else:
-                rendering = 0
+            # (2) 压制中: 已投递未完成的渲染批次覆盖的真实文件数
+            rendering = min(total - done, max(0, self.render_inflight_files))
 
-            # (3) YOLO 精析中 (Analyzing)
-            active_yolo = max(0, self.analysis_total - self.analysis_done)
-            yolo = min(total - done - rendering, active_yolo)
+            # (3) YOLO 精析中: 待析队列 + 分析在飞
+            yolo_pending = max(0, self.analysis_total - self.analysis_done)
+            yolo = min(total - done - rendering, yolo_pending)
 
-            # (4) 纯静态快进就绪 (Static Ready)
-            static_candidates = max(0, self.prescreen_done - self.analysis_total)
+            # (4) 静态快进就绪: 已过筛/已分析但尚未进入渲染批次的文件
+            static_candidates = max(0, self.prescreen_done - yolo_pending - done - rendering)
             static = max(0, min(total - done - rendering - yolo, static_candidates))
 
-            # (5) 粗筛中 (Prescreening)
-            prescreen_remain = max(0, self.prescreen_total - self.prescreen_done)
-            prescreen = min(8, max(0, min(total - done - rendering - yolo - static, prescreen_remain)))
+            # (5) QSV 粗筛在飞: 总待筛 - 已完成 - 队列中等待
+            prescreen_inflight = max(0, self.prescreen_total - self.prescreen_done - self.prescreen_queue_size)
+            prescreen = min(total - done - rendering - yolo - static, prescreen_inflight)
 
-            # (6) 待输入 (Pending)
+            # (6) 待输入: 守恒残差
             pending = max(0, total - (done + rendering + yolo + static + prescreen))
 
             # 3. 构造 48 字符等宽堆叠条 (针对 Windows Terminal 完美等宽对齐)

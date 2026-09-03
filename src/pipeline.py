@@ -425,6 +425,8 @@ class StreamingOrchestrator:
 
                     if not batch_segs:
                         logger.warning(f"render batch {b_idx} has no timeline segments, skipping")
+                        if self.dashboard is not None:
+                            self.dashboard.render_batch_finished(len(files_to_batch))
                         continue
 
                     res_path = build_batch_render(
@@ -446,17 +448,20 @@ class StreamingOrchestrator:
                             )
                         )
                         if self.dashboard is not None:
+                            self.dashboard.render_batch_finished(len(files_to_batch))
                             # 精准渲染阶段自身计时与剩余预估
                             t_start = render_start_t[0] if render_start_t else t_r0
                             el_sec = max(0.1, time.monotonic() - t_start)
                             n_done = self.dashboard.render_done + 1
                             n_total = max(n_done, self.dashboard.render_total)
                             avg_s = el_sec / max(1, n_done)
+                            enc_name = "NVENC" if gpu == "nv" else gpu.upper()
                             self.dashboard.update_render(
                                 completed=n_done,
-                                latest_batch=f"Batch {b_idx} on {gpu.upper()}",
-                                speed_str=f"均速 {avg_s:.1f}s/批",
+                                latest_batch=f"Batch {b_idx} on {enc_name}",
+                                speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
                             )
+                            self._sync_queue_levels()
                     else:
                         if gpu == "qsv":
                             # QSV 编码失败或异常，自动 failover 回退到 NVENC 重试
@@ -464,12 +469,16 @@ class StreamingOrchestrator:
                             heavy_queue.put((b_idx, files_to_batch))
                         else:
                             self._add_error(f"render batch {b_idx} returned no output")
+                            if self.dashboard is not None:
+                                self.dashboard.render_batch_finished(len(files_to_batch))
                 except Exception:
                     logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
                     if gpu == "qsv":
                         heavy_queue.put((b_idx, files_to_batch))
                     else:
                         self._add_error(f"render batch {b_idx} failed on {gpu}")
+                        if self.dashboard is not None:
+                            self.dashboard.render_batch_finished(len(files_to_batch))
                 finally:
                     if gpu == "nv":
                         self.work_stealing.register_render_end()
@@ -489,10 +498,12 @@ class StreamingOrchestrator:
             else:
                 light_queue.put((b_idx, files))
             if self.dashboard is not None:
+                self.dashboard.render_batch_dispatched(len(files))
                 self.dashboard.update_render(
                     completed=self.dashboard.render_done,
                     total=self.dashboard.render_total + 1,
                 )
+            self._sync_queue_levels()
 
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
@@ -564,6 +575,7 @@ class StreamingOrchestrator:
         )
         self.dashboard.update_prescreen(completed=prescreen_done_pre, total=len(all_tasks))
         self.dashboard.update_analysis(completed=analysis_done_pre, total=len(pending_analysis) + analysis_done_pre)
+        self._sync_queue_levels()
 
         for task in all_tasks:
             if task["prescreen_status"] == "PENDING":
