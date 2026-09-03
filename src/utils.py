@@ -102,16 +102,28 @@ class WorkStealingManager:
             hw_cfg.get("max_nv_decoders", 1),
         )
         self.device: str = hw_cfg.get("device", "cuda:0")
+        self.cold_start_burst: bool = sched_cfg.get("cold_start_burst", False)
 
         self._lock = threading.Lock()
         self._render_active_count = 0
         self._active_nv_decoders = 0
         self._state = "NORMAL_DECOUPLED"
 
+    def enable_cold_start_burst(self) -> None:
+        """激活冷启动破冰模式：在渲染任务就绪前优先调用 NVDEC 协同解码冲刷队列。"""
+        with self._lock:
+            self.cold_start_burst = True
+
+    def disable_cold_start_burst(self) -> None:
+        """停用冷启动破冰模式，回归常规水位线管控。"""
+        with self._lock:
+            self.cold_start_burst = False
+
     def register_render_start(self) -> None:
         """Pass 2 NVENC 渲染批次开始信号：阻断 NVDEC 工作窃取，优先保证 NVENC 编码会话与带宽。"""
         with self._lock:
             self._render_active_count += 1
+            self.cold_start_burst = False
             self._state = "RENDER_PREEMPTION_YIELD"
 
     def register_render_end(self) -> None:
@@ -155,7 +167,11 @@ class WorkStealingManager:
                 self._state = "NORMAL_DECOUPLED"
                 return "qsv"
 
-            if queue_size >= self.watermark_high:
+            # 冷启动破冰协同条件：显式启用了 cold_start_burst 且队列非空且无渲染运行
+            is_cold_burst = (self.cold_start_burst and self._render_active_count == 0 and queue_size >= 1)
+            is_queue_backlog = (queue_size >= self.watermark_high)
+
+            if is_cold_burst or is_queue_backlog:
                 if self._active_nv_decoders < self.max_nv_decoders:
                     self._state = "COOPERATIVE_BURST"
                     return "cuda"
@@ -168,6 +184,8 @@ class WorkStealingManager:
                 if self._state == "COOPERATIVE_BURST" and self._active_nv_decoders < self.max_nv_decoders:
                     return "cuda"
                 return "qsv"
+
+
 
     def acquire_nvdec_slot(self) -> bool:
         """尝试占用一个 NVDEC 解码协同槽位。"""

@@ -558,7 +558,13 @@ class MotionDetector:
             enabled=self.audio_vad_enabled,
         )
 
+        # YOLO 联动推理开关与采样参数
+        yolo_cfg = config.get("yolo", {})
+        self.yolo_enabled = yolo_cfg.get("enabled", False)
+        self.yolo_sample_fps = float(yolo_cfg.get("sample_fps", 0.5))
+
         self.last_perf: dict = {}
+
 
     def create_ema_model(self) -> EmaBackgroundModel:
         """Helper to create configured EMA background model."""
@@ -927,15 +933,23 @@ class MotionDetector:
 
                     if getattr(self, "yolo_enabled", False) and (total_frames - 1) % yolo_sample_interval == 0:
                         try:
-                            yolo_frames_buffer[total_frames - 1] = frame.reformat(
+                            rgb_raw = frame.reformat(
                                 width=self.width, height=self.height, format="rgb24"
                             ).to_ndarray()
                         except Exception:
-                            yolo_frames_buffer[total_frames - 1] = cv2.resize(
+                            rgb_raw = cv2.resize(
                                 frame.to_ndarray(format="rgb24"),
                                 (self.width, self.height),
                                 interpolation=cv2.INTER_LINEAR,
                             )
+                        # 内存切片压缩为 JPEG 字节，单帧从 292KB 降至约 15KB
+                        bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
+                        ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        if ok_enc:
+                            yolo_frames_buffer[total_frames - 1] = buf_jpg
+                        else:
+                            yolo_frames_buffer[total_frames - 1] = rgb_raw
+
 
                     # Analysis 灰度图极速提取 (直接提取 YUV420p 的 Y 平面，零色彩空间转换开销)
                     try:

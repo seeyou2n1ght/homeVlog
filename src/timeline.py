@@ -373,9 +373,17 @@ def partition_timeline_by_batches(
     return batches
 
 
-def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[TimelineSegment]:
-    config = load_config()
-    rows = db.get_all_file_tasks_for_date(date, cam_index)
+def build_timeline_from_rows(
+    rows: list[dict],
+    date: str,
+    target_files: set[str] | list[str] | None = None,
+    config: dict | None = None,
+) -> list[TimelineSegment]:
+    """
+    基于给定的数据库任务行集合构建时间轴片段，支持按 target_files 精准局部过滤。
+    """
+    if config is None:
+        config = load_config()
 
     day_start = ts_to_unix(date + "000000")
 
@@ -392,7 +400,7 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
         )
         file_offset = day_offset
 
-        if row["prescreen_status"] == "STATIC":
+        if row.get("prescreen_status") == "STATIC":
             file_end_offset = file_offset + file_dur
             files_meta.append({
                 "filepath": row["filepath"],
@@ -406,7 +414,7 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
                 source_file=row["filepath"],
                 file_start_offset=file_offset,
             ))
-        elif row["analysis_segments"]:
+        elif row.get("analysis_segments"):
             segs = segments_from_json(row["analysis_segments"])
             if not segs:
                 file_end_offset = file_offset + file_dur
@@ -486,6 +494,11 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
     # 严格按物理文件边界切分，防止跨文件批次渲染时超出物理文件时长
     split_segs = split_segments_at_file_boundaries(filtered, files_meta)
 
+    # 若指定 target_files，则快速局部过滤出目标文件的切片
+    target_set = set(target_files) if target_files is not None else None
+    if target_set is not None:
+        split_segs = [s for s in split_segs if s.source_file in target_set]
+
     unique_files = list(dict.fromkeys(s.source_file for s in split_segs))
     file_to_idx = {f: i for i, f in enumerate(unique_files)}
 
@@ -505,11 +518,19 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
             duration=end_in_file - start_in_file,
         ))
 
+    return timeline
+
+
+def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[TimelineSegment]:
+    config = load_config()
+    rows = db.get_all_file_tasks_for_date(date, cam_index)
+    timeline = build_timeline_from_rows(rows, date, config=config)
     logger.debug(
-        "timeline for %s cam%d: %d files, %d segments",
-        date, cam_index, len(unique_files), len(timeline),
+        "timeline for %s cam%d: %d segments",
+        date, cam_index, len(timeline),
     )
     return timeline
+
 
 
 def build_concat_filter(

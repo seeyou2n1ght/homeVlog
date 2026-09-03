@@ -45,6 +45,8 @@ class StreamingOrchestrator:
 
         # 异构硬件自适应调度器
         self.work_stealing = WorkStealingManager(config=self.config)
+        self.work_stealing.enable_cold_start_burst()
+
 
         # 队列定义
         self.prescreen_queue = queue.Queue()
@@ -329,10 +331,10 @@ class StreamingOrchestrator:
                     self.work_stealing.register_render_start()
                 try:
                     all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
-                    full_timeline = build_timeline(self.db, self.date, self.cam_index)
-                    batch_segs = [
-                        s for s in full_timeline if s.filepath in files_to_batch
-                    ]
+                    from src.timeline import build_timeline_from_rows
+                    batch_segs = build_timeline_from_rows(
+                        all_rows, self.date, target_files=files_to_batch, config=self.config
+                    )
 
                     if not batch_segs:
                         logger.warning(f"render batch {b_idx} has no timeline segments, skipping")
@@ -380,12 +382,14 @@ class StreamingOrchestrator:
                         self.work_stealing.register_render_end()
                     batch_queue.task_done()
 
-        # 启动 1 个 NVENC 主力 Worker + 1 个 QSV 辅助 Worker (防锁争抢与饥饿)
+        # 启动 2 个 NVENC 主力 Worker (压榨 3060Ti 双编引擎) + 1 个 QSV 辅助 Worker
         render_threads = []
-        for gpu in ["nv", "qsv"]:
+        render_gpus = ["nv", "nv", "qsv"]
+        for gpu in render_gpus:
             t = threading.Thread(target=_render_worker, args=(gpu,), daemon=True)
             t.start()
             render_threads.append(t)
+
 
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
