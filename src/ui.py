@@ -46,7 +46,7 @@ def print_batch_startup_banner(
     date_range: tuple[str, str],
     cameras: list[str],
     output_dir: str = "output",
-    device_info: str = "Intel UHD 770 (QSV 粗筛/解码) + RTX 3060Ti (NVENC 渲染/YOLO)",
+    device_info: str = "核显 UHD 770（解码+粗筛）＋ 独显 RTX 3060Ti（AI 分析+渲染）",
 ) -> None:
     """在多天批量浓缩任务启动时，打印宏观全局规划 Banner。"""
     table = Table.grid(padding=(0, 2))
@@ -59,7 +59,7 @@ def print_batch_startup_banner(
 
     cam_str = ", ".join(cameras) if cameras else "全机位"
     table.add_row("📷 监控机位:", f"[bold green]{cam_str}[/]")
-    table.add_row("⚡ 硬件协同:", f"[bold magenta]{device_info}[/]")
+    table.add_row("⚡ 硬件分工:", f"[bold magenta]{device_info}[/]")
     table.add_row("📦 归档输出:", f"[dim]{output_dir}/ (成片按日自动命名归档)[/dim]")
 
     panel = Panel(
@@ -77,7 +77,7 @@ def print_startup_banner(
     cam_index: int,
     total_files: int,
     total_duration_s: float,
-    device_info: str = "Intel UHD 770 (QSV 粗筛/解码) + RTX 3060Ti (NVENC 渲染/YOLO)",
+    device_info: str = "核显 UHD 770（解码+粗筛）＋ 独显 RTX 3060Ti（AI 分析+渲染）",
     output_path: Optional[str] = None,
     cam_name: Optional[str] = None,
     batch_progress: Optional[str] = None,
@@ -96,9 +96,9 @@ def print_startup_banner(
 
     table.add_row(
         "🎬 输入素材:",
-        f"[bold green]{total_files}[/] 个监控切片 | 原始总时长: [bold yellow]{hours:.2f}[/] 小时 ([dim]{total_duration_s:.1f} 秒[/dim])",
+        f"[bold green]{total_files}[/] 个监控切片 | 原始总时长: [bold yellow]{hours:.2f}[/] 小时",
     )
-    table.add_row("⚡ 硬件协同:", f"[bold magenta]{device_info}[/]")
+    table.add_row("⚡ 硬件分工:", f"[bold magenta]{device_info}[/]")
     if output_path:
         table.add_row("📦 成片目标:", f"[dim]{output_path}[/dim]")
 
@@ -133,23 +133,23 @@ def print_summary_card(
     metric_table.add_column("数值与明细", style="white")
 
     metric_table.add_row(
-        "原始素材规模",
-        f"[bold]{total_files}[/] 个文件 (总计 [yellow]{total_input_dur / 3600:.2f}[/] 小时 / [dim]{total_input_dur:.1f}s[/dim])",
+        "输入素材",
+        f"[bold]{total_files}[/] 个文件 (总计 [yellow]{total_input_dur / 3600:.2f}[/] 小时)",
     )
     metric_table.add_row(
-        "生成浓缩成片",
+        "输出成片",
         f"[bold green]{output_path.name}[/] ([cyan]{file_sz_mb:.2f} MB[/cyan])",
     )
     metric_table.add_row(
-        "全流程总耗时",
-        f"[bold yellow]{el_m:02d}分{el_s:02d}秒[/bold yellow] (物理耗时 [dim]{elapsed_wall:.2f}s[/dim])",
+        "总耗时",
+        f"[bold yellow]{el_m:02d}分{el_s:02d}秒[/bold yellow]",
     )
     metric_table.add_row(
-        "等效加速倍率",
-        f"[bold red]{speedup:.2f}x 实时加速[/bold red]",
+        "处理速度",
+        f"[bold red]{speedup:.1f}× 实时[/bold red]",
     )
     metric_table.add_row(
-        "文件输出路径",
+        "输出路径",
         f"{str(output_path)}",
     )
 
@@ -170,7 +170,7 @@ def print_summary_card(
     cam_label = f"{cam_name} (Cam {cam_index})" if cam_name and cam_name != f"cam{cam_index}" else f"Cam {cam_index}"
     panel = Panel(
         Group(*renderables),
-        title=f"[bold green]✨ HomeVlog 浓缩流水线处理圆满完成 | {date} {cam_label}[/bold green]",
+        title=f"[bold green]✨ HomeVlog 处理完成 | {date} {cam_label}[/bold green]",
         border_style="green",
         padding=(1, 2),
     )
@@ -414,26 +414,26 @@ class PipelineDashboard:
 
             # 格式化调度器状态徽标 (短文本防折行)
             if self.scheduler_state == "COOPERATIVE_BURST":
-                sched_badge = f"[bold yellow on black] ⚡ BURST (NVDEC {self.active_nv_decoders}/{self.max_nv_decoders}+QSV) [/]"
+                sched_badge = f"[bold yellow on black] ⚡ 双卡协同 (NVDEC {self.active_nv_decoders}/{self.max_nv_decoders}) [/]"
             elif self.scheduler_state == "RENDER_PREEMPTION_YIELD":
-                sched_badge = "[bold magenta on black] 🎬 RENDER PREEMPT [/]"
+                sched_badge = "[bold magenta on black] 🎬 渲染优先 [/]"
             else:
-                sched_badge = "[bold green on black] 🍃 NORMAL (QSV) [/]"
+                sched_badge = "[bold green on black] 🍃 常规（核显解码） [/]"
 
             elapsed_s = int(time.monotonic() - self._start_time)
             mins, secs = divmod(elapsed_s, 60)
             time_str = f"{mins:02d}:{secs:02d}"
 
             q_info = (
-                f"[dim]待筛:[/] [cyan]{self.prescreen_queue_size}[/] | "
-                f"[dim]待析:[/] [yellow]{self.analysis_queue_size}[/] | "
-                f"[dim]待编:[/] [magenta]{self.render_queue_size}[/]"
+                f"[dim]粗筛:[/] [cyan]{self.prescreen_queue_size}[/] | "
+                f"[dim]分析:[/] [yellow]{self.analysis_queue_size}[/] | "
+                f"[dim]渲染:[/] [magenta]{self.render_queue_size}[/]"
             )
 
             hw_table.add_row(
                 f"[bold cyan]日期:[/] {self.date} (Cam {self.cam_index})",
-                f"[bold cyan]调度策略:[/] {sched_badge}",
-                f"[bold cyan]队列水位:[/] {q_info} [dim](耗时 {time_str})[/dim]",
+                f"[bold cyan]运行模式:[/] {sched_badge}",
+                f"[bold cyan]待办:[/] {q_info} [dim](已运行 {time_str})[/dim]",
             )
 
             # 2. 方案 A: 各工序切片分布 (文件级真实计数，守恒归一化)
@@ -485,15 +485,15 @@ class PipelineDashboard:
             if w_pend > 0:
                 t_bar.append("┈" * w_pend, style="dim white")
             pct = (done / total) * 100
-            t_bar.append(f"]  {done}/{total} ({pct:.1f}% 闭环)", style="bold white")
+            t_bar.append(f"]  {done}/{total} 已完成 ({pct:.1f}%)", style="bold white")
 
             legend_text = Text.from_markup(
-                f"  [bold green]█ 已成片 {done}[/] │ "
-                f"[bold magenta]█ 压制中 {rendering}[/] │ "
-                f"[bold yellow]█ YOLO精析 {yolo}[/] │ "
-                f"[cyan]▒ 静态快进 {static}[/] │ "
-                f"[bold blue]░ QSV粗筛 {prescreen}[/] │ "
-                f"[dim white]┈ 待输入 {pending}[/]"
+                f"  [bold green]█ 已完成 {done}[/] │ "
+                f"[bold magenta]█ 渲染中 {rendering}[/] │ "
+                f"[bold yellow]█ AI 分析中 {yolo}[/] │ "
+                f"[cyan]▒ 待渲染 {static}[/] │ "
+                f"[bold blue]░ 粗筛中 {prescreen}[/] │ "
+                f"[dim white]┈ 待处理 {pending}[/]"
             )
 
             # 4. 微观阶段进展表 (极简紧凑 3 行)
@@ -510,7 +510,7 @@ class PipelineDashboard:
             if self.last_prescreen_file:
                 p_detail += f" ({Path(self.last_prescreen_file).name[:20]})"
             micro_table.add_row(
-                "• Pass 1 粗筛",
+                "• ① 快速粗筛",
                 f"[{p_pct:>3}%] {self.prescreen_done}/{self.prescreen_total}",
                 p_detail or "[dim]准备就绪[/dim]"
             )
@@ -519,7 +519,7 @@ class PipelineDashboard:
             if self.last_analysis_file:
                 a_detail += f" ({Path(self.last_analysis_file).name[:20]})"
             micro_table.add_row(
-                "• Pass 1.5精析",
+                "• ② AI 精析",
                 f"[{a_pct:>3}%] {self.analysis_done}/{self.analysis_total}" if self.analysis_total > 0 else "[  0%] 等待疑点",
                 a_detail or ("[dim]等待疑点入队[/dim]" if self.analysis_total == 0 else "[dim]推断中[/dim]")
             )
@@ -529,7 +529,7 @@ class PipelineDashboard:
                 if self.last_render_batch:
                     r_detail += f" ({self.last_render_batch})"
                 micro_table.add_row(
-                    "• Pass 2 渲染",
+                    "• ③ 视频渲染",
                     f"[{r_pct:>3}%] {self.render_done}/{self.render_total} 批" if self.render_total > 0 else "[  0%] 准备批次",
                     r_detail or "[dim]等待批次合成[/dim]"
                 )
@@ -538,7 +538,7 @@ class PipelineDashboard:
             elements: list[Any] = [
                 hw_table,
                 Text(""),
-                Text("🎬 全天素材工序全景流动分布 [横轴总长 = 全天素材 100%]:", style="bold cyan"),
+                Text("🎬 全天素材处理全景:", style="bold cyan"),
                 t_bar,
                 legend_text,
                 Text(""),

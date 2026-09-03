@@ -28,7 +28,6 @@ from src.utils import (
     WorkStealingManager,
 )
 from src.monitor import get_monitor, get_perf, PerfRecord
-from src.timeline import build_timeline
 
 logger = logging.getLogger("homevlog")
 
@@ -176,6 +175,10 @@ class StreamingOrchestrator:
                         extra={"status": "ERROR"},
                     )
                 )
+                # 必须回传 FAILED 消息推进渲染保序滑窗，否则窗口停摆导致整条流水线死锁
+                self.render_batch_queue.put(
+                    {"filepath": filepath, "status": "FAILED"}
+                )
             finally:
                 self.prescreen_queue.task_done()
 
@@ -220,8 +223,10 @@ class StreamingOrchestrator:
             if yolo_verifier:
                 is_yolo_active = True
                 yolo_device = self.config.get("hardware", {}).get("device", "cpu")
+                # yolo_buffer 帧键以解码实际 effective_fps 为基准，禁止使用固定的 detector.fps
+                effective_fps = getattr(detector, "last_perf", {}).get("effective_fps") or detector.fps
                 segments = yolo_verifier.verify(
-                    filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=detector.fps
+                    filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
                 )
             yolo_after = len(segments)
 
@@ -261,11 +266,12 @@ class StreamingOrchestrator:
             task_el = max(0.1, time.monotonic() - t0)
             frames_done = getattr(detector, "last_perf", {}).get("frames", 0)
             fps_val = frames_done / task_el if frames_done else 0.0
-            speed_str = f"{fps_val:.1f} fps" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
+            hw_label = "核显" if gpu == "qsv" else "独显"
+            speed_str = f"{fps_val:.1f} 帧/秒（{hw_label}解码）" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
             self.dashboard.update_analysis(
                 completed=n_done,
                 latest_file=Path(filepath).name,
-                speed_str=f"{speed_str} ({gpu.upper()})",
+                speed_str=speed_str,
             )
             self._sync_queue_levels()
 
@@ -358,11 +364,14 @@ class StreamingOrchestrator:
 
         pending_files: list[str] = []
         batch_idx = 0
+        dispatched_batch_ids: list[int] = []
         time.sleep(max(0, self.render_delay))
         heavy_queue = queue.Queue()
         light_queue = queue.Queue()
         all_dispatched_event = threading.Event()
         render_start_t: list[float] = []
+        # 已进入终态（失败已上报 / 空时间轴跳过）的批次集合，用于收尾对账去重
+        terminal_batch_ids: set[int] = set()
 
         def _is_heavy_batch(files_to_batch: list[str]) -> bool:
             """检查批次中是否包含需复杂处理的 DYNAMIC 动作片段。"""
@@ -384,31 +393,23 @@ class StreamingOrchestrator:
         def _render_worker(gpu: str):
             while True:
                 item = None
-                if gpu == "nv":
-                    # NVENC 优先取 heavy 任务，其次协助消费 light 任务
-                    try:
-                        item = heavy_queue.get_nowait()
-                    except queue.Empty:
-                        try:
-                            item = light_queue.get(timeout=0.5)
-                        except queue.Empty:
-                            if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
-                                break
-                            continue
-                elif gpu == "qsv":
-                    # QSV 严禁处理 heavy 任务，仅协助处理 light 任务
-                    # 收尾防拖尾保护：当分发完毕且剩余轻任务 <= 1 时，QSV 主动退出让位 NVENC
-                    if all_dispatched_event.is_set() and light_queue.qsize() <= 1:
-                        break
+                # NVENC 优先取 heavy 任务，其次协助消费 light 任务
+                try:
+                    item = heavy_queue.get_nowait()
+                except queue.Empty:
                     try:
                         item = light_queue.get(timeout=0.5)
                     except queue.Empty:
-                        if all_dispatched_event.is_set() and light_queue.empty():
+                        if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
                             break
                         continue
 
                 if item is None:
-                    break
+                    # 哨兵仅为唤醒信号，不是退出许可：仅当分发完毕且双队列均已排空
+                    # 才允许退出；否则继续消费滞留批次，杜绝 light 批次被 stranded 静默丢弃
+                    if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                        break
+                    continue
 
                 b_idx, files_to_batch = item
                 if not render_start_t:
@@ -425,6 +426,8 @@ class StreamingOrchestrator:
 
                     if not batch_segs:
                         logger.warning(f"render batch {b_idx} has no timeline segments, skipping")
+                        with self.batch_lock:
+                            terminal_batch_ids.add(b_idx)
                         if self.dashboard is not None:
                             self.dashboard.render_batch_finished(len(files_to_batch))
                         continue
@@ -458,27 +461,23 @@ class StreamingOrchestrator:
                             enc_name = "NVENC" if gpu == "nv" else gpu.upper()
                             self.dashboard.update_render(
                                 completed=n_done,
-                                latest_batch=f"Batch {b_idx} on {enc_name}",
+                                latest_batch=f"批次 {b_idx}（{enc_name} 编码）",
                                 speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
                             )
                             self._sync_queue_levels()
                     else:
-                        if gpu == "qsv":
-                            # QSV 编码失败或异常，自动 failover 回退到 NVENC 重试
-                            logger.warning("Streaming: QSV batch %d failed, falling back to NVENC", b_idx)
-                            heavy_queue.put((b_idx, files_to_batch))
-                        else:
-                            self._add_error(f"render batch {b_idx} returned no output")
-                            if self.dashboard is not None:
-                                self.dashboard.render_batch_finished(len(files_to_batch))
-                except Exception:
-                    logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
-                    if gpu == "qsv":
-                        heavy_queue.put((b_idx, files_to_batch))
-                    else:
-                        self._add_error(f"render batch {b_idx} failed on {gpu}")
+                        self._add_error(f"render batch {b_idx} returned no output")
+                        with self.batch_lock:
+                            terminal_batch_ids.add(b_idx)
                         if self.dashboard is not None:
                             self.dashboard.render_batch_finished(len(files_to_batch))
+                except Exception:
+                    logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
+                    self._add_error(f"render batch {b_idx} failed on {gpu}")
+                    with self.batch_lock:
+                        terminal_batch_ids.add(b_idx)
+                    if self.dashboard is not None:
+                        self.dashboard.render_batch_finished(len(files_to_batch))
                 finally:
                     if gpu == "nv":
                         self.work_stealing.register_render_end()
@@ -497,6 +496,7 @@ class StreamingOrchestrator:
                 heavy_queue.put((b_idx, files))
             else:
                 light_queue.put((b_idx, files))
+            dispatched_batch_ids.append(b_idx)
             if self.dashboard is not None:
                 self.dashboard.render_batch_dispatched(len(files))
                 self.dashboard.update_render(
@@ -548,6 +548,17 @@ class StreamingOrchestrator:
             light_queue.put(None)
         for t in render_threads:
             t.join()
+
+        # 渲染对账：分发批次必须全部到达终态（产出或已上报失败），
+        # 任何无记录的缺失即为静默丢批，立即上报
+        with self.batch_lock:
+            produced_ids = {bi for bi, _ in self.batch_paths}
+            accounted = produced_ids | terminal_batch_ids
+        missing = [bi for bi in dispatched_batch_ids if bi not in accounted]
+        if missing:
+            self._add_error(f"render batches silently dropped: {missing}")
+            logger.error("render reconciliation failed: dispatched=%s produced=%s missing=%s",
+                         dispatched_batch_ids, sorted(produced_ids), missing)
 
 
     def run(self):
@@ -620,8 +631,11 @@ class StreamingOrchestrator:
             self.render_batch_queue.join()
 
         self.stop_event.set()
+        # 渲染超时上限为 max(7200, files*600)，远高于任何固定 join 超时；
+        # 使用带超时的 join 会导致超时后静默拼接缺失批次，故必须无限等待。
+        # 渲染线程内部已有 ffmpeg 看门狗兜底，不会永久阻塞。
         for t in threads:
-            t.join(timeout=3600)
+            t.join()
 
         if self.dashboard is not None:
             self.dashboard.stop()
@@ -714,6 +728,20 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         print_error_summary(run_errors)
 
     if ok:
+        # 生成外挂 SRT 字幕：播放时间轴 → 真实监控墙钟时间映射（含 ramping 非线性还原）
+        if config.get("render", {}).get("generate_subtitles", False):
+            try:
+                from src.timeline import build_timeline, save_timecode_subtitles
+                full_timeline = build_timeline(db, date, cam_index)
+                save_timecode_subtitles(
+                    full_timeline,
+                    output_path.with_suffix(".srt"),
+                    rows=all_rows,
+                    base_date=date,
+                )
+            except Exception as e:
+                logger.warning("save_timecode_subtitles failed: %s", e)
+
         db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
         print_summary_card(
             date=date,
@@ -742,7 +770,9 @@ def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: floa
         pass
 
 
-def run_pipeline(skip_render: bool = False, input_dir: str | None = None, dashboard_enabled: bool = True) -> dict:
+def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True) -> dict:
+    from src.utils import cleanup_temp_artifacts
+    cleanup_temp_artifacts()
     db = VlogDatabase()
     monitor = get_monitor()
     monitor.start()

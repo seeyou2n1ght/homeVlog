@@ -18,7 +18,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.utils import setup_logging, load_config, reset_semaphores, get_logger
+from src.utils import setup_logging, load_config, reset_semaphores
 from src.pipeline import run_pipeline
 from src.database import VlogDatabase
 from src.scanner import scan_directory, get_date_cam_groups
@@ -73,6 +73,8 @@ def main():
         return
 
     if args.date:
+        from src.utils import cleanup_temp_artifacts
+        cleanup_temp_artifacts()
         db = VlogDatabase()
         try:
             from src.pipeline import process_date_cam
@@ -88,10 +90,12 @@ def main():
             sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
             from src.scanner import resolve_camera_identity
             cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam, config=config)
+            # 先关闭日志体系，避免退出清理阶段桥接器向终端写出残留转义序列
+            logging.shutdown()
             if ok:
-                console.print(f"[bold green]✔ 指定日期机位处理完成: {args.date} ({cam_display}) (SUCCESS)[/bold green]")
+                console.print(f"[bold green]✔ 处理完成: {args.date} ({cam_display})[/bold green]")
             else:
-                console.print(f"[bold red]✖ 指定日期机位处理失败: {args.date} ({cam_display}) (FAILED)[/bold red]")
+                console.print(f"[bold red]✖ 处理失败: {args.date} ({cam_display})[/bold red]")
 
         finally:
             db.close()
