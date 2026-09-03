@@ -192,6 +192,32 @@ class TestVlogDatabaseLifecycle:
         finally:
             db.close()
 
+    def test_reset_failed_tasks_self_healing(self, tmp_path):
+        """FAILED 预筛/分析任务自动重置为 PENDING，retry_count 上限后不再重置。"""
+        db_path = tmp_path / "test_reset.db"
+        db = VlogDatabase(db_path=db_path)
+        try:
+            db.add_file_task("f1.mp4", 0, "20260901", "20260901100000", "20260901100500", 300.0)
+            db.add_file_task("f2.mp4", 0, "20260901", "20260901100500", "20260901101000", 300.0)
+            db.set_prescreen_result("f1.mp4", "FAILED", "")
+            db.set_prescreen_result("f2.mp4", "SUSPICIOUS", "")
+            db.set_analysis_result("f2.mp4", "FAILED", "")
+
+            res = db.reset_failed_tasks("20260901", 0, max_retries=2)
+            assert res == {"prescreen": 1, "analysis": 1}
+            assert db.get_pending_file_count_for_date("20260901", 0) == 2
+
+            # 再次失败并重置：retry_count 达到上限后不再重置
+            db.set_prescreen_result("f1.mp4", "FAILED", "")
+            db.reset_failed_tasks("20260901", 0, max_retries=2)
+            db.set_prescreen_result("f1.mp4", "FAILED", "")
+            res = db.reset_failed_tasks("20260901", 0, max_retries=2)
+            assert res["prescreen"] == 0
+            tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert tasks[0]["prescreen_status"] == "FAILED"
+        finally:
+            db.close()
+
     def test_concurrent_read_write_wal_safety(self, tmp_path):
         """高并发多线程读写，验证 WAL 模式下数据库绝无死锁。"""
         db_path = tmp_path / "test_wal_concurrency.db"

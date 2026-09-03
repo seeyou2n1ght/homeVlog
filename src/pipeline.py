@@ -328,6 +328,11 @@ class StreamingOrchestrator:
                             detector = detector_cuda
                         else:
                             detector = detectors["qsv"]
+                        # 渲染在租约后恰好启动的竞争窗口：cuda 任务直接降级 QSV 解码，
+                        # 避免 NV 信号量被渲染占满后重试耗尽造成假 FAILED
+                        if gpu == "cuda" and self.work_stealing.is_render_active:
+                            gpu = "qsv"
+                            detector = detectors["qsv"]
                         self._execute_analysis_task(
                             task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0
                         )
@@ -658,6 +663,9 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     config = load_config()
     monitor = get_monitor()
     t_start = time.monotonic()
+    # 失败任务自愈：将历史 FAILED 预筛/分析重置为 PENDING（retry_count 上限防护），
+    # 使此前因信号量饥饿等原因丢失的文件在本次运行中补齐
+    db.reset_failed_tasks(date, cam_index)
     if db.is_render_completed(date, cam_index):
         pending_count = db.get_pending_file_count_for_date(date, cam_index)
         if pending_count == 0:
@@ -728,6 +736,21 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         print_error_summary(run_errors)
 
     if ok:
+        # 渲染批次级失败（含对账缺失）的日期不标记 COMPLETED，
+        # 使下次运行自动重跑补齐，避免"带洞成片"被永久封存
+        render_batch_errors = [
+            e for e in run_errors
+            if e.startswith("render batch") or e.startswith("render batches silently dropped")
+        ]
+        if render_batch_errors:
+            logger.error(
+                "render %s cam%d completed with %d batch failures, marking FAILED for retry: %s",
+                date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
+            )
+            db.set_render_status(date, cam_index, "FAILED")
+            _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+            return False
+
         # 生成外挂 SRT 字幕：播放时间轴 → 真实监控墙钟时间映射（含 ramping 非线性还原）
         if config.get("render", {}).get("generate_subtitles", False):
             try:

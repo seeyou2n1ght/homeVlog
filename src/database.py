@@ -144,6 +144,44 @@ class VlogDatabase:
                 logger.error("DB error in set_analysis_result for %s: %s", filepath, e)
                 self.conn.rollback()
 
+    def reset_failed_tasks(self, date: str, cam_index: int, max_retries: int = 3) -> dict:
+        """将 FAILED 预筛/分析任务重置为 PENDING，使重跑时自愈补齐丢失内容。
+
+        retry_count 上限防护：连续损坏的文件最多重试 max_retries 次后保持 FAILED，
+        避免坏文件造成无限重跑。返回各类重置数量。
+        """
+        with self._lock:
+            try:
+                cur = self.conn.execute(
+                    """UPDATE file_tasks
+                       SET prescreen_status='PENDING', retry_count=retry_count+1,
+                           updated_at=datetime('now', 'localtime')
+                       WHERE date=? AND cam_index=? AND prescreen_status='FAILED'
+                         AND retry_count < ?""",
+                    (date, cam_index, max_retries),
+                )
+                n_pre = cur.rowcount
+                cur = self.conn.execute(
+                    """UPDATE file_tasks
+                       SET analysis_status='PENDING', retry_count=retry_count+1,
+                           updated_at=datetime('now', 'localtime')
+                       WHERE date=? AND cam_index=? AND analysis_status='FAILED'
+                         AND retry_count < ?""",
+                    (date, cam_index, max_retries),
+                )
+                n_ana = cur.rowcount
+                self.conn.commit()
+            except Exception as e:
+                logger.error("DB error in reset_failed_tasks: %s", e)
+                self.conn.rollback()
+                return {"prescreen": 0, "analysis": 0}
+        if n_pre or n_ana:
+            logger.info(
+                "reset failed tasks for %s cam%d: prescreen=%d analysis=%d",
+                date, cam_index, n_pre, n_ana,
+            )
+        return {"prescreen": n_pre, "analysis": n_ana}
+
     def get_all_file_tasks_for_date(self, date: str, cam_index: int) -> list[dict]:
         with self._lock:
             try:

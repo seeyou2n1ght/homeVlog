@@ -172,7 +172,7 @@ render:
   # R4: 真实墙钟时间码 OSD 烧录与字幕生成 (视频左上角已有自带水印，默认关闭)
   timecode_osd_enabled: false
   # 生成 SRT 字幕文件: 将播放时间戳映射回真实监控墙钟时间，方便定位事件
-  generate_subtitles: true
+  generate_subtitles: false
 
 output:
   naming: "DailyVlog_{date}_cam{index}.mp4"

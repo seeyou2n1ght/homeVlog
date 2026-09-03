@@ -62,15 +62,15 @@ def _prescreen_keyframes(
     sample_ts: list[float] = []
     has_audio = 0
 
-    if gpu == "qsv":
-        from src.utils import get_qsv_semaphore
-        io_sem = get_qsv_semaphore()
-    else:
-        from src.utils import get_nv_semaphore
-        io_sem = get_nv_semaphore()
+    # 关键帧预筛为 CPU 软解（av.open 无 hwaccel），不消耗 QSV/NV 硬件槽位，
+    # 仅属 NAS IO 负载，统一走 Disk IO 信号量——
+    # 避免与分析阶段长占用 QSV 槽形成饥饿（生产实测 137 文件因此被误判 FAILED）
+    from src.utils import get_disk_semaphore
+    io_sem = get_disk_semaphore()
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-    if not acquire_with_retry(io_sem):
+    # 预筛属排队型负载（非死锁风险），预算放宽至 30s×6，避免高峰拥塞误判 FAILED
+    if not acquire_with_retry(io_sem, timeout=30.0, retries=6):
         logger.warning("prescreen keyframes: io semaphore acquire timeout for %s", filepath)
         return {"status": "FAILED", "error": "io semaphore acquire timeout", "has_audio": 0}
     try:

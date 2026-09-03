@@ -153,7 +153,8 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     err_log = TEMP_DIR / f"_stderr_batch{batch_idx}_{date}_cam{cam_index}.log"
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-    if not acquire_with_retry(io_sem):
+    # 渲染是产出关键路径，预算放宽至 30s×10：等待解码租约释放远优于批次 abort
+    if not acquire_with_retry(io_sem, timeout=30.0, retries=10):
         logger.warning(
             "batch-render cam%d batch%d: io semaphore acquire timeout, aborting",
             cam_index, batch_idx,
