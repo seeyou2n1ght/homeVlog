@@ -8,6 +8,7 @@
 """
 
 import queue
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -101,18 +102,22 @@ class TestProcessDateCamPipeline:
             db.close()
 
     def test_in_order_sliding_window_dispatch(self, tmp_path):
-        """验证即使文件分析以乱序完成，渲染管理器仍按物理录制时间严格保序打包。"""
+        """验证即使文件分析以乱序完成，渲染管理器仍按物理录制时间严格保序打包批次。"""
         db_path = tmp_path / "test_in_order.db"
         db = VlogDatabase(db_path=db_path)
-        # 按时间顺序注册 4 个文件
-        f0 = "cam0_20260901000000_20260901000500.mp4"
-        f1 = "cam0_20260901000500_20260901001000.mp4"
-        f2 = "cam0_20260901001000_20260901001500.mp4"
-        f3 = "cam0_20260901001500_20260901002000.mp4"
-        for f in [f0, f1, f2, f3]:
-            db.add_file_task(f, 0, "20260901", "20260901000000", "20260901000500", 300.0)
-            db.set_prescreen_result(f, "STATIC")
 
+        # 4 个起止时间互不相同的任务，物理时间顺序 f0 < f1 < f2 < f3
+        task_defs = [
+            ("cam0_20260901000000_20260901003000.mp4", "20260901000000", "20260901003000"),
+            ("cam0_20260901003000_20260901010000.mp4", "20260901003000", "20260901010000"),
+            ("cam0_20260901010000_20260901013000.mp4", "20260901010000", "20260901013000"),
+            ("cam0_20260901013000_20260901020000.mp4", "20260901013000", "20260901020000"),
+        ]
+        f0, f1, f2, f3 = (t[0] for t in task_defs)
+        file_start = {fname: start for fname, start, _ in task_defs}
+        for fname, start_ts, end_ts in task_defs:
+            db.add_file_task(fname, 0, "20260901", start_ts, end_ts, 1800.0)
+            db.set_prescreen_result(fname, "STATIC")
 
         cfg = {
             "pipeline": {"render_start_delay": 0},
@@ -122,27 +127,49 @@ class TestProcessDateCamPipeline:
             db=db, date="20260901", cam_index=0, config=cfg, render_enabled=True, dashboard_enabled=False
         )
 
-        # 模拟乱序完成消息推入 render_batch_queue (f2 -> f0 -> f3 -> f1)
-        orch.render_batch_queue.put({"filepath": f2, "status": "STATIC"})
-        orch.render_batch_queue.put({"filepath": f0, "status": "STATIC"})
-        orch.render_batch_queue.put({"filepath": f3, "status": "STATIC"})
-        orch.render_batch_queue.put({"filepath": f1, "status": "STATIC"})
+        # 乱序完成消息推入 render_batch_queue (f2 -> f0 -> f3 -> f1)
+        for fname in (f2, f0, f3, f1):
+            orch.render_batch_queue.put({"filepath": fname, "status": "STATIC"})
         orch.stop_event.set()
 
-        dispatched_batches = []
-        with patch("src.pipeline.build_batch_render", side_effect=lambda segs, bi, *args, **kw: f"mock_batch_{bi}.mp4"):
-            with patch("src.pipeline.concat_output_files", return_value=True):
-                # 运行 _render_manager 单一组件
-                import threading
-                t = threading.Thread(target=orch._render_manager)
-                t.start()
-                t.join(timeout=3.0)
+        # 用 spy 捕获每个批次实际派发的目标文件集合（来自 build_timeline_from_rows 的 target_files）
+        from src.timeline import build_timeline_from_rows as _real_build
+        dispatched_targets: list[list[str]] = []
 
-        # 验证所有生成的批次序号严格升序且时间戳单调递增
-        assert len(orch.batch_paths) == 2
-        # batch 0 必须包含 f0 与 f1，batch 1 必须包含 f2 与 f3
-        orch.batch_paths.sort(key=lambda x: x[0])
-        assert orch.batch_paths[0][0] == 0
-        assert orch.batch_paths[1][0] == 1
-        db.close()
+        def _spy_build(rows, date, target_files=None, config=None):
+            files = list(target_files or [])
+            dispatched_targets.append(files)
+            return _real_build(rows, date, target_files=files, config=config)
+
+        try:
+            with patch("src.timeline.build_timeline_from_rows", side_effect=_spy_build):
+                with patch(
+                    "src.pipeline.build_batch_render",
+                    side_effect=lambda segs, bi, *args, **kwargs: f"mock_batch_{bi}.mp4",
+                ):
+                    # 运行 _render_manager 单一组件
+                    t = threading.Thread(target=orch._render_manager)
+                    t.start()
+                    t.join(timeout=10.0)
+            assert not t.is_alive(), "_render_manager did not terminate in time"
+
+            # 恰好 2 个批次被派发
+            assert len(dispatched_targets) == 2, f"unexpected dispatch: {dispatched_targets}"
+
+            # batch 0 的目标文件集合必须是时序最早的 {f0, f1}，batch 1 为 {f2, f3}
+            assert set(dispatched_targets[0]) == {f0, f1}
+            assert set(dispatched_targets[1]) == {f2, f3}
+
+            # 每个批次内部文件时序严格单调递增（无重复、无乱序）
+            for batch_files in dispatched_targets:
+                starts = [file_start[fp] for fp in batch_files]
+                assert starts == sorted(starts), f"batch not in time order: {batch_files}"
+                assert len(set(batch_files)) == len(batch_files), f"duplicate file in batch: {batch_files}"
+
+            # 两个批次序号严格升序且成功产出
+            orch.batch_paths.sort(key=lambda x: x[0])
+            assert [b[0] for b in orch.batch_paths] == [0, 1]
+            assert all("mock_batch_" in p.name for _, p in orch.batch_paths)
+        finally:
+            db.close()
 

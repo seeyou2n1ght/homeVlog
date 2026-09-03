@@ -10,466 +10,28 @@ import numpy as np
 
 from src.utils import parse_res, ts_to_unix
 from src.monitor import get_perf, PerfRecord
+from src.scheduler import acquire_with_retry
+
+# 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.filters 提供（单一实现，防漂移）。
+# 此处 re-export 以保持 `from src.detector import ...` 的历史导入路径兼容。
+from src.filters import (
+    AudioEnergyVAD,
+    EmaBackgroundModel,
+    SpatialGridMotionFilter,
+    _median_filter,
+    _smooth_labels,
+)
+
+__all__ = [
+    "AudioEnergyVAD",
+    "EmaBackgroundModel",
+    "SpatialGridMotionFilter",
+    "MotionDetector",
+    "_median_filter",
+    "_smooth_labels",
+]
 
 logger = logging.getLogger("homevlog")
-
-
-class EmaBackgroundModel:
-    """
-    Lightweight Temporal Sliding Background Model with Selective EMA Update.
-
-    Mathematical Model:
-        B_t(x, y) = (1 - alpha(x, y)) * B_{t-1}(x, y) + alpha(x, y) * I_t(x, y)
-        where:
-          - alpha(x, y) = alpha_fg (~0.005) when |I_t(x, y) - B_{t-1}(x, y)| > fg_threshold (foreground motion)
-          - alpha(x, y) = alpha_bg (~0.05) when pixel is static background
-
-    Dual-difference Motion Saliency:
-        D_frame(x, y) = |I_t(x, y) - I_{t-1}(x, y)|
-        D_bg(x, y)    = |I_t(x, y) - B_t(x, y)|
-        M_t(x, y)     = max(D_frame(x, y), beta * D_bg(x, y))  (beta ~ 0.6)
-    """
-
-    def __init__(
-        self,
-        alpha_bg: float = 0.05,
-        alpha_fg: float = 0.005,
-        beta: float = 0.6,
-        fg_threshold: float = 12.0,
-    ):
-        self.alpha_bg = float(alpha_bg)
-        self.alpha_fg = float(alpha_fg)
-        self.beta = float(beta)
-        self.fg_threshold = float(fg_threshold)
-        self.background: np.ndarray | None = None
-        self.prev_frame: np.ndarray | None = None
-
-    def reset(self) -> None:
-        """Reset background model and previous frame cache."""
-        self.background = None
-        self.prev_frame = None
-
-    def update(self, gray_roi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Update EMA background model with incoming grayscale ROI frame.
-
-        Args:
-            gray_roi: 2D NumPy array representing the grayscale region of interest.
-
-        Returns:
-            tuple of (saliency_map, d_frame, d_bg) as float32 arrays with identical shape.
-        """
-        roi_float = np.squeeze(gray_roi).astype(np.float32)
-        if self.background is None or self.prev_frame is None:
-            self.background = roi_float.copy()
-            self.prev_frame = roi_float.copy()
-            zeros = np.zeros_like(roi_float)
-            return zeros, zeros, zeros
-
-        # 1. Instantaneous frame difference: D_frame = |I_t - I_{t-1}|
-        d_frame = np.abs(roi_float - self.prev_frame)
-
-        # 2. Prior background difference: D_bg_prior = |I_t - B_{t-1}|
-        d_bg_prior = np.abs(roi_float - self.background)
-
-        # 3. Selective EMA background update based on prior foreground segmentation
-        alpha_map = np.where(d_bg_prior > self.fg_threshold, self.alpha_fg, self.alpha_bg)
-        self.background = (1.0 - alpha_map) * self.background + alpha_map * roi_float
-
-        # 4. Posterior background difference: D_bg = |I_t - B_t|
-        d_bg = np.abs(roi_float - self.background)
-
-        # 5. Dual-difference motion saliency fusion: M_t = max(D_frame, beta * D_bg)
-        saliency_map = np.maximum(d_frame, self.beta * d_bg)
-
-        self.prev_frame = roi_float
-        return saliency_map, d_frame, d_bg
-
-
-class SpatialGridMotionFilter:
-    """
-    Dynamic 8x8 Spatial Grid Energy Extractor, Connected Component Noise Filter,
-    and Spatial-Temporal Confidence Memory Cooldown Manager.
-
-    Features:
-    - Divides ROI into grid_rows x grid_cols (default 8x8 = 64 cells).
-    - Extracts per-cell energy E_{r,c}(t) and maintains adaptive per-cell noise floors.
-    - Suppresses isolated single-cell spikes (IR night vision noise) via 8-connected components.
-    - Boosts contiguous active grid clusters (subtle human movement on couch/desk).
-    - Tracks spatial-temporal confidence decay grid C_{r,c}(t) in [0.0, 1.0] with exponential cooldown.
-    - Guards early termination: only permitted when consecutive static frames >= window,
-      current energy < threshold, and all regional confidence has decayed (max C_{r,c} < 0.05).
-    """
-
-    def __init__(
-        self,
-        grid_rows: int = 8,
-        grid_cols: int = 8,
-        cooldown_half_life: float = 15.0,
-        min_connected_cells: int = 2,
-        cell_noise_alpha: float = 0.02,
-        sens_multiplier: float = 1.5,
-        base_noise_thresh: float = 1.5,
-        cluster_boost: float = 1.2,
-    ):
-        self.grid_rows = int(grid_rows)
-        self.grid_cols = int(grid_cols)
-        self.cooldown_half_life = float(cooldown_half_life)
-        self.min_connected_cells = int(min_connected_cells)
-        self.cell_noise_alpha = float(cell_noise_alpha)
-        self.sens_multiplier = float(sens_multiplier)
-        self.base_noise_thresh = float(base_noise_thresh)
-        self.cluster_boost = float(cluster_boost)
-
-        self.confidence_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
-        self.noise_floor_grid = np.full((self.grid_rows, self.grid_cols), self.base_noise_thresh, dtype=np.float32)
-        self.cell_energies = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
-        self.active_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=bool)
-
-    def reset(self) -> None:
-        """Reset internal grid state and noise floors."""
-        self.confidence_grid.fill(0.0)
-        self.noise_floor_grid.fill(self.base_noise_thresh)
-        self.cell_energies.fill(0.0)
-        self.active_grid.fill(False)
-
-    def extract_grid_energies(self, saliency_map: np.ndarray) -> np.ndarray:
-        """
-        Partition saliency map into grid_rows x grid_cols and compute per-cell mean energy.
-        """
-        h, w = saliency_map.shape[:2]
-        row_edges = np.linspace(0, h, self.grid_rows + 1, dtype=int)
-        col_edges = np.linspace(0, w, self.grid_cols + 1, dtype=int)
-        energies = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
-
-        for r in range(self.grid_rows):
-            r_start, r_end = row_edges[r], row_edges[r + 1]
-            for c in range(self.grid_cols):
-                c_start, c_end = col_edges[c], col_edges[c + 1]
-                cell = saliency_map[r_start:r_end, c_start:c_end]
-                energies[r, c] = float(np.mean(cell)) if cell.size > 0 else 0.0
-
-        return energies
-
-    def find_connected_components(self, binary_grid: np.ndarray) -> list[set[tuple[int, int]]]:
-        """
-        Extract 8-connected components from a 2D boolean grid.
-        """
-        rows, cols = binary_grid.shape
-        visited = np.zeros((rows, cols), dtype=bool)
-        components: list[set[tuple[int, int]]] = []
-
-        for r in range(rows):
-            for c in range(cols):
-                if binary_grid[r, c] and not visited[r, c]:
-                    comp: set[tuple[int, int]] = set()
-                    queue = [(r, c)]
-                    visited[r, c] = True
-                    while queue:
-                        cr, cc = queue.pop(0)
-                        comp.add((cr, cc))
-                        for dr in (-1, 0, 1):
-                            for dc in (-1, 0, 1):
-                                if dr == 0 and dc == 0:
-                                    continue
-                                nr, nc = cr + dr, cc + dc
-                                if 0 <= nr < rows and 0 <= nc < cols:
-                                    if binary_grid[nr, nc] and not visited[nr, nc]:
-                                        visited[nr, nc] = True
-                                        queue.append((nr, nc))
-                    components.append(comp)
-        return components
-
-    def process_frame(
-        self,
-        saliency_map: np.ndarray,
-        dt: float,
-    ) -> tuple[float, bool, dict]:
-        """
-        Process a single frame's motion saliency map.
-
-        Args:
-            saliency_map: 2D float32 motion saliency map.
-            dt: Elapsed time since last frame in seconds.
-
-        Returns:
-            tuple of (effective_frame_energy, is_motion_detected, stats_dict)
-        """
-        energies = self.extract_grid_energies(saliency_map)
-        self.cell_energies = energies
-
-        # 1. Raw cell activation against adaptive per-cell noise floor
-        cell_thresholds = np.maximum(
-            self.base_noise_thresh,
-            self.noise_floor_grid * self.sens_multiplier,
-        )
-        raw_active = energies > cell_thresholds
-
-        # 2. 8-Neighborhood connected component filtering & spatial noise suppression
-        components = self.find_connected_components(raw_active)
-        filtered_active = np.zeros((self.grid_rows, self.grid_cols), dtype=bool)
-
-        for comp in components:
-            if len(comp) >= self.min_connected_cells:
-                # Contiguous cluster: confirmed genuine target movement
-                for r, c in comp:
-                    filtered_active[r, c] = True
-            else:
-                # Isolated single-cell: filter unless it is an extreme high-magnitude spike
-                for r, c in comp:
-                    if energies[r, c] > cell_thresholds[r, c] * 2.5:
-                        filtered_active[r, c] = True
-
-        self.active_grid = filtered_active
-        num_active_cells = int(np.sum(filtered_active))
-
-        # 3. Adaptive noise floor tracking on inactive cells
-        inactive_mask = ~filtered_active
-        if np.any(inactive_mask):
-            self.noise_floor_grid[inactive_mask] = (
-                (1.0 - self.cell_noise_alpha) * self.noise_floor_grid[inactive_mask]
-                + self.cell_noise_alpha * energies[inactive_mask]
-            )
-
-        # 4. Spatial-temporal confidence decay grid C_{r,c}(t)
-        decay_factor = (
-            float(np.exp(-dt / max(0.1, self.cooldown_half_life)))
-            if self.cooldown_half_life > 0
-            else 0.0
-        )
-        self.confidence_grid[filtered_active] = 1.0
-        self.confidence_grid[~filtered_active] *= decay_factor
-
-        # 5. Compute frame-level effective energy
-        global_mean = float(np.mean(saliency_map)) if saliency_map.size > 0 else 0.0
-        if num_active_cells > 0:
-            active_energy_mean = float(np.mean(energies[filtered_active])) * self.cluster_boost
-            effective_energy = max(global_mean, active_energy_mean)
-            is_motion = True
-        else:
-            # All noise suppressed or quiet background -> dampen raw diff noise
-            effective_energy = global_mean * 0.3
-            is_motion = False
-
-        stats = {
-            "active_cells": num_active_cells,
-            "max_confidence": float(np.max(self.confidence_grid)),
-            "mean_energy": float(np.mean(energies)),
-            "effective_energy": effective_energy,
-        }
-        return effective_energy, is_motion, stats
-
-    def can_early_terminate(
-        self,
-        consecutive_static: int,
-        term_window: int,
-        current_energy: float,
-        term_threshold: float,
-    ) -> bool:
-        """
-        Anti-Miss Early Termination Guard:
-        Early termination break is only permitted when:
-          (a) consecutive static frames >= term_window
-          (b) current energy < term_threshold
-          (c) all regional memory confidence decayed below 0.05
-        """
-        if consecutive_static < term_window:
-            return False
-        if current_energy >= term_threshold:
-            return False
-        max_conf = float(np.max(self.confidence_grid))
-        if max_conf >= 0.05:
-            return False
-        return True
-
-
-class AudioEnergyVAD:
-    """
-    In-Memory Short-Time RMS Energy Envelope Voice & Audio Activity Detector (VAD).
-
-    Mathematical Formulation:
-      1. Window Framing:
-         Divides audio stream into ~50ms windows (N = sample_rate * window_ms / 1000).
-      2. Short-Time RMS:
-         RMS_k = sqrt( (1 / N) * sum_{n=0}^{N-1} s_k[n]^2 )
-      3. Logarithmic Energy (dBFS):
-         dBFS_k = 20 * log10(RMS_k + 1e-7)
-      4. Adaptive Steady-State Background Noise Floor Tracking:
-         N_audio = percentile(dBFS_all, 15)
-      5. Audio Activity Activation:
-         dBFS_k > (N_audio + noise_margin_db) and dBFS_k >= min_dbfs
-      6. Event Interval Extraction:
-         Returns [(t_start, t_end, "ACTIVE"), ...] for active speech/sound segments.
-    """
-
-    def __init__(
-        self,
-        sample_rate: int = 16000,
-        window_ms: int = 50,
-        noise_margin_db: float = 12.0,
-        min_dbfs: float = -42.0,
-        min_speech_duration: float = 0.3,
-        enabled: bool = True,
-    ):
-        self.sample_rate = int(sample_rate)
-        self.window_ms = int(window_ms)
-        self.window_samples = max(1, int(self.sample_rate * self.window_ms / 1000.0))
-        self.noise_margin_db = float(noise_margin_db)
-        self.min_dbfs = float(min_dbfs)
-        self.min_speech_duration = float(min_speech_duration)
-        self.enabled = bool(enabled)
-
-    def compute_rms_dbfs(self, samples: np.ndarray) -> tuple[float, float]:
-        """
-        Compute RMS energy and dBFS for a 1D audio sample array.
-        """
-        if samples.size == 0:
-            return 0.0, -140.0
-        s = samples.astype(np.float32)
-        rms = float(np.sqrt(np.mean(s ** 2)))
-        dbfs = float(20.0 * np.log10(rms + 1e-7))
-        return rms, dbfs
-
-    def compute_dbfs_windows(
-        self, audio: np.ndarray, start_offset: float = 0.0
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        """
-        Partition audio into ~50ms windows and calculate dBFS for each window.
-
-        Args:
-            audio: 1D mono float32 audio NumPy array.
-            start_offset: Base time offset in seconds.
-
-        Returns:
-            tuple of (timestamps, dbfs_array, noise_floor_db)
-        """
-        if not self.enabled or audio.size == 0:
-            return np.array([], dtype=np.float32), np.array([], dtype=np.float32), -140.0
-
-        n_samples = len(audio)
-        w_size = self.window_samples
-        n_windows = n_samples // w_size
-
-        if n_windows == 0:
-            rms, dbfs = self.compute_rms_dbfs(audio)
-            return (
-                np.array([start_offset], dtype=np.float32),
-                np.array([dbfs], dtype=np.float32),
-                dbfs,
-            )
-
-        # Truncate to exact multiple of window size for fast zero-copy vectorized computing
-        truncated = np.asarray(audio[: n_windows * w_size], dtype=np.float32).reshape((n_windows, w_size))
-        # Vectorized RMS: sqrt(sum(w^2, axis=1) / w_size) — avoid pow2 allocations
-        sum_sq = np.sum(truncated * truncated, axis=1)
-        rms_vec = np.sqrt(sum_sq / float(w_size))
-        dbfs_vec = 20.0 * np.log10(rms_vec + 1e-7)
-
-        # Time for each window center or start
-        dt = w_size / float(self.sample_rate)
-        timestamps = start_offset + np.arange(n_windows, dtype=np.float32) * dt
-
-        # Adaptive 15th percentile noise floor
-        noise_floor_db = float(np.percentile(dbfs_vec, 15))
-        return timestamps, dbfs_vec, noise_floor_db
-
-    def detect_events(
-        self, audio: np.ndarray, start_offset: float = 0.0
-    ) -> tuple[list[tuple[float, float, str]], dict]:
-        """
-        Detect active audio event intervals from raw mono float32 audio buffer.
-
-        Args:
-            audio: 1D mono float32 audio NumPy array.
-            start_offset: Base time offset in seconds.
-
-        Returns:
-            tuple of (events, stats_dict)
-            where events is [(t_start, t_end, "ACTIVE"), ...]
-        """
-        if not self.enabled or audio.size == 0:
-            return [], {
-                "noise_floor_db": -140.0,
-                "total_windows": 0,
-                "active_windows": 0,
-                "events_count": 0,
-            }
-
-        timestamps, dbfs_vec, noise_floor_db = self.compute_dbfs_windows(
-            audio, start_offset=start_offset
-        )
-        if dbfs_vec.size == 0:
-            return [], {
-                "noise_floor_db": -140.0,
-                "total_windows": 0,
-                "active_windows": 0,
-                "events_count": 0,
-            }
-
-        # 1. Relative threshold activation: delta above 15th percentile noise floor AND absolute min_dbfs
-        is_relative_active = (dbfs_vec >= (noise_floor_db + self.noise_margin_db)) & (
-            dbfs_vec >= self.min_dbfs
-        )
-
-        # 2. Continuous voiced/harmonic audio activation:
-        # In 100% duty cycle continuous speech, 15th percentile noise floor rises to speech levels (>= -38.0 dBFS).
-        # We distinguish genuine speech/tones from stationary noise (r1 ~ 0) and flat DC bias (std == 0)
-        # via lag-1 autocorrelation (r1 >= 0.5) and AC sample variation (std > 1e-4).
-        n_windows = len(dbfs_vec)
-        w_size = self.window_samples
-        if noise_floor_db >= -38.0 and n_windows > 0 and len(audio) >= n_windows * w_size:
-            candidate_idx = np.where(~is_relative_active & (dbfs_vec >= max(self.min_dbfs, -35.0)))[0]
-            if len(candidate_idx) > 0:
-                truncated = audio[: n_windows * w_size].reshape((n_windows, w_size)).astype(np.float32)
-                cand_blocks = truncated[candidate_idx]
-                rms_sq = np.mean(cand_blocks ** 2, axis=1)
-                cov1 = np.mean(cand_blocks[:, 1:] * cand_blocks[:, :-1], axis=1)
-                r1_vec = cov1 / (rms_sq + 1e-9)
-                std_vec = np.std(cand_blocks, axis=1)
-                is_voiced = (r1_vec >= 0.5) & (std_vec > 1e-4)
-                active_mask = is_relative_active.copy()
-                active_mask[candidate_idx[is_voiced]] = True
-            else:
-                active_mask = is_relative_active
-        else:
-            active_mask = is_relative_active
-
-        dt = self.window_samples / self.sample_rate
-        min_active_windows = max(1, int(round(self.min_speech_duration / dt)))
-
-        # Group consecutive active windows into intervals
-        events: list[tuple[float, float, str]] = []
-        n = len(active_mask)
-        i = 0
-        while i < n:
-            if active_mask[i]:
-                run_start = i
-                while i < n and active_mask[i]:
-                    i += 1
-                run_end = i
-                if (run_end - run_start) >= min_active_windows:
-                    t_start = float(timestamps[run_start])
-                    t_end = float(timestamps[run_end - 1] + dt)
-                    events.append((t_start, t_end, "ACTIVE"))
-            else:
-                i += 1
-
-        stats = {
-            "noise_floor_db": round(noise_floor_db, 2),
-            "total_windows": int(n),
-            "active_windows": int(np.sum(active_mask)),
-            "events_count": len(events),
-        }
-        return events, stats
-
-    def is_active_at(
-        self, t: float, events: list[tuple[float, float, str]], tolerance: float = 0.1
-    ) -> bool:
-        """Check whether timestamp t falls within any detected active audio event."""
-        for t_start, t_end, _ in events:
-            if (t_start - tolerance) <= t <= (t_end + tolerance):
-                return True
-        return False
 
 
 class MotionDetector:
@@ -655,6 +217,7 @@ class MotionDetector:
                     saliency = np.zeros_like(roi, dtype=np.float32)
                 prev_gray = roi
 
+            # is_night_mode 等新参数按默认值（白天模式）处理，保持最小变更
             eff_energy, is_grid_motion, _ = grid_filter.process_frame(saliency, dt)
             energies.append(eff_energy)
 
@@ -773,7 +336,18 @@ class MotionDetector:
             io_sem = get_nv_semaphore()
             hw_name = "cuda"
 
-        io_sem.acquire()
+        # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+        if not acquire_with_retry(io_sem):
+            logger.warning(
+                "decode semaphore acquire timeout for %s, aborting decode",
+                Path(filepath).name,
+            )
+            return decoded_frames, yolo_buffer, np.array([], dtype=np.float32), {
+                "has_audio": 0,
+                "effective_fps": self.fps,
+                "decode_time": 0.0,
+                "frames": 0,
+            }
 
         audio_samples_list: list[np.ndarray] = []
         audio_resampler = None
@@ -948,11 +522,15 @@ class MotionDetector:
 
     def analyze(
         self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
-    ) -> tuple[list[dict], dict]:
+    ) -> tuple[list[dict], dict[int, np.ndarray]]:
         """
         全文件分析入口。
         Phase 1: 硬件解码到内存 (信号量保护，单槽位)
         Phase 2: CPU 运动分析 (无信号量，长文件自动分片并行)
+
+        返回 (labels, yolo_buffer)：
+        - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
+        - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
         # Phase 1: 解码
         decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
@@ -981,6 +559,7 @@ class MotionDetector:
         # Phase 2: CPU 分析 — 长文件分片并行，短文件直通
         CHUNK_THRESHOLD = 300.0
         n_frames = len(decoded_frames)
+        early_term_any = False
 
         if file_duration > CHUNK_THRESHOLD and n_frames > 100:
             n_chunks = max(2, min(4, int(np.ceil(file_duration / CHUNK_THRESHOLD))))
@@ -1007,8 +586,10 @@ class MotionDetector:
                 for f in futures:
                     c_idx = futures[f]
                     try:
-                        chunk_results, _ = f.result()
+                        chunk_results, chunk_meta = f.result()
                         all_results[c_idx] = chunk_results
+                        if chunk_meta.get("early_terminated"):
+                            early_term_any = True
                     except Exception as e:
                         logger.error("Chunk %d analysis failed for %s: %s", c_idx, filepath, e)
 
@@ -1016,10 +597,11 @@ class MotionDetector:
             for chunk_res in all_results:
                 results.extend(chunk_res)
         else:
-            results, _ = self.analyze_frames(
+            results, frames_meta = self.analyze_frames(
                 decoded_frames, start_offset=start_offset, file_duration=file_duration,
                 fps=effective_fps, audio_data=full_audio,
             )
+            early_term_any = bool(frames_meta.get("early_terminated"))
 
         t_analysis_end = time.monotonic()
 
@@ -1029,76 +611,10 @@ class MotionDetector:
             "analysis_time": round(t_analysis_end - t_decode_end, 3),
             "frames": decode_meta["frames"],
             "motion_ratio": round(motion_count / len(results), 3) if results else 0,
-            "early_term": False,
+            "early_term": early_term_any,
             "effective_fps": effective_fps,
             "has_audio": has_audio,
             "audio_events": len(audio_events),
             "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
         }
         return results, yolo_buffer
-
-
-def _median_filter(signal: list[float], window: int) -> list[float]:
-    if window < 3:
-        return signal
-    arr = np.array(signal, dtype=np.float32)
-    pad_width = window // 2
-    padded = np.pad(arr, pad_width, mode="edge")
-    try:
-        from numpy.lib.stride_tricks import sliding_window_view
-        windows = sliding_window_view(padded, window)
-        return np.median(windows, axis=1).tolist()
-    except ImportError:
-        n = len(arr)
-        result = np.empty_like(arr)
-        for i in range(n):
-            left = max(0, i - pad_width)
-            right = min(n, i + pad_width + 1)
-            result[i] = np.median(arr[left:right])
-        return result.tolist()
-
-
-def _smooth_labels(
-    raw: list[bool],
-    min_motion: int,
-    min_static: int,
-    noise_suppress: int,
-) -> list[bool]:
-    if not raw:
-        return raw
-    smoothed = list(raw)
-    n = len(smoothed)
-
-    i = 0
-    while i < n:
-        if smoothed[i]:
-            run_end = i
-            while run_end < n and smoothed[run_end]:
-                run_end += 1
-            if run_end - i < min_motion:
-                for j in range(i, run_end):
-                    smoothed[j] = False
-            i = run_end
-        else:
-            run_end = i
-            while run_end < n and not smoothed[run_end]:
-                run_end += 1
-            if 0 < run_end - i < noise_suppress:
-                for j in range(i, run_end):
-                    smoothed[j] = True
-            i = run_end
-
-    i = 0
-    while i < n:
-        if not smoothed[i]:
-            run_end = i
-            while run_end < n and not smoothed[run_end]:
-                run_end += 1
-            if 0 < run_end - i < min_static:
-                for j in range(i, run_end):
-                    smoothed[j] = True
-            i = run_end
-        else:
-            i += 1
-
-    return smoothed

@@ -1,8 +1,12 @@
+import logging
 import subprocess
 import time as _time
 from dataclasses import dataclass
 
+from src.scheduler import acquire_with_retry
 from src.utils import load_config
+
+logger = logging.getLogger("homevlog")
 
 
 @dataclass
@@ -32,7 +36,16 @@ def run_ffmpeg(
         
     from src.utils import get_disk_semaphore
     io_sem = get_disk_semaphore()
-    io_sem.acquire()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("run_ffmpeg: io semaphore acquire timeout")
+        return FFmpegResult(
+            returncode=-1,
+            stdout=b"",
+            stderr=b"io semaphore acquire timeout",
+            timed_out=False,
+            duration=0.0,
+        )
     try:
         proc = subprocess.Popen(cmd, **kwargs)
         t0 = _time.monotonic()
@@ -72,7 +85,10 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
     
     from src.utils import get_disk_semaphore
     io_sem = get_disk_semaphore()
-    io_sem.acquire()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("run_ffprobe: io semaphore acquire timeout for %s", filepath)
+        return None
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     finally:

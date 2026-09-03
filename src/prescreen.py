@@ -10,6 +10,7 @@ import numpy as np
 
 from src.database import VlogDatabase
 from src.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args
+from src.scheduler import acquire_with_retry
 from src.utils import load_config, parse_res
 from src.monitor import get_perf, PerfRecord
 
@@ -71,7 +72,10 @@ def _prescreen_keyframes(
         from src.utils import get_nv_semaphore
         io_sem = get_nv_semaphore()
 
-    io_sem.acquire()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("prescreen keyframes: io semaphore acquire timeout for %s", filepath)
+        return {"status": "FAILED", "error": "io semaphore acquire timeout", "has_audio": 0}
     try:
         with av.open(str(filepath), options={"buffer_size": "2097152"}) as container:
             if not container.streams.video:
@@ -347,7 +351,10 @@ def _prescreen_stream_fps(
     proc: subprocess.Popen | None = None
     completed_read = False
 
-    io_sem.acquire()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("prescreen stream_fps: io semaphore acquire timeout for %s", filepath)
+        return {"status": "FAILED", "error": "io semaphore acquire timeout"}
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

@@ -77,27 +77,6 @@ class YoloVerifier:
         if device is None:
             device = self.device
 
-        # 兼顾单元测试 Mock：若 _verify_segment_batch 被 patch，直通逐片段 mock 判定
-        from unittest.mock import Mock
-        if isinstance(getattr(self, "_verify_segment_batch", None), Mock):
-            verified_segments = []
-            for seg in segments:
-                if seg.state == "DYNAMIC_AUDIO" or seg.state != "DYNAMIC":
-                    verified_segments.append(seg)
-                    continue
-                local_start = max(0.0, seg.start_time - seg.file_start_offset)
-                local_end = max(0.0, seg.end_time - seg.file_start_offset)
-                duration = local_end - local_start
-                if duration <= 0 or seg.max_energy >= self.skip_energy_threshold:
-                    verified_segments.append(seg)
-                    continue
-                if self._verify_segment_batch(filepath, local_start, duration, frames_buffer, analysis_fps):
-                    verified_segments.append(seg)
-                else:
-                    seg.state = "STATIC"
-                    verified_segments.append(seg)
-            return verified_segments
-
         # 1. 筛选需要 YOLO 验证的动态片段，收集全局待检帧
         segs_to_verify: list[tuple[int, Any, float, float]] = [] # (index, seg, local_start, duration)
         for idx, seg in enumerate(segments):
@@ -186,38 +165,4 @@ class YoloVerifier:
                 verified_segments.append(seg)
 
         return verified_segments
-
-    def _verify_segment_batch(self, filepath: str, start_time: float, duration: float, frames_buffer: dict, analysis_fps: float) -> bool:
-        """兼容接口：支持单个片段的待检帧提取与推理判定。"""
-        start_frame_idx = int(start_time * analysis_fps)
-        end_frame_idx = int((start_time + duration) * analysis_fps)
-        sample_step = max(1, int(analysis_fps / self.sample_fps))
-        frames_to_check = []
-        import cv2
-        for f_idx in range(start_frame_idx, end_frame_idx + 1, sample_step):
-            if f_idx in frames_buffer:
-                buf_item = frames_buffer[f_idx]
-                if isinstance(buf_item, (bytes, bytearray, np.ndarray)) and getattr(buf_item, "ndim", 0) == 1:
-                    img = cv2.imdecode(np.frombuffer(buf_item, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        frames_to_check.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                elif isinstance(buf_item, np.ndarray):
-                    frames_to_check.append(buf_item)
-
-        if not frames_to_check:
-            return True
-
-        try:
-            results = self.model(frames_to_check, verbose=False, stream=True)
-            for r in results:
-                if r.boxes is not None and len(r.boxes.cls) > 0:
-                    classes = r.boxes.cls.cpu().numpy()
-                    confs = r.boxes.conf.cpu().numpy()
-                    for cls, conf in zip(classes, confs):
-                        if int(cls) in self.target_classes and conf >= self.confidence:
-                            return True
-        except Exception as e:
-            logger.error(f"YOLO single batch failed: {e}")
-            return True
-        return False
 

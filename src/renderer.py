@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from src.utils import parse_res, OUTPUT_DIR, TEMP_DIR
+from src.scheduler import acquire_with_retry
 from src.ffmpeg import run_ffmpeg
 from src.timeline import (
     TimelineSegment,
@@ -348,6 +349,27 @@ def _render_batches_sequential(batches, output_path, fps, width, height, seg_cfg
 
 
 def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0) -> str | None:
+    output_path = Path(output_path)
+
+    # 断点续渲：已存在的完整批次产物直接复用（Round 11 基准声明能力）
+    try:
+        if output_path.exists() and output_path.stat().st_size >= 512 * 1024:
+            logger.info(
+                "batch-render cam%d batch%d reusing existing output %s",
+                cam_index, batch_idx, output_path.name,
+            )
+            return str(output_path)
+    except OSError as e:
+        logger.warning("batch-render reuse check failed for %s: %s", output_path.name, e)
+
+    from src.utils import load_config
+    cfg = {}
+    try:
+        cfg = load_config()
+    except Exception:
+        pass
+    render_cfg = cfg.get("render", {})
+
     hwaccel_args = []
     for fp in input_files:
         hwaccel_args += ["-fflags", "+genpts"]
@@ -386,16 +408,25 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     else:
         from src.utils import get_nv_semaphore
         io_sem = get_nv_semaphore()
-    io_sem.acquire()
     err_log = TEMP_DIR / f"_stderr_batch{batch_idx}_{date}_cam{cam_index}.log"
-    try:
 
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning(
+            "batch-render cam%d batch%d: io semaphore acquire timeout, aborting",
+            cam_index, batch_idx,
+        )
+        fc_script.unlink(missing_ok=True)
+        return None
+
+    proc: subprocess.Popen | None = None
+    t0 = time.monotonic()
+    try:
         with open(err_log, "wb") as f_err:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=f_err)
             FFmpegProcessRegistry.register(str(output_path), proc)
-            t0 = time.monotonic()
             if encoder == "qsv":
-                render_timeout = 360
+                render_timeout = render_cfg.get("qsv_timeout_s", 360)
             else:
                 render_timeout = max(7200, len(input_files) * 600)
             try:
@@ -403,28 +434,39 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             except subprocess.TimeoutExpired:
                 logger.warning("Render timeout expired on %s for %s, killing process", encoder, output_path)
                 proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
                 return None
             finally:
                 FFmpegProcessRegistry.deregister(str(output_path))
+    except Exception:
+        logger.exception("batch-render cam%d batch%d spawn/IO error", cam_index, batch_idx)
+        return None
     finally:
+        # 信号量释放单次原则 + 超时/失败路径统一清理临时脚本
         io_sem.release()
-        
-    elapsed = time.monotonic() - t0
-    fc_script.unlink(missing_ok=True)
+        fc_script.unlink(missing_ok=True)
 
-    if proc.returncode == 0:
+    elapsed = time.monotonic() - t0
+
+    if proc is not None and proc.returncode == 0:
         err_log.unlink(missing_ok=True)
         return str(output_path)
-    else:
-        err_tail = ""
-        if err_log.exists():
-            try:
-                err_tail = err_log.read_bytes()[-1000:].decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            err_log.unlink(missing_ok=True)
-        logger.error("batch-render cam%d batch%d failed:\n%s", cam_index, batch_idx, err_tail)
-        return None
+
+    err_tail = ""
+    if err_log.exists():
+        try:
+            err_tail = err_log.read_bytes()[-1000:].decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        err_log.unlink(missing_ok=True)
+    logger.error(
+        "batch-render cam%d batch%d failed after %.1fs:\n%s",
+        cam_index, batch_idx, elapsed, err_tail,
+    )
+    return None
 
 
 
@@ -469,7 +511,11 @@ def _run_ffmpeg_render(input_files, filter_complex, output_path, encoder, fps, o
     else:
         from src.utils import get_nv_semaphore
         io_sem = get_nv_semaphore()
-    io_sem.acquire()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("render cam%d: io semaphore acquire timeout, aborting", cam_index)
+        fc_script.unlink(missing_ok=True)
+        return None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         t0 = time.monotonic()
@@ -477,6 +523,7 @@ def _run_ffmpeg_render(input_files, filter_complex, output_path, encoder, fps, o
             _, stderr = proc.communicate(timeout=7200)
         except Exception:
             proc.kill()
+            fc_script.unlink(missing_ok=True)
             return None
     finally:
         io_sem.release()

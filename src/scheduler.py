@@ -5,14 +5,47 @@
 2. 硬件并发信号量隔离 (NV, QSV, Disk I/O) 与槽位生命周期管理。
 """
 
+import logging
 import threading
 from contextlib import contextmanager
 
+logger = logging.getLogger("homevlog")
 
 _disk_semaphore: threading.Semaphore | None = None
 _nv_semaphore: threading.Semaphore | None = None
 _qsv_semaphore: threading.Semaphore | None = None
 _io_lock = threading.Lock()
+
+
+def acquire_with_retry(
+    sem: threading.Semaphore,
+    timeout: float = 30.0,
+    retries: int = 3,
+) -> bool:
+    """带超时与重试的信号量获取（AGENTS.md 铁律：禁止无限阻塞的 acquire）。
+
+    防止 prescreen 与 analysis 争用 QSV/NV 信号量时发生死锁：
+    单次 acquire 限时 `timeout` 秒，最多尝试 `retries` 次。
+
+    Args:
+        sem: 目标信号量。
+        timeout: 单次 acquire 超时秒数（推荐 30s）。
+        retries: 最大尝试次数（含首次，推荐 3 次）。
+
+    Returns:
+        True: 成功持有信号量，调用方必须在 finally 块中恰好 release 一次。
+        False: 重试耗尽仍未获取，调用方应走各自的失败返回路径。
+    """
+    max_attempts = max(1, int(retries))
+    for attempt in range(1, max_attempts + 1):
+        if sem.acquire(timeout=timeout):
+            return True
+        logger.warning(
+            "semaphore acquire timeout after %.1fs (attempt %d/%d)",
+            timeout, attempt, max_attempts,
+        )
+    logger.error("semaphore acquire failed after %d attempts", max_attempts)
+    return False
 
 
 def reset_semaphores() -> None:

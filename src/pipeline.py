@@ -304,7 +304,7 @@ class StreamingOrchestrator:
                 self.analysis_queue.task_done()
 
     def _render_manager(self):
-        """渲染管理器：监听分析完成的文件，构建批次并启动渲染 Worker。"""
+        """渲染管理器：In-Order Sliding Window 保序消费完成消息，构建时间严格单调的批次并启动渲染 Worker。"""
         out_cfg = self.config.get("output", {})
         fps = out_cfg.get("fps", 20)
         from src.utils import parse_res
@@ -313,7 +313,19 @@ class StreamingOrchestrator:
         seg_cfg = self.config.get("segment", {})
         audio_cfg = out_cfg.get("audio", {})
 
-        pending_files = []
+        # ---- In-Order Sliding Window：按物理录制时间严格保序的批次调度 ----
+        # 乱序到达的完成消息（STATIC/ANALYZED/FAILED）经滑动窗口重排：
+        # 仅当队首（最早录制）文件就绪时窗口才向前推进，确保跨批次时间轴 100% 单调。
+        all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+        ordered_files: list[str] = [
+            r["filepath"]
+            for r in sorted(all_rows, key=lambda r: r.get("file_start_time") or "")
+        ]
+        ordered_set = set(ordered_files)
+        ready_status: dict[str, str] = {}
+        head = 0
+
+        pending_files: list[str] = []
         batch_idx = 0
         time.sleep(max(0, self.render_delay))
         heavy_queue = queue.Queue()
@@ -454,21 +466,38 @@ class StreamingOrchestrator:
         while not self.stop_event.is_set() or not self.render_batch_queue.empty():
             try:
                 msg = self.render_batch_queue.get(timeout=2)
-                if msg.get("status") == "FAILED":
-                    self.render_batch_queue.task_done()
-                    continue
-                pending_files.append(msg["filepath"])
-
-                if len(pending_files) >= self.batch_max_files:
-                    _enqueue_batch(batch_idx, list(pending_files))
-                    pending_files = []
-                    batch_idx += 1
-                self.render_batch_queue.task_done()
             except queue.Empty:
                 continue
 
+            filepath = msg.get("filepath")
+            if filepath is not None:
+                status = msg.get("status", "FAILED")
+                if filepath in ordered_set:
+                    # 记录就绪状态（FAILED 同样计入，用于推进窗口指针）
+                    ready_status[filepath] = status
+                elif status != "FAILED":
+                    # 不在有序队列中的文件（DB 与消息不一致的兜底）直接追加，避免永久滞留
+                    pending_files.append(filepath)
+
+                # 推进保序滑动窗口：仅当队首文件已就绪时向前推进
+                while head < len(ordered_files) and ordered_files[head] in ready_status:
+                    fp_head = ordered_files[head]
+                    # FAILED 文件跳过入批，但指针必须推进
+                    if ready_status[fp_head] != "FAILED":
+                        pending_files.append(fp_head)
+                    head += 1
+
+                # 窗口推进可能一次放入多个文件，循环按 batch_max_files 切分
+                while len(pending_files) >= self.batch_max_files:
+                    _enqueue_batch(batch_idx, list(pending_files[: self.batch_max_files]))
+                    pending_files = pending_files[self.batch_max_files :]
+                    batch_idx += 1
+            self.render_batch_queue.task_done()
+
+        # 消费循环结束：flush 窗口中剩余的就绪文件（含 head 未达队尾的兜底场景）
         if pending_files:
             _enqueue_batch(batch_idx, list(pending_files))
+            pending_files = []
 
         all_dispatched_event.set()
 
