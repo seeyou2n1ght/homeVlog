@@ -46,9 +46,9 @@ def run_ffmpeg(
             timed_out=False,
             duration=0.0,
         )
+    t0 = _time.monotonic()
     try:
         proc = subprocess.Popen(cmd, **kwargs)
-        t0 = _time.monotonic()
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
             returncode = proc.returncode
@@ -58,9 +58,18 @@ def run_ffmpeg(
             stdout, stderr = proc.communicate()
             returncode = -9
             timed_out = True
+    except OSError as e:
+        # ffmpeg 可执行文件缺失或 spawn 失败：返回结构化错误而非 UnboundLocalError
+        return FFmpegResult(
+            returncode=-1,
+            stdout=b"",
+            stderr=f"ffmpeg spawn failed: {e}".encode("utf-8", errors="replace"),
+            timed_out=False,
+            duration=_time.monotonic() - t0,
+        )
     finally:
         io_sem.release()
-        
+
     elapsed = _time.monotonic() - t0
 
     return FFmpegResult(

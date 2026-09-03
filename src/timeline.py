@@ -135,6 +135,85 @@ def calculate_speed_ramping_curve(
     )
 
 
+def compute_display_plans(
+    timeline: list[TimelineSegment],
+    static_keyframe_interval: float = 30.0,
+    keyframe_display_duration: float = 0.5,
+    min_static_display_duration: float = 1.5,
+    speed_ramping: bool = True,
+    ramp_duration_s: float = 1.0,
+) -> list[tuple[float, SpeedRampInfo | None]]:
+    """计算每个 TimelineSegment 的成片展示时长，与 build_concat_filter 严格同源。
+
+    返回 [(display_dur, ramp_info_or_None), ...]：
+    - DYNAMIC/DYNAMIC_AUDIO: 展示时长 == 源时长，ramp_info 为 None；
+    - STATIC: 按全局抽帧倍率压缩，若相邻动态段且启用变速则返回 ramp_info。
+    """
+    kf_interval = max(static_keyframe_interval, 1.0)
+    display_dur = max(keyframe_display_duration, 0.1)
+    global_speed_factor = kf_interval / display_dur
+
+    plans: list[tuple[float, SpeedRampInfo | None]] = []
+    n = len(timeline)
+    for i, seg in enumerate(timeline):
+        dur = seg.end_in_file - seg.start_in_file
+        if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+            plans.append((dur, None))
+            continue
+        target = max(dur / global_speed_factor, min_static_display_duration)
+        target = min(target, dur)
+        v_fast = dur / target if target > 0 else 1.0
+        has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        if speed_ramping and (has_in or has_out):
+            info = calculate_speed_ramping_curve(
+                dur=dur, v_fast=v_fast,
+                has_ramp_in=has_in, has_ramp_out=has_out,
+                ramp_duration_s=ramp_duration_s,
+            )
+            plans.append((info.target_display_dur, info))
+        else:
+            plans.append((target, None))
+    return plans
+
+
+def src_offset_at_display(
+    d: float,
+    src_dur: float,
+    disp_dur: float,
+    ramp_info: SpeedRampInfo | None = None,
+) -> float:
+    """将成片展示时间偏移 d 逆映射回源片段时间偏移（支持变速 ramping 曲线）。"""
+    if disp_dur <= 0:
+        return 0.0
+    if ramp_info is None:
+        return d * (src_dur / disp_dur)
+
+    v_fast = max(1.0, ramp_info.v_fast)
+    inv_v = 1.0 / v_fast
+    s_in = ramp_info.ramp_in_src_dur
+    s_out = ramp_info.ramp_out_src_dur
+    s_mid = s_in + ramp_info.cruise_src_dur
+    k_in = (1.0 - inv_v) / (2.0 * s_in) if s_in > 0 else 0.0
+    k_out = (1.0 - inv_v) / (2.0 * s_out) if s_out > 0 else 0.0
+    p_in = s_in * (1.0 + inv_v) / 2.0 if s_in > 0 else 0.0
+    p_mid = p_in + (ramp_info.cruise_src_dur / v_fast if ramp_info.cruise_src_dur > 0 else 0.0)
+
+    if s_in > 0 and d < p_in and k_in > 0:
+        # d = s - k_in * s^2  →  求逆（小根）
+        disc = max(0.0, 1.0 - 4.0 * k_in * d)
+        return (1.0 - math.sqrt(disc)) / (2.0 * k_in)
+    if d < p_mid:
+        return s_in + (d - p_in) * v_fast
+    # ramp-out: d - p_mid = u * inv_v + k_out * u^2
+    dp = d - p_mid
+    if k_out > 0:
+        u = (-inv_v + math.sqrt(inv_v * inv_v + 4.0 * k_out * dp)) / (2.0 * k_out)
+    else:
+        u = dp * v_fast
+    return s_mid + u
+
+
 def build_timecode_drawtext_filter(
     start_unix: float,
     speed_factor: float = 1.0,
@@ -204,6 +283,19 @@ def generate_timecode_subtitles(
     rows_dict = {r["filepath"]: r for r in (rows or [])}
     day_start_unix = ts_to_unix(base_date + "000000")
 
+    # 展示时长计划与渲染滤镜图严格同源，含 speed ramping 非线性映射
+    cfg = load_config()
+    seg_cfg = cfg.get("segment", {})
+    render_cfg = cfg.get("render", {})
+    plans = compute_display_plans(
+        timeline,
+        static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
+        keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
+        min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
+        speed_ramping=render_cfg.get("speed_ramping_enabled", True),
+        ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
+    )
+
     is_ass = format_type.lower() in ("ass", "ssa")
     entries = []
     entry_idx = 1
@@ -224,7 +316,7 @@ def generate_timecode_subtitles(
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
         ])
 
-    for seg in timeline:
+    for seg, (seg_disp_dur, ramp_info) in zip(timeline, plans):
         row = rows_dict.get(seg.filepath)
         if row and row.get("file_start_time"):
             file_start_unix = ts_to_unix(row["file_start_time"])
@@ -237,17 +329,16 @@ def generate_timecode_subtitles(
 
         seg_wall_start = file_start_unix + seg.start_in_file
         seg_src_dur = seg.end_in_file - seg.start_in_file
-        seg_disp_dur = seg.duration
-        speed = seg_src_dur / seg_disp_dur if seg_disp_dur > 0 else 1.0
 
         n_steps = max(1, int(math.ceil(seg_disp_dur / step_s)))
         for k in range(n_steps):
-            t0 = cur_out_time + k * step_s
+            d0 = k * step_s
+            t0 = cur_out_time + d0
             t1 = min(cur_out_time + (k + 1) * step_s, cur_out_time + seg_disp_dur)
             if t1 <= t0:
                 continue
 
-            src_offset = (k * step_s) * speed
+            src_offset = src_offset_at_display(d0, seg_src_dur, seg_disp_dur, ramp_info)
             wall_unix = seg_wall_start + src_offset
             wall_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall_unix))
 
@@ -516,8 +607,6 @@ def build_concat_filter(
     - Real-world surveillance wall-clock timecode OSD overlay (drawtext).
     """
     kf_interval = max(static_keyframe_interval, 1.0)
-    display_dur = max(keyframe_display_duration, 0.1)
-    global_speed_factor = kf_interval / display_dur
 
     tmp_cfg = {}
     try:
@@ -538,15 +627,16 @@ def build_concat_filter(
         timecode_osd = False
 
     if scale_mode == "cuda":
-        scale_filter = f"hwupload_cuda,scale_cuda={output_width}:{output_height},hwdownload,format=nv12,fps={output_fps}"
+        scale_core = f"hwupload_cuda,scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
     elif scale_mode == "cuda_passthrough":
-        scale_filter = f"scale_cuda={output_width}:{output_height},hwdownload,format=nv12,fps={output_fps}"
+        scale_core = f"scale_cuda={output_width}:{output_height},hwdownload,format=nv12"
     elif scale_mode == "qsv":
-        scale_filter = f"scale_qsv=w={output_width}:h={output_height},hwdownload,format=nv12,fps={output_fps}"
+        scale_core = f"scale_qsv=w={output_width}:h={output_height},hwdownload,format=nv12"
     elif scale_mode == "skip":
-        scale_filter = f"fps={output_fps}"
+        scale_core = "null"
     else:
-        scale_filter = f"scale={output_width}:{output_height},fps={output_fps}"
+        scale_core = f"scale={output_width}:{output_height}"
+    scale_filter = f"{scale_core},fps={output_fps}"
 
 
     use_keyframe_slideshow = (scale_mode == "cpu")
@@ -569,19 +659,38 @@ def build_concat_filter(
             input_has_audio[idx] = False
 
     # --- Step 2: Per-file scale (once per input) ---
+    # 静态段关键帧抽取快路径 (hybrid_keyframe 的真实含义):
+    # 当某输入文件在本批次内全部为 STATIC 段且各段时长 >= 2*kf_interval 时，
+    # 在解码侧以 select 按 kf_interval 抽帧，置于 scale/hwdownload 之前——
+    # 仅被选中的帧进入缩放与显存回下载，消除静态段全帧解码的渲染瓶颈。
+    # 短静态段（与动态段混排的文件）维持全帧链，保证 trim 区间必有帧可用。
+    segs_by_file: dict[int, list[TimelineSegment]] = {}
+    for seg in timeline:
+        segs_by_file.setdefault(seg.input_index, []).append(seg)
+
     scale_parts: list[str] = []
     file_split_labels: dict[int, list[str]] = {}
     file_split_counter: dict[int, int] = {}
+    n_keyframe_fast = 0
 
     for idx in sorted(segs_per_file):
         n_segs = segs_per_file[idx]
+        file_segs = segs_by_file.get(idx, [])
+        all_static = all(s.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
+        min_src_dur = min((s.end_in_file - s.start_in_file) for s in file_segs) if file_segs else 0.0
+        use_kf_fastpath = all_static and min_src_dur >= 2.0 * kf_interval
 
-        if scale_filter is not None:
+        if use_kf_fastpath:
+            # 快路径剥离文件链尾部 fps：稀疏关键帧直接进入段级 trim/setpts，
+            # 段级 fps 过滤器负责将每帧铺陈为 keyframe_display_duration 时长
+            sel = f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{kf_interval:.1f})'"
+            scale_parts.append(f"[{idx}:v]{sel},{scale_core}[scaled_{idx}]")
+            n_keyframe_fast += 1
+        elif scale_filter is not None:
             scale_parts.append(f"[{idx}:v]{scale_filter}[scaled_{idx}]")
-            base_label = f"scaled_{idx}"
         else:
             scale_parts.append(f"[{idx}:v]null[skip_{idx}]")
-            base_label = f"skip_{idx}"
+        base_label = f"scaled_{idx}" if (scale_filter is not None or use_kf_fastpath) else f"skip_{idx}"
 
         if n_segs > 1:
             out_labels = [f"[s{idx}_{k}]" for k in range(n_segs)]
@@ -592,11 +701,26 @@ def build_concat_filter(
 
         file_split_counter[idx] = 0
 
+    if n_keyframe_fast:
+        logger.info(
+            "keyframe fast-path: %d/%d input files use select-based static extraction (kf=%.0fs)",
+            n_keyframe_fast, len(segs_per_file), kf_interval,
+        )
+
     # --- Step 3: Per-segment trim from scaled/split stream ---
+    # 展示时长计划与字幕墙钟映射共用同一来源，杜绝两套时长计算漂移
+    display_plans = compute_display_plans(
+        timeline,
+        static_keyframe_interval=static_keyframe_interval,
+        keyframe_display_duration=keyframe_display_duration,
+        min_static_display_duration=min_static_display_duration,
+        speed_ramping=bool(speed_ramping),
+        ramp_duration_s=ramp_duration_s,
+    )
+
     parts_v: list[str] = []
     parts_a: list[str] = []
     seg_count = 0
-    num_segs = len(timeline)
 
     rows_dict = {r["filepath"]: r for r in (rows or [])}
 
@@ -650,27 +774,13 @@ def build_concat_filter(
             else:
                 parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a{seg_count}]")
         else:
-            # Static segment speed scaling and speed ramping
-            target_display_dur = max(dur / global_speed_factor, min_static_display_duration)
-            target_display_dur = min(target_display_dur, dur)
-            v_fast = dur / target_display_dur if target_display_dur > 0 else 1.0
-
-            has_ramp_in = (i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO"))
-            has_ramp_out = (i < num_segs - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO"))
-
-            if speed_ramping and (has_ramp_in or has_ramp_out):
-                ramp_info = calculate_speed_ramping_curve(
-                    dur=dur,
-                    v_fast=v_fast,
-                    has_ramp_in=has_ramp_in,
-                    has_ramp_out=has_ramp_out,
-                    ramp_duration_s=ramp_duration_s,
-                )
+            # Static segment speed scaling and speed ramping (与字幕映射同源)
+            actual_display_dur, ramp_info = display_plans[i]
+            if ramp_info is not None:
                 pts_filter = ramp_info.pts_expr.replace(",", "\\,")
-                actual_display_dur = ramp_info.target_display_dur
             else:
+                v_fast = dur / actual_display_dur if actual_display_dur > 0 else 1.0
                 pts_filter = f"(PTS-STARTPTS)/{v_fast:.4f}"
-                actual_display_dur = target_display_dur
 
             fps_filter = f",fps=fps={output_fps}" if use_keyframe_slideshow else ""
             parts_v.append(

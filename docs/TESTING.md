@@ -6,7 +6,7 @@
 
 ## 一、 测试架构与设计方法学
 
-测试套件采用**高内聚业务领域驱动**架构，彻底摒弃了碎片化的里程碑用例，划分为 8 个核心业务测试模块，共收敛为 **87 个高价值测试用例（86 passed + 1 skipped）**，全套回归耗时约 **4.4 秒**。
+测试套件采用**高内聚业务领域驱动**架构，彻底摒弃了碎片化的里程碑用例，划分为 9 个核心业务测试模块，共收敛为 **101 个高价值测试用例（100 passed + 1 skipped）**，全套回归耗时约 **5 秒**。
 
 ### 1. 测试方法学
 - **等价类划分与格式覆盖**：覆盖 H.264、H.265 (HEVC)、单声道/双声道 AAC 与完全静音音轨的自适应探测。
@@ -30,10 +30,11 @@
 | :--- | :--- | :--- |
 | [`tests/test_database_and_scanner.py`](../tests/test_database_and_scanner.py) | 9 passed | SQLite WAL 读写解耦、信号量超时重试、NAS 小米摄像头 MAC 解析与目录提取、时间戳解析、多目录扫描 |
 | [`tests/test_motion_and_vad.py`](../tests/test_motion_and_vad.py) | 14 passed | `EmaBackgroundModel` 双差分、`SpatialGridMotionFilter` 8x8 空间连通域、暗光婴儿微动敏感度、IR-Cut 全局闪光抑制、`AudioEnergyVAD` 50ms RMS 分帧 |
-| [`tests/test_timeline_and_ramping.py`](../tests/test_timeline_and_ramping.py) | 39 passed | $C^1$ 连续平滑非线性变速过渡 PTS 曲线、动态段 1.0s/1.5s 前后延展、外挂 SRT/ASS 与硬字幕滤镜 |
+| [`tests/test_timeline_and_ramping.py`](../tests/test_timeline_and_ramping.py) | 45 passed | $C^1$ 连续平滑非线性变速过渡 PTS 曲线、动态段 1.0s/1.5s 前后延展、外挂 SRT/ASS 与硬字幕滤镜、展示时长计划与 ramping 逆映射 |
 | [`tests/test_scheduler_and_hardware.py`](../tests/test_scheduler_and_hardware.py) | 7 passed | `WorkStealingManager` 三态流转（NORMAL / BURST / PREEMPTION）、硬件信号量争用与重置 |
-| [`tests/test_renderer_and_ffmpeg.py`](../tests/test_renderer_and_ffmpeg.py) | 6 passed | 2路 NVENC 满载并发渲染调度 (防 8GB 显存溢出换页)、批次断点秒级复用、Filtergraph 指令构建、防死锁重定向 |
-| [`tests/test_pipeline_streaming.py`](../tests/test_pipeline_streaming.py) | 4 passed | 流式多阶段重叠编排引擎、物理时序保序滑动窗口分发（抗乱序完成）、队列积压溢出反压保护 |
+| [`tests/test_renderer_and_ffmpeg.py`](../tests/test_renderer_and_ffmpeg.py) | 8 passed | 2路 NVENC 满载并发渲染调度 (防 8GB 显存溢出换页)、批次断点秒级复用、Filtergraph 指令构建、静态段关键帧抽取快路径 |
+| [`tests/test_pipeline_streaming.py`](../tests/test_pipeline_streaming.py) | 5 passed | 流式多阶段重叠编排引擎、物理时序保序滑动窗口分发（抗乱序完成）、轻批次哨兵防滞留与渲染收尾对账 |
+| [`tests/test_phase1_regression.py`](../tests/test_phase1_regression.py) | 5 passed | 时间轴末帧闭环铁律、自适应 FPS ultra_long 档位边界、YOLO 验证帧索引 fps 对齐 |
 
 
 
@@ -73,6 +74,6 @@ uv run pytest --cov=src tests/ --cov-report=term-missing
 
 ## 四、 持续集成与准入基线
 
-1. **零破坏性回归 (Zero-Regression)**：任何新增功能或重构提交，必须保证上述 **86 项核心用例 100% 绿灯**（1 项 E2E 用例按硬件条件跳过）。
+1. **零破坏性回归 (Zero-Regression)**：任何新增功能或重构提交，必须保证上述 **100 项核心用例 100% 绿灯**（1 项 E2E 用例按硬件条件跳过）。
 2. **执行时效基线**：全套单元与集成测试在现代 8 核心 CPU 上的运行时间不得超过 **5 秒**。
 3. **代码静态检查**：代码在提交前必须通过 `python -m compileall main.py src` 语法校验。

@@ -227,6 +227,27 @@ def parse_res(spec: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+def cleanup_temp_artifacts() -> int:
+    """清理 temp/ 下上次运行遗留的批次临时产物 (_batch*/_fc*/_stderr*/.concat_*)。
+
+    仅在流水线启动前调用（运行中的批次文件不得触碰）。
+    返回清理的文件数。
+    """
+    removed = 0
+    if not TEMP_DIR.exists():
+        return 0
+    for pattern in ("_batch*.mp4", "_fc_*.txt", "_stderr_*.log", ".concat_*.txt"):
+        for f in TEMP_DIR.glob(pattern):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        logging.getLogger("homevlog").info("temp cleanup: removed %d stale artifacts", removed)
+    return removed
+
+
 def cleanup_resources(db=None):
     """Deep GC, clear CUDA cache, truncate SQLite WAL, and kill tracked ffmpeg processes."""
     import gc

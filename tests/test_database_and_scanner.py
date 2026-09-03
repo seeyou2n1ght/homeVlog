@@ -158,22 +158,24 @@ class TestVlogDatabaseLifecycle:
             filepath = "00_20260901100000_20260901100500.mp4"
             db.add_file_task(filepath, 0, "20260901", "20260901100000", "20260901100500", 300.0)
 
-            # 1. 预筛前为 PENDING
-            pending = db.get_prescreen_pending("20260901", 0)
-            assert len(pending) == 1
-            assert pending[0]["filepath"] == filepath
-            assert not db.is_prescreen_complete("20260901", 0)
+            # 1. 初始为 PENDING
+            tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert len(tasks) == 1
+            assert tasks[0]["filepath"] == filepath
+            assert tasks[0]["prescreen_status"] == "PENDING"
+            assert db.get_pending_file_count_for_date("20260901", 0) == 1
 
             # 2. 预筛标记为 SUSPICIOUS
             db.set_prescreen_result(filepath, "SUSPICIOUS", '{"diff": 15}')
-            assert db.is_prescreen_complete("20260901", 0)
-            suspicious = db.get_suspicious_files("20260901", 0)
-            assert len(suspicious) == 1
-            assert not db.is_analysis_complete("20260901", 0)
+            tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert tasks[0]["prescreen_status"] == "SUSPICIOUS"
+            assert db.get_pending_file_count_for_date("20260901", 0) == 1
 
             # 3. 详细分析标记为 ANALYZED
             db.set_analysis_result(filepath, "ANALYZED", '[{"start": 0, "end": 10, "label": "DYNAMIC"}]')
-            assert db.is_analysis_complete("20260901", 0)
+            tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert tasks[0]["analysis_status"] == "ANALYZED"
+            assert db.get_pending_file_count_for_date("20260901", 0) == 0
 
             # 4. 渲染任务生命周期
             db.upsert_render_task("20260901", 0, "PENDING")

@@ -89,6 +89,71 @@ class TestFiltergraphGenerationAndClosure:
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 
+    def test_keyframe_fastpath_pure_static_file(self):
+        """纯静态长文件走 select 抽帧快路径，滤镜图标签保持闭包。"""
+        t1 = TimelineSegment(
+            filepath="night.mp4",
+            input_index=0,
+            start_in_file=0.0,
+            end_in_file=300.0,
+            state="STATIC",
+            duration=300.0,
+        )
+        rows = [{"filepath": "night.mp4", "has_audio": 0}]
+        filter_str = build_concat_filter(
+            timeline=[t1],
+            rows=rows,
+            output_fps=20,
+            output_width=1920,
+            output_height=1080,
+            scale_mode="cuda_passthrough",
+            static_keyframe_interval=30.0,
+        )
+        # 快路径：select 抽帧置于 scale/hwdownload 之前
+        assert "select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,30.0)'" in filter_str
+        assert filter_str.index("select=") < filter_str.index("scale_cuda=")
+        is_closed, reason = verify_filtergraph_labels_closure(filter_str)
+        assert is_closed, f"Filtergraph not closed: {reason}"
+
+    def test_keyframe_fastpath_not_applied_to_mixed_or_short(self):
+        """混排动态段或短静态段不启用快路径，保证 trim 区间有帧。"""
+        segs = [
+            TimelineSegment(
+                filepath="mix.mp4", input_index=0,
+                start_in_file=0.0, end_in_file=120.0,
+                state="STATIC", duration=120.0,
+            ),
+            TimelineSegment(
+                filepath="mix.mp4", input_index=0,
+                start_in_file=120.0, end_in_file=130.0,
+                state="DYNAMIC", duration=10.0,
+            ),
+        ]
+        rows = [{"filepath": "mix.mp4", "has_audio": 0}]
+        filter_str = build_concat_filter(
+            timeline=segs, rows=rows, output_fps=20,
+            output_width=1920, output_height=1080,
+            scale_mode="cuda_passthrough",
+        )
+        assert "select='isnan(prev_selected_t)" not in filter_str
+
+        short_static = [
+            TimelineSegment(
+                filepath="short.mp4", input_index=0,
+                start_in_file=0.0, end_in_file=45.0,
+                state="STATIC", duration=45.0,
+            ),
+        ]
+        rows = [{"filepath": "short.mp4", "has_audio": 0}]
+        filter_str = build_concat_filter(
+            timeline=short_static, rows=rows, output_fps=20,
+            output_width=1920, output_height=1080,
+            scale_mode="cuda_passthrough",
+            static_keyframe_interval=30.0,
+        )
+        # 45s < 2*30s 阈值，不启用快路径
+        assert "select='isnan(prev_selected_t)" not in filter_str
+
     def test_partition_timeline_by_batches_preserves_count(self):
         segments = [
             TimelineSegment(

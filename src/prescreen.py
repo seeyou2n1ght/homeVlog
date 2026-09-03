@@ -3,16 +3,13 @@ import logging
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 
-from src.database import VlogDatabase
 from src.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args
 from src.scheduler import acquire_with_retry
-from src.utils import load_config, parse_res
-from src.monitor import get_perf, PerfRecord
+from src.utils import parse_res
 
 logger = logging.getLogger("homevlog")
 
@@ -483,108 +480,3 @@ def _prescreen_stream_fps(
             "sample_fps": sample_fps,
         }),
     }
-
-
-def run_prescreen_for_cam(
-    db: VlogDatabase,
-    date: str,
-    cam_index: int,
-    parallel: int = 4,
-) -> dict:
-    """Run Pass1 prescreen using dual-GPU work-stealing queue."""
-    from queue import Queue
-    config = load_config()
-    pending = db.get_prescreen_pending(date, cam_index)
-    if not pending:
-        logger.info("prescreen: no PENDING files for %s cam%d", date, cam_index)
-        return {"done": 0, "static": 0, "suspicious": 0, "failed": 0}
-
-    logger.info("prescreen: %d files for %s cam%d", len(pending), date, cam_index)
-    parallel = config.get("detection", {}).get("prescreen_parallel", parallel)
-
-    sorted_tasks = sorted(pending, key=lambda t: t.get("file_duration") or 0, reverse=True)
-    task_queue: Queue[dict | None] = Queue()
-    for task in sorted_tasks:
-        task_queue.put(task)
-        
-    for _ in range(parallel):
-        task_queue.put(None)
-
-    stats = {"done": 0, "static": 0, "suspicious": 0, "failed": 0}
-    t0 = time.monotonic()
-
-    prescreen_gpu_policy = config.get("pipeline", {}).get("prescreen_gpu_policy", "qsv_only")
-
-    with ThreadPoolExecutor(max_workers=parallel) as pool:
-        futures = []
-        for i in range(parallel):
-            if prescreen_gpu_policy == "qsv_only":
-                gpu = "qsv"
-            elif prescreen_gpu_policy == "cuda_only":
-                gpu = "cuda"
-            elif prescreen_gpu_policy == "alternating":
-                gpu = "qsv" if i % 2 == 0 else "cuda"
-            else:
-                gpu = "qsv"
-            futures.append(pool.submit(_prescreen_worker, db, task_queue, config, gpu))
-            
-        for f in as_completed(futures):
-            try:
-                local = f.result()
-                for k in stats:
-                    stats[k] += local[k]
-            except Exception:
-                logger.exception("prescreen worker crashed")
-
-    elapsed = time.monotonic() - t0
-    logger.info(
-        "prescreen %s cam%d done in %.1fs: static=%d suspicious=%d failed=%d (%.1f files/s)",
-        date, cam_index, elapsed, stats["static"], stats["suspicious"], stats["failed"],
-        len(pending) / elapsed if elapsed > 0 else 0,
-    )
-    return stats
-
-
-def _prescreen_worker(db: VlogDatabase, task_queue, config: dict, gpu: str) -> dict:
-    """Process PENDING files from queue with given GPU (Work-Stealing)."""
-    perf = get_perf()
-    local = {"done": 0, "static": 0, "suspicious": 0, "failed": 0}
-
-    while True:
-        task = task_queue.get()
-        if task is None:
-            break
-
-        filepath = task["filepath"]
-        duration = task["file_duration"] or 300.0
-
-        t0 = time.monotonic()
-        result = prescreen_file(filepath, duration, config, gpu)
-        elapsed = time.monotonic() - t0
-
-        extra = {"status": result["status"]}
-        try:
-            rj = json.loads(result.get("result_json", "{}"))
-            extra["max_diff"] = rj.get("max_diff", 0)
-            extra["n_segments"] = len(rj.get("sample_ts", []))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        perf.add(PerfRecord(
-            stage="prescreen", file=Path(filepath).name, gpu=gpu,
-            duration=round(elapsed, 3), extra=extra,
-        ))
-
-        local["done"] += 1
-        has_audio = result.get("has_audio")
-        if result["status"] == "FAILED":
-            db.set_prescreen_result(filepath, "FAILED", result.get("result_json", ""), has_audio=has_audio)
-            local["failed"] += 1
-        else:
-            db.set_prescreen_result(filepath, result["status"], result.get("result_json", ""), has_audio=has_audio)
-            if result["status"] == "STATIC":
-                local["static"] += 1
-            else:
-                local["suspicious"] += 1
-
-    return local

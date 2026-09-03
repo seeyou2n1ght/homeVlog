@@ -57,7 +57,6 @@ def mock_config(temp_test_dir):
             "scanner_freeze_minutes": 0,
             "min_disk_space_gb": 1,
             "file_stabilize_wait": 0.01,
-            "render_retry_max": 2,
         },
         "pipeline": {
             "streaming_mode": True,

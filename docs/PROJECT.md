@@ -82,5 +82,5 @@ HomeVlog is a high-throughput, zero-idle, dual-GPU intelligent video condensatio
 - `src/ui.py`: Rich live terminal dashboard and telemetry cards
 - `src/monitor.py`: System & GPU hardware telemetry collector
 - `src/utils.py`: Config loading, path resolution, and tri-split logging
-- `tests/`: 8 domain-driven test suites (86 passed + 1 skipped in ~4.4s)
+- `tests/`: 9 domain-driven test suites (100 passed + 1 skipped in ~5s)
 

@@ -307,6 +307,19 @@ class MotionDetector:
                 "is_audio_active": is_audio_active,
             })
 
+        # 时间轴闭环 (AGENTS.md 铁律): 末帧时间戳严格等于 start_offset + file_duration，
+        # 杜绝渲染出的 Vlog 出现时间轴空洞或跳秒
+        if file_duration > 0 and results:
+            t_close = start_offset + file_duration
+            if results[-1]["time"] < t_close - 1e-6:
+                results.append({
+                    "time": t_close,
+                    "is_motion": False,
+                    "state": "STATIC",
+                    "energy": 0.0,
+                    "is_audio_active": False,
+                })
+
         meta = {
             "has_audio": 1 if audio_events or (audio_data is not None and len(audio_data) > 0) else 0,
             "audio_events": audio_events,
@@ -356,10 +369,6 @@ class MotionDetector:
         total_frames = 0
         video_frame_count = 0
 
-        yolo_sample_interval = max(
-            1, int(self.fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))
-        )
-
         try:
             from av.audio.resampler import AudioResampler
             audio_resampler = AudioResampler(format="fltp", layout="mono", rate=self.vad_sample_rate)
@@ -408,12 +417,21 @@ class MotionDetector:
                         effective_fps = self.fps_tiers["short"]
                     elif file_duration <= self.fps_tier_thresholds["medium_max"]:
                         effective_fps = self.fps_tiers["medium"]
-                    else:
+                    elif file_duration <= self.fps_tier_thresholds.get("long_max", 1800):
                         effective_fps = self.fps_tiers["long"]
+                    else:
+                        # 超长静止文件（夜间）降至 ultra_long 档，再省 30-40% 解码时间
+                        effective_fps = self.fps_tiers.get("ultra_long", self.fps_tiers["long"])
                 else:
                     effective_fps = self.fps
 
                 frame_step = max(1, int(round(video_fps / effective_fps)))
+
+                # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
+                # 保证 yolo_buffer 帧键与分析阶段时间轴严格对齐
+                yolo_sample_interval = max(
+                    1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5))))
+                )
 
                 watchdog_timeout = max(self.decode_timeout * 3, 60.0)
                 if file_duration > 0:
@@ -569,18 +587,29 @@ class MotionDetector:
 
             from concurrent.futures import ThreadPoolExecutor
             all_results: list[list[dict]] = [[] for _ in range(n_chunks)]
+            audio_sr = self.vad_sample_rate
             with ThreadPoolExecutor(max_workers=n_chunks) as pool:
                 futures = {}
                 for c_idx in range(n_chunks):
                     f_start = c_idx * chunk_size
                     f_end = (c_idx + 1) * chunk_size if c_idx < n_chunks - 1 else n_frames
-                    chunk_offset = start_offset + (f_start / n_frames) * file_duration if n_frames > 0 else start_offset
-                    chunk_dur = ((f_end - f_start) / n_frames) * file_duration if n_frames > 0 else file_duration
+                    rel_start = (f_start / n_frames) * file_duration if n_frames > 0 else 0.0
+                    rel_end = (f_end / n_frames) * file_duration if n_frames > 0 else file_duration
+                    chunk_offset = start_offset + rel_start
+                    chunk_dur = rel_end - rel_start
                     chunk_frames = decoded_frames[f_start:f_end]
+                    # 按 chunk 时间窗切片音频：避免全量音频重复 VAD（O(N^2)）
+                    # 及事件时间戳整体平移错位导致的 DYNAMIC_AUDIO 误判
+                    if full_audio.size > 0:
+                        a_start = int(rel_start * audio_sr)
+                        a_end = int(rel_end * audio_sr)
+                        chunk_audio = full_audio[a_start:a_end]
+                    else:
+                        chunk_audio = full_audio
                     futures[pool.submit(
                         self.analyze_frames, chunk_frames,
                         start_offset=chunk_offset, file_duration=chunk_dur,
-                        fps=effective_fps, audio_data=full_audio
+                        fps=effective_fps, audio_data=chunk_audio
                     )] = c_idx
 
                 for f in futures:

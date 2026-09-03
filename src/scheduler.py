@@ -71,7 +71,7 @@ def get_disk_semaphore() -> threading.Semaphore:
 
 
 def get_nv_semaphore() -> threading.Semaphore:
-    """获取 NVIDIA 硬件编解码并发信号量 (默认上限 3，针对 3060Ti 优化)。"""
+    """获取 NVIDIA 硬件编解码并发信号量 (生产配置上限 2，3060Ti 8GB 显存安全水位)。"""
     global _nv_semaphore
     if _nv_semaphore is None:
         with _io_lock:

@@ -114,14 +114,14 @@ class VlogDatabase:
                 if has_audio is not None:
                     self.conn.execute(
                         """UPDATE file_tasks
-                           SET prescreen_status=?, prescreen_result=?, has_audio=?, updated_at=datetime('now')
+                           SET prescreen_status=?, prescreen_result=?, has_audio=?, updated_at=datetime('now', 'localtime')
                            WHERE filepath=?""",
                         (status, result_json, has_audio, str(filepath)),
                     )
                 else:
                     self.conn.execute(
                         """UPDATE file_tasks
-                           SET prescreen_status=?, prescreen_result=?, updated_at=datetime('now')
+                           SET prescreen_status=?, prescreen_result=?, updated_at=datetime('now', 'localtime')
                            WHERE filepath=?""",
                         (status, result_json, str(filepath)),
                     )
@@ -130,25 +130,12 @@ class VlogDatabase:
                 logger.error("DB error in set_prescreen_result for %s: %s", filepath, e)
                 self.conn.rollback()
 
-    def get_prescreen_pending(self, date: str, cam_index: int) -> list[dict]:
-        try:
-            rows = self.conn.execute(
-                """SELECT * FROM file_tasks
-                   WHERE date=? AND cam_index=? AND prescreen_status='PENDING'
-                   ORDER BY file_start_time""",
-                (date, cam_index),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            logger.error("DB error in get_prescreen_pending: %s", e)
-            return []
-
     def set_analysis_result(self, filepath: str, status: str, segments_json: str = ""):
         with self._lock:
             try:
                 self.conn.execute(
                     """UPDATE file_tasks
-                       SET analysis_status=?, analysis_segments=?, updated_at=datetime('now')
+                       SET analysis_status=?, analysis_segments=?, updated_at=datetime('now', 'localtime')
                        WHERE filepath=?""",
                     (status, segments_json, str(filepath)),
                 )
@@ -156,22 +143,6 @@ class VlogDatabase:
             except Exception as e:
                 logger.error("DB error in set_analysis_result for %s: %s", filepath, e)
                 self.conn.rollback()
-
-    def get_suspicious_files(self, date: str, cam_index: int) -> list[dict]:
-        with self._lock:
-            try:
-                rows = self.conn.execute(
-                    """SELECT * FROM file_tasks
-                       WHERE date=? AND cam_index=?
-                         AND prescreen_status='SUSPICIOUS'
-                         AND analysis_status='PENDING'
-                       ORDER BY file_start_time""",
-                    (date, cam_index),
-                ).fetchall()
-                return [dict(r) for r in rows]
-            except Exception as e:
-                logger.error("DB error in get_suspicious_files: %s", e)
-                return []
 
     def get_all_file_tasks_for_date(self, date: str, cam_index: int) -> list[dict]:
         with self._lock:
@@ -187,40 +158,12 @@ class VlogDatabase:
                 logger.error("DB error in get_all_file_tasks_for_date: %s", e)
                 return []
 
-    def is_prescreen_complete(self, date: str, cam_index: int) -> bool:
-        with self._lock:
-            try:
-                row = self.conn.execute(
-                    """SELECT COUNT(*) as cnt FROM file_tasks
-                       WHERE date=? AND cam_index=? AND prescreen_status='PENDING'""",
-                    (date, cam_index),
-                ).fetchone()
-                return row is not None and row["cnt"] == 0
-            except Exception as e:
-                logger.error("DB error in is_prescreen_complete: %s", e)
-                return False
-
-    def is_analysis_complete(self, date: str, cam_index: int) -> bool:
-        with self._lock:
-            try:
-                pending = self.conn.execute(
-                    """SELECT COUNT(*) as cnt FROM file_tasks
-                       WHERE date=? AND cam_index=?
-                         AND prescreen_status IN ('SUSPICIOUS')
-                         AND analysis_status='PENDING'""",
-                    (date, cam_index),
-                ).fetchone()
-                return pending is not None and pending["cnt"] == 0
-            except Exception as e:
-                logger.error("DB error in is_analysis_complete: %s", e)
-                return False
-
     def upsert_render_task(self, date: str, cam_index: int, status: str = "PENDING"):
         with self._lock:
             try:
                 self.conn.execute(
                     """INSERT INTO render_tasks (date, cam_index, status, updated_at)
-                       VALUES (?, ?, ?, datetime('now'))
+                       VALUES (?, ?, ?, datetime('now', 'localtime'))
                        ON CONFLICT(date, cam_index) DO UPDATE SET
                          status=excluded.status, updated_at=excluded.updated_at""",
                     (date, cam_index, status),
@@ -236,7 +179,7 @@ class VlogDatabase:
                 self.conn.execute(
                     """INSERT INTO render_tasks
                        (date, cam_index, status, output_file, updated_at)
-                       VALUES (?, ?, ?, ?, datetime('now'))
+                       VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
                        ON CONFLICT(date, cam_index) DO UPDATE SET
                          status=excluded.status,
                          output_file=excluded.output_file,

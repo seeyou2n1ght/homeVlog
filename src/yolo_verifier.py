@@ -11,6 +11,9 @@ logger = logging.getLogger("homevlog")
 class YoloVerifier:
     _model_lock = threading.Lock()
     _shared_model = None
+    # 推理串行锁：共享模型被多个分析线程并发调用，
+    # ultralytics predictor 非线程安全，CUDA 上下文必须串行进入
+    _inference_lock = threading.Lock()
 
     def __init__(self, config: dict, device: str | None = None):
         yolo_cfg = config.get("yolo", {})
@@ -133,7 +136,7 @@ class YoloVerifier:
         t0 = time.monotonic()
         try:
             import torch
-            with torch.inference_mode():
+            with YoloVerifier._inference_lock, torch.inference_mode():
                 results = self.model(all_frames, verbose=False, stream=True)
                 for frame_i, r in enumerate(results):
                     if r.boxes is not None and len(r.boxes.cls) > 0:

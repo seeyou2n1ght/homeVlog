@@ -62,8 +62,6 @@ recovery:
   min_disk_space_gb: 20
   # 文件稳定性二次确认等待 (秒)
   file_stabilize_wait: 1.2
-  # 渲染失败重试最大次数
-  render_retry_max: 2
 
 detection:
   # [Pass 1] 快速预筛 (Prescreen)
@@ -74,12 +72,6 @@ detection:
   prescreen_diff_threshold: 8.0
 
   prescreen_extract_timeout: 120.0
-
-  # 预筛选阈值自适应标定: 首次运行对少量文件做全量分析，自动计算最优阈值分界点
-  # 后续文件使用标定后的阈值，避免固定阈值在不同光照条件下误判
-  prescreen_auto_calibrate: true
-  prescreen_calibrate_samples: 6
-
 
   # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
@@ -172,10 +164,6 @@ render:
   # 静态片段处理模式: hybrid_keyframe (幻灯片抽帧，极低解码压力)
   static_mode: "hybrid_keyframe"
   batch_max_files: 8
-  # 输出 QC 校验门: 渲染完成后自动校验帧数/时长与预期匹配度，不匹配则标记告警
-  qc_validate: true
-  # 动态批次大小: 根据批次内 DYNAMIC segment 比例自适应调整批次大小
-  dynamic_batch_sizing: true
   # R4: 动态变速过渡 (Speed Ramping)
   speed_ramping_enabled: true
   ramp_duration_s: 1.0

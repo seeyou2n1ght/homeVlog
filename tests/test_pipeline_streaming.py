@@ -173,3 +173,54 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
+    def test_light_batches_not_stranded_by_sentinels(self, tmp_path):
+        """回归: 纯静态轻批次在哨兵投递后滞留 light 队列时不得被 stranded。
+
+        场景: 8 个 STATIC 文件 → 4 个轻批次；2 个 NV worker 忙于前 2 批时
+        收尾哨兵已投 heavy 队列。旧逻辑 worker 拿到哨兵即退出，batch 2/3
+        被静默丢弃；修复后必须全部产出且无静默丢批告警。
+        """
+        db_path = tmp_path / "test_strand.db"
+        db = VlogDatabase(db_path=db_path)
+
+        files = []
+        for i in range(8):
+            start = f"20260901{i:02d}0000"   # 14 位: YYYYMMDDHHMMSS，按小时递增
+            end = f"20260901{i:02d}0500"
+            fname = f"cam0_{start}_{end}.mp4"
+            db.add_file_task(fname, 0, "20260901", start, end, 300.0)
+            db.set_prescreen_result(fname, "STATIC")
+            files.append(fname)
+
+        cfg = {
+            "pipeline": {"render_start_delay": 0},
+            "render": {"batch_max_files": 2},
+            "scheduler": {"watermark_high": 10, "watermark_low": 3},
+        }
+        orch = StreamingOrchestrator(
+            db=db, date="20260901", cam_index=0, config=cfg, render_enabled=True, dashboard_enabled=False
+        )
+
+        # 全部就绪消息预置（轻批次路径），随后立即停止分发循环
+        for fname in files:
+            orch.render_batch_queue.put({"filepath": fname, "status": "STATIC"})
+        orch.stop_event.set()
+
+        def _slow_render(segs, bi, *args, **kwargs):
+            time.sleep(0.2)  # 保证哨兵在 worker 完成首批前已投递
+            return f"mock_batch_{bi}.mp4"
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=_slow_render):
+                t = threading.Thread(target=orch._render_manager)
+                t.start()
+                t.join(timeout=30.0)
+            assert not t.is_alive(), "_render_manager did not terminate (possible deadlock)"
+
+            orch.batch_paths.sort(key=lambda x: x[0])
+            produced = [b[0] for b in orch.batch_paths]
+            assert produced == [0, 1, 2, 3], f"light batches stranded: produced={produced}"
+            assert not any("silently dropped" in e for e in orch.errors), orch.errors
+        finally:
+            db.close()
+
