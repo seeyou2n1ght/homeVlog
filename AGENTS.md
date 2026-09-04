@@ -11,6 +11,7 @@ This file provides guidance to Codex or other coding agents when working in this
 - **信号量释放单次原则**: `io_sem.release()` 必须在 `finally` 块中恰好调用一次。禁止在 `return` 前显式调用 `release()` 后又在 `finally` 中重复释放，否则信号量计数膨胀导致并发失控。
 - **子进程注册与优雅停机约束**: 所有通过 `subprocess.Popen` 启动的后台 FFmpeg 进程（包含 Pass 2 批次渲染与 Pass 1.5 管道解码），必须通过 `FFmpegProcessRegistry.register()` 注册并在 `finally` 块中 `deregister()`。严禁产生脱离管控的孤儿进程，确保用户按 Ctrl+C 时由 `kill_all()` 瞬间释放 GPU 会话。
 - **断点续传与原子批次约束**: 批次渲染必须采用 `_batchX.tmp.mp4` 临时文件原子写入，经退出码与大小校验后原子替换正式文件；`cleanup_temp_artifacts()` 严禁默认删除有效 `_batch*.mp4`，保障随时中断随时秒级续跑。
+- **确定性渲染等待与对账闭环**: `StreamingOrchestrator` 严禁仅等待单文件队列派发完毕即提前退出，必须等待 `render_finished_event` 确保所有渲染批次 100% 物理落盘与对账完成；若有批次失败，强制阻断最终合并并保留有效批次供下次断点复用，杜绝生成带洞成片。
 - **分析管道灰度直通**: 管道解码必须严格维持 `-pix_fmt gray` 单通道灰度直通，帧尺寸为 `w * h`。严禁在管道中输出 3 通道数据后由 CPU 转灰度。
 
 ## 核心开发哲学

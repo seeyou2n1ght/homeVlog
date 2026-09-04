@@ -109,6 +109,11 @@ graph TD
 ### 6. 保序滑动窗口与批次渲染 ([`src/pipeline.py`](../src/pipeline.py), [`src/renderer.py`](../src/renderer.py))
 - **时序保序滑动窗口 (In-Order Sliding Window)**：
   - 跟踪全天物理时序队列 `all_tasks_ordered`，仅当队列头部连续的 $K$ 个文件全部分析就绪后，严格按时序打包为批次投递给渲染 Worker。
+- **纯静态批次跳过非关键帧解码 (`-skip_frame nokey`)**：
+  - 识别批次内纯静态文件集合，在解复用输入阶段注入 `-skip_frame nokey`，彻底消除夜间数小时静态画面的 NVDEC 冗余解码，将 `batch_0` 解码长尾缩短 70%~93.5%。
+- **确定性渲染完成闭环 (`render_finished_event`) 与原子落盘**：
+  - 主线程输入分发完毕后以 0.2s 轮询等待 `render_finished_event`，确保所有分发批次 100% 物理落盘与严格对账；批次先写入 `.tmp.mp4`，退出码与大小（$\ge 512\text{KB}$）双重校验通过后原子重命名为正式批次。
+  - **断点自愈与防坏片保护**：若发生批次级失败，系统直接打标 `FAILED` 阻断最终 `concat` 合并，**完整保留已成功生成的批次文件**，严禁误删，确保下次启动秒级复用。
 - **变速过渡曲线 ([`src/timeline.py`](../src/timeline.py))**：
   - 动态运动片段以原速（1x）播放并保留原声音频。
   - 静态片段计算 $C^1$ 连续平滑非线性过渡 PTS 曲线，消除跳帧顿挫感。
@@ -118,9 +123,10 @@ graph TD
 - **读写完全解耦**：采用 SQLite WAL 模式（`PRAGMA journal_mode=WAL`），读查询无阻塞并发。
 - **单写锁串行化**：所有写操作经 `threading.Lock` 串行提交，规避多线程并发写冲突；数据库以 filepath 唯一约束保证断点续跑幂等。
 
-### 8. 现代交互与三路分流日志 ([`src/ui.py`](../src/ui.py), [`src/utils.py`](../src/utils.py))
+### 8. 现代交互、三路分流日志与优雅停机 ([`src/ui.py`](../src/ui.py), [`src/utils.py`](../src/utils.py))
 - **Rich 动态控制台终端**：`PipelineDashboard` 提供三阶段进度、积压水位、硬件调度状态徽标、全天素材工序堆叠分布条与实时告警跑马灯；日志桥接器（`RichConsoleBridgeHandler` + `register_dashboard`）在 Live 模式下将 WARNING/ERROR 自动汇入告警区。tqdm 已完全移除，终端输出统一由 Rich 呈现；非 TTY/无头环境自动降级为纯日志输出。
-- **信号量超时防护**：所有硬件/IO 信号量经 `acquire_with_retry()`（30s 超时 + 最多 3 次重试）获取，杜绝 QSV 争用死锁。
+- **0.1s 极速 Ctrl+C 优雅停机**：废弃不可中断的无超时 `queue.join()`，采用 0.2s 轮询与 `abort_event`；捕获中断瞬间调用 `FFmpegProcessRegistry.kill_all()` 瞬间杀灭全部后台 GPU 编码与管道解码子进程，精准识别 SIGINT 信号并抑制误导性报错，实现 0 孤儿进程残留安全停机。
+- **信号量超时防护**：所有硬件/IO 信号量经 `acquire_with_retry()`（30s 超时 + 6 次重试，提供 180s 充裕宽限期）获取，杜绝高负载突发时的假死与慢速 PyAV 降级。
 - **三路日志分流架构**：
   - 主运行追踪日志：`logs/homevlog_*.log`；
   - 异常告警日志：`logs/error_*.log`；

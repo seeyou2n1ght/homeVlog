@@ -55,7 +55,7 @@ scheduler:
 
 recovery:
   # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)
-  skip_today: false
+  skip_today: true
   # 文件稳定等待 (分钟): 0 表示不等待 (对于已完成的往日素材建议设为 0)
   scanner_freeze_minutes: 0
   # 磁盘空间保护 (GB): 剩余空间低于此值将停止流水线
