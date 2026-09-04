@@ -286,10 +286,18 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         output_path.unlink(missing_ok=True)
     except OSError:
         pass
-    logger.error(
-        "batch-render cam%d batch%d failed after %.1fs:\n%s",
-        cam_index, batch_idx, elapsed, err_tail,
-    )
+    # 判断是否为用户 Ctrl+C 中断信号引起的正常退出，避免误报 ERROR
+    is_interrupted = "received signal 2" in err_tail or (proc is not None and proc.returncode in (255, -2, 130))
+    if is_interrupted:
+        logger.info(
+            "batch-render cam%d batch%d terminated by signal (Ctrl+C)",
+            cam_index, batch_idx,
+        )
+    else:
+        logger.error(
+            "batch-render cam%d batch%d failed after %.1fs:\n%s",
+            cam_index, batch_idx, elapsed, err_tail,
+        )
     return None
 
 

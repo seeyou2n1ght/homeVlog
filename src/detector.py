@@ -367,6 +367,8 @@ class MotionDetector:
                 except Exception:
                     pass
                 return frames, yolo_buffer, full_audio, meta
+            if meta.get("aborted"):
+                return [], {}, np.array([], dtype=np.float32), meta
             logger.warning(
                 "pipe decode yielded 0 frames for %s, falling back to PyAV",
                 Path(filepath).name,
@@ -479,11 +481,14 @@ class MotionDetector:
                     proc.stdout.close()
                 except OSError:
                     pass
+            is_aborted = False
             if proc and proc.stderr:
                 try:
                     if not decoded_frames and proc.returncode != 0:
                         err_tail = proc.stderr.read().decode('utf-8', errors='ignore')[-300:]
-                        if err_tail.strip():
+                        if "received signal 2" in err_tail or proc.returncode in (255, -2, 130):
+                            is_aborted = True
+                        elif err_tail.strip():
                             logger.warning("pipe decode stderr for %s: %s", Path(filepath).name, err_tail.strip())
                     proc.stderr.close()
                 except Exception:
@@ -496,6 +501,7 @@ class MotionDetector:
             "decode_time": round(time.monotonic() - t_decode_start, 3),
             "frames": total_frames,
             "sem_wait": sem_wait,
+            "aborted": is_aborted,
         }
         return decoded_frames, yolo_buffer, meta
 
