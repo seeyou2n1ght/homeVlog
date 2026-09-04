@@ -85,6 +85,15 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             return
+        elif path in ("/prototype", "/prototype.html"):
+            self._send_file(STATIC_DIR / "prototype.html", "text/html; charset=utf-8")
+            return
+        elif path == "/prototype.js":
+            self._send_file(STATIC_DIR / "prototype.js", "application/javascript; charset=utf-8")
+            return
+        elif path == "/prototype.css":
+            self._send_file(STATIC_DIR / "prototype.css", "text/css; charset=utf-8")
+            return
         elif path == "/app.js":
             self._send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
             return

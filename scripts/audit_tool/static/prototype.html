@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HomeVlog Cinema Audit Workbench v2.4 (High-Fidelity Prototype)</title>
+  <link rel="stylesheet" href="/prototype.css">
+</head>
+<body>
+
+  <!-- ========================================================================
+       1. Top Header Bar
+       ======================================================================== -->
+  <header class="header-bar">
+    <div class="logo-group">
+      <span class="logo-badge">PROTOTYPE v2.4</span>
+      <div class="app-title">
+        HOMEVLOG AUDIT
+        <span class="app-subtitle">多模态高保真智能审核工作台 (设计概念验证)</span>
+      </div>
+    </div>
+
+    <!-- KPI & Progress Stream -->
+    <div class="header-kpi-flow">
+      <div class="progress-capsule">
+        <div class="progress-meta">
+          <span>分段审核进度</span>
+          <span class="count" id="progress-text">312 / 1420 (22%)</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-bar" style="width: 22%;"></div>
+        </div>
+      </div>
+
+      <div class="metrics-capsule-group">
+        <div class="metric-pill">
+          <span class="label">P</span>
+          <span class="val" id="metric-precision">91.4%</span>
+        </div>
+        <div class="metric-pill">
+          <span class="label">R</span>
+          <span class="val" id="metric-recall">88.2%</span>
+        </div>
+        <div class="metric-pill tp">
+          <span class="label">TP</span>
+          <span class="val" id="metric-tp">285</span>
+        </div>
+        <div class="metric-pill fp">
+          <span class="label">FP</span>
+          <span class="val" id="metric-fp">21</span>
+        </div>
+        <div class="metric-pill fn">
+          <span class="label">FN</span>
+          <span class="val" id="metric-fn">6</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Header Actions -->
+    <div class="header-actions">
+      <button class="hdr-btn" id="btn-rerender" title="触发后台异步重浓缩">
+        <span>🔄</span> 触发重分段
+      </button>
+      <button class="hdr-btn" id="btn-export" title="导出审核标注与训练集">
+        <span>📥</span> 导出标注
+      </button>
+      <button class="hdr-btn primary" id="btn-generate" title="生成最终 Vlog 成片">
+        <span>🎬</span> 生成成片
+      </button>
+      <a href="/index.html" class="hdr-btn" style="text-decoration: none;" title="返回当前已上线的标准主界面">
+        <span>⚙️</span> 返回旧版
+      </a>
+    </div>
+  </header>
+
+  <!-- ========================================================================
+       2. Main Layout
+       ======================================================================== -->
+  <main class="main-workspace">
+
+    <!-- Left Drawer: Segments & Filter -->
+    <aside class="left-drawer">
+      <div class="drawer-header">
+        <div class="drawer-title-row">
+          <span class="drawer-title">
+            待审分段列表
+            <span class="badge-count" id="drawer-count">64 条待审</span>
+          </span>
+          <button class="tl-tool-btn" id="btn-refresh-list" title="刷新列表">🔄</button>
+        </div>
+
+        <div class="drawer-tabs">
+          <button class="drawer-tab-btn active" data-tab="all">全部</button>
+          <button class="drawer-tab-btn" data-tab="fp_candidate">待纠偏 (34)</button>
+          <button class="drawer-tab-btn" data-tab="fn_candidate">高能漏检 (18)</button>
+          <button class="drawer-tab-btn" data-tab="reviewed">已审通过 (12)</button>
+        </div>
+
+        <div class="filter-row">
+          <input type="text" class="filter-input" id="search-input" placeholder="🔍 检索切片编号 / 时间 / 特征...">
+          <select class="filter-select" id="filter-cam">
+            <option value="all">机位全部</option>
+            <option value="0">CAM 0 (客厅)</option>
+            <option value="1">CAM 1 (玄关)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Segment Card List -->
+      <div class="segment-card-list" id="segment-card-list">
+        <!-- Dynamically injected cards -->
+      </div>
+    </aside>
+
+    <!-- Center Stage -->
+    <section class="center-stage">
+
+      <!-- 2.1 Timeline Card -->
+      <div class="timeline-section-card">
+        <div class="timeline-header-row">
+          <div class="timeline-title-group">
+            <span class="current-file-badge" id="current-file-label">20260320_CAM0.mp4</span>
+            <span style="font-size: 11px; color: var(--text-secondary);" id="current-range-label">18:07:24 ~ 18:07:48 (24.0s)</span>
+          </div>
+
+          <div class="timeline-scale-controls">
+            <button class="tl-tool-btn" id="tl-zoom-out">🔍 -</button>
+            <button class="tl-tool-btn" id="tl-zoom-in">🔍 +</button>
+            <button class="tl-tool-btn active" id="tl-zoom-fit">适应切片</button>
+            <button class="tl-tool-btn" id="tl-speed-1x">1x</button>
+            <button class="tl-tool-btn" id="tl-speed-2x">2x</button>
+          </div>
+        </div>
+
+        <div class="timeline-container">
+          <div class="minimap-label">全片宏观时间轴概览 (MINIMAP)</div>
+          <div class="timeline-track minimap-track" id="minimap-track">
+            <!-- Minimap segments -->
+            <div class="minimap-viewport-window" id="minimap-viewport" style="left: 45%; width: 10%;"></div>
+          </div>
+
+          <div class="detailed-label" style="margin-top: 4px;">聚焦切片展开与能量分布 (DETAILED TIMELINE)</div>
+          <div class="timeline-track detailed-track" id="detailed-track">
+            <!-- Detailed segments -->
+            <div class="scrubber-line" id="scrubber-line" style="left: 50%;">
+              <div class="scrubber-handle"></div>
+            </div>
+          </div>
+
+          <div class="timeline-ticks-bar" id="timeline-ticks-bar">
+            <span>18:07:20</span>
+            <span>18:07:28</span>
+            <span>18:07:36 (PEAK)</span>
+            <span>18:07:44</span>
+            <span>18:07:52</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2.2 Cinema Gallery Tri-Frame Section -->
+      <div class="cinema-gallery-section">
+
+        <!-- Left Frame: Start -->
+        <div class="frame-card">
+          <div class="frame-card-header">
+            <span class="frame-role-title">
+              <span class="role-dot"></span> 起点进入帧
+            </span>
+            <span class="frame-timestamp" id="start-time-text">18:07:24.000</span>
+          </div>
+          <div class="frame-viewport" id="viewport-start" title="点击放大查看">
+            <img id="img-start" src="" alt="Start Frame">
+            <div class="viewport-overlay-badges">
+              <span class="overlay-pill">运动触发点</span>
+            </div>
+          </div>
+          <div class="frame-wing-diag">
+            <span>背景差分度</span>
+            <span class="mono-metric" id="diag-diff-start">0.328</span>
+          </div>
+        </div>
+
+        <!-- Center Hero Frame: Peak -->
+        <div class="frame-card hero-card">
+          <div class="frame-card-header">
+            <span class="frame-role-title">
+              <span class="role-dot hero"></span> 🔥 能量峰值帧 (HERO)
+            </span>
+            <span class="frame-timestamp" id="peak-time-text">18:07:36.500</span>
+          </div>
+          <div class="frame-viewport" id="viewport-peak" title="点击微距放大审查">
+            <img id="img-peak" src="" alt="Peak Frame">
+            <video id="video-peak" loop muted playsinline style="display: none;"></video>
+            
+            <!-- YOLO Bounding Box Simulation -->
+            <div class="yolo-box" id="hero-bbox" style="top: 25%; left: 38%; width: 24%; height: 50%;">
+              <span class="yolo-box-label" id="hero-bbox-label">person: 0.91</span>
+            </div>
+
+            <div class="viewport-overlay-badges">
+              <span class="overlay-pill peak" id="hero-energy-pill">⚡ 峰值能量 84.2%</span>
+              <span class="overlay-pill bbox-tag" id="hero-conf-pill">YOLO Conf 91%</span>
+            </div>
+
+            <div class="viewport-action-overlay">
+              <button class="vp-action-btn" id="btn-toggle-clip" title="按空格键播放动图">
+                <span>🎞</span> 动图预览 (Space)
+              </button>
+              <button class="vp-action-btn" id="btn-zoom-hero" title="按 Z 键极速微距">
+                <span>🔍</span> 原画微距 (Z)
+              </button>
+            </div>
+          </div>
+
+          <!-- Hero Intelligence Telemetry Matrix -->
+          <div class="telemetry-matrix-panel">
+            <div class="telemetry-item">
+              <span class="telemetry-label">位移矢量</span>
+              <span class="telemetry-val highlight-cyan" id="metric-vector">14.8 px/s</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="telemetry-label">SSIM 景致变化</span>
+              <span class="telemetry-val highlight-amber" id="metric-ssim">0.74 (显著)</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="telemetry-label">光斑变形率</span>
+              <span class="telemetry-val highlight-green" id="metric-flare">4.2% (正常)</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="telemetry-label">初判建议</span>
+              <span class="telemetry-val highlight-green" id="metric-advice">保持动态 (TP)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Frame: End -->
+        <div class="frame-card">
+          <div class="frame-card-header">
+            <span class="frame-role-title">
+              <span class="role-dot"></span> 终点离开帧
+            </span>
+            <span class="frame-timestamp" id="end-time-text">18:07:48.000</span>
+          </div>
+          <div class="frame-viewport" id="viewport-end" title="点击放大查看">
+            <img id="img-end" src="" alt="End Frame">
+            <div class="viewport-overlay-badges">
+              <span class="overlay-pill">运动衰减点</span>
+            </div>
+          </div>
+          <div class="frame-wing-diag">
+            <span>残留能量</span>
+            <span class="mono-metric" id="diag-diff-end">0.065</span>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- ========================================================================
+       3. Bottom Keyboard Cockpit Deck (60px)
+       ======================================================================== -->
+  <footer class="cockpit-deck">
+    <!-- Left: Status Pulse -->
+    <div class="system-pulse-group">
+      <span class="pulse-dot"></span>
+      <span>YOLOv9 实时辅助审查就绪</span>
+      <span class="system-stat-tag">RTX 4060 Ti | 14.2ms/60fps</span>
+    </div>
+
+    <!-- Middle: 1/2/3/4 Decision Action Buttons -->
+    <div class="cockpit-action-group">
+      <button class="cockpit-btn fp" id="action-fp" title="快捷键 1">
+        <span class="key-shortcut">1</span> 标为误报 (FP) - 剔除静态
+      </button>
+      <button class="cockpit-btn fn" id="action-fn" title="快捷键 2">
+        <span class="key-shortcut">2</span> 标为漏检 (FN) - 补齐保留
+      </button>
+      <button class="cockpit-btn tp" id="action-tp" title="快捷键 3">
+        <span class="key-shortcut">3</span> 保持动态 (TP) - 算法正确
+      </button>
+      <button class="cockpit-btn micro" id="action-micro" title="快捷键 4">
+        <span class="key-shortcut">4</span> 降级微动 - 延时保留
+      </button>
+    </div>
+
+    <!-- Right: Shortcuts Cheat Sheet -->
+    <div class="cockpit-shortcuts">
+      <div class="shortcut-item">
+        <span class="kbd-badge">J</span> / <span class="kbd-badge">K</span> 切片跳转
+      </div>
+      <div class="shortcut-item">
+        <span class="kbd-badge">Space</span> 动图预览
+      </div>
+      <div class="shortcut-item">
+        <span class="kbd-badge">Z</span> 极速微距
+      </div>
+      <div class="shortcut-item">
+        <span class="kbd-badge">Enter</span> 确认下一条
+      </div>
+    </div>
+  </footer>
+
+  <!-- ========================================================================
+       4. Fullscreen Lightbox Modal
+       ======================================================================== -->
+  <div class="lightbox-modal" id="lightbox-modal">
+    <div class="lightbox-top-bar">
+      <div class="lightbox-title" id="lightbox-title">原画微距细节审查 (滚轮缩放 / 拖拽平移)</div>
+      <button class="lightbox-close-btn" id="lightbox-close">✕ 关闭 (Esc)</button>
+    </div>
+    <div class="lightbox-content-viewport" id="lightbox-viewport">
+      <img class="lightbox-image-target" id="lightbox-img" src="" alt="Macro Zoom Inspection">
+    </div>
+  </div>
+
+  <!-- Toast Notification Area -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- Load Prototype Interaction Logic -->
+  <script src="/prototype.js"></script>
+</body>
+</html>
