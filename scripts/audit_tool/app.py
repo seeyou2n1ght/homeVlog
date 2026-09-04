@@ -7,6 +7,7 @@
 
 import sys
 import json
+import time
 import socket
 import logging
 import argparse
@@ -141,13 +142,20 @@ class AuditHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Cached frame not found")
             return
         elif path == "/api/export":
-            fmt = params.get("format", ["csv"])[0]
+            fmt = params.get("format", ["csv"])[0].lower()
             content, ctype = service.export_report(fmt=fmt)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
-            fn = f"audit_report_{int(time.time())}.{fmt}"
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            fn = f"homevlog_audit_{ts}.{fmt}"
             self.send_header("Content-Disposition", f'attachment; filename="{fn}"')
-            body = content.encode("utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+
+            if fmt == "csv":
+                body = b'\xef\xbb\xbf' + content.encode("utf-8")
+            else:
+                body = content.encode("utf-8")
+
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

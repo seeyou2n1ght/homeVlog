@@ -143,3 +143,48 @@ def test_resolve_local_timestamp(tmp_path):
     finally:
         db.close()
 
+
+def test_audit_http_export():
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+    from scripts.audit_tool.app import AuditHandler
+
+    server = HTTPServer(("127.0.0.1", 0), AuditHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    try:
+        # 1. 测试 CSV 导出 (含 UTF-8 BOM 与命名)
+        csv_url = f"http://127.0.0.1:{port}/api/export?format=csv"
+        req = urllib.request.Request(csv_url)
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            ctype = resp.headers.get("Content-Type", "")
+            cdisp = resp.headers.get("Content-Disposition", "")
+            assert "text/csv" in ctype
+            assert "homevlog_audit_" in cdisp
+            assert ".csv" in cdisp
+            raw_bytes = resp.read()
+            assert raw_bytes.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM 校验
+
+        # 2. 测试 JSON 导出
+        json_url = f"http://127.0.0.1:{port}/api/export?format=json"
+        req = urllib.request.Request(json_url)
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            ctype = resp.headers.get("Content-Type", "")
+            cdisp = resp.headers.get("Content-Disposition", "")
+            assert "application/json" in ctype
+            assert "homevlog_audit_" in cdisp
+            assert ".json" in cdisp
+            raw_bytes = resp.read()
+            import json
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            assert isinstance(parsed, list)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+

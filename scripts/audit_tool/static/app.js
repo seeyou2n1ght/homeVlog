@@ -116,17 +116,11 @@ function initEventListeners() {
   // 报表导出
   const btnExpCsv = document.getElementById('btn-export-csv');
   if (btnExpCsv) {
-    btnExpCsv.addEventListener('click', () => {
-      showToast('正在生成并下载 CSV 报表...', 'info');
-      window.location.href = '/api/export?format=csv';
-    });
+    btnExpCsv.addEventListener('click', () => triggerReportDownload('csv'));
   }
   const btnExpJson = document.getElementById('btn-export-json');
   if (btnExpJson) {
-    btnExpJson.addEventListener('click', () => {
-      showToast('正在生成并下载 JSON 报表...', 'info');
-      window.location.href = '/api/export?format=json';
-    });
+    btnExpJson.addEventListener('click', () => triggerReportDownload('json'));
   }
 
   // 工具按钮
@@ -290,6 +284,17 @@ function showToast(msg, type = 'success') {
     toast.style.transition = 'opacity 0.3s';
     setTimeout(() => toast.remove(), 300);
   }, 2500);
+}
+
+// 触发报表下载 (不影响当前页面状态)
+function triggerReportDownload(fmt) {
+  showToast(`正在导出并下载 ${fmt.toUpperCase()} 复核报表...`, 'info');
+  const a = document.createElement('a');
+  a.href = `/api/export?format=${fmt}`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 200);
 }
 
 // ================== 全局看板与各分类数量徽标 ==================
