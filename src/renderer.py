@@ -106,14 +106,18 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
 
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
 
+    # 识别批次内纯静态文件（没有任何动态段），在解复用阶段跳过所有非关键帧解码
+    files_with_dynamic = {s.filepath for s in batch_copy if s.state in ("DYNAMIC", "DYNAMIC_AUDIO")}
+    pure_static_files = {f for f in files if f not in files_with_dynamic}
+
     result = _run_batch_render(
         files, fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,
-        date, cam_index, batch_idx=bi,
+        date, cam_index, batch_idx=bi, pure_static_files=pure_static_files,
     )
     return result
 
 
-def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0) -> str | None:
+def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0, pure_static_files=None) -> str | None:
     output_path = Path(output_path)
 
     # 断点续渲：已存在的完整批次产物直接复用
@@ -138,6 +142,9 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     hwaccel_args = []
     for fp in input_files:
         hwaccel_args += ["-fflags", "+genpts"]
+        # 对纯静态长文件跳过所有非关键帧解码，直接消除 batch_0 835s NVDEC 解码长尾
+        if pure_static_files and str(fp) in pure_static_files:
+            hwaccel_args += ["-skip_frame", "nokey"]
         if encoder == "nv":
             hwaccel_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif encoder == "qsv":
@@ -163,9 +170,11 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         cmd += ["-filter_hw_device", "gpu"]
     cmd += ["-/filter_complex", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
     cmd += enc_args
+    tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+    tmp_output_path.unlink(missing_ok=True)
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
     cmd += ["-tag:v", "hvc1", "-movflags", "+faststart"]
-    cmd += [str(output_path)]
+    cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
         from src.utils import get_qsv_semaphore
@@ -190,7 +199,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     try:
         with open(err_log, "wb") as f_err:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=f_err)
-            FFmpegProcessRegistry.register(str(output_path), proc)
+            FFmpegProcessRegistry.register(str(tmp_output_path), proc)
             if encoder == "qsv":
                 render_timeout = render_cfg.get("qsv_timeout_s", 360)
             else:
@@ -198,19 +207,32 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             try:
                 proc.wait(timeout=render_timeout)
             except subprocess.TimeoutExpired:
-                logger.warning("Render timeout expired on %s for %s, killing process", encoder, output_path)
+                logger.warning("Render timeout expired on %s for %s, killing process", encoder, tmp_output_path)
                 proc.kill()
                 try:
                     proc.wait(timeout=10)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-                # 删除残缺产物，防止断点续渲复用损坏批次
-                output_path.unlink(missing_ok=True)
+                tmp_output_path.unlink(missing_ok=True)
                 return None
+            except BaseException:
+                # 包含 KeyboardInterrupt 等中断异常，立即杀灭当前子进程并清理未完成的临时文件
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                tmp_output_path.unlink(missing_ok=True)
+                raise
             finally:
-                FFmpegProcessRegistry.deregister(str(output_path))
+                FFmpegProcessRegistry.deregister(str(tmp_output_path))
+    except KeyboardInterrupt:
+        tmp_output_path.unlink(missing_ok=True)
+        raise
     except Exception:
         logger.exception("batch-render cam%d batch%d spawn/IO error", cam_index, batch_idx)
+        tmp_output_path.unlink(missing_ok=True)
         return None
     finally:
         # 信号量释放单次原则 + 超时/失败路径统一清理临时脚本
@@ -219,9 +241,21 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
 
     elapsed = time.monotonic() - t0
 
-    if proc is not None and proc.returncode == 0:
-        # 持久化编码吞吐指标（speed/fps 此前随 stderr 日志删除而丢失，
-        # 是评估渲染瓶颈与编码参数调优的关键数据源）
+    if proc is not None and proc.returncode == 0 and tmp_output_path.exists():
+        try:
+            if tmp_output_path.stat().st_size >= 512 * 1024:
+                # 原子重命名为正式批次成片，保证断点续传绝不复用半成品
+                tmp_output_path.replace(output_path)
+            else:
+                logger.warning("batch-render cam%d batch%d output too small (%d bytes), discarding",
+                               cam_index, batch_idx, tmp_output_path.stat().st_size)
+                tmp_output_path.unlink(missing_ok=True)
+                return None
+        except OSError as e:
+            logger.warning("batch-render atomic rename failed: %s", e)
+            return None
+
+        # 持久化编码吞吐指标
         enc_stats = _parse_ffmpeg_progress(err_log)
         size_mb = 0.0
         try:

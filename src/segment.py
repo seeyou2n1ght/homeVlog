@@ -85,11 +85,12 @@ def build_segments(
 
     # Apply pre-roll and post-roll to dynamic segments for natural transition
     if pre_roll > 0 or post_roll > 0:
+        total_min_t = frame_labels[0]["time"]
         total_max_t = frame_labels[-1]["time"]
         dyn_spans = []
         for s in segments:
             if s.is_dynamic:
-                st = max(0.0, s.start_time - pre_roll)
+                st = max(total_min_t, s.start_time - pre_roll)
                 et = min(total_max_t, s.end_time + post_roll)
                 dyn_spans.append((st, et, s.state, s.max_energy))
 
@@ -106,7 +107,7 @@ def build_segments(
 
             # Reconstruct complete segment sequence with static spans in between
             new_segments = []
-            curr_t = 0.0
+            curr_t = total_min_t
             for st, et, state, energy in merged_dyn:
                 if st > curr_t:
                     new_segments.append(Segment(

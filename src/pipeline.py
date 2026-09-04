@@ -69,6 +69,7 @@ class StreamingOrchestrator:
 
         # 状态控制
         self.stop_event = threading.Event()
+        self.abort_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
         self.error_lock = threading.Lock()
@@ -103,9 +104,9 @@ class StreamingOrchestrator:
 
     def _prescreen_worker(self, gpu: str = "qsv"):
         """预筛 Worker：将扫描到的文件进行快速筛选。"""
-        while not self.stop_event.is_set() or not self.prescreen_queue.empty():
+        while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.prescreen_queue.empty()):
             try:
-                task = self.prescreen_queue.get(timeout=1)
+                task = self.prescreen_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -291,9 +292,9 @@ class StreamingOrchestrator:
             
         perf = get_perf()
 
-        while not self.stop_event.is_set() or not self.analysis_queue.empty():
+        while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
             try:
-                task = self.analysis_queue.get(timeout=1)
+                task = self.analysis_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -396,7 +397,7 @@ class StreamingOrchestrator:
             return False
 
         def _render_worker(gpu: str):
-            while True:
+            while not self.abort_event.is_set():
                 item = None
                 # NVENC 优先取 heavy 任务，其次协助消费 light 任务
                 try:
@@ -410,8 +411,6 @@ class StreamingOrchestrator:
                         continue
 
                 if item is None:
-                    # 哨兵仅为唤醒信号，不是退出许可：仅当分发完毕且双队列均已排空
-                    # 才允许退出；否则继续消费滞留批次，杜绝 light 批次被 stranded 静默丢弃
                     if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
                         break
                     continue
@@ -510,9 +509,9 @@ class StreamingOrchestrator:
                 )
             self._sync_queue_levels()
 
-        while not self.stop_event.is_set() or not self.render_batch_queue.empty():
+        while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.render_batch_queue.empty()):
             try:
-                msg = self.render_batch_queue.get(timeout=2)
+                msg = self.render_batch_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -630,17 +629,33 @@ class StreamingOrchestrator:
             t_rm.start()
             threads.append(t_rm)
 
-        self.prescreen_queue.join()
-        self.analysis_queue.join()
-        if self.render_enabled:
-            self.render_batch_queue.join()
+        def _wait_queue_interruptible(q: queue.Queue):
+            while not self.abort_event.is_set():
+                with q.all_tasks_done:
+                    if q.unfinished_tasks == 0:
+                        break
+                    q.all_tasks_done.wait(timeout=0.2)
+
+        try:
+            _wait_queue_interruptible(self.prescreen_queue)
+            _wait_queue_interruptible(self.analysis_queue)
+            if self.render_enabled:
+                _wait_queue_interruptible(self.render_batch_queue)
+        except (KeyboardInterrupt, SystemExit):
+            logger.warning("StreamingOrchestrator interrupted by user (Ctrl+C). Terminating subprocesses...")
+            self.abort_event.set()
+            self.stop_event.set()
+            from src.renderer import FFmpegProcessRegistry
+            FFmpegProcessRegistry.kill_all()
+            if self.dashboard is not None:
+                self.dashboard.stop()
+                self.dashboard = None
+            unregister_dashboard()
+            raise
 
         self.stop_event.set()
-        # 渲染超时上限为 max(7200, files*600)，远高于任何固定 join 超时；
-        # 使用带超时的 join 会导致超时后静默拼接缺失批次，故必须无限等待。
-        # 渲染线程内部已有 ffmpeg 看门狗兜底，不会永久阻塞。
         for t in threads:
-            t.join()
+            t.join(timeout=2.0)
 
         if self.dashboard is not None:
             self.dashboard.stop()
@@ -850,6 +865,9 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                     ok += 1
                 else:
                     failed += 1
+            except KeyboardInterrupt:
+                logger.warning("run_pipeline interrupted by user (Ctrl+C). Halting batch pipeline.")
+                raise
             except Exception:
                 logger.exception("pipeline crash")
                 failed += 1

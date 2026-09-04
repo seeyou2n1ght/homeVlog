@@ -141,11 +141,12 @@ segment:
   # 动态片段前后缓冲 (秒): 确保人物入画和动作余波完整无生硬截断
   pre_roll: 1.0
   post_roll: 1.5
-  # 静态片段抽帧基准与过渡参数
-  static_keyframe_interval: 30.0
-  keyframe_display_duration: 0.5
-  min_static_display_duration: 1.5
+  # 静态片段抽帧基准与过渡参数 (优化后：快进浓缩比提升，杜绝微小静态段膨胀成片)
+  static_keyframe_interval: 45.0
+  keyframe_display_duration: 0.35
+  min_static_display_duration: 0.4
   min_segment_duration: 0.1
+  macro_collapse_static: true
 
 yolo:
   enabled: true

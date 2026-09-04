@@ -227,16 +227,21 @@ def parse_res(spec: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-def cleanup_temp_artifacts() -> int:
-    """清理 temp/ 下上次运行遗留的批次临时产物 (_batch*/_fc*/_stderr*/.concat_*)。
+def cleanup_temp_artifacts(clean_batches: bool = False) -> int:
+    """清理 temp/ 下上次运行遗留的中间临时产物。
 
-    仅在流水线启动前调用（运行中的批次文件不得触碰）。
+    默认 clean_batches=False：保留已渲染完成的完整 _batch*.mp4，仅清理未完成的 *.tmp.mp4、
+    滤镜脚本 _fc_*.txt、日志 _stderr_*.log 与拼接列表 .concat_*.txt，保障断点续传复用。
+    当 clean_batches=True（如用户传入 --clean-temp 时）：全量清理所有批次成片。
     返回清理的文件数。
     """
     removed = 0
     if not TEMP_DIR.exists():
         return 0
-    for pattern in ("_batch*.mp4", "_fc_*.txt", "_stderr_*.log", ".concat_*.txt"):
+    patterns = ["*.tmp.mp4", "_batch*.tmp.mp4", "_fc_*.txt", "_stderr_*.log", ".concat_*.txt"]
+    if clean_batches:
+        patterns.extend(["_batch*.mp4"])
+    for pattern in patterns:
         for f in TEMP_DIR.glob(pattern):
             try:
                 f.unlink()
@@ -244,7 +249,7 @@ def cleanup_temp_artifacts() -> int:
             except OSError:
                 pass
     if removed:
-        logging.getLogger("homevlog").info("temp cleanup: removed %d stale artifacts", removed)
+        logging.getLogger("homevlog").info("temp cleanup: removed %d stale artifacts (clean_batches=%s)", removed, clean_batches)
     return removed
 
 

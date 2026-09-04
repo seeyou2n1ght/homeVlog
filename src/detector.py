@@ -390,7 +390,7 @@ class MotionDetector:
         decoded_frames: list[np.ndarray] = []
         yolo_buffer: dict[int, np.ndarray] = {}
         w, h = self.width, self.height
-        frame_size = w * h * 3
+        frame_size = w * h  # 单通道灰度直通，IPC 管道数据量降低 66.7%
 
         if self.decode_gpu == "qsv":
             from src.utils import get_qsv_semaphore
@@ -406,7 +406,7 @@ class MotionDetector:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             *hw_args, "-i", str(filepath),
-            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ]
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
@@ -433,8 +433,11 @@ class MotionDetector:
         t_decode_start = time.monotonic()
         total_frames = 0
         proc: subprocess.Popen | None = None
+        from src.renderer import FFmpegProcessRegistry
+        pipe_key = f"pipe_decode_{Path(filepath).name}_{time.monotonic()}"
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            FFmpegProcessRegistry.register(pipe_key, proc)
             assert proc.stdout is not None
             while True:
                 if time.monotonic() - t_decode_start > watchdog_timeout:
@@ -448,25 +451,42 @@ class MotionDetector:
                 raw = proc.stdout.read(frame_size)
                 if len(raw) < frame_size:
                     break
-                rgb = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
 
                 if getattr(self, "yolo_enabled", False) and total_frames % yolo_sample_interval == 0:
-                    bgr_tmp = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    bgr_tmp = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                     ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    yolo_buffer[total_frames] = buf_jpg if ok_enc else rgb.copy()
+                    yolo_buffer[total_frames] = buf_jpg if ok_enc else bgr_tmp
 
-                decoded_frames.append(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
+                decoded_frames.append(gray)
                 total_frames += 1
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            except BaseException:
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise
         finally:
+            FFmpegProcessRegistry.deregister(pipe_key)
             if proc and proc.stdout:
                 try:
                     proc.stdout.close()
                 except OSError:
+                    pass
+            if proc and proc.stderr:
+                try:
+                    if not decoded_frames and proc.returncode != 0:
+                        err_tail = proc.stderr.read().decode('utf-8', errors='ignore')[-300:]
+                        if err_tail.strip():
+                            logger.warning("pipe decode stderr for %s: %s", Path(filepath).name, err_tail.strip())
+                    proc.stderr.close()
+                except Exception:
                     pass
             io_sem.release()
 

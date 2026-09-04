@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--no-render", action="store_true", help="skip Pass2 rendering")
     parser.add_argument("--date", type=str, help="process specific date (YYYYMMDD)")
     parser.add_argument("--cam", type=int, help="process specific camera index")
+    parser.add_argument("--clean-temp", action="store_true", help="force clean all temporary batch video files before starting")
     parser.add_argument("--no-tui", action="store_true", help="disable interactive live dashboard and use plain output")
     parser.add_argument("--debug", action="store_true", help="enable verbose debug logging")
     args = parser.parse_args()
@@ -48,62 +49,68 @@ def main():
         reset_semaphores()
 
     config = load_config()
-    from src.utils import get_input_dirs
+    from src.utils import get_input_dirs, cleanup_temp_artifacts, cleanup_resources
     input_dirs = [args.input_dir] if args.input_dir else get_input_dirs(config)
     dashboard_enabled = not args.no_tui
 
-    if args.scan:
-        db = VlogDatabase()
-        try:
-            scan_directory(db, input_dir=input_dirs)
-            groups = get_date_cam_groups(db)
-            if groups:
+    # 启动前清理临时脚本与破损文件；仅当显式指定 --clean-temp 时才清空已渲染批次
+    cleanup_temp_artifacts(clean_batches=args.clean_temp)
+
+    try:
+        if args.scan:
+            db = VlogDatabase()
+            try:
+                scan_directory(db, input_dir=input_dirs)
+                groups = get_date_cam_groups(db)
+                if groups:
+                    from src.scanner import resolve_camera_identity
+                    cam_map = {}
+                    for d, cam in groups:
+                        tasks = db.get_all_file_tasks_for_date(d, cam)
+                        s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
+                        disp, _ = resolve_camera_identity(s_dir, cam_index=cam, config=config)
+                        cam_map[cam] = disp
+                    print_scan_results(groups, camera_display_names=cam_map)
+                else:
+                    console.print("[yellow]未发现符合命名格式的监控切片文件。[/yellow]")
+            finally:
+                db.close()
+            return
+
+        if args.date:
+            db = VlogDatabase()
+            try:
+                from src.pipeline import process_date_cam
+                from src.monitor import get_monitor
+                scan_directory(db, input_dir=input_dirs)
+                monitor = get_monitor()
+                monitor.start()
+                cam = args.cam if args.cam is not None else 0
+                ok = process_date_cam(db, args.date, cam, skip_render=args.no_render, dashboard_enabled=dashboard_enabled)
+                monitor.shutdown()
+
+                tasks = db.get_all_file_tasks_for_date(args.date, cam)
+                sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
                 from src.scanner import resolve_camera_identity
-                cam_map = {}
-                for d, cam in groups:
-                    tasks = db.get_all_file_tasks_for_date(d, cam)
-                    s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
-                    disp, _ = resolve_camera_identity(s_dir, cam_index=cam, config=config)
-                    cam_map[cam] = disp
-                print_scan_results(groups, camera_display_names=cam_map)
-            else:
-                console.print("[yellow]未发现符合命名格式的监控切片文件。[/yellow]")
-        finally:
-            db.close()
-        return
+                cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam, config=config)
+                logging.shutdown()
+                if ok:
+                    console.print(f"[bold green]✔ 处理完成: {args.date} ({cam_display})[/bold green]")
+                else:
+                    console.print(f"[bold red]✖ 处理失败: {args.date} ({cam_display})[/bold red]")
+            finally:
+                db.close()
+            return
 
-    if args.date:
-        from src.utils import cleanup_temp_artifacts
-        cleanup_temp_artifacts()
-        db = VlogDatabase()
-        try:
-            from src.pipeline import process_date_cam
-            from src.monitor import get_monitor
-            scan_directory(db, input_dir=input_dirs)
-            monitor = get_monitor()
-            monitor.start()
-            cam = args.cam if args.cam is not None else 0
-            ok = process_date_cam(db, args.date, cam, skip_render=args.no_render, dashboard_enabled=dashboard_enabled)
-            monitor.shutdown()
+        result = run_pipeline(skip_render=args.no_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled)
+        console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}")
 
-            tasks = db.get_all_file_tasks_for_date(args.date, cam)
-            sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
-            from src.scanner import resolve_camera_identity
-            cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam, config=config)
-            # 先关闭日志体系，避免退出清理阶段桥接器向终端写出残留转义序列
-            logging.shutdown()
-            if ok:
-                console.print(f"[bold green]✔ 处理完成: {args.date} ({cam_display})[/bold green]")
-            else:
-                console.print(f"[bold red]✖ 处理失败: {args.date} ({cam_display})[/bold red]")
-
-        finally:
-            db.close()
-        return
-
-    result = run_pipeline(skip_render=args.no_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled)
-
-    console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}")
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]⚠ 用户中断 (Ctrl+C)。已平稳终止子进程与硬件会话，当前已分析任务与批次已安全落盘。下次启动将自动断点续传。[/bold yellow]")
+        from src.renderer import FFmpegProcessRegistry
+        FFmpegProcessRegistry.kill_all()
+        cleanup_resources()
+        sys.exit(130)
 
 
 if __name__ == "__main__":
