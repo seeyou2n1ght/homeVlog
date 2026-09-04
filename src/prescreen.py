@@ -48,34 +48,71 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
     return frame
 
 
+def _calc_dynamic_threshold(base_threshold: float, mean_luma: float, is_prior_active: bool = False) -> float:
+    """计算综合光照（暗光/强光）与时间邻域先验保护后的自适应判定阈值。"""
+    if mean_luma < 50.0:
+        # 暗光 / 红外夜视低动态范围场景: 灵敏度上调 (阈值下调 60%)
+        dyn = max(2.0, base_threshold * 0.4)
+    elif mean_luma > 180.0:
+        # 逆光 / 强光噪点密集场景: 适当抑制噪点上浮
+        dyn = base_threshold * 1.25
+    else:
+        dyn = base_threshold
+
+    if is_prior_active:
+        # 时间邻域弹性保护：前段包含明确动态时，本段门槛下调 35% 防止因暂歇漏切
+        dyn = max(1.8, dyn * 0.65)
+    return round(float(dyn), 2)
+
+
+def _calc_spatial_concentration(diff_map: np.ndarray) -> float:
+    """计算 4x4 空间网格的能量集中度。
+    
+    真实前景移动（集中度高 >= 1.35）；全局光照/白平衡跳变（集中度低 < 1.2，整图弥漫）。
+    """
+    h, w = diff_map.shape[:2]
+    gh, gw = max(1, h // 4), max(1, w // 4)
+    grid_means = []
+    for r in range(4):
+        for c in range(4):
+            cell = diff_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]
+            if cell.size > 0:
+                grid_means.append(float(np.mean(cell)))
+    if not grid_means:
+        return 1.0
+    mean_val = float(np.mean(diff_map))
+    max_val = max(grid_means)
+    if max_val == 0.0 or mean_val == 0.0:
+        return 1.0
+    return float(max_val / (mean_val + 1e-4))
+
+
 def _prescreen_keyframes(
     filepath: str,
     duration: float,
     max_keyframes: int,
     threshold: float,
     gpu: str = "qsv",
+    is_prior_active: bool = False,
 ) -> dict:
-    """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带即时早停机制。"""
+    """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带自适应动态阈值与空间集中度早停机制。"""
     import av
     import cv2
     diffs: list[float] = []
     sample_ts: list[float] = []
     has_audio = 0
 
-    # 关键帧预筛为 CPU 软解（av.open 无 hwaccel），不消耗 QSV/NV 硬件槽位，
-    # 仅属 NAS IO 负载，统一走 Disk IO 信号量——
-    # 避免与分析阶段长占用 QSV 槽形成饥饿（生产实测 137 文件因此被误判 FAILED）
     from src.utils import get_disk_semaphore
     io_sem = get_disk_semaphore()
 
-    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-    # 预筛属排队型负载（非死锁风险），预算放宽至 30s×6，避免高峰拥塞误判 FAILED
     _t_sem = time.monotonic()
     _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
     sem_wait = round(time.monotonic() - _t_sem, 2)
     if not _sem_ok:
         logger.warning("prescreen keyframes: io semaphore acquire timeout for %s", filepath)
         return {"status": "FAILED", "error": "io semaphore acquire timeout", "has_audio": 0}
+
+    effective_threshold = threshold
     try:
         with av.open(str(filepath), options={"buffer_size": "2097152"}) as container:
             if not container.streams.video:
@@ -86,9 +123,10 @@ def _prescreen_keyframes(
 
             first_frame: np.ndarray | None = None
             prev_frame: np.ndarray | None = None
+            concentrations: list[float] = []
+            mean_lumas: list[float] = []
             k = 0
             for frame in container.decode(stream):
-                # 提取 Y 平面并快速切片下采样
                 y_raw = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape((frame.height, frame.width))
                 curr_frame = y_raw[::8, ::8]
 
@@ -101,19 +139,38 @@ def _prescreen_keyframes(
                     k += 1
                     continue
 
-                # 动态环境光自适应
+                # 动态环境光自适应与先验保护
                 mean_luma = float(np.mean(curr_frame))
-                current_threshold = threshold
-                if mean_luma < 50.0:
-                    current_threshold = max(1.5, threshold * 0.3)
+                mean_lumas.append(mean_luma)
+                current_threshold = _calc_dynamic_threshold(threshold, mean_luma, is_prior_active=is_prior_active)
+                effective_threshold = current_threshold
 
-                diff_prev = float(cv2.norm(curr_frame, prev_frame, cv2.NORM_L1) / curr_frame.size)
-                diff_first = float(cv2.norm(curr_frame, first_frame, cv2.NORM_L1) / curr_frame.size)
+                diff_prev_map = cv2.absdiff(curr_frame, prev_frame)
+                diff_first_map = cv2.absdiff(curr_frame, first_frame)
+
+                diff_prev = float(np.mean(diff_prev_map))
+                diff_first = float(np.mean(diff_first_map))
                 d = max(diff_prev, diff_first)
                 diffs.append(d)
 
-                # 即时早停：一旦发现动作，立即标记为 SUSPICIOUS 返回
+                active_map = diff_prev_map if diff_prev >= diff_first else diff_first_map
+                concentration = _calc_spatial_concentration(active_map)
+                concentrations.append(concentration)
+
+                # 空间集中度智能早停:
+                # 1. 突破阈值且具备局部高能集中性 (concentration >= 1.35)
+                # 2. 或绝对能量极大 (d >= current_threshold * 1.6)
+                is_motion = False
                 if d > current_threshold:
+                    if concentration >= 1.35 or d >= current_threshold * 1.6:
+                        is_motion = True
+                    else:
+                        logger.debug(
+                            "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f",
+                            Path(filepath).name, d, current_threshold, concentration
+                        )
+
+                if is_motion:
                     return {
                         "status": "SUSPICIOUS",
                         "has_audio": has_audio,
@@ -124,6 +181,7 @@ def _prescreen_keyframes(
                             "max_diff": max(diffs),
                             "threshold": current_threshold,
                             "mean_luma": mean_luma,
+                            "concentration": round(concentration, 2),
                             "early_stop": True,
                             "checked_pairs": len(diffs),
                             "sem_wait": sem_wait,
@@ -144,16 +202,18 @@ def _prescreen_keyframes(
         return {"status": "STATIC", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False, "sem_wait": sem_wait})}
 
     max_diff = max(diffs)
-    status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
+    # 所有检查帧均未满足局部动作条件（弥散光影已在循环中成功抑制），判定为静止
     return {
-        "status": status,
+        "status": "STATIC",
         "has_audio": has_audio,
         "result_json": json.dumps({
             "mode": "keyframes",
             "sample_ts": sample_ts,
             "diffs": diffs,
             "max_diff": max_diff,
-            "threshold": threshold,
+            "threshold": effective_threshold,
+            "mean_luma": round(float(np.mean(mean_lumas)), 2) if mean_lumas else 100.0,
+            "concentration": round(max(concentrations), 2) if concentrations else 1.0,
             "early_stop": False,
             "checked_pairs": len(diffs),
             "sem_wait": sem_wait,
@@ -166,6 +226,7 @@ def prescreen_file(
     duration: float,
     config: dict,
     gpu: str = "qsv",
+    is_prior_active: bool = False,
 ) -> dict:
     """按需逐帧提取 + 即时早停 diff: 只要发现一次动静即终止提取，极速抛弃。"""
     det_cfg = config.get("detection", {})
@@ -188,6 +249,7 @@ def prescreen_file(
             max_keyframes=min(segments, 15),
             threshold=threshold,
             gpu=gpu,
+            is_prior_active=is_prior_active,
         )
         if kf_res.get("status") != "FALLBACK":
             return kf_res
@@ -201,6 +263,7 @@ def prescreen_file(
                 threshold,
                 gpu,
                 timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
+                is_prior_active=is_prior_active,
             )
     elif mode == "stream_fps":
         return _prescreen_stream_fps(
@@ -212,6 +275,7 @@ def prescreen_file(
             threshold,
             gpu,
             timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
+            is_prior_active=is_prior_active,
         )
     ts_list = _calc_sample_timestamps(duration, segments, timestamp_margin)
 
@@ -223,18 +287,17 @@ def prescreen_file(
         return {"status": "FAILED", "error": f"failed to extract first frame at t={ts_list[0]:.1f}s"}
     
     prev_frame = first_frame
+    effective_threshold = threshold
 
     for i in range(1, len(ts_list)):
         curr_frame = _extract_frame(filepath, ts_list[i], width, height, gpu=gpu)
         if curr_frame is None:
             return {"status": "FAILED", "error": f"failed to extract frame at t={ts_list[i]:.1f}s"}
 
-        # 动态环境光自适应：检测当前画面平均亮度（Luma）
+        # 动态环境光自适应与先验保护
         mean_luma = float(np.mean(curr_frame))
-        # 极低对比度（红外夜视）下，动态下调阈值，防止微小动作漏报
-        current_threshold = threshold
-        if mean_luma < 50.0:
-            current_threshold = max(1.5, threshold * 0.3)
+        current_threshold = _calc_dynamic_threshold(threshold, mean_luma, is_prior_active=is_prior_active)
+        effective_threshold = current_threshold
 
         # 双重比对防盲区：与上一帧比（抓取瞬间动作），与首帧比（抓取长时间停留或场景改变）
         diff_prev = float(np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32))))
@@ -266,12 +329,7 @@ def prescreen_file(
         return {"status": "FAILED", "error": "no frame pairs to compare"}
 
     max_diff = max(diffs)
-    # 取最后一帧亮度作为参考
-    final_threshold = threshold
-    if prev_frame is not None and float(np.mean(prev_frame)) < 50.0:
-        final_threshold = max(1.5, threshold * 0.3)
-        
-    status = "SUSPICIOUS" if max_diff > final_threshold else "STATIC"
+    status = "SUSPICIOUS" if max_diff > effective_threshold else "STATIC"
 
     return {
         "status": status,
@@ -280,7 +338,7 @@ def prescreen_file(
             "sample_ts": ts_list,
             "diffs": diffs,
             "max_diff": max_diff,
-            "threshold": final_threshold,
+            "threshold": effective_threshold,
             "early_stop": False,
             "checked_pairs": len(diffs),
             "ffmpeg_calls": len(ts_list),
@@ -333,6 +391,7 @@ def _prescreen_stream_fps(
     threshold: float,
     gpu: str,
     timeout: float,
+    is_prior_active: bool = False,
 ) -> dict:
     """用单个低 FPS 解码流做预筛，避免每个采样点启动一次 seek 进程。"""
     frame_size = width * height * 3
@@ -352,6 +411,7 @@ def _prescreen_stream_fps(
     sample_ts: list[float] = []
     proc: subprocess.Popen | None = None
     completed_read = False
+    effective_threshold = threshold
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     if not acquire_with_retry(io_sem):
@@ -402,9 +462,8 @@ def _prescreen_stream_fps(
 
                 curr_frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
                 mean_luma = float(np.mean(curr_frame))
-                current_threshold = threshold
-                if mean_luma < 50.0:
-                    current_threshold = max(1.5, threshold * 0.3)
+                current_threshold = _calc_dynamic_threshold(threshold, mean_luma, is_prior_active=is_prior_active)
+                effective_threshold = current_threshold
 
                 diff_prev = float(
                     np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32)))
@@ -470,7 +529,7 @@ def _prescreen_stream_fps(
         return {"status": "FAILED", "error": f"stream_fps 没有可比较帧对: {err}"}
 
     max_diff = max(diffs)
-    status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
+    status = "SUSPICIOUS" if max_diff > effective_threshold else "STATIC"
     return {
         "status": status,
         "result_json": json.dumps({
@@ -478,7 +537,7 @@ def _prescreen_stream_fps(
             "sample_ts": sample_ts,
             "diffs": diffs,
             "max_diff": max_diff,
-            "threshold": threshold,
+            "threshold": effective_threshold,
             "early_stop": False,
             "checked_pairs": len(diffs),
             "ffmpeg_calls": 1,

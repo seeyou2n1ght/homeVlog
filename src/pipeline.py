@@ -76,6 +76,11 @@ class StreamingOrchestrator:
         self.error_lock = threading.Lock()
         self.errors: list[str] = []
 
+        # 时间邻域先验保护状态追踪
+        self._prev_task_map: dict[str, str] = {}
+        self._prescreen_results: dict[str, str] = {}
+        self._prescreen_results_lock = threading.Lock()
+
         # Rich 仪表盘 (tqdm 已下线，统一由 PipelineDashboard 呈现)
         self.dashboard_enabled = dashboard_enabled
         self.dashboard: PipelineDashboard | None = None
@@ -115,10 +120,19 @@ class StreamingOrchestrator:
             duration = task.get("file_duration") or 300.0
             t0 = time.monotonic()
 
+            # 时间邻域弹性保护：前置相邻素材若存在活动，本段门槛弹性下调以防漏切
+            prev_fp = self._prev_task_map.get(filepath)
+            is_prior_active = False
+            if prev_fp:
+                with self._prescreen_results_lock:
+                    is_prior_active = (self._prescreen_results.get(prev_fp) == "SUSPICIOUS")
+
             try:
-                res = prescreen_file(filepath, duration, self.config, gpu=gpu)
+                res = prescreen_file(filepath, duration, self.config, gpu=gpu, is_prior_active=is_prior_active)
                 result_json = res.get("result_json", "")
                 self.db.set_prescreen_result(filepath, res["status"], result_json)
+                with self._prescreen_results_lock:
+                    self._prescreen_results[filepath] = res["status"]
 
                 extra = {"status": res["status"]}
                 try:
@@ -579,6 +593,12 @@ class StreamingOrchestrator:
 
     def run(self):
         all_tasks = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+        for i, t in enumerate(all_tasks):
+            if i > 0:
+                self._prev_task_map[t["filepath"]] = all_tasks[i - 1]["filepath"]
+            if t.get("prescreen_status") and t["prescreen_status"] != "PENDING":
+                self._prescreen_results[t["filepath"]] = t["prescreen_status"]
+
         pending_prescreen = [t for t in all_tasks if t["prescreen_status"] == "PENDING"]
         pending_analysis = [t for t in all_tasks if t["prescreen_status"] == "SUSPICIOUS" and t["analysis_status"] == "PENDING"]
 

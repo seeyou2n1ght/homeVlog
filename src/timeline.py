@@ -460,6 +460,56 @@ def build_timeline_from_rows(
                 source_file=row["filepath"],
                 file_start_offset=file_offset,
             ))
+        elif row.get("segments"):
+            segs = []
+            for s_rec in row["segments"]:
+                manual = s_rec.get("manual_label")
+                if manual in ("CONFIRMED_MOTION", "MISSED_MOTION"):
+                    eff_state = "DYNAMIC"
+                elif manual in ("FALSE_ALARM", "CONFIRMED_STATIC"):
+                    eff_state = "STATIC"
+                else:
+                    eff_state = s_rec.get("state", "STATIC")
+
+                segs.append(Segment(
+                    start_time=float(s_rec["start_time"]),
+                    end_time=float(s_rec["end_time"]),
+                    state=eff_state,
+                    source_file=row["filepath"],
+                    file_start_offset=float(s_rec.get("file_start_offset", file_offset)),
+                    max_energy=float(s_rec.get("max_energy", 0.0) or 0.0),
+                    avg_confidence=float(s_rec.get("avg_confidence", 0.0) or 0.0),
+                ))
+
+            if not segs:
+                file_end_offset = file_offset + file_dur
+                files_meta.append({
+                    "filepath": row["filepath"],
+                    "file_start_offset": file_offset,
+                    "file_end_offset": file_end_offset,
+                    "duration": file_dur,
+                })
+                all_segments.append(Segment(
+                    start_time=file_offset, end_time=file_end_offset,
+                    state="STATIC",
+                    source_file=row["filepath"],
+                    file_start_offset=file_offset,
+                ))
+            else:
+                if segs[0].file_start_offset is not None and segs[0].file_start_offset >= 0:
+                    file_offset = segs[0].file_start_offset
+                if file_dur <= 0 and segs:
+                    file_dur = max(s.end_time for s in segs) - file_offset
+                file_end_offset = file_offset + file_dur
+                files_meta.append({
+                    "filepath": row["filepath"],
+                    "file_start_offset": file_offset,
+                    "file_end_offset": file_end_offset,
+                    "duration": file_dur,
+                })
+                for s in segs:
+                    s.source_file = row["filepath"]
+                all_segments.extend(segs)
         elif row.get("analysis_segments"):
             segs = segments_from_json(row["analysis_segments"])
             if not segs:
@@ -570,6 +620,17 @@ def build_timeline_from_rows(
 def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[TimelineSegment]:
     config = load_config()
     rows = db.get_all_file_tasks_for_date(date, cam_index)
+    try:
+        segments_list = db.get_all_segments_for_date(date, cam_index)
+        segs_by_file_id: dict[int, list[dict]] = {}
+        for s in segments_list:
+            segs_by_file_id.setdefault(s["file_id"], []).append(s)
+        for r in rows:
+            if r["id"] in segs_by_file_id:
+                r["segments"] = segs_by_file_id[r["id"]]
+    except Exception as e:
+        logger.debug(f"Could not load relational segments: {e}")
+
     timeline = build_timeline_from_rows(rows, date, config=config)
     logger.debug(
         "timeline for %s cam%d: %d segments",

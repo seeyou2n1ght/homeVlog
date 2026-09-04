@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HomeVlog Studio • 动静态识别智能审核台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="dark-theme">
+  <!-- 顶部科技感 Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="brand-badge">
+        <div class="brand-pulse"></div>
+        <span class="brand-icon">🎬</span>
+        <div class="brand-text">
+          <span class="brand-name">HOME<span class="brand-accent">VLOG</span></span>
+          <span class="brand-sub">STUDIO AUDIT</span>
+        </div>
+      </div>
+      <div class="divider-v"></div>
+      <div class="scope-selector">
+        <span class="scope-icon">⚡</span>
+        <span class="scope-text" id="header-scope-desc">疑难争议优先排查模式</span>
+      </div>
+    </div>
+
+    <!-- 核心指标流看板 (Glassmorphism Pill Cards) -->
+    <div class="header-center">
+      <div class="metric-pill">
+        <div class="pill-dot gray"></div>
+        <div class="pill-meta">
+          <span class="pill-title">已审进度</span>
+          <span class="pill-value" id="metric-reviewed-segs">0 <small id="metric-total-segs">/ 0</small></span>
+        </div>
+        <div class="progress-ring-wrap">
+          <div class="mini-progress-bar"><div class="mini-progress-fill" id="metric-progress-bar" style="width: 0%"></div></div>
+        </div>
+      </div>
+
+      <div class="metric-pill tp-pill">
+        <div class="pill-dot green"></div>
+        <div class="pill-meta">
+          <span class="pill-title">有效动态 (TP)</span>
+          <span class="pill-value" id="metric-tp">0</span>
+        </div>
+      </div>
+
+      <div class="metric-pill fp-pill">
+        <div class="pill-dot red"></div>
+        <div class="pill-meta">
+          <span class="pill-title">光影误报 (FP)</span>
+          <span class="pill-value" id="metric-fp">0</span>
+        </div>
+      </div>
+
+      <div class="metric-pill fn-pill">
+        <div class="pill-dot blue"></div>
+        <div class="pill-meta">
+          <span class="pill-title">漏报微动 (FN)</span>
+          <span class="pill-value" id="metric-fn">0</span>
+        </div>
+      </div>
+
+      <div class="metric-pill score-pill">
+        <div class="pill-dot amber"></div>
+        <div class="pill-meta">
+          <span class="pill-title">Precision / Recall</span>
+          <span class="pill-value font-mono" id="metric-prec-rec">-% / -%</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="action-btn-group">
+        <button class="btn btn-accent" id="btn-open-rerender" title="应用当前人工审核打标并重新压制 Vlog">
+          <span class="icon">🚀</span> 重新浓缩成片
+        </button>
+        <button class="btn btn-glass" id="btn-open-archive-modal" title="查看真实反馈帧归档与备份状态">
+          <span class="icon">💾</span> 归档库 (<span id="archive-count-badge">0</span>)
+        </button>
+        <button class="btn btn-glass" id="btn-export-csv" title="导出 CSV 供离线分析与调参">
+          <span class="icon">📊</span> 导出 CSV
+        </button>
+        <button class="btn btn-glass" id="btn-export-json" title="导出标注 JSON">
+          <span class="icon">📄</span> JSON
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 主屏双栏工作区 -->
+  <main class="workspace-layout">
+    <!-- 左侧可折叠抽屉式侧边栏 -->
+    <aside class="sidebar-panel" id="sidebar-panel">
+      <div class="sidebar-header">
+        <div class="tab-capsule">
+          <button class="tab-cap-btn active" id="tab-anomalies">
+            <span>⚡ 疑难样本</span>
+            <span class="bubble-tag red" id="anomaly-count">0</span>
+          </button>
+          <button class="tab-cap-btn" id="tab-tree">
+            <span>📁 全量目录</span>
+          </button>
+        </div>
+        <button class="btn-icon-toggle" id="btn-sidebar-toggle" title="折叠/展开侧边栏">◀</button>
+      </div>
+
+      <!-- 搜索过滤条 -->
+      <div class="search-filter-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="filter-input" placeholder="按文件名或能量分搜索..." />
+      </div>
+
+      <!-- 列表容器：疑难列表 -->
+      <div class="tab-content" id="anomaly-content">
+        <div class="card-list" id="anomaly-items">
+          <div class="state-loader">正在全库挖掘边缘争议切片...</div>
+        </div>
+      </div>
+
+      <!-- 列表容器：全量素材树 -->
+      <div class="tab-content hidden" id="tree-content">
+        <div class="tree-container" id="tree-items">
+          <div class="state-loader">加载素材库目录...</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 右侧主审校视窗 -->
+    <section class="stage-panel">
+      <!-- 视频上下文信息与全局分段条 -->
+      <div class="stage-banner-card">
+        <div class="banner-file-row">
+          <div class="file-headline">
+            <span class="file-icon">📹</span>
+            <h3 class="file-name font-mono" id="current-filename">请选择待排查片段</h3>
+            <span class="status-chip" id="current-status-chip">WAITING</span>
+          </div>
+          <div class="file-tags" id="current-segment-tags">
+            <!-- 能量分、时长、打标状态标签 -->
+          </div>
+        </div>
+
+        <!-- 现代化音视频时间轴 (Wave/Timeline Scrubber) -->
+        <div class="timeline-widget">
+          <div class="timeline-ruler">
+            <span class="ruler-mark" id="ruler-start">00:00</span>
+            <span class="ruler-mark" id="ruler-mid">12:00</span>
+            <span class="ruler-mark" id="ruler-end">24:00</span>
+          </div>
+          <div class="timeline-track-wrap" id="timeline-track-wrap">
+            <div class="timeline-track" id="timeline-bar">
+              <!-- 动态分段色块 -->
+            </div>
+            <div class="timeline-playhead" id="timeline-playhead"></div>
+          </div>
+          <div class="timeline-footer">
+            <span class="legend-item"><i class="dot dot-dyn"></i> DYNAMIC (原速)</span>
+            <span class="legend-item"><i class="dot dot-sta"></i> STATIC (快进)</span>
+            <span class="legend-item"><i class="dot dot-fp"></i> 误报 (FP)</span>
+            <span class="legend-item"><i class="dot dot-fn"></i> 漏报 (FN)</span>
+            <span class="timeline-hover-tip font-mono" id="timeline-hover-info">悬停分段查看详情</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 视觉审校三联画廊 (Triptych Cinema Grid) -->
+      <div class="gallery-container">
+        <div class="gallery-toolbar">
+          <div class="gallery-title">
+            <h4>切片关键帧多维对账</h4>
+            <span class="sub-tip">起点 (Start) ➔ 峰值能量时刻 (Peak) ➔ 终点 (End)</span>
+          </div>
+          <div class="gallery-actions">
+            <button class="btn btn-accent" id="btn-yolo-enhance">
+              <span class="btn-icon">⚡</span> 运行 YOLO 强化画框
+            </button>
+            <button class="btn btn-cyan" id="btn-clip-preview">
+              <span class="btn-icon">🎬</span> 动图微视频预览
+            </button>
+          </div>
+        </div>
+
+        <div class="triptych-grid">
+          <!-- 起点帧 -->
+          <div class="triptych-card" id="card-start">
+            <div class="card-glass-header">
+              <span class="card-anchor">起点进入</span>
+              <span class="card-ts font-mono" id="ts-start">0.00s</span>
+            </div>
+            <div class="card-visual-wrapper">
+              <img id="img-start" src="" alt="Start Frame" />
+              <div class="img-shimmer" id="shimmer-start"></div>
+            </div>
+          </div>
+
+          <!-- 核心峰值能量帧 (带高亮轮廓与聚焦指示) -->
+          <div class="triptych-card focus-hero" id="card-mid">
+            <div class="card-glass-header">
+              <span class="card-anchor highlight">★ 峰值能量 / YOLO 检验点</span>
+              <span class="card-ts font-mono highlight" id="ts-mid">0.00s</span>
+            </div>
+            <div class="card-visual-wrapper hero-frame">
+              <img id="img-mid" src="" alt="Peak Frame" />
+              <div class="img-shimmer" id="shimmer-mid"></div>
+              <div class="hero-badge" id="hero-badge">CENTER</div>
+            </div>
+          </div>
+
+          <!-- 终点帧 -->
+          <div class="triptych-card" id="card-end">
+            <div class="card-glass-header">
+              <span class="card-anchor">终点离开</span>
+              <span class="card-ts font-mono" id="ts-end">0.00s</span>
+            </div>
+            <div class="card-visual-wrapper">
+              <img id="img-end" src="" alt="End Frame" />
+              <div class="img-shimmer" id="shimmer-end"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- YOLO 强化检测结果浮层条 -->
+        <div class="yolo-inspector-bar">
+          <div class="inspector-label">
+            <span class="pulse-chip"></span>
+            <span>AI 视觉检测解析:</span>
+          </div>
+          <div class="inspector-tags" id="yolo-tags">
+            <span class="inspector-placeholder">点击「⚡ 运行 YOLO 强化画框」即刻进行多目标分析与边界框定位</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部极速复核指挥舱 (Action Cockpit) -->
+      <footer class="action-cockpit">
+        <div class="cockpit-shortcuts">
+          <span class="kbd-label">键盘流指令:</span>
+          <span class="kbd-hint"><kbd>1</kbd> 确认动态</span>
+          <span class="kbd-hint"><kbd>2</kbd> 误报假动作</span>
+          <span class="kbd-hint"><kbd>3</kbd> 漏报有人</span>
+          <span class="kbd-hint"><kbd>4</kbd> 纯静止</span>
+          <span class="kbd-hint"><kbd>J</kbd>/<kbd>K</kbd> 切换切片</span>
+        </div>
+
+        <div class="decision-deck">
+          <button class="decision-btn btn-decision-tp" id="btn-label-tp" data-label="CONFIRMED_MOTION">
+            <div class="btn-kbd">1</div>
+            <div class="btn-content">
+              <span class="btn-main">确认有效运动 (TP)</span>
+              <span class="btn-desc">维持原速 • 保留高光</span>
+            </div>
+          </button>
+
+          <button class="decision-btn btn-decision-fp" id="btn-label-fp" data-label="FALSE_ALARM">
+            <div class="btn-kbd">2</div>
+            <div class="btn-content">
+              <span class="btn-main">误报假动态 (FP)</span>
+              <span class="btn-desc">光影/晃动 • 降为静止快进</span>
+            </div>
+          </button>
+
+          <button class="decision-btn btn-decision-fn" id="btn-label-fn" data-label="MISSED_MOTION">
+            <div class="btn-kbd">3</div>
+            <div class="btn-content">
+              <span class="btn-main">漏报微动有人 (FN)</span>
+              <span class="btn-desc">慢速/暗光 • 提为动态原速</span>
+            </div>
+          </button>
+
+          <button class="decision-btn btn-decision-tn" id="btn-label-tn" data-label="CONFIRMED_STATIC">
+            <div class="btn-kbd">4</div>
+            <div class="btn-content">
+              <span class="btn-main">确认纯静止 (TN)</span>
+              <span class="btn-desc">无活动空镜 • 快速掠过</span>
+            </div>
+          </button>
+        </div>
+      </footer>
+    </section>
+  </main>
+
+  <!-- 动图预览模态框 (Cinema Modal) -->
+  <div class="modal-scrim hidden" id="preview-modal">
+    <div class="modal-box">
+      <div class="modal-top">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">🎬</span>
+          <h4 id="modal-title">高画质动态预览 (WebP 10fps)</h4>
+        </div>
+        <button class="btn-close" id="btn-modal-close">✕</button>
+      </div>
+      <div class="modal-view">
+        <div class="modal-canvas">
+          <img id="modal-preview-img" src="" alt="WebP Preview" />
+          <div class="modal-spinner" id="modal-loading">
+            <div class="spin-ring"></div>
+            <span>正在通过 FFmpeg 极速提取并压制 WebP 动图...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重新浓缩进度控制面板 (Re-render Modal) -->
+  <div class="modal-scrim hidden" id="rerender-modal">
+    <div class="modal-box" style="width: 580px;">
+      <div class="modal-top">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">🚀</span>
+          <h4 id="rerender-modal-title">即时秒级重新浓缩 (Re-render Vlog)</h4>
+        </div>
+        <button class="btn-close" id="btn-rerender-close">✕</button>
+      </div>
+      <div class="modal-view" style="padding: 20px;">
+        <div class="rerender-meta-box" style="display: flex; flex-direction: column; gap: 8px; font-size: 13px;">
+          <div class="meta-row" style="display: flex; justify-content: space-between;">
+            <span style="color: var(--text-muted)">目标日期与机位:</span>
+            <strong class="font-mono" id="rerender-target-desc">-</strong>
+          </div>
+          <div class="meta-row" id="rerender-file-check-row" style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: var(--text-muted)">素材物理校验:</span>
+            <span class="status-chip" id="rerender-file-check-status">等待启动探测...</span>
+          </div>
+        </div>
+
+        <div class="rerender-progress-section" style="margin: 20px 0;">
+          <div class="progress-info-row" style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
+            <span id="rerender-stage-text">准备就绪</span>
+            <span class="font-mono" id="rerender-pct-text">0%</span>
+          </div>
+          <div class="progress-bar-container" style="height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden;">
+            <div class="progress-bar-fill" id="rerender-progress-fill" style="width: 0%; height: 100%; background: linear-gradient(90deg, #06b6d4, #3b82f6); transition: width 0.3s;"></div>
+          </div>
+          <div class="progress-sub-row" style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+            <span id="rerender-batch-text">批次: 0 / 0</span>
+            <span class="font-mono" id="rerender-time-text">已耗时: 0.0s</span>
+          </div>
+        </div>
+
+        <div class="missing-files-alert hidden" id="rerender-missing-alert" style="background: rgba(245, 158, 11, 0.1); border: 1px solid var(--color-amber); border-radius: 6px; padding: 10px; font-size: 12px; color: var(--color-amber); margin-bottom: 16px;">
+          <div style="font-weight: 700;">⚠️ 检测到部分素材文件不存在或不可达:</div>
+          <div id="rerender-missing-list" style="margin-top: 4px; font-family: var(--font-mono); max-height: 80px; overflow-y: auto;"></div>
+          <div style="margin-top: 4px; font-size: 11px; color: var(--text-muted);">系统已自动在时间轴中剔除对应丢失片段，保障其余片段正常合成。</div>
+        </div>
+
+        <div class="rerender-actions" style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button class="btn btn-glass" id="btn-rerender-cancel">关闭</button>
+          <button class="btn btn-cyan" id="btn-rerender-start">开始重新浓缩</button>
+          <button class="btn btn-accent hidden" id="btn-rerender-open-dir">📂 打开成片目录</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 真实反馈帧归档库弹窗 (Archive Modal) -->
+  <div class="modal-scrim hidden" id="archive-modal">
+    <div class="modal-box" style="width: 580px;">
+      <div class="modal-top">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">💾</span>
+          <h4>真实反馈画面归档库 (Feedback Archive)</h4>
+        </div>
+        <button class="btn-close" id="btn-archive-close">✕</button>
+      </div>
+      <div class="modal-view" style="padding: 20px;">
+        <div class="rerender-meta-box" style="display: flex; flex-direction: column; gap: 10px; font-size: 13px;">
+          <div class="meta-row" style="display: flex; justify-content: space-between;">
+            <span style="color: var(--text-muted)">本地物理存储目录:</span>
+            <strong class="font-mono" id="archive-dir-path" style="color: var(--color-cyan)">data/feedback_archive</strong>
+          </div>
+          <div class="meta-row" style="display: flex; justify-content: space-between;">
+            <span style="color: var(--text-muted)">已归档关键帧数:</span>
+            <span class="font-mono" id="archive-total-images" style="font-weight: 700;">0 张</span>
+          </div>
+          <div class="meta-row" style="display: flex; justify-content: space-between;">
+            <span style="color: var(--text-muted)">占用磁盘空间:</span>
+            <span class="font-mono" id="archive-total-size">0.0 MB</span>
+          </div>
+          <div class="meta-row" style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <span style="color: var(--text-muted)">已校正样本分布:</span>
+            <div id="archive-label-breakdown" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+          </div>
+        </div>
+
+        <div style="background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.2); border-radius: 6px; padding: 12px; margin: 18px 0; font-size: 12px; line-height: 1.6;">
+          <div style="font-weight: 700; color: var(--color-cyan);">💡 自动备份机制说明:</div>
+          <div style="color: var(--text-muted); margin-top: 4px;">
+            在审核工作台打标（误报、漏报或确认）时，系统会自动将该切片的核心关键帧无损提取并持久化至本地归档库。即使 NAS 网络断开或原始视频被监控轮替删除，这些宝贵的真实反馈数据也将永久保存，直接服务于 YOLO 小样本微调与预筛选算法自进化。
+          </div>
+        </div>
+
+        <div class="rerender-actions" style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button class="btn btn-glass" id="btn-archive-modal-close">关闭</button>
+          <button class="btn btn-cyan" id="btn-archive-batch-run">⚡ 补齐全量历史归档</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻量 Toast 浮动通知 -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

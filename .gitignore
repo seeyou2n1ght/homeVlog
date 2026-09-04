@@ -94,6 +94,7 @@ pts.txt
 .cursor/
 .gemini/
 .agents/
+.workbuddy/
 *.swp
 *.swo
 

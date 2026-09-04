@@ -28,7 +28,31 @@ CREATE TABLE IF NOT EXISTS file_tasks (
 
     retry_count INTEGER DEFAULT 0,
     error_msg TEXT,
-    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+    has_audio INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES file_tasks(id) ON DELETE CASCADE,
+    filepath TEXT NOT NULL,
+    cam_index INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL NOT NULL,
+    duration REAL NOT NULL,
+    state TEXT NOT NULL,
+    max_energy REAL DEFAULT 0.0,
+    avg_confidence REAL DEFAULT 0.0,
+    file_start_offset REAL DEFAULT 0.0,
+
+    -- 人工审核打标与反向纠偏
+    manual_label TEXT,
+    review_notes TEXT,
+    reviewed_at TEXT,
+    archived_frame_path TEXT,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(file_id, start_time, end_time)
 );
 
 CREATE TABLE IF NOT EXISTS render_tasks (
@@ -46,6 +70,10 @@ CREATE TABLE IF NOT EXISTS render_tasks (
 CREATE INDEX IF NOT EXISTS idx_file_tasks_date ON file_tasks(date, cam_index);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_prescreen ON file_tasks(prescreen_status);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_analysis ON file_tasks(analysis_status);
+CREATE INDEX IF NOT EXISTS idx_segments_file ON segments(file_id);
+CREATE INDEX IF NOT EXISTS idx_segments_date ON segments(date, cam_index);
+CREATE INDEX IF NOT EXISTS idx_segments_state ON segments(state);
+CREATE INDEX IF NOT EXISTS idx_segments_manual ON segments(manual_label);
 CREATE INDEX IF NOT EXISTS idx_render_tasks_status ON render_tasks(status);
 """
 
@@ -66,6 +94,11 @@ class VlogDatabase:
             columns = [row["name"] for row in cursor.fetchall()]
             if "has_audio" not in columns:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN has_audio INTEGER DEFAULT 0")
+
+            cursor_seg = self.conn.execute("PRAGMA table_info(segments)")
+            seg_columns = [row["name"] for row in cursor_seg.fetchall()]
+            if "archived_frame_path" not in seg_columns:
+                self.conn.execute("ALTER TABLE segments ADD COLUMN archived_frame_path TEXT")
             self.conn.commit()
 
     @property
@@ -130,19 +163,190 @@ class VlogDatabase:
                 logger.error("DB error in set_prescreen_result for %s: %s", filepath, e)
                 self.conn.rollback()
 
-    def set_analysis_result(self, filepath: str, status: str, segments_json: str = ""):
+    def set_analysis_result(self, filepath: str, status: str, segments: list | str = ""):
         with self._lock:
             try:
+                import json
+                segments_list = []
+                segments_json = ""
+                if isinstance(segments, str):
+                    segments_json = segments
+                    if segments.strip():
+                        try:
+                            segments_list = json.loads(segments)
+                        except Exception:
+                            segments_list = []
+                elif isinstance(segments, list):
+                    segments_list = segments
+                    try:
+                        dict_list = [s.to_dict() if hasattr(s, "to_dict") else dict(s) for s in segments]
+                        segments_json = json.dumps(dict_list)
+                    except Exception:
+                        segments_json = ""
+
+                # 1. 更新 file_tasks 状态与兼容用 JSON
                 self.conn.execute(
                     """UPDATE file_tasks
                        SET analysis_status=?, analysis_segments=?, updated_at=datetime('now', 'localtime')
                        WHERE filepath=?""",
                     (status, segments_json, str(filepath)),
                 )
+
+                # 2. 查询 file_task 元数据以供 segments 外键关联
+                row = self.conn.execute(
+                    "SELECT id, cam_index, date FROM file_tasks WHERE filepath=?",
+                    (str(filepath),)
+                ).fetchone()
+
+                if row and segments_list:
+                    file_id = row["id"]
+                    cam_index = row["cam_index"]
+                    date_val = row["date"]
+
+                    # 幂等清理该文件旧分段
+                    self.conn.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
+
+                    records = []
+                    for s in segments_list:
+                        if hasattr(s, "start_time"):
+                            st = float(s.start_time)
+                            et = float(s.end_time)
+                            state = str(s.state)
+                            energy = float(getattr(s, "max_energy", 0.0) or 0.0)
+                            conf = float(getattr(s, "avg_confidence", 0.0) or 0.0)
+                            offset = float(getattr(s, "file_start_offset", 0.0) or 0.0)
+                        elif isinstance(s, dict):
+                            st = float(s.get("start_time", s.get("start", 0.0)))
+                            et = float(s.get("end_time", s.get("end", 0.0)))
+                            state = str(s.get("state", s.get("label", "STATIC")))
+                            energy = float(s.get("max_energy", 0.0) or 0.0)
+                            conf = float(s.get("avg_confidence", 0.0) or 0.0)
+                            offset = float(s.get("file_start_offset", 0.0) or 0.0)
+                        else:
+                            continue
+
+                        dur = max(et - st, 0.0)
+                        records.append((
+                            file_id, str(filepath), cam_index, date_val,
+                            st, et, dur, state, energy, conf, offset
+                        ))
+
+                    if records:
+                        self.conn.executemany(
+                            """INSERT OR REPLACE INTO segments
+                               (file_id, filepath, cam_index, date, start_time, end_time, duration,
+                                state, max_energy, avg_confidence, file_start_offset)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            records,
+                        )
+
                 self.conn.commit()
             except Exception as e:
                 logger.error("DB error in set_analysis_result for %s: %s", filepath, e)
                 self.conn.rollback()
+
+    def get_segments_for_file(self, filepath: str) -> list[dict]:
+        with self._lock:
+            try:
+                rows = self.conn.execute(
+                    """SELECT * FROM segments WHERE filepath=? ORDER BY start_time""",
+                    (str(filepath),)
+                ).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                logger.error("DB error in get_segments_for_file for %s: %s", filepath, e)
+                return []
+
+    def get_all_segments_for_date(self, date: str, cam_index: int) -> list[dict]:
+        with self._lock:
+            try:
+                rows = self.conn.execute(
+                    """SELECT * FROM segments WHERE date=? AND cam_index=? ORDER BY file_id, start_time""",
+                    (date, cam_index)
+                ).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                logger.error("DB error in get_all_segments_for_date: %s", e)
+                return []
+
+    def update_segment_review(self, segment_id: int, manual_label: str, notes: str = "", archived_frame_path: str | None = None) -> bool:
+        with self._lock:
+            try:
+                if archived_frame_path:
+                    self.conn.execute(
+                        """UPDATE segments
+                           SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime'), archived_frame_path=?
+                           WHERE id=?""",
+                        (manual_label, notes, archived_frame_path, segment_id),
+                    )
+                else:
+                    self.conn.execute(
+                        """UPDATE segments
+                           SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime')
+                           WHERE id=?""",
+                        (manual_label, notes, segment_id),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error("DB error in update_segment_review: %s", e)
+                self.conn.rollback()
+                return False
+
+    def set_segment_archived_path(self, segment_id: int, archived_frame_path: str) -> bool:
+        with self._lock:
+            try:
+                self.conn.execute(
+                    "UPDATE segments SET archived_frame_path=? WHERE id=?",
+                    (archived_frame_path, segment_id),
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error("DB error in set_segment_archived_path: %s", e)
+                self.conn.rollback()
+                return False
+
+    def get_segment_by_id(self, segment_id: int) -> dict | None:
+        with self._lock:
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM segments WHERE id=?",
+                    (segment_id,),
+                ).fetchone()
+                return dict(row) if row else None
+            except Exception as e:
+                logger.error("DB error in get_segment_by_id: %s", e)
+                return None
+
+    def get_anomaly_segments(self, date: str | None = None, cam_index: int | None = None, limit: int = 100) -> list[dict]:
+        """主动召回高争议与潜在误判/漏判的切片 (Active Learning 模式)"""
+        with self._lock:
+            try:
+                query = """
+                    SELECT * FROM segments
+                    WHERE (
+                        (state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)
+                        OR (state = 'STATIC' AND max_energy >= 1.5 AND max_energy < 2.5)
+                        OR (duration < 3.0 AND state = 'DYNAMIC')
+                    )
+                """
+                params = []
+                if date:
+                    query += " AND date = ?"
+                    params.append(date)
+                if cam_index is not None:
+                    query += " AND cam_index = ?"
+                    params.append(cam_index)
+
+                query += " ORDER BY (manual_label IS NULL) DESC, max_energy DESC LIMIT ?"
+                params.append(limit)
+
+                rows = self.conn.execute(query, params).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                logger.error("DB error in get_anomaly_segments: %s", e)
+                return []
 
     def reset_failed_tasks(self, date: str, cam_index: int, max_retries: int = 3) -> dict:
         """将 FAILED 预筛/分析任务重置为 PENDING，使重跑时自愈补齐丢失内容。

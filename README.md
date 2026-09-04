@@ -1,106 +1,140 @@
-
 # HomeVlog
 
-HomeVlog 是一个用于家庭主机闲时批量处理室内监控素材的 DailyVlog 生成工具。它会扫描 NAS 或本地目录中的 H.265/MP4 监控录像，按日期和摄像头分组，检测运动片段，压缩静态片段，并输出按天合并的精简视频。
+HomeVlog 是专为家庭 NAS 与本地主机打造的室内监控智能浓缩工具。它可以自动扫描并处理全天的 4K H.265/MP4 监控视频，利用硬件加速过滤纯静止与弥散光影时段，精细保留人物/宠物的动态与家庭声音，最终生成平滑过渡的家庭 DailyVlog 成片。
 
-当前代码以 `StreamingOrchestrator` 为主流程：预筛选（Prescreen）、精细分析（Analysis）、批次渲染（Render）三个阶段重叠流式运行，并通过 SQLite 记录状态，支持增量防重、故障自愈与断点恢复。
+系统基于 Intel 核显 (QSV) 与 NVIDIA 独显 (CUDA/NVENC) 异构协同，配合 Active Learning 质检审核平台，支持秒级时间轴修正与专属机位模型自进化。
 
-## 适用硬件与性能极限
+---
 
-目标生产环境：
+## 硬件表现与实测战报
 
-- **CPU**: Intel i5-12600K (16 线程全负载)
-- **iGPU**: UHD 770 / Intel QSV (双 VDBox 高并发解码)
-- **dGPU**: RTX 3060Ti / NVDEC + NVENC (CUDA 算力全开)
-- **输入**: NAS/SMB 上的 4K H.265 素材 (支持高延迟网络环境)
+测试平台：Intel i5-12600K + Intel UHD 770 (核显) + NVIDIA RTX 3060Ti (8GB 独显)
 
-**性能指标 (12600K + UHD 770 + RTX 3060Ti 实测)**：
-- **全天监控处理耗时**: 24.8 小时 (89,566 秒) 监控素材仅需 **13 分 24 秒 ~ 18 分 12 秒**（处理倍速最高突破 **109.86x**，平均 ~92x）。
-- **稳态达成 15~30 分钟 SLA**: 真实生产连续 5 天（120 小时）素材高压运行，单日平均处理耗时 **16.5 分钟**，彻底收敛在设计目标区间内。
-- **成片高保真极速浓缩**: 24 小时 4K 原始文件浓缩为 **2.3GB ~ 3.8GB** DailyVlog，动态事件与家庭原声 100% 原速保真。
-- **GPU 算力利用率**: 解码利用率稳定 ~80%~85%，RTX 3060Ti 双编引擎满负荷输出，UHD 770 Video Decode 专职 100% 极速解码。
-- **自动化测试矩阵**: **107 / 107 核心业务用例通过（1 项环境依赖跳过），全量回归仅约 7 秒**。
+- **全天监控处理耗时**: 24 小时 (89,500+ 秒) 4K 监控素材平均处理耗时 **16.5 分钟** (实测 13.4 ~ 22.7 分钟)，等效处理倍速 **81x ~ 110x**。
+- **高压缩率与保真度**: 24 小时 40GB~60GB 监控录像浓缩为 **2.3GB ~ 3.8GB** 成片；有效动态与对话事件 100% 原速原声保留，静态段 30x~60x 平滑快进。
+- **高稳态自动化测试**: 125 项全量核心测试用例自动化回归约 9 秒全绿。
 
-## 核心架构与优化策略
+---
 
-### 1. 异构自适应工作窃取调度器 (Work-Stealing Scheduler)
-- **Intel UHD 770 (QSV)**: 专职承担预筛（Prescreen）与主干分析（Analysis）硬件解码，充分利用双 Gen12 VDBox 吞吐。
-- **NVIDIA RTX 3060Ti (NVENC/CUDA)**: 专职承担 YOLOv11 Tensor Core 张量批推理与双路 NVENC 硬件渲染。
-- **超长切片分片并发解码 (Intra-File Chunking)**: 针对 5 分钟以上中长动态切片，自动拆分为 2~4 个独立分片并行 Seek 解码，消灭长尾木桶效应。
-- **动态工作窃取 (`WorkStealingManager`)**: 队列积压超过高水位线时动态向 CUDA 租借 NVDEC 槽位；渲染启动时毫秒级原子让步（`RENDER_PREEMPTION_YIELD`），彻底根除硬件争用与死锁。
+## 快速上手
 
-### 2. 小米摄像头多机位 MAC 自动别名映射 (Camera MAC & Alias)
-- **物理目录智能解析 (`parse_camera_dir`)**: 自动解析 NAS 备份目录形如 `XiaomiCamera_01_B888805AA3CD` 中的唯一硬件 MAC 地址，根治文件名同名 `00_*.mp4` 冲突。
-- **人类友好别名支持**: 配置文件支持将 MAC 映射为人类可读名称（如 `baby_room`），成片自动命名为 `DailyVlog_{date}_{camera}.mp4`，并在终端与日志中优雅透出。
+### 1. 安装依赖
 
-### 3. 时空连通域抗噪与多模态感知 (Filters & VAD)
-- **轻量选择性 EMA 滑动背景**: 双差分显著图融合，前景低速吸收、背景高速更新，精准捕获静坐等微动作。
-- **8×8 空间连通域滤波 (`SpatialGridMotionFilter`)**: 动态跟踪 64 个网格单元底噪，8-邻域连通分量过滤孤立红外夜视噪点，聚类放大连续动作。
-- **AudioEnergyVAD 声音事件唤醒**: 内存流 50ms 短时 RMS 包络与一阶自相关分析，交谈/啼哭等声音事件自动锁定 1x 原速原声。
+本项目使用 uv 管理虚拟环境与依赖（已预置 PyTorch CUDA 12.4 支持）：
 
-### 4. 平滑变速过渡与时间码字幕 (Speed Ramping & OSD)
-- **静态段关键帧抽取快路径 (Keyframe Fast-Path)**: 纯静态文件在解码侧以 `select` 按 `static_keyframe_interval` 抽帧，置于 scale/hwdownload 之前，仅关键帧进入缩放与显存回下载，消除静态段全帧解码瓶颈。
-- **变速过渡曲线 (`calculate_speed_ramping_curve`)**: 静态片段计算 $C^1$ 连续平滑非线性过渡 PTS 曲线，消除跳帧顿挫感。
-- **动作前后平滑缓冲 (Pre/Post-Roll)**: 动态动作前置扩展 1.0s，后置顺延 1.5s，完整保留动作起势与余波。
-- **音频 afade 防爆音淡入淡出**: 动态段音轨自动进行 0.25s 线性双向交叉淡入淡出。
-- **时间码 OSD 与字幕**: 支持硬字幕滤镜实时烧录真实墙上时间戳，或导出外挂 SRT / ASS 字幕文件；字幕墙钟映射与渲染滤镜图共用同一展示时长计划，并按 ramping 曲线精确逆映射还原。
-
-### 5. 现代终端交互与三路日志体系
-- **Rich 动态控制台终端 (`PipelineDashboard`)**: 实时呈现多阶段进度、积压队列深度、调度器硬件状态徽标与跑马灯告警。
-- **三路分流日志**: 主运行日志 (`homevlog_*.log`)、独立异常日志 (`error_*.log`) 与结构化审计事件流 (`events_*.jsonl`)。
-
-## 快速开始
-
-安装依赖：
-
-```powershell
+`powershell
 uv sync
-```
+`
 
-运行完整流程（默认开启 Rich 动态仪表盘）：
+### 2. 运行主流水线
 
-```powershell
+默认启动流式浓缩流水线，并展示 Rich 终端动态仪表盘：
+
+`powershell
 uv run python main.py
-```
+`
 
-CLI 常用选项：
-```powershell
-uv run python main.py --no-tui    # 禁用 Rich Live 仪表盘，使用标准文本输出（适合后台守护进程）
-uv run python main.py --debug     # 开启调试级别日志输出
-uv run python main.py --scan      # 扫描当前素材目录并展示机位与归档列表
-uv run python main.py --date 20260901 --cam 0  # 仅处理指定日期与机位
-```
+常用命令行参数：
+`powershell
+# 仅扫描素材目录并输出机位与日期清单，不执行分析渲染
+uv run python main.py --scan
 
-执行全量自动化测试（100 个核心用例）：
+# 指定处理特定日期与机位 (camera_id 支持 MAC 后缀或别名)
+uv run python main.py --date 20260901 --cam 0
 
-```powershell
-uv run pytest tests/
-```
+# 无 TUI 终端模式 (适合作为后台 Windows 服务或无头任务运行)
+uv run python main.py --no-tui
 
+# 开启调试详细日志
+uv run python main.py --debug
+`
+
+---
+
+## 质检审核与秒级重浓缩平台
+
+系统自带独立的 Web 端人工质检审核工作台，用于复核识别结果、挖掘难样本并实现零重复解码的秒级重新渲染。
+
+### 启动审核平台
+`powershell
+uv run python scripts/audit_tool/app.py
+`
+- 服务默认启动在 http://127.0.0.1:8765 并自动打开浏览器。
+- 可选参数：--port 8888，--no-browser。
+
+### 平台主要功能
+1. **疑难样本排查 (Active Learning)**：自动筛选并置顶疑似光影误报段（动态但无目标）与疑似微动漏判段（能量临界区）。
+2. **快捷键一键标注**：
+   - 1: 标记为确认有效动态 (TP)
+   - 2: 标记为误判假动态 (FP - 窗帘/树影/光斑)
+   - 3: 标记为漏判微动 (FN - 实际有人)
+   - 4: 标记为确认纯静止 (TN)
+   - J / K (或上下方向键): 快速切换前后切片
+3. **真实反馈帧物理归档**：标注时自动从 4K 原片抽取变动瞬间原图与差分图，写入 data/archives/ 目录与 manifest.jsonl，用于算法优化。
+4. **秒级即时重浓缩**：在界面直接点击「即时重浓缩成片」，系统复用数据库已分析的时间轴与人工修正结果，直接调用 Pass 2 NVENC 硬件渲染，数十秒内生成修正版成片。
+
+---
+
+## 专属机位模型微调与调参闭环
+
+针对特定机位特有的复杂光影、晃动窗帘或特殊视角，系统支持全流程无代码自进化闭环：
+
+### 1. 导出机位标注数据集
+将人工审核打标的历史切片与归档原图导出为标准 YOLO 数据集（包含 8:2 划分与负样本支持）：
+`powershell
+uv run python scripts/export_dataset.py --output data/datasets/my_cam --camera B888805AA3CD
+`
+
+### 2. 本地微调 YOLOv11 权重
+使用本地 RTX 3060Ti 对骨干网络执行冻结微调（reeze=10, AMP 混合精度），训练机位专属权重：
+`powershell
+# 训练 15 个 epoch，并在训练完成后直接热替换更新当前系统的模型
+uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epochs 15 --apply
+`
+
+### 3. 预筛选超参数寻优
+根据标注结果自动通过网格搜索调优当前机位的最佳时空预筛选阈值：
+`powershell
+uv run python scripts/tune_thresholds.py --camera B888805AA3CD
+`
+
+---
+
+## 核心文档导航
+
+- **[AGENTS.md](file:///c:/Users/seeyo/code/homeVlog/AGENTS.md)**：AI Agent 开发守则、硬件信号量单次原则、优雅停机与时间轴闭环铁律。
+- **[docs/ARCHITECTURE.md](file:///c:/Users/seeyo/code/homeVlog/docs/ARCHITECTURE.md)**：系统三级流式流水线拓扑、异构工作窃取调度器、EMA/VAD 动静识别算子与 SQLite 表结构设计。
+- **[docs/BENCHMARK.md](file:///c:/Users/seeyo/code/homeVlog/docs/BENCHMARK.md)**：连续 5 天 120 小时生产环境实测数据、各演进阶段性能瓶颈定位与 RCA 记录。
+
+---
 
 ## 项目结构
 
-```text
-config/settings.yaml              系统核心参数配置文件
-main.py                           CLI 运行入口
-models/yolo11n.pt                 目标检测模型权重
+`	ext
+config/settings.yaml              系统核心参数配置
+main.py                           主流水线 CLI 入口
+models/                           目标检测模型权重仓库 (内置 yolo11n / yolo11s / yolo11m)
+data/
+  ├── vlog.db                     SQLite WAL 任务状态与切片标记数据库
+  └── archives/                   真实人工反馈原图归档仓库与索引清单
 src/
   ├── pipeline.py                 流式并发编排引擎 (StreamingOrchestrator)
-  ├── scheduler.py                异构算力工作窃取调度器与硬件并发信号量
-  ├── filters.py                  EMA 背景建模、8x8空间网格滤波抗噪与音频VAD
-  ├── prescreen.py                Pass 1 关键帧跳跃极速粗筛
-  ├── detector.py                 Pass 1.5 视频解码驱动与检测协调器
-  ├── yolo_verifier.py            Pass 1.8 Tensor Core YOLOv11 动态批验证
-  ├── segment.py                  动作片段聚类、平滑吸收与序列化
-  ├── timeline.py                 平滑变速 PTS 曲线与 Filtergraph 滤镜图构建
+  ├── scheduler.py                异构硬件调度器与并发信号量管理
+  ├── prescreen.py                Pass 1 关键帧跳跃粗筛 (自适应空间集中度算子)
+  ├── detector.py                 Pass 1.5 解码驱动与 EMA/连通域检测
+  ├── filters.py                  EMA 背景建模、8x8 连通域抗噪与 AudioEnergyVAD
+  ├── yolo_verifier.py            Pass 1.8 Tensor Core YOLO 动态批验证
+  ├── timeline.py                 平滑变速 PTS 曲线、重浓缩时间轴修正与滤镜构建
   ├── renderer.py                 Pass 2 多批次并发硬件渲染与拼接
-  ├── database.py                 SQLite WAL 任务状态持久化与并发管理
-  ├── ui.py                       Rich 终端动态仪表盘与汇总卡片
-  ├── monitor.py                  系统性能指标采样与 PerfRecord 采集
-  ├── ffmpeg.py                   底层 FFmpeg 子进程执行封装
-  └── utils.py                    配置加载、路径常量与三路日志体系
-tests/                            9大业务领域核心测试套件 (100 用例，约 5s)
-docs/                             系统架构设计、性能压测与测试基础设施文档
-
-```
-
+  ├── archiver.py                 真实反馈帧原图抽取与原子归档模块
+  ├── database.py                 SQLite WAL 任务管理与 segments 切片持久化
+  ├── ui.py                       Rich 终端动态仪表盘
+  └── ffmpeg.py                   FFmpeg 子进程封装与生命周期托管注册表
+scripts/
+  ├── audit_tool/                 人机协同 Web 二次审核与秒级重浓缩平台
+  ├── export_dataset.py           审核样本与归档帧导出 YOLO 数据集工具
+  ├── train_yolo.py               专属机位 YOLOv11 本地轻量微调工具
+  └── tune_thresholds.py          预筛选超参数网格搜索寻优脚本
+tests/                            125 项自动化业务测试套件
+docs/                             系统架构设计与性能基准测试文档
+`

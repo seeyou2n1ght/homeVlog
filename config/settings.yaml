@@ -153,7 +153,11 @@ yolo:
   streaming_verify: true
   # 触发式推理: 如果动作能量超过此值，认为显著运动，直接跳过 YOLO 推理
   skip_energy_threshold: 12.0
-  model_path: "models/yolo11n.pt"
+  # 模型选型说明:
+  # - models/yolo11n.pt: 2.6M 参数，显存 ~270MB，单帧 2.38ms (极速低负载)
+  # - models/yolo11s.pt: 9.4M 参数，显存 ~480MB，单帧 3.63ms (黄金平衡档，推荐默认)
+  # - models/yolo11m.pt: 20.1M 参数，显存 ~920MB，单帧 6.67ms (大算力高精档)
+  model_path: "models/yolo11s.pt"
   device: "cuda:0"
   # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
