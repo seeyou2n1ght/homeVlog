@@ -28,8 +28,8 @@ def run_ffmpeg(
     capture_output: bool = True,
     log_stderr: bool = False,
 ) -> FFmpegResult:
-    cmd = ["ffmpeg", "-hide_banner", "-y"] + args
-    kwargs = {}
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-nostdin"] + args
+    kwargs = {"stdin": subprocess.DEVNULL}
     if capture_output:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE

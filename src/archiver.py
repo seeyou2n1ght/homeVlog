@@ -72,7 +72,7 @@ def extract_and_archive_frame(
 
     if source_fp.exists() and source_fp.stat().st_size > 0:
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
             "-ss", f"{t_mid:.3f}",
             "-i", str(source_fp),
             "-vframes", "1",

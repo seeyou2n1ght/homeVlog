@@ -12,14 +12,14 @@ from src.utils import cleanup_temp_artifacts, TEMP_DIR
 
 
 def test_cleanup_temp_artifacts_preserves_valid_batches(tmp_path):
-    b1 = TEMP_DIR / '_batch0_test.mp4'
-    b1.write_bytes(b'x' * 1024)
-    tmp_b = TEMP_DIR / '_batch1_test.tmp.mp4'
-    tmp_b.write_bytes(b'temp data')
-    fc = TEMP_DIR / '_fc_batch0_test.txt'
-    fc.write_text('filter complex')
+    with patch("src.utils.TEMP_DIR", tmp_path):
+        b1 = tmp_path / '_batch0_test.mp4'
+        b1.write_bytes(b'x' * 1024)
+        tmp_b = tmp_path / '_batch1_test.tmp.mp4'
+        tmp_b.write_bytes(b'temp data')
+        fc = tmp_path / '_fc_batch0_test.txt'
+        fc.write_text('filter complex')
 
-    try:
         cleaned = cleanup_temp_artifacts(clean_batches=False)
         assert b1.exists()
         assert not tmp_b.exists()
@@ -27,10 +27,6 @@ def test_cleanup_temp_artifacts_preserves_valid_batches(tmp_path):
 
         cleaned_all = cleanup_temp_artifacts(clean_batches=True)
         assert not b1.exists()
-    finally:
-        b1.unlink(missing_ok=True)
-        tmp_b.unlink(missing_ok=True)
-        fc.unlink(missing_ok=True)
 
 
 def test_pure_static_files_marked_for_skip_frame(tmp_path):

@@ -156,7 +156,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     audio_bitrate = audio_cfg.get("bitrate", "96k")
     audio_channels = audio_cfg.get("channels", 1)
 
-    cmd = ["ffmpeg", "-hide_banner", "-y"]
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-nostdin"]
     if encoder == "nv":
         cmd += ["-init_hw_device", "cuda=gpu:0"]
     elif encoder == "qsv":
@@ -198,7 +198,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     t0 = time.monotonic()
     try:
         with open(err_log, "wb") as f_err:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=f_err)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=f_err)
             FFmpegProcessRegistry.register(str(tmp_output_path), proc)
             if encoder == "qsv":
                 render_timeout = render_cfg.get("qsv_timeout_s", 360)
