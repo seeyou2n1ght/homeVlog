@@ -52,6 +52,8 @@ scheduler:
   max_nv_decoders: 1
   # 冷启动破冰: 渲染任务就绪前优先用 NVDEC 加速分析队列消费 (实测 NVDEC 解码速度是 QSV 的 2-3 倍)
   cold_start_burst: true
+  # 显存安全保护阈值 (MB): 物理显存已用超过此阈值时强制抑制 NVDEC 借调，让步 QSV 独占，保障 >=1.5GB 留白
+  vram_watermark_mb: 6200
 
 recovery:
   # 是否跳过当天素材 (因为当天完整素材可能还没有备份完毕)

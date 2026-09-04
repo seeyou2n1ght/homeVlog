@@ -855,7 +855,11 @@ def build_concat_filter(
 
     labels = "".join(f"[v{i}][a{i}]" for i in range(seg_count))
     all_parts = scale_parts + parts_v + parts_a
-    concat = f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v_tmp][a_tmp];[v_tmp]fps={output_fps}[v];[a_tmp]aresample={audio_sample_rate}[a]"
+    concat = (
+        f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v_tmp][a_tmp];"
+        f"[v_tmp]fps={output_fps}[v];"
+        f"[a_tmp]aresample={audio_sample_rate}:async=1000:first_pts=0,asetpts=N/SR/TB[a]"
+    )
 
     return concat
 

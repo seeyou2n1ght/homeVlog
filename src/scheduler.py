@@ -15,6 +15,27 @@ _disk_semaphore: threading.Semaphore | None = None
 _nv_semaphore: threading.Semaphore | None = None
 _qsv_semaphore: threading.Semaphore | None = None
 _io_lock = threading.Lock()
+_nvml_initialized: bool = False
+_nvml_lock = threading.Lock()
+
+
+def get_nv_vram_used_mb(gpu_index: int = 0) -> int | None:
+    """获取指定 NVIDIA GPU 当前物理已用显存 (MB)。
+
+    返回 None 表示系统无 NVIDIA GPU、驱动未加载或 NVML 探测不可用。
+    """
+    global _nvml_initialized
+    try:
+        import pynvml
+        with _nvml_lock:
+            if not _nvml_initialized:
+                pynvml.nvmlInit()
+                _nvml_initialized = True
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return int(mem.used / 1024 / 1024)
+    except Exception:
+        return None
 
 
 def acquire_with_retry(
@@ -126,11 +147,38 @@ class WorkStealingManager:
         )
         self.device: str = hw_cfg.get("device", "cuda:0")
         self.cold_start_burst: bool = sched_cfg.get("cold_start_burst", False)
+        self.vram_watermark_mb: int = sched_cfg.get(
+            "vram_watermark_mb",
+            hw_cfg.get("vram_watermark_mb", 6200),
+        )
+        self._vram_probe_fn = get_nv_vram_used_mb
 
         self._lock = threading.Lock()
         self._render_active_count = 0
         self._active_nv_decoders = 0
         self._state = "NORMAL_DECOUPLED"
+
+    def set_vram_probe_fn(self, fn) -> None:
+        """设置显存探测函数（支持单元测试注入 Mock）。"""
+        with self._lock:
+            self._vram_probe_fn = fn
+
+    def is_vram_under_pressure(self) -> bool:
+        """检测当前显卡物理显存是否超过安全水位线。"""
+        if self._vram_probe_fn is None:
+            return False
+        try:
+            used_mb = self._vram_probe_fn()
+            if used_mb is not None and used_mb >= self.vram_watermark_mb:
+                logger.warning(
+                    "WorkStealing: VRAM usage (%d MB) exceeded watermark (%d MB), triggering VRAM_PRESSURE_YIELD",
+                    used_mb,
+                    self.vram_watermark_mb,
+                )
+                return True
+        except Exception as e:
+            logger.debug("WorkStealing: VRAM probe error: %s", e)
+        return False
 
     def enable_cold_start_burst(self) -> None:
         """激活冷启动破冰模式：在渲染任务就绪前优先调用 NVDEC 协同解码冲刷队列。"""
@@ -190,6 +238,11 @@ class WorkStealingManager:
                 self._state = "NORMAL_DECOUPLED"
                 return "qsv"
 
+            # 显存物理安全防御：已用显存超警戒线时强制让步 QSV
+            if self.is_vram_under_pressure():
+                self._state = "VRAM_PRESSURE_YIELD"
+                return "qsv"
+
             # 冷启动破冰协同条件：显式启用了 cold_start_burst 且队列非空且无渲染运行
             is_cold_burst = (self.cold_start_burst and self._render_active_count == 0 and queue_size >= 1)
             is_queue_backlog = (queue_size >= self.watermark_high)
@@ -212,6 +265,9 @@ class WorkStealingManager:
         """尝试占用一个 NVDEC 解码协同槽位。"""
         with self._lock:
             if self._render_active_count > 0:
+                return False
+            if self.is_vram_under_pressure():
+                self._state = "VRAM_PRESSURE_YIELD"
                 return False
             if self._active_nv_decoders < self.max_nv_decoders:
                 self._active_nv_decoders += 1

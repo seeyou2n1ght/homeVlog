@@ -67,6 +67,39 @@ class TestWorkStealingScheduler:
         mgr.register_render_end()
         assert not mgr.is_render_active
 
+    def test_vram_pressure_yield_forces_qsv(self):
+        """测试物理显存触及安全高水位时强制抑制 NVDEC 借调，让步 QSV。"""
+        cfg = {
+            "scheduler": {
+                "watermark_high": 5,
+                "watermark_low": 2,
+                "nvdec_cooperative": True,
+                "max_nv_decoders": 1,
+                "vram_watermark_mb": 6000,
+            },
+            "hardware": {"device": "cuda:0"},
+        }
+        mgr = WorkStealingManager(config=cfg)
+        mgr.disable_cold_start_burst()
+
+        # 模拟显存水位安全 (4000MB < 6000MB)：高队列时允许 CUDA 协同
+        mgr.set_vram_probe_fn(lambda: 4000)
+        assert mgr.get_analysis_device(queue_size=10) == "cuda"
+        assert mgr.state == "COOPERATIVE_BURST"
+
+        # 模拟显存触及警戒线 (6500MB >= 6000MB)：强制进入 VRAM_PRESSURE_YIELD 并让步 QSV
+        mgr.set_vram_probe_fn(lambda: 6500)
+        assert mgr.get_analysis_device(queue_size=10) == "qsv"
+        assert mgr.state == "VRAM_PRESSURE_YIELD"
+
+        # 显存承压状态下拒绝出租 NVDEC 槽位
+        assert not mgr.acquire_nvdec_slot()
+
+        # 显存恢复安全水位 (5500MB < 6000MB)：恢复协同借调
+        mgr.set_vram_probe_fn(lambda: 5500)
+        assert mgr.get_analysis_device(queue_size=10) == "cuda"
+        assert mgr.state == "COOPERATIVE_BURST"
+
     def test_lease_device_context_manager(self):
         cfg = {
             "scheduler": {"watermark_high": 5, "watermark_low": 2, "nvdec_cooperative": True, "max_nv_decoders": 1},

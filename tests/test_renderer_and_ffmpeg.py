@@ -86,6 +86,7 @@ class TestFiltergraphGenerationAndClosure:
         )
 
         assert "concat=n=2:v=1:a=1" in filter_str
+        assert "async=1000:first_pts=0,asetpts=N/SR/TB[a]" in filter_str
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 
