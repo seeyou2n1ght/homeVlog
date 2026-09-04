@@ -70,7 +70,10 @@ def _prescreen_keyframes(
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     # 预筛属排队型负载（非死锁风险），预算放宽至 30s×6，避免高峰拥塞误判 FAILED
-    if not acquire_with_retry(io_sem, timeout=30.0, retries=6):
+    _t_sem = time.monotonic()
+    _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
+    sem_wait = round(time.monotonic() - _t_sem, 2)
+    if not _sem_ok:
         logger.warning("prescreen keyframes: io semaphore acquire timeout for %s", filepath)
         return {"status": "FAILED", "error": "io semaphore acquire timeout", "has_audio": 0}
     try:
@@ -123,6 +126,7 @@ def _prescreen_keyframes(
                             "mean_luma": mean_luma,
                             "early_stop": True,
                             "checked_pairs": len(diffs),
+                            "sem_wait": sem_wait,
                         }),
                     }
 
@@ -137,7 +141,7 @@ def _prescreen_keyframes(
         io_sem.release()
 
     if not diffs:
-        return {"status": "STATIC", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False})}
+        return {"status": "STATIC", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False, "sem_wait": sem_wait})}
 
     max_diff = max(diffs)
     status = "SUSPICIOUS" if max_diff > threshold else "STATIC"
@@ -152,6 +156,7 @@ def _prescreen_keyframes(
             "threshold": threshold,
             "early_stop": False,
             "checked_pairs": len(diffs),
+            "sem_wait": sem_wait,
         }),
     }
 

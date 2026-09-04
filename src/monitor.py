@@ -140,7 +140,11 @@ class Monitor:
         return cpu, ram, per_gpu_load, per_gpu_mem, per_gpu_enc, per_gpu_dec
 
     def _sample_igpu(self) -> dict[str, float]:
-        """采样 Intel iGPU 各引擎利用率 (%)，通过 Windows typeperf 单次读取。"""
+        """采样 Intel iGPU 各引擎利用率 (%)，通过 Windows typeperf 单次读取。
+
+        counter 路径为通配符形式（新版 Windows 无 pid_0 聚合实例），
+        输出列与进程实例一一对应，需按引擎类型分组求和。
+        """
         if not self._igpu_available:
             return {}
         try:
@@ -152,27 +156,36 @@ class Monitor:
             )
             if result.returncode != 0:
                 return {}
-            # typeperf 输出格式: 第 2 行为列头，第 3 行为数据
             lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+
+            # 列头行: 含 "GPU Engine" 实例路径；数据行: 以日期时间戳开头
+            header_line = None
             data_line = None
             for line in lines:
-                if line.startswith('"') and not line.startswith('\"\\\\'):
-                    # 数据行以时间戳开头 (如 "09/02/2026 14:55:00.000")
+                if "GPU Engine" in line:
+                    header_line = line
+                elif line.startswith('"') and not line.startswith('"\\\\'):
                     data_line = line
-                    break
-            if not data_line:
+            if not header_line or not data_line:
                 return {}
-            parts = [p.strip().strip('"') for p in data_line.split('","')]
-            # parts[0] 是时间戳，parts[1:] 是各 counter 的值
-            values = parts[1:]
-            engine_names = list(self._igpu_counters.keys())
+
+            headers = [p.strip().strip('"') for p in header_line.split('","')]
+            values = [p.strip().strip('"') for p in data_line.split('","')]
+            # headers[0]/values[0] 为 (PDH-CSV 版本/时间戳)，数据列从 1 开始
+            engtype_pat = re.compile(r"engtype_(\w+)\)")
             result_dict: dict[str, float] = {}
-            for i, name in enumerate(engine_names):
-                if i < len(values):
-                    try:
-                        result_dict[name] = max(0.0, float(values[i]))
-                    except (ValueError, TypeError):
-                        result_dict[name] = 0.0
+            for i, col in enumerate(headers[1:], start=1):
+                m = engtype_pat.search(col)
+                if not m or i >= len(values):
+                    continue
+                eng = m.group(1)
+                # 由显示名映射表反查：engtype → display name
+                disp = _IGPU_ENG_DISPLAY.get(eng, eng)
+                try:
+                    val = max(0.0, float(values[i]))
+                except (ValueError, TypeError):
+                    continue
+                result_dict[disp] = result_dict.get(disp, 0.0) + val
             return result_dict
         except Exception:
             return {}
@@ -388,6 +401,14 @@ def get_perf() -> PerfCollector:
 _ENGTYPE_PATTERN = re.compile(r"engtype_(\w+)")
 _LUID_PATTERN = re.compile(r"luid_0x[0-9a-fA-F]+_0x([0-9a-fA-F]+)")
 
+# iGPU 引擎类型 → 显示名映射（发现与采样共用）
+_IGPU_ENG_DISPLAY = {
+    "3D": "3D",
+    "VideoDecode": "Video Decode",
+    "VideoEncode": "Video Encode",
+    "Compute": "Compute",
+}
+
 
 def _discover_intel_gpu_counters() -> dict[str, str]:
     """通过 typeperf 枚举 Windows GPU Engine counter，识别 Intel iGPU 的引擎。
@@ -423,7 +444,9 @@ def _discover_intel_gpu_counters() -> dict[str, str]:
     if not intel_luids:
         return {}
 
-    # 第二步: 枚举 GPU Engine counter，用 pid_0 (系统总计) 采集各引擎
+    # 第二步: 枚举 GPU Engine counter。
+    # 注意: 新版 Windows 已不提供 pid_0 系统级聚合实例（本机实测仅有按进程实例），
+    # 因此按 (luid, engtype) 全量分组，采样时用通配符路径动态聚合。
     try:
         result = subprocess.run(
             ["typeperf", "-qx", "GPU Engine"],
@@ -435,60 +458,50 @@ def _discover_intel_gpu_counters() -> dict[str, str]:
     except Exception:
         return {}
 
-    # 解析 counter 行，按 LUID 分组找出非 NVIDIA 的 GPU（即 Intel iGPU）
-    # 策略: 收集所有 pid_0 的 counter，按 LUID 分组，排除 NVIDIA LUID
-    luid_counters: dict[str, dict[str, str]] = {}  # {luid: {engtype: counter_path}}
+    # 按 LUID 分组收集引擎类型全集（不限 pid）
+    luid_engines: dict[str, set[str]] = {}
+    luid_full: dict[str, str] = {}  # short_luid -> 完整 luid_..._phys_N 段
+    full_pat = re.compile(r"(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+_phys_\d+)")
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line or "Utilization Percentage" not in line:
             continue
-        if "pid_0_" not in line:
-            continue
-
         luid_match = _LUID_PATTERN.search(line)
         eng_match = _ENGTYPE_PATTERN.search(line)
-        if not luid_match or not eng_match:
+        full_match = full_pat.search(line)
+        if not luid_match or not eng_match or not full_match:
             continue
-
         luid = luid_match.group(1).lower()
-        engtype = eng_match.group(1)
-        luid_counters.setdefault(luid, {})[engtype] = line
+        luid_engines.setdefault(luid, set()).add(eng_match.group(1))
+        luid_full[luid] = full_match.group(1)
 
-    if not luid_counters:
+    if not luid_engines:
         return {}
 
-    # 第三步: 如果有多个 LUID，尝试识别哪个是 Intel（非 NVIDIA）
-    # NVIDIA GPU 通常先被 NVML 发现，我们取不被 NVML 管理的那个 LUID
-    # 简单策略: 如果只有 1 个 LUID，它就是唯一的 GPU（可能不对）
-    # 如果有 2 个 LUID，排除已通过 NVML 发现的那个
-    # 检查每个 LUID 是否包含 "3D" engtype（Intel iGPU 一般有 3D 引擎）
-    target_luid = None
-    if len(luid_counters) == 1:
-        target_luid = list(luid_counters.keys())[0]
-    else:
-        # 多 GPU 时，选包含 VideoDecode 引擎且引擎数量最多的非首 LUID
-        # （NVIDIA 通常是 phys_0，Intel 是 phys_1，但 LUID 排序不可靠）
-        # 更可靠的方式: 用 LUID 数量最多引擎类型的那个（Intel 通常有更多引擎类型）
-        candidates = sorted(luid_counters.items(), key=lambda x: len(x[1]), reverse=True)
-        for luid, engines in candidates:
-            if "VideoDecode" in engines or "VideoEncode" in engines:
-                target_luid = luid
-                break
-        if target_luid is None:
-            target_luid = candidates[0][0]
+    # 第三步: 识别 Intel LUID——排除带 NVIDIA 特征引擎 (OFA 光流/VR) 的 LUID，
+    # 在剩余候选中优先选含 VideoDecode 且引擎类型最多者
+    nvidia_markers = ("OFA", "VR")
+    candidates = [
+        (luid, engs) for luid, engs in luid_engines.items()
+        if not any(any(e.startswith(m) for m in nvidia_markers) for e in engs)
+    ] or list(luid_engines.items())
+    candidates.sort(key=lambda x: ("VideoDecode" in x[1], len(x[1])), reverse=True)
+    target_luid = candidates[0][0]
 
-    engines = luid_counters[target_luid]
-    # 标准化引擎名称
+    # 生成通配符 counter 路径（采样时按进程实例动态求和）
+    full_seg = luid_full[target_luid]
     name_map = {
         "3D": "3D",
         "VideoDecode": "Video Decode",
         "VideoEncode": "Video Encode",
-        "Copy": "Copy",
-        "VideoProcessing": "Video Processing",
+        "Compute": "Compute",
     }
     result_counters: dict[str, str] = {}
-    for engtype, counter_path in engines.items():
-        display_name = name_map.get(engtype, engtype)
-        result_counters[display_name] = counter_path
+    for engtype, display_name in name_map.items():
+        if engtype in luid_engines[target_luid]:
+            result_counters[display_name] = (
+                f"\\GPU Engine(pid_*_{full_seg}_eng_*_engtype_{engtype})"
+                "\\Utilization Percentage"
+            )
 
     return result_counters

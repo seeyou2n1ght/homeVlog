@@ -1,4 +1,5 @@
 import logging
+import re
 import subprocess
 import time
 import threading
@@ -8,8 +9,30 @@ from src.utils import TEMP_DIR
 from src.scheduler import acquire_with_retry
 from src.ffmpeg import run_ffmpeg
 from src.timeline import build_concat_filter
+from src.monitor import get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
+
+_FFMPEG_PROGRESS_RE = re.compile(
+    r"frame=\s*(\d+)\s+fps=\s*([\d.]+).*?speed=\s*([\d.]+)x"
+)
+
+
+def _parse_ffmpeg_progress(err_log: Path) -> dict:
+    """从 ffmpeg stderr 日志提取最后一帧进度（编码帧数/fps/倍速）。"""
+    try:
+        tail = err_log.read_bytes()[-4000:].decode("utf-8", errors="replace")
+    except OSError:
+        return {}
+    matches = _FFMPEG_PROGRESS_RE.findall(tail.replace("\r", "\n"))
+    if not matches:
+        return {}
+    frames, fps, speed = matches[-1]
+    return {
+        "enc_frames": int(frames),
+        "enc_fps": float(fps),
+        "encode_speed_x": float(speed),
+    }
 
 
 class FFmpegProcessRegistry:
@@ -197,6 +220,23 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     elapsed = time.monotonic() - t0
 
     if proc is not None and proc.returncode == 0:
+        # 持久化编码吞吐指标（speed/fps 此前随 stderr 日志删除而丢失，
+        # 是评估渲染瓶颈与编码参数调优的关键数据源）
+        enc_stats = _parse_ffmpeg_progress(err_log)
+        size_mb = 0.0
+        try:
+            size_mb = round(output_path.stat().st_size / (1024 * 1024), 1)
+        except OSError:
+            pass
+        get_perf().add(
+            PerfRecord(
+                stage="render_enc",
+                file=output_path.name,
+                gpu=encoder,
+                duration=round(elapsed, 3),
+                extra={**enc_stats, "size_mb": size_mb},
+            )
+        )
         err_log.unlink(missing_ok=True)
         return str(output_path)
 

@@ -779,18 +779,44 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     else:
         db.set_render_status(date, cam_index, "FAILED")
 
-    _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+    _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
+               headline=_build_headline(output_path, total_input_dur, elapsed_wall) if ok else None)
     return ok
 
 
-def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float):
+def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float, headline: dict | None = None):
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         perf_path = LOGS_DIR / f"perf_{date}_cam{cam_index}_{timestamp}.json"
-        perf.dump(perf_path, metadata={"date": date, "cam": cam_index, "pipeline_duration": round(pipeline_duration, 2), "monitor_summary": monitor.stages_data(), "perf_summary": perf.summary_by_stage()})
+        metadata = {"date": date, "cam": cam_index, "pipeline_duration": round(pipeline_duration, 2), "monitor_summary": monitor.stages_data(), "perf_summary": perf.summary_by_stage()}
+        if headline:
+            metadata["headline"] = headline
+        perf.dump(perf_path, metadata=metadata)
         perf.reset()
     except Exception:
         pass
+
+
+def _build_headline(output_path: Path, total_input_dur: float, elapsed_wall: float) -> dict:
+    """汇总单日头条指标：处理倍速、浓缩率、产出体积（性能评估的顶层仪表盘）。"""
+    headline: dict = {
+        "input_dur_s": round(total_input_dur, 1),
+        "wall_s": round(elapsed_wall, 1),
+        "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
+    }
+    try:
+        headline["output_size_mb"] = round(output_path.stat().st_size / (1024 * 1024), 1)
+    except OSError:
+        pass
+    try:
+        from src.ffmpeg import get_duration
+        out_dur = get_duration(str(output_path))
+        if out_dur and out_dur > 0:
+            headline["output_dur_s"] = round(out_dur, 1)
+            headline["condensation_x"] = round(total_input_dur / out_dur, 1)
+    except Exception:
+        pass
+    return headline
 
 
 def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True) -> dict:

@@ -410,14 +410,17 @@ class MotionDetector:
         ]
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-        if not acquire_with_retry(io_sem):
+        _t_sem = time.monotonic()
+        _sem_ok = acquire_with_retry(io_sem)
+        sem_wait = round(time.monotonic() - _t_sem, 2)
+        if not _sem_ok:
             logger.warning(
                 "decode semaphore acquire timeout for %s, aborting decode",
                 Path(filepath).name,
             )
             return decoded_frames, yolo_buffer, {
                 "has_audio": 0, "effective_fps": effective_fps,
-                "decode_time": 0.0, "frames": 0,
+                "decode_time": 0.0, "frames": 0, "sem_wait": sem_wait,
             }
 
         yolo_sample_interval = max(
@@ -472,6 +475,7 @@ class MotionDetector:
             "effective_fps": effective_fps,
             "decode_time": round(time.monotonic() - t_decode_start, 3),
             "frames": total_frames,
+            "sem_wait": sem_wait,
         }
         return decoded_frames, yolo_buffer, meta
 
@@ -512,7 +516,10 @@ class MotionDetector:
             hw_name = "cuda"
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-        if not acquire_with_retry(io_sem):
+        _t_sem = time.monotonic()
+        _sem_ok = acquire_with_retry(io_sem)
+        sem_wait = round(time.monotonic() - _t_sem, 2)
+        if not _sem_ok:
             logger.warning(
                 "decode semaphore acquire timeout for %s, aborting decode",
                 Path(filepath).name,
@@ -522,6 +529,7 @@ class MotionDetector:
                 "effective_fps": self.fps,
                 "decode_time": 0.0,
                 "frames": 0,
+                "sem_wait": sem_wait,
             }
 
         audio_samples_list: list[np.ndarray] = []
@@ -697,6 +705,7 @@ class MotionDetector:
             "effective_fps": effective_fps,
             "decode_time": round(t_decode_end - t_decode_start, 3),
             "frames": total_frames,
+            "sem_wait": sem_wait,
         }
         return decoded_frames, yolo_buffer, full_audio, meta
 
@@ -727,6 +736,7 @@ class MotionDetector:
                 "early_term": False,
                 "has_audio": has_audio,
                 "audio_events": 0,
+                "sem_wait": decode_meta.get("sem_wait", 0.0),
             }
             return [], yolo_buffer
 
@@ -807,5 +817,6 @@ class MotionDetector:
             "has_audio": has_audio,
             "audio_events": len(audio_events),
             "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
+            "sem_wait": decode_meta.get("sem_wait", 0.0),
         }
         return results, yolo_buffer
