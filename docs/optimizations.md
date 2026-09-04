@@ -16,6 +16,11 @@
 | **硬件调度层** | [`src/scheduler.py`](../src/scheduler.py) | 混杂在工具层，无动态租借与让步机制 | `WorkStealingManager` 三态流转与硬件并发信号量隔离 | 杜绝 NVENC 超限与显存争用，实现全双工协同 |
 | **渲染流式调度** | [`src/pipeline.py`](../src/pipeline.py) | 依赖无序到达队列导致多批次切片时间错乱 | 物理时序滑动窗口（In-Order Sliding Window） | 保证 100% 时间单调性，消除跨批次时序空洞 |
 | **数据库并发** | [`src/database.py`](../src/database.py) | 读查询无差别 `join()` 阻塞等待，单任务单次 commit | WAL 模式读写完全解耦 + 异步写事务微批合并 | 消除读线程锁等待，写吞吐提升 **10x** |
+| **渲染长尾消除** | [`src/renderer.py`](../src/renderer.py) | 夜间纯静态长切片被送入 NVDEC 全量流式解码，`batch_0` 耗时高达 835s | 批次纯静态文件解复用追加 `-skip_frame nokey` 跳过非关键帧 | 纯静态文件解码帧数暴降 **90%+**，长尾彻底铲除 |
+| **分析管道瘦身** | [`src/detector.py`](../src/detector.py) | 管道回传 `rgb24` 膨胀 3 倍，CPU 频繁 `cv2.cvtColor` 转灰度 | 管道单通道灰度直通 (`-pix_fmt gray`)，移除 CPU 色彩空间转换 | 管道 IPC 传输量缩减 **66.7%**，卸载 CPU 计算负担 |
+| **批次原子断点** | [`src/renderer.py`](../src/renderer.py)<br/>[`src/utils.py`](../src/utils.py) | 渲染中断遗留半成品污染，启动时误删所有批次成片 | `.tmp.mp4` 原子重命名写入 + `cleanup_temp_artifacts` 保护有效批次 | 杜绝坏块污染，实现真正的批次级秒级断点续跑 |
+| **可中断优雅停机** | [`src/pipeline.py`](../src/pipeline.py)<br/>[`main.py`](../main.py) | Windows Python 下无超时 `queue.join()` 锁死，Ctrl+C 无法退出 | 0.2s 轮询切片 + `abort_event` + `FFmpegProcessRegistry.kill_all()` | 1 秒内响应 Ctrl+C 干净退出，即时释放 GPU 显存与硬件会话 |
+| **时间轴参数收敛** | [`config/settings.yaml`](../config/settings.yaml)<br/>[`src/segment.py`](../src/segment.py) | 短静态段保底 1.5s 撑大总时长至 4 小时，`curr_t=0` 越界倒灌 | 调优 `min_static_display: 0.4s` + 修复 `curr_t=total_min_t` 绝对时间戳 | 成片收敛至 **15~30 分钟** 精炼 DailyVlog，数据物理严密 |
 
 ---
 

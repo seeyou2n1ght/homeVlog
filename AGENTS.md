@@ -8,8 +8,10 @@ This file provides guidance to Codex or other coding agents when working in this
 - **Lazy Metadata 强制约束**: 禁止在 `src/scanner.py` 中增加任何阻塞式的文件读写（如 `ffprobe`）。所有元数据探测必须在 Analysis 阶段通过 PyAV 懒加载完成，并存入 DB。
 - **时间轴闭环**: 修改 `src/detector.py` 的 `analyze()` 返回值时，必须确保最后一帧的时间戳严格等于 `start_offset + file_duration`，杜绝渲染出的 Vlog 出现时间轴空洞或跳秒。
 - **硬件并发信号量与调度**: 算力并发控制必须通过 `src.scheduler` 中的 `get_nv_semaphore()`、`get_qsv_semaphore()` 与 `WorkStealingManager` 协调，防止 NVENC 超出驱动并发限制（当前生产配置 `max_nv_concurrency: 2`，8GB 显存安全上限）或 QSV 句柄耗尽崩溃。
-- **信号量超时强制约束**: 所有 `io_sem.acquire()` 调用必须带 `timeout` 参数（推荐 30s），并通过重试循环（最多3次）防止 prescreen 与 analysis 争用 QSV 信号量时发生死锁。禁止使用无限阻塞的 `acquire()`。
 - **信号量释放单次原则**: `io_sem.release()` 必须在 `finally` 块中恰好调用一次。禁止在 `return` 前显式调用 `release()` 后又在 `finally` 中重复释放，否则信号量计数膨胀导致并发失控。
+- **子进程注册与优雅停机约束**: 所有通过 `subprocess.Popen` 启动的后台 FFmpeg 进程（包含 Pass 2 批次渲染与 Pass 1.5 管道解码），必须通过 `FFmpegProcessRegistry.register()` 注册并在 `finally` 块中 `deregister()`。严禁产生脱离管控的孤儿进程，确保用户按 Ctrl+C 时由 `kill_all()` 瞬间释放 GPU 会话。
+- **断点续传与原子批次约束**: 批次渲染必须采用 `_batchX.tmp.mp4` 临时文件原子写入，经退出码与大小校验后原子替换正式文件；`cleanup_temp_artifacts()` 严禁默认删除有效 `_batch*.mp4`，保障随时中断随时秒级续跑。
+- **分析管道灰度直通**: 管道解码必须严格维持 `-pix_fmt gray` 单通道灰度直通，帧尺寸为 `w * h`。严禁在管道中输出 3 通道数据后由 CPU 转灰度。
 
 ## 核心开发哲学
 
