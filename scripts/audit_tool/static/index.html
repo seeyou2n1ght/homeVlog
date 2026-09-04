@@ -109,10 +109,29 @@
         <button class="btn-icon-toggle" id="btn-sidebar-toggle" title="折叠/展开侧边栏">◀</button>
       </div>
 
-      <!-- 搜索过滤条 -->
-      <div class="search-filter-box">
-        <span class="search-icon">🔍</span>
-        <input type="text" id="filter-input" placeholder="按文件名或能量分搜索..." />
+      <!-- 错检多维分类胶囊栏 (Categorization Filter) -->
+      <div class="category-filter-bar" id="category-filter-bar">
+        <button class="cat-chip active" data-category="all" id="cat-all">全部 <span class="cat-badge" id="badge-cat-all">0</span></button>
+        <button class="cat-chip" data-category="fp_suspect" id="cat-fp">疑似误报 <span class="cat-badge fp" id="badge-cat-fp">0</span></button>
+        <button class="cat-chip" data-category="fn_suspect" id="cat-fn">疑似漏报 <span class="cat-badge fn" id="badge-cat-fn">0</span></button>
+        <button class="cat-chip" data-category="jitter" id="cat-jitter">短碎片 <span class="cat-badge jitter" id="badge-cat-jitter">0</span></button>
+        <button class="cat-chip" data-category="reviewed" id="cat-reviewed">已复核 <span class="cat-badge reviewed" id="badge-cat-reviewed">0</span></button>
+      </div>
+
+      <!-- 搜索与排序工具行 -->
+      <div class="search-sort-row">
+        <div class="search-filter-box">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="filter-input" placeholder="按文件名或描述过滤..." />
+        </div>
+        <div class="sort-box">
+          <select id="sort-select" title="列表排序方式">
+            <option value="energy">⚡ 按争议/能量降序</option>
+            <option value="time_asc">🕒 按时间先后顺序</option>
+            <option value="time_desc">🕒 按时间从新到旧</option>
+            <option value="duration">⏱️ 按切片时长</option>
+          </select>
+        </div>
       </div>
 
       <!-- 列表容器：疑难列表 -->
@@ -137,7 +156,10 @@
         <div class="banner-file-row">
           <div class="file-headline">
             <span class="file-icon">📹</span>
-            <h3 class="file-name font-mono" id="current-filename">请选择待排查片段</h3>
+            <div class="file-info-group">
+              <h3 class="file-name font-mono" id="current-filename">请选择待排查片段</h3>
+              <span class="file-clock-range font-mono" id="current-file-clock">--:--:-- ~ --:--:--</span>
+            </div>
             <span class="status-chip" id="current-status-chip">WAITING</span>
           </div>
           <div class="file-tags" id="current-segment-tags">
@@ -145,25 +167,51 @@
           </div>
         </div>
 
-        <!-- 现代化音视频时间轴 (Wave/Timeline Scrubber) -->
-        <div class="timeline-widget">
-          <div class="timeline-ruler">
-            <span class="ruler-mark" id="ruler-start">00:00</span>
-            <span class="ruler-mark" id="ruler-mid">12:00</span>
-            <span class="ruler-mark" id="ruler-end">24:00</span>
-          </div>
-          <div class="timeline-track-wrap" id="timeline-track-wrap">
-            <div class="timeline-track" id="timeline-bar">
-              <!-- 动态分段色块 -->
+        <!-- 🚀 双层联动时间轴核心组件 (Dual-Track Interactive Timeline) -->
+        <div class="dual-timeline-container" id="dual-timeline-container">
+          <!-- 上层：全文件缩略小地图 (Minimap Track) -->
+          <div class="timeline-minimap-row">
+            <span class="minimap-label">全景概览</span>
+            <div class="minimap-track-wrap" id="minimap-track-wrap">
+              <div class="minimap-track" id="minimap-bar"></div>
+              <div class="minimap-lens" id="minimap-lens" title="当前焦点放大视窗 (可左右拖动或点击跳转)"></div>
             </div>
-            <div class="timeline-playhead" id="timeline-playhead"></div>
+            <span class="minimap-duration font-mono" id="minimap-duration-txt">00:00.0</span>
           </div>
+
+          <!-- 局部缩放与聚焦工具栏 -->
+          <div class="timeline-focus-toolbar">
+            <div class="focus-info-col">
+              <span class="focus-title">切片焦点交互轨</span>
+              <span class="focus-range-text font-mono" id="focus-range-txt">视窗范围: 00:00.0 ~ 00:30.0 (放大 1.0x)</span>
+            </div>
+            <div class="focus-controls">
+              <button class="btn-ctrl" id="btn-zoom-in" title="放大时间轴 (Ctrl + 滚轮向上)">🔍 放大 (+)</button>
+              <button class="btn-ctrl" id="btn-zoom-out" title="缩小时间轴 (Ctrl + 滚轮向下)">🔍 缩小 (-)</button>
+              <button class="btn-ctrl btn-ctrl-accent" id="btn-zoom-focus" title="自动以当前选中切片为中心展开">⊙ 聚焦切片</button>
+              <button class="btn-ctrl" id="btn-zoom-reset" title="还原全文件平铺">⤢ 全局全景</button>
+            </div>
+          </div>
+
+          <!-- 下层：焦点交互轨 (Focus Track) -->
+          <div class="focus-track-wrapper" id="focus-track-wrapper">
+            <!-- 真实墙钟刻度尺 -->
+            <div class="focus-ruler" id="focus-ruler"></div>
+            <!-- 放大后的切片轨 -->
+            <div class="focus-track" id="focus-track">
+              <div class="focus-segments-layer" id="focus-segments-layer"></div>
+              <div class="focus-cursor" id="focus-cursor"></div>
+            </div>
+          </div>
+
           <div class="timeline-footer">
-            <span class="legend-item"><i class="dot dot-dyn"></i> DYNAMIC (原速)</span>
-            <span class="legend-item"><i class="dot dot-sta"></i> STATIC (快进)</span>
-            <span class="legend-item"><i class="dot dot-fp"></i> 误报 (FP)</span>
-            <span class="legend-item"><i class="dot dot-fn"></i> 漏报 (FN)</span>
-            <span class="timeline-hover-tip font-mono" id="timeline-hover-info">悬停分段查看详情</span>
+            <div class="legend-group">
+              <span class="legend-item"><i class="dot dot-dyn"></i> DYNAMIC (原速)</span>
+              <span class="legend-item"><i class="dot dot-sta"></i> STATIC (快进)</span>
+              <span class="legend-item"><i class="dot dot-fp"></i> 误报 (FP)</span>
+              <span class="legend-item"><i class="dot dot-fn"></i> 漏报 (FN)</span>
+            </div>
+            <span class="timeline-hover-tip font-mono" id="timeline-hover-info">点击切片精准选择 • 滚轮缩放 • 拖拽平移</span>
           </div>
         </div>
       </div>
@@ -189,37 +237,58 @@
           <!-- 起点帧 -->
           <div class="triptych-card" id="card-start">
             <div class="card-glass-header">
-              <span class="card-anchor">起点进入</span>
+              <div class="card-header-left">
+                <span class="card-anchor">起点进入</span>
+                <span class="card-clock-badge font-mono" id="clock-start">--:--:--</span>
+              </div>
               <span class="card-ts font-mono" id="ts-start">0.00s</span>
             </div>
-            <div class="card-visual-wrapper">
-              <img id="img-start" src="" alt="Start Frame" />
-              <div class="img-shimmer" id="shimmer-start"></div>
+            <div class="card-visual-wrapper" id="wrap-start">
+              <img id="img-start" class="frame-img hidden" alt="Start Frame" />
+              <div class="img-placeholder" id="placeholder-start">
+                <span class="ph-icon">⏳</span>
+                <span class="ph-text">等待切片加载...</span>
+              </div>
+              <div class="img-shimmer hidden" id="shimmer-start"></div>
             </div>
           </div>
 
           <!-- 核心峰值能量帧 (带高亮轮廓与聚焦指示) -->
           <div class="triptych-card focus-hero" id="card-mid">
             <div class="card-glass-header">
-              <span class="card-anchor highlight">★ 峰值能量 / YOLO 检验点</span>
+              <div class="card-header-left">
+                <span class="card-anchor highlight">★ 峰值能量 / YOLO 检验点</span>
+                <span class="card-clock-badge highlight font-mono" id="clock-mid">--:--:--</span>
+              </div>
               <span class="card-ts font-mono highlight" id="ts-mid">0.00s</span>
             </div>
-            <div class="card-visual-wrapper hero-frame">
-              <img id="img-mid" src="" alt="Peak Frame" />
-              <div class="img-shimmer" id="shimmer-mid"></div>
-              <div class="hero-badge" id="hero-badge">CENTER</div>
+            <div class="card-visual-wrapper hero-frame" id="wrap-mid">
+              <img id="img-mid" class="frame-img hidden" alt="Peak Frame" />
+              <div class="img-placeholder" id="placeholder-mid">
+                <span class="ph-icon">⚡</span>
+                <span class="ph-text">等待切片加载...</span>
+              </div>
+              <div class="img-shimmer hidden" id="shimmer-mid"></div>
+              <div class="hero-badge" id="hero-badge">CENTER PEAK</div>
             </div>
           </div>
 
           <!-- 终点帧 -->
           <div class="triptych-card" id="card-end">
             <div class="card-glass-header">
-              <span class="card-anchor">终点离开</span>
+              <div class="card-header-left">
+                <span class="card-anchor">终点离开</span>
+                <span class="card-clock-badge font-mono" id="clock-end">--:--:--</span>
+              </div>
               <span class="card-ts font-mono" id="ts-end">0.00s</span>
             </div>
-            <div class="card-visual-wrapper">
-              <img id="img-end" src="" alt="End Frame" />
-              <div class="img-shimmer" id="shimmer-end"></div>
+            <div class="card-visual-wrapper" id="wrap-end">
+              <img id="img-end" class="frame-img hidden" alt="End Frame" />
+              <div class="img-placeholder" id="placeholder-end">
+                <span class="ph-icon">⏳</span>
+                <span class="ph-text">等待切片加载...</span>
+              </div>
+              <div class="img-shimmer hidden" id="shimmer-end"></div>
             </div>
           </div>
         </div>
@@ -231,20 +300,28 @@
             <span>AI 视觉检测解析:</span>
           </div>
           <div class="inspector-tags" id="yolo-tags">
-            <span class="inspector-placeholder">点击「⚡ 运行 YOLO 强化画框」即刻进行多目标分析与边界框定位</span>
+            <span class="inspector-placeholder">点击「⚡ 运行 YOLO 强化画框 (快捷键 Y)」即刻进行多目标分析与边界框定位</span>
           </div>
         </div>
       </div>
 
       <!-- 底部极速复核指挥舱 (Action Cockpit) -->
       <footer class="action-cockpit">
-        <div class="cockpit-shortcuts">
-          <span class="kbd-label">键盘流指令:</span>
-          <span class="kbd-hint"><kbd>1</kbd> 确认动态</span>
-          <span class="kbd-hint"><kbd>2</kbd> 误报假动作</span>
-          <span class="kbd-hint"><kbd>3</kbd> 漏报有人</span>
-          <span class="kbd-hint"><kbd>4</kbd> 纯静止</span>
-          <span class="kbd-hint"><kbd>J</kbd>/<kbd>K</kbd> 切换切片</span>
+        <div class="cockpit-top-row">
+          <div class="cockpit-shortcuts">
+            <span class="kbd-label">快捷指令:</span>
+            <span class="kbd-hint"><kbd>1</kbd> 动态(TP)</span>
+            <span class="kbd-hint"><kbd>2</kbd> 误报(FP)</span>
+            <span class="kbd-hint"><kbd>3</kbd> 漏报(FN)</span>
+            <span class="kbd-hint"><kbd>4</kbd> 纯静止(TN)</span>
+            <span class="kbd-hint"><kbd>J</kbd>/<kbd>K</kbd> 上下切片</span>
+            <span class="kbd-hint"><kbd>Space</kbd> 动图预览</span>
+            <span class="kbd-hint"><kbd>Y</kbd> YOLO画框</span>
+          </div>
+          <div class="nav-btn-group">
+            <button class="btn btn-glass btn-sm" id="btn-prev-seg" title="快捷键 J 或 ↑">▲ 上一个切片 (J)</button>
+            <button class="btn btn-glass btn-sm" id="btn-next-seg" title="快捷键 K 或 ↓">▼ 下一个切片 (K)</button>
+          </div>
         </div>
 
         <div class="decision-deck">
@@ -259,7 +336,7 @@
           <button class="decision-btn btn-decision-fp" id="btn-label-fp" data-label="FALSE_ALARM">
             <div class="btn-kbd">2</div>
             <div class="btn-content">
-              <span class="btn-main">误报假动态 (FP)</span>
+              <span class="btn-main">纠偏为静态误报 (FP)</span>
               <span class="btn-desc">光影/晃动 • 降为静止快进</span>
             </div>
           </button>
@@ -267,8 +344,8 @@
           <button class="decision-btn btn-decision-fn" id="btn-label-fn" data-label="MISSED_MOTION">
             <div class="btn-kbd">3</div>
             <div class="btn-content">
-              <span class="btn-main">漏报微动有人 (FN)</span>
-              <span class="btn-desc">慢速/暗光 • 提为动态原速</span>
+              <span class="btn-main">纠偏为有人漏报 (FN)</span>
+              <span class="btn-desc">微动/暗光 • 提为动态原速</span>
             </div>
           </button>
 

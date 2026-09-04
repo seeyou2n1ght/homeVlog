@@ -56,7 +56,9 @@ def extract_and_archive_frame(
 
     start_t = float(segment.get("start_time", 0.0))
     end_t = float(segment.get("end_time", 0.0))
+    file_offset = float(segment.get("file_start_offset", 0.0) or 0.0)
     t_mid = round((start_t + end_t) / 2.0, 2)
+    local_mid = max(0.0, t_mid - file_offset) if (t_mid >= file_offset and file_offset > 0) else t_mid
 
     date_str = str(segment.get("date", "unknown"))
     cam_idx = int(segment.get("cam_index", 0))
@@ -73,7 +75,7 @@ def extract_and_archive_frame(
     if source_fp.exists() and source_fp.stat().st_size > 0:
         cmd = [
             "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-            "-ss", f"{t_mid:.3f}",
+            "-ss", f"{local_mid:.3f}",
             "-i", str(source_fp),
             "-vframes", "1",
             "-q:v", "2",

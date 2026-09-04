@@ -122,9 +122,56 @@ class AuditService:
             })
         return result
 
-    def get_anomalies(self, date: str | None = None, cam_index: int | None = None, limit: int = 60) -> list[dict[str, Any]]:
-        """获取疑难/争议切片优先队列 (Active Learning)。"""
-        return self.db.get_anomaly_segments(date=date, cam_index=cam_index, limit=limit)
+    def get_anomalies(
+        self,
+        category: str = "all",
+        date: str | None = None,
+        cam_index: int | None = None,
+        limit: int = 60,
+    ) -> list[dict[str, Any]]:
+        """获取疑难/争议切片优先队列 (Active Learning)，支持分类过滤。"""
+        return self.db.get_anomaly_segments(category=category, date=date, cam_index=cam_index, limit=limit)
+
+    def _resolve_local_timestamp(self, filepath: str, timestamp: float) -> tuple[float, float]:
+        """将绝对秒数或相对秒数换算为安全的视频文件内相对秒数，并返回 (local_t, file_duration)。"""
+        file_duration = 300.0
+        file_offset = 0.0
+        with self.db._lock:
+            try:
+                row = self.db.conn.execute(
+                    "SELECT file_duration, file_start_time FROM file_tasks WHERE filepath=?",
+                    (filepath,)
+                ).fetchone()
+                if row:
+                    file_duration = float(row["file_duration"] or 300.0)
+                    st_str = row["file_start_time"]
+                    if st_str and len(st_str) >= 14:
+                        hh = int(st_str[8:10])
+                        mm = int(st_str[10:12])
+                        ss = int(st_str[12:14])
+                        file_offset = float(hh * 3600 + mm * 60 + ss)
+            except Exception:
+                pass
+
+        if file_offset == 0.0:
+            stem = Path(filepath).stem
+            parts = stem.split("_")
+            for p in parts:
+                if len(p) == 14 and p.isdigit():
+                    hh = int(p[8:10])
+                    mm = int(p[10:12])
+                    ss = int(p[12:14])
+                    file_offset = float(hh * 3600 + mm * 60 + ss)
+                    break
+
+        local_t = float(timestamp)
+        if file_offset > 0 and local_t >= file_offset:
+            local_t = local_t - file_offset
+
+        if file_duration > 0:
+            local_t = max(0.0, min(local_t, max(0.0, file_duration - 0.1)))
+
+        return local_t, file_duration
 
     def get_file_segments(self, file_id: int | None = None, filepath: str | None = None) -> dict[str, Any]:
         """获取单个文件的所有分段与时间轴信息。"""
@@ -153,8 +200,8 @@ class AuditService:
     def extract_frame(self, filepath: str, timestamp: float, width: int = 640) -> Path | None:
         """从视频抽取指定时间点的画面并保存为 JPEG 缓存。支持文件缺失时生成优雅占位图。"""
         fp = Path(filepath)
+        placeholder = CACHE_DIR / "_file_missing_placeholder.jpg"
         if not fp.exists() or fp.stat().st_size == 0:
-            placeholder = CACHE_DIR / "_file_missing_placeholder.jpg"
             if not placeholder.exists():
                 import numpy as np
                 import cv2
@@ -167,15 +214,17 @@ class AuditService:
                 cv2.imwrite(str(placeholder), img)
             return placeholder
 
-        # 构造缓存键: 文件名_时间戳_分辨率
-        cache_name = f"{fp.stem}_{timestamp:.2f}_{width}.jpg"
+        local_t, file_duration = self._resolve_local_timestamp(filepath, timestamp)
+
+        # 构造缓存键: 文件名_相对时间戳_分辨率
+        cache_name = f"{fp.stem}_{local_t:.2f}_{width}.jpg"
         out_file = CACHE_DIR / cache_name
         if out_file.exists() and out_file.stat().st_size > 0:
             return out_file
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{timestamp:.3f}",
+            "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-ss", f"{local_t:.3f}",
             "-i", str(fp),
             "-vframes", "1",
             "-vf", f"scale={width}:-1",
@@ -184,11 +233,25 @@ class AuditService:
         ]
         try:
             res = subprocess.run(cmd, capture_output=True, timeout=10)
-            if res.returncode == 0 and out_file.exists():
+            if res.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
                 return out_file
         except Exception as e:
-            logger.error("FFmpeg frame extract failed for %s @ %.2f: %s", filepath, timestamp, e)
-        return None
+            logger.error("FFmpeg frame extract failed for %s @ %.2f (local %.2f): %s", filepath, timestamp, local_t, e)
+
+        if not placeholder.exists():
+            try:
+                import numpy as np
+                import cv2
+                img = np.zeros((360, 640, 3), dtype=np.uint8)
+                img[:] = (20, 25, 38)
+                cv2.putText(img, "FRAME EXTRACTION FAILED", (120, 170),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (239, 68, 68), 2)
+                cv2.putText(img, f"File: {fp.name}", (120, 210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (148, 163, 184), 1)
+                cv2.imwrite(str(placeholder), img)
+            except Exception:
+                pass
+        return placeholder if placeholder.exists() else None
 
     def generate_preview_clip(self, filepath: str, start_time: float, end_time: float, max_dur: float = 6.0) -> Path | None:
         """截取指定片段生成短动图 (WebP)，供浏览器直接预览。"""
@@ -196,15 +259,20 @@ class AuditService:
         if not fp.exists():
             return None
 
-        actual_dur = min(max(end_time - start_time, 1.0), max_dur)
-        cache_name = f"{fp.stem}_{start_time:.1f}_{actual_dur:.1f}.webp"
+        local_start, file_duration = self._resolve_local_timestamp(filepath, start_time)
+        local_end, _ = self._resolve_local_timestamp(filepath, end_time)
+        if local_end <= local_start:
+            local_end = min(file_duration, local_start + 4.0)
+
+        actual_dur = min(max(local_end - local_start, 1.0), max_dur)
+        cache_name = f"{fp.stem}_{local_start:.1f}_{actual_dur:.1f}.webp"
         out_file = CACHE_DIR / cache_name
         if out_file.exists() and out_file.stat().st_size > 0:
             return out_file
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", f"{start_time:.3f}",
+            "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-ss", f"{local_start:.3f}",
             "-t", f"{actual_dur:.3f}",
             "-i", str(fp),
             "-vf", "fps=10,scale=480:-1:flags=lanczos",
@@ -220,13 +288,14 @@ class AuditService:
             if res.returncode == 0 and out_file.exists():
                 return out_file
         except Exception as e:
-            logger.error("FFmpeg clip generate failed for %s @ %.1f-%.1f: %s", filepath, start_time, end_time, e)
+            logger.error("FFmpeg clip generate failed for %s @ %.1f-%.1f (local %.1f): %s", filepath, start_time, end_time, local_start, e)
         return None
 
     def detect_and_draw_yolo(self, filepath: str, timestamp: float) -> dict[str, Any]:
         """对指定帧运行高精 YOLO 推理，并在图片上绘制预测框与置信度。"""
         import cv2
-        frame_path = self.extract_frame(filepath, timestamp, width=800)
+        local_t, _ = self._resolve_local_timestamp(filepath, timestamp)
+        frame_path = self.extract_frame(filepath, local_t, width=800)
         if not frame_path or not frame_path.exists():
             return {"error": "Failed to extract frame"}
 

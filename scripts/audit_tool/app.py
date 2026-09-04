@@ -101,7 +101,10 @@ class AuditHandler(BaseHTTPRequestHandler):
         elif path == "/api/anomalies":
             limit = int(params.get("limit", [60])[0])
             dt = params.get("date", [None])[0]
-            self._send_json(service.get_anomalies(date=dt, limit=limit))
+            cat = params.get("category", ["all"])[0]
+            cam = params.get("cam_index", [None])[0]
+            cam_int = int(cam) if cam is not None else None
+            self._send_json(service.get_anomalies(category=cat, date=dt, cam_index=cam_int, limit=limit))
             return
         elif path == "/api/file_segments":
             fid = params.get("file_id", [None])[0]

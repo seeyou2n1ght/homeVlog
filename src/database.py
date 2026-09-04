@@ -319,31 +319,82 @@ class VlogDatabase:
                 logger.error("DB error in get_segment_by_id: %s", e)
                 return None
 
-    def get_anomaly_segments(self, date: str | None = None, cam_index: int | None = None, limit: int = 100) -> list[dict]:
-        """主动召回高争议与潜在误判/漏判的切片 (Active Learning 模式)"""
+    def get_anomaly_segments(
+        self,
+        category: str = "all",
+        date: str | None = None,
+        cam_index: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """主动召回高争议与潜在误判/漏判的切片，支持按错检类型多维过滤 (Active Learning 模式)。
+
+        Categories:
+            - 'all': 召回所有争议疑难切片
+            - 'fp_suspect': 疑似误报 (算法判定 DYNAMIC，但 YOLO 无目标且能量偏低，疑似光影/微尘)
+            - 'fn_suspect': 疑似漏报 (算法判定 STATIC，但能量接近临界阈值，疑似微动漏检)
+            - 'jitter': 极短毛刺 (时长 < 3.0s 的动态突变碎片)
+            - 'reviewed': 已完成人工复核的切片
+        """
         with self._lock:
             try:
-                query = """
-                    SELECT * FROM segments
-                    WHERE (
-                        (state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)
-                        OR (state = 'STATIC' AND max_energy >= 1.5 AND max_energy < 2.5)
-                        OR (duration < 3.0 AND state = 'DYNAMIC')
-                    )
-                """
+                where_clauses = []
                 params = []
+
+                if category == "fp_suspect":
+                    where_clauses.append("(state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)")
+                elif category == "fn_suspect":
+                    where_clauses.append("(state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0)")
+                elif category == "jitter":
+                    where_clauses.append("(duration < 3.0 AND state = 'DYNAMIC')")
+                elif category == "reviewed":
+                    where_clauses.append("manual_label IS NOT NULL")
+                else:  # 'all' 或默认
+                    where_clauses.append(
+                        "((state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0) "
+                        "OR (state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0) "
+                        "OR (duration < 3.0 AND state = 'DYNAMIC'))"
+                    )
+
                 if date:
-                    query += " AND date = ?"
+                    where_clauses.append("date = ?")
                     params.append(date)
                 if cam_index is not None:
-                    query += " AND cam_index = ?"
+                    where_clauses.append("cam_index = ?")
                     params.append(cam_index)
 
-                query += " ORDER BY (manual_label IS NULL) DESC, max_energy DESC LIMIT ?"
+                where_str = " AND ".join(where_clauses)
+                query = f"""
+                    SELECT * FROM segments
+                    WHERE {where_str}
+                    ORDER BY (manual_label IS NULL) DESC, max_energy DESC
+                    LIMIT ?
+                """
                 params.append(limit)
 
                 rows = self.conn.execute(query, params).fetchall()
-                return [dict(r) for r in rows]
+                results = []
+                for r in rows:
+                    item = dict(r)
+                    # 语义化标记错检原因
+                    if item.get("manual_label"):
+                        item["anomaly_type"] = "reviewed"
+                        item["reason_desc"] = f"已复核 ({item['manual_label']})"
+                    elif item.get("state") == "DYNAMIC" and float(item.get("avg_confidence", 0.0)) == 0.0 and float(item.get("max_energy", 0.0)) < 8.0:
+                        item["anomaly_type"] = "fp_suspect"
+                        item["reason_desc"] = "疑似光影刚性 (无目标置信度)"
+                    elif item.get("state") == "STATIC" and float(item.get("max_energy", 0.0)) >= 1.5 and float(item.get("max_energy", 0.0)) <= 3.0:
+                        item["anomaly_type"] = "fn_suspect"
+                        item["reason_desc"] = "疑似微动作漏判 (能量临界)"
+                    elif float(item.get("duration", 0.0)) < 3.0 and item.get("state") == "DYNAMIC":
+                        item["anomaly_type"] = "jitter"
+                        item["reason_desc"] = f"极短突发碎片 ({float(item['duration']):.1f}s)"
+                    else:
+                        item["anomaly_type"] = "other"
+                        item["reason_desc"] = "待复核样本"
+
+                    results.append(item)
+
+                return results
             except Exception as e:
                 logger.error("DB error in get_anomaly_segments: %s", e)
                 return []
