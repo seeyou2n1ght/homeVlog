@@ -227,10 +227,10 @@ class AuditService:
             "-ss", f"{local_t:.3f}",
             "-i", str(fp),
             "-vframes", "1",
-            "-vf", f"scale={width}:-1",
-            "-q:v", "3",
-            str(out_file)
         ]
+        if width > 0:
+            cmd.extend(["-vf", f"scale={width}:-1"])
+        cmd.extend(["-q:v", "2", str(out_file)])
         try:
             res = subprocess.run(cmd, capture_output=True, timeout=10)
             if res.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:

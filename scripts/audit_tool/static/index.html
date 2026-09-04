@@ -241,15 +241,19 @@
                 <span class="card-anchor">起点进入</span>
                 <span class="card-clock-badge font-mono" id="clock-start">--:--:--</span>
               </div>
-              <span class="card-ts font-mono" id="ts-start">0.00s</span>
+              <div class="card-header-right">
+                <span class="card-ts font-mono" id="ts-start">0.00s</span>
+                <button class="btn-card-zoom" id="btn-zoom-start" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+              </div>
             </div>
-            <div class="card-visual-wrapper" id="wrap-start">
+            <div class="card-visual-wrapper" id="wrap-start" title="点击全屏放大查看高清细节">
               <img id="img-start" class="frame-img hidden" alt="Start Frame" />
               <div class="img-placeholder" id="placeholder-start">
                 <span class="ph-icon">⏳</span>
                 <span class="ph-text">等待切片加载...</span>
               </div>
               <div class="img-shimmer hidden" id="shimmer-start"></div>
+              <div class="zoom-hover-hint"><span>🔍 点击放大细节</span></div>
             </div>
           </div>
 
@@ -260,9 +264,12 @@
                 <span class="card-anchor highlight">★ 峰值能量 / YOLO 检验点</span>
                 <span class="card-clock-badge highlight font-mono" id="clock-mid">--:--:--</span>
               </div>
-              <span class="card-ts font-mono highlight" id="ts-mid">0.00s</span>
+              <div class="card-header-right">
+                <span class="card-ts font-mono highlight" id="ts-mid">0.00s</span>
+                <button class="btn-card-zoom highlight" id="btn-zoom-mid" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+              </div>
             </div>
-            <div class="card-visual-wrapper hero-frame" id="wrap-mid">
+            <div class="card-visual-wrapper hero-frame" id="wrap-mid" title="点击全屏放大查看高清细节">
               <img id="img-mid" class="frame-img hidden" alt="Peak Frame" />
               <div class="img-placeholder" id="placeholder-mid">
                 <span class="ph-icon">⚡</span>
@@ -270,6 +277,7 @@
               </div>
               <div class="img-shimmer hidden" id="shimmer-mid"></div>
               <div class="hero-badge" id="hero-badge">CENTER PEAK</div>
+              <div class="zoom-hover-hint"><span>🔍 点击放大细节</span></div>
             </div>
           </div>
 
@@ -280,15 +288,19 @@
                 <span class="card-anchor">终点离开</span>
                 <span class="card-clock-badge font-mono" id="clock-end">--:--:--</span>
               </div>
-              <span class="card-ts font-mono" id="ts-end">0.00s</span>
+              <div class="card-header-right">
+                <span class="card-ts font-mono" id="ts-end">0.00s</span>
+                <button class="btn-card-zoom" id="btn-zoom-end" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+              </div>
             </div>
-            <div class="card-visual-wrapper" id="wrap-end">
+            <div class="card-visual-wrapper" id="wrap-end" title="点击全屏放大查看高清细节">
               <img id="img-end" class="frame-img hidden" alt="End Frame" />
               <div class="img-placeholder" id="placeholder-end">
                 <span class="ph-icon">⏳</span>
                 <span class="ph-text">等待切片加载...</span>
               </div>
               <div class="img-shimmer hidden" id="shimmer-end"></div>
+              <div class="zoom-hover-hint"><span>🔍 点击放大细节</span></div>
             </div>
           </div>
         </div>
@@ -475,6 +487,39 @@
           <button class="btn btn-glass" id="btn-archive-modal-close">关闭</button>
           <button class="btn btn-cyan" id="btn-archive-batch-run">⚡ 补齐全量历史归档</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 🚀 高清关键帧细节放大查看器 (High-Def Lightbox Modal) -->
+  <div class="modal-scrim hidden" id="lightbox-modal">
+    <div class="lightbox-box" id="lightbox-box">
+      <div class="lightbox-header">
+        <div class="lightbox-title-group">
+          <span class="lightbox-icon">🔍</span>
+          <h4 id="lightbox-title">关键帧高清细节放大视窗</h4>
+          <span class="lightbox-meta font-mono" id="lightbox-meta">--:--:--</span>
+          <span class="lightbox-status font-mono" id="lightbox-status">100%</span>
+        </div>
+        <div class="lightbox-controls">
+          <button class="btn-ctrl" id="btn-lightbox-zoom-in" title="放大图像 (+)">🔍＋ 放大</button>
+          <button class="btn-ctrl" id="btn-lightbox-zoom-out" title="缩小图像 (-)">🔍－ 缩小</button>
+          <button class="btn-ctrl" id="btn-lightbox-reset" title="适应窗口/复位">⊙ 复位</button>
+          <button class="btn-ctrl btn-ctrl-accent" id="btn-lightbox-actual" title="100% 原生像素对齐">1:1 原图</button>
+          <button class="btn-close" id="btn-lightbox-close" title="关闭细节视窗 (Esc)">✕</button>
+        </div>
+      </div>
+      <div class="lightbox-viewport" id="lightbox-viewport">
+        <div class="lightbox-canvas" id="lightbox-canvas">
+          <img id="lightbox-img" class="lightbox-img" alt="Zoomed Frame" />
+        </div>
+        <div class="lightbox-spinner hidden" id="lightbox-loading">
+          <div class="spin-ring"></div>
+          <span>正在极速调取高分辨率原画关键帧...</span>
+        </div>
+      </div>
+      <div class="lightbox-footer">
+        <span class="lightbox-hint font-mono">💡 鼠标滚轮缩放 • 左键按住拖拽平移 • 双击智能切换 1:1 • 按 Esc 退出</span>
       </div>
     </div>
   </div>

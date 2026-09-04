@@ -1470,3 +1470,204 @@ body {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ================== 卡片放大按钮与悬停提示 ================== */
+.card-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-card-zoom {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: all 0.16s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.btn-card-zoom:hover {
+  background: rgba(6, 182, 212, 0.2);
+  border-color: var(--color-cyan);
+  color: #fff;
+  transform: scale(1.04);
+}
+
+.btn-card-zoom.highlight {
+  background: rgba(6, 182, 212, 0.15);
+  border-color: rgba(6, 182, 212, 0.35);
+  color: #38bdf8;
+}
+
+.card-visual-wrapper {
+  cursor: zoom-in;
+}
+
+.zoom-hover-hint {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  background: rgba(5, 8, 17, 0.78);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: #cbd5e1;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: all 0.2s ease;
+  z-index: 5;
+}
+
+.card-visual-wrapper:hover .zoom-hover-hint {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ================== 🚀 高清细节放大查看器 (Lightbox) ================== */
+.lightbox-box {
+  background: #070b14;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-lg);
+  width: 94vw;
+  max-width: 1440px;
+  height: 90vh;
+  max-height: 920px;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.85);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  animation: modal-pop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modal-pop {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.lightbox-header {
+  padding: 12px 20px;
+  background: rgba(15, 23, 42, 0.85);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 10;
+}
+
+.lightbox-title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.lightbox-title-group h4 {
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  margin: 0;
+}
+
+.lightbox-icon {
+  font-size: 18px;
+}
+
+.lightbox-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.lightbox-status {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-cyan);
+  background: rgba(6, 182, 212, 0.12);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.lightbox-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lightbox-viewport {
+  flex: 1;
+  background: #020409;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+
+.lightbox-canvas {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  transform-origin: center center;
+  transition: transform 0.05s ease-out;
+}
+
+.lightbox-canvas.panning {
+  cursor: grabbing;
+}
+
+.lightbox-img {
+  max-width: 96%;
+  max-height: 96%;
+  object-fit: contain;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.lightbox-spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  background: rgba(5, 8, 17, 0.85);
+  padding: 16px 24px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(8px);
+  z-index: 20;
+}
+
+.lightbox-footer {
+  padding: 8px 18px;
+  background: rgba(15, 23, 42, 0.85);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+

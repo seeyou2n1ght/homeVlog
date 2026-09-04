@@ -39,6 +39,7 @@ const state = {
 // DOM 初始化入口
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
+  initLightbox();
   loadOverview();
   loadCategoryBadges();
   loadAnomalies();
@@ -227,6 +228,26 @@ function switchCategory(cat) {
 function handleKeydown(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
+  // 若高清细节放大视窗开启，优先响应视窗内缩放与关闭
+  if (lightboxState && lightboxState.isOpen) {
+    if (e.key === 'Escape') {
+      closeLightbox();
+      return;
+    } else if (e.key === '+' || e.key === '=') {
+      zoomLightbox(1.25);
+      return;
+    } else if (e.key === '-' || e.key === '_') {
+      zoomLightbox(0.8);
+      return;
+    } else if (e.key === '0') {
+      resetLightboxZoom();
+      return;
+    } else if (e.key === '1') {
+      setLightboxActualSize();
+      return;
+    }
+  }
+
   if (e.key === '1') {
     submitCurrentReview('CONFIRMED_MOTION');
   } else if (e.key === '2') {
@@ -251,6 +272,7 @@ function handleKeydown(e) {
     if (rModal && !rModal.classList.contains('hidden')) closeRerenderModal();
     const aModal = document.getElementById('archive-modal');
     if (aModal && !aModal.classList.contains('hidden')) closeArchiveModal();
+    if (lightboxState && lightboxState.isOpen) closeLightbox();
   }
 }
 
@@ -1527,3 +1549,236 @@ async function triggerBatchArchive() {
     btn.disabled = false;
   }
 }
+
+// ================== 🚀 高清关键帧细节放大查看器 (Lightbox Engine) ==================
+
+const lightboxState = {
+  isOpen: false,
+  scale: 1.0,
+  minScale: 0.5,
+  maxScale: 6.0,
+  translateX: 0,
+  translateY: 0,
+  isPanning: false,
+  panStartX: 0,
+  panStartY: 0,
+  startTranslateX: 0,
+  startTranslateY: 0,
+  currentPos: '',
+  currentTimestamp: 0
+};
+
+function initLightbox() {
+  const modal = document.getElementById('lightbox-modal');
+  const btnClose = document.getElementById('btn-lightbox-close');
+  const btnZoomIn = document.getElementById('btn-lightbox-zoom-in');
+  const btnZoomOut = document.getElementById('btn-lightbox-zoom-out');
+  const btnReset = document.getElementById('btn-lightbox-reset');
+  const btnActual = document.getElementById('btn-lightbox-actual');
+  const viewport = document.getElementById('lightbox-viewport');
+  const canvas = document.getElementById('lightbox-canvas');
+
+  if (btnClose) btnClose.addEventListener('click', closeLightbox);
+  if (btnZoomIn) btnZoomIn.addEventListener('click', () => zoomLightbox(1.25));
+  if (btnZoomOut) btnZoomOut.addEventListener('click', () => zoomLightbox(0.8));
+  if (btnReset) btnReset.addEventListener('click', resetLightboxZoom);
+  if (btnActual) btnActual.addEventListener('click', setLightboxActualSize);
+
+  // 点击背景外侧关闭
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closeLightbox();
+    });
+  }
+
+  // 绑定三联卡片头部放大按钮与卡片容器点击
+  ['start', 'mid', 'end'].forEach(pos => {
+    const btnZoom = document.getElementById(`btn-zoom-${pos}`);
+    if (btnZoom) {
+      btnZoom.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openLightbox(pos);
+      });
+    }
+
+    const wrap = document.getElementById(`wrap-${pos}`);
+    if (wrap) {
+      wrap.addEventListener('click', (e) => {
+        const img = document.getElementById(`img-${pos}`);
+        if (img && !img.classList.contains('hidden') && img.src) {
+          openLightbox(pos);
+        }
+      });
+    }
+  });
+
+  // 滚轮缩放画布 (以视窗中心或指针为锚点)
+  if (viewport) {
+    viewport.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = viewport.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left - rect.width / 2;
+      const mouseY = e.clientY - rect.top - rect.height / 2;
+
+      const factor = e.deltaY < 0 ? 1.2 : 0.833;
+      zoomLightboxAt(factor, mouseX, mouseY);
+    }, { passive: false });
+  }
+
+  // 鼠标拖拽平移
+  if (canvas) {
+    canvas.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      lightboxState.isPanning = true;
+      lightboxState.panStartX = e.clientX;
+      lightboxState.panStartY = e.clientY;
+      lightboxState.startTranslateX = lightboxState.translateX;
+      lightboxState.startTranslateY = lightboxState.translateY;
+      canvas.classList.add('panning');
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!lightboxState.isPanning) return;
+      const dx = e.clientX - lightboxState.panStartX;
+      const dy = e.clientY - lightboxState.panStartY;
+      lightboxState.translateX = lightboxState.startTranslateX + dx;
+      lightboxState.translateY = lightboxState.startTranslateY + dy;
+      applyLightboxTransform();
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (lightboxState.isPanning) {
+        lightboxState.isPanning = false;
+        if (canvas) canvas.classList.remove('panning');
+      }
+    });
+
+    // 双击居中复位或 2.0x 放大切换
+    canvas.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      if (Math.abs(lightboxState.scale - 1.0) < 0.15) {
+        zoomLightbox(2.0);
+      } else {
+        resetLightboxZoom();
+      }
+    });
+  }
+}
+
+function openLightbox(pos) {
+  if (state.selectedSegIndex < 0 || !state.currentFile) return;
+  const seg = state.currentSegments[state.selectedSegIndex];
+  const fp = state.currentFile.filepath;
+  const modal = document.getElementById('lightbox-modal');
+  const imgEl = document.getElementById('lightbox-img');
+  const spinner = document.getElementById('lightbox-loading');
+  const titleEl = document.getElementById('lightbox-title');
+  const metaEl = document.getElementById('lightbox-meta');
+
+  if (!modal || !imgEl) return;
+
+  lightboxState.isOpen = true;
+  lightboxState.currentPos = pos;
+  resetLightboxZoom();
+
+  // 计算时间戳与语义标题
+  let timestamp = seg.start_time;
+  let posName = '起点进入时刻 (Start Frame)';
+  if (pos === 'mid') {
+    timestamp = (seg.start_time + seg.end_time) / 2.0;
+    posName = '★ 核心峰值能量时刻 (Peak Frame / YOLO 检验点)';
+  } else if (pos === 'end') {
+    timestamp = Math.max(seg.end_time - 0.1, seg.start_time);
+    posName = '终点离开时刻 (End Frame)';
+  }
+  lightboxState.currentTimestamp = timestamp;
+
+  const firstStart = state.currentSegments[0].start_time;
+  const isDayOffset = (firstStart >= 3600);
+  const baseOffset = isDayOffset ? firstStart : 0;
+  const relTime = isDayOffset ? (timestamp - baseOffset) : timestamp;
+  const clockTime = formatClockTime(state.timeline.fileOffsetSec + relTime);
+  const fn = (fp || '').split('\\').pop().split('/').pop();
+
+  if (titleEl) titleEl.innerText = posName;
+  if (metaEl) metaEl.innerText = `${clockTime} (${relTime.toFixed(2)}s) • ${fn}`;
+
+  modal.classList.remove('hidden');
+
+  // 先挂载当前已有图片作为瞬时底图预览，防止白屏等待
+  const cardImg = document.getElementById(`img-${pos}`);
+  if (cardImg && cardImg.src && !cardImg.classList.contains('hidden')) {
+    imgEl.src = cardImg.src;
+  }
+
+  // 若中继帧已具备 YOLO 增强画框结果，直接采用画框图供用户微距检阅
+  if (pos === 'mid' && cardImg && cardImg.src && (cardImg.src.includes('yolo') || cardImg.src.includes('data:image'))) {
+    imgEl.src = cardImg.src;
+    if (spinner) spinner.classList.add('hidden');
+    return;
+  }
+
+  // 异步获取 1080P/超高清原画关键帧
+  if (spinner) spinner.classList.remove('hidden');
+  const hdSrc = `/api/frame?filepath=${encodeURIComponent(fp)}&t=${timestamp.toFixed(3)}&w=1920`;
+  const tempImg = new Image();
+  tempImg.onload = () => {
+    imgEl.src = hdSrc;
+    if (spinner) spinner.classList.add('hidden');
+  };
+  tempImg.onerror = () => {
+    if (spinner) spinner.classList.add('hidden');
+  };
+  tempImg.src = hdSrc;
+}
+
+function closeLightbox() {
+  lightboxState.isOpen = false;
+  const modal = document.getElementById('lightbox-modal');
+  if (modal) modal.classList.add('hidden');
+}
+
+function resetLightboxZoom() {
+  lightboxState.scale = 1.0;
+  lightboxState.translateX = 0;
+  lightboxState.translateY = 0;
+  applyLightboxTransform();
+}
+
+function setLightboxActualSize() {
+  lightboxState.scale = 1.5;
+  lightboxState.translateX = 0;
+  lightboxState.translateY = 0;
+  applyLightboxTransform();
+}
+
+function zoomLightbox(factor) {
+  const newScale = Math.max(lightboxState.minScale, Math.min(lightboxState.maxScale, lightboxState.scale * factor));
+  lightboxState.scale = newScale;
+  applyLightboxTransform();
+}
+
+function zoomLightboxAt(factor, mouseX, mouseY) {
+  const oldScale = lightboxState.scale;
+  const newScale = Math.max(lightboxState.minScale, Math.min(lightboxState.maxScale, oldScale * factor));
+  if (Math.abs(newScale - oldScale) < 1e-4) return;
+
+  const scaleRatio = newScale / oldScale;
+  lightboxState.translateX = mouseX - (mouseX - lightboxState.translateX) * scaleRatio;
+  lightboxState.translateY = mouseY - (mouseY - lightboxState.translateY) * scaleRatio;
+  lightboxState.scale = newScale;
+
+  applyLightboxTransform();
+}
+
+function applyLightboxTransform() {
+  const canvas = document.getElementById('lightbox-canvas');
+  const statusEl = document.getElementById('lightbox-status');
+  if (canvas) {
+    canvas.style.transform = `translate(${lightboxState.translateX}px, ${lightboxState.translateY}px) scale(${lightboxState.scale})`;
+  }
+  if (statusEl) {
+    statusEl.innerText = `${Math.round(lightboxState.scale * 100)}%`;
+  }
+}
+
