@@ -70,6 +70,7 @@ class StreamingOrchestrator:
         # 状态控制
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
+        self.render_finished_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
         self.error_lock = threading.Lock()
@@ -416,13 +417,21 @@ class StreamingOrchestrator:
                     continue
 
                 b_idx, files_to_batch = item
+                if self.abort_event.is_set():
+                    break
                 if not render_start_t:
                     render_start_t.append(time.monotonic())
                 t_r0 = time.monotonic()
                 if gpu == "nv":
                     self.work_stealing.register_render_start()
                 try:
-                    all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+                    all_rows = []
+                    try:
+                        all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+                    except Exception as e:
+                        if self.abort_event.is_set():
+                            break
+                        logger.warning("DB query failed for batch %d: %s", b_idx, e)
                     from src.timeline import build_timeline_from_rows
                     batch_segs = build_timeline_from_rows(
                         all_rows, self.date, target_files=files_to_batch, config=self.config
@@ -540,29 +549,32 @@ class StreamingOrchestrator:
                     batch_idx += 1
             self.render_batch_queue.task_done()
 
-        # 消费循环结束：flush 窗口中剩余的就绪文件（含 head 未达队尾的兜底场景）
-        if pending_files:
-            _enqueue_batch(batch_idx, list(pending_files))
-            pending_files = []
+        try:
+            # 消费循环结束：flush 窗口中剩余的就绪文件（含 head 未达队尾的兜底场景）
+            if pending_files:
+                _enqueue_batch(batch_idx, list(pending_files))
+                pending_files = []
 
-        all_dispatched_event.set()
+            all_dispatched_event.set()
 
-        for _ in render_threads:
-            heavy_queue.put(None)
-            light_queue.put(None)
-        for t in render_threads:
-            t.join()
+            for _ in render_threads:
+                heavy_queue.put(None)
+                light_queue.put(None)
+            for t in render_threads:
+                t.join()
 
-        # 渲染对账：分发批次必须全部到达终态（产出或已上报失败），
-        # 任何无记录的缺失即为静默丢批，立即上报
-        with self.batch_lock:
-            produced_ids = {bi for bi, _ in self.batch_paths}
-            accounted = produced_ids | terminal_batch_ids
-        missing = [bi for bi in dispatched_batch_ids if bi not in accounted]
-        if missing:
-            self._add_error(f"render batches silently dropped: {missing}")
-            logger.error("render reconciliation failed: dispatched=%s produced=%s missing=%s",
-                         dispatched_batch_ids, sorted(produced_ids), missing)
+            # 渲染对账：分发批次必须全部到达终态（产出或已上报失败），
+            # 任何无记录的缺失即为静默丢批，立即上报
+            with self.batch_lock:
+                produced_ids = {bi for bi, _ in self.batch_paths}
+                accounted = produced_ids | terminal_batch_ids
+            missing = [bi for bi in dispatched_batch_ids if bi not in accounted]
+            if missing:
+                self._add_error(f"render batches silently dropped: {missing}")
+                logger.error("render reconciliation failed: dispatched=%s produced=%s missing=%s",
+                             dispatched_batch_ids, sorted(produced_ids), missing)
+        finally:
+            self.render_finished_event.set()
 
 
     def run(self):
@@ -641,10 +653,18 @@ class StreamingOrchestrator:
             _wait_queue_interruptible(self.analysis_queue)
             if self.render_enabled:
                 _wait_queue_interruptible(self.render_batch_queue)
+            # 通知上游与调度管理器：所有输入队列消费完毕，准备收尾
+            self.stop_event.set()
+            if self.render_enabled:
+                # 等待所有分发的渲染批次真正执行完成并完成对账
+                while not self.abort_event.is_set():
+                    if self.render_finished_event.wait(timeout=0.2):
+                        break
         except (KeyboardInterrupt, SystemExit):
             logger.warning("StreamingOrchestrator interrupted by user (Ctrl+C). Terminating subprocesses...")
             self.abort_event.set()
             self.stop_event.set()
+            self.render_finished_event.set()
             from src.renderer import FFmpegProcessRegistry
             FFmpegProcessRegistry.kill_all()
             if self.dashboard is not None:
@@ -655,7 +675,7 @@ class StreamingOrchestrator:
 
         self.stop_event.set()
         for t in threads:
-            t.join(timeout=2.0)
+            t.join(timeout=5.0)
 
         if self.dashboard is not None:
             self.dashboard.stop()
@@ -729,20 +749,6 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         db.set_render_status(date, cam_index, "FAILED")
         return False
 
-    db.upsert_render_task(date, cam_index, "RENDERING")
-    try:
-        if len(batch_paths) == 1:
-            batch_paths[0].rename(output_path)
-            ok = True
-        else:
-            ok = concat_output_files(batch_paths, output_path)
-            for p in batch_paths:
-                p.unlink(missing_ok=True)
-    except Exception:
-        logger.exception("finalize render output failed")
-        db.set_render_status(date, cam_index, "FAILED")
-        return False
-
     elapsed_wall = time.monotonic() - t_start
     # 运行期间的告警与异常汇总 (含管线内部错误)
     with orchestrator.error_lock:
@@ -750,53 +756,69 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     if run_errors:
         print_error_summary(run_errors)
 
-    if ok:
-        # 渲染批次级失败（含对账缺失）的日期不标记 COMPLETED，
-        # 使下次运行自动重跑补齐，避免"带洞成片"被永久封存
-        render_batch_errors = [
-            e for e in run_errors
-            if e.startswith("render batch") or e.startswith("render batches silently dropped")
-        ]
-        if render_batch_errors:
-            logger.error(
-                "render %s cam%d completed with %d batch failures, marking FAILED for retry: %s",
-                date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
-            )
-            db.set_render_status(date, cam_index, "FAILED")
-            _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
-            return False
-
-        # 生成外挂 SRT 字幕：播放时间轴 → 真实监控墙钟时间映射（含 ramping 非线性还原）
-        if config.get("render", {}).get("generate_subtitles", False):
-            try:
-                from src.timeline import build_timeline, save_timecode_subtitles
-                full_timeline = build_timeline(db, date, cam_index)
-                save_timecode_subtitles(
-                    full_timeline,
-                    output_path.with_suffix(".srt"),
-                    rows=all_tasks,
-                    base_date=date,
-                )
-            except Exception as e:
-                logger.warning("save_timecode_subtitles failed: %s", e)
-
-        db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
-        print_summary_card(
-            date=date,
-            cam_index=cam_index,
-            total_files=total_files,
-            total_input_dur=total_input_dur,
-            output_path=output_path,
-            elapsed_wall=elapsed_wall,
-            cam_name=cam_display,
+    # 渲染批次级失败（含对账缺失）严禁合成半成品或删除已成批次
+    render_batch_errors = [
+        e for e in run_errors
+        if e.startswith("render batch") or e.startswith("render batches silently dropped")
+    ]
+    if render_batch_errors:
+        logger.error(
+            "render %s cam%d has %d batch failures, aborting concat to preserve valid batches for resume: %s",
+            date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
         )
-        logger.info("Pipeline %s cam%d finished in %.1fs", date, cam_index, elapsed_wall)
-    else:
         db.set_render_status(date, cam_index, "FAILED")
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+        return False
+
+    db.upsert_render_task(date, cam_index, "RENDERING")
+    try:
+        if len(batch_paths) == 1:
+            batch_paths[0].rename(output_path)
+            ok = True
+        else:
+            ok = concat_output_files(batch_paths, output_path)
+            if ok:
+                for p in batch_paths:
+                    p.unlink(missing_ok=True)
+            else:
+                logger.error("concat_output_files failed for %s cam%d", date, cam_index)
+                db.set_render_status(date, cam_index, "FAILED")
+                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+                return False
+    except Exception:
+        logger.exception("finalize render output failed")
+        db.set_render_status(date, cam_index, "FAILED")
+        return False
+
+    # 生成外挂 SRT 字幕：播放时间轴 → 真实监控墙钟时间映射（含 ramping 非线性还原）
+    if config.get("render", {}).get("generate_subtitles", False):
+        try:
+            from src.timeline import build_timeline, save_timecode_subtitles
+            full_timeline = build_timeline(db, date, cam_index)
+            save_timecode_subtitles(
+                full_timeline,
+                output_path.with_suffix(".srt"),
+                rows=all_tasks,
+                base_date=date,
+            )
+        except Exception as e:
+            logger.warning("save_timecode_subtitles failed: %s", e)
+
+    db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
+    print_summary_card(
+        date=date,
+        cam_index=cam_index,
+        total_files=total_files,
+        total_input_dur=total_input_dur,
+        output_path=output_path,
+        elapsed_wall=elapsed_wall,
+        cam_name=cam_display,
+    )
+    logger.info("Pipeline %s cam%d finished in %.1fs", date, cam_index, elapsed_wall)
 
     _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-               headline=_build_headline(output_path, total_input_dur, elapsed_wall) if ok else None)
-    return ok
+               headline=_build_headline(output_path, total_input_dur, elapsed_wall))
+    return True
 
 
 def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float, headline: dict | None = None):

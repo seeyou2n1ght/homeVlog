@@ -265,3 +265,43 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
+    def test_orchestrator_waits_for_render_finished_event(self, tmp_path):
+        """验证 StreamingOrchestrator.run() 必须等待 render_finished_event，不因 render_batch_queue 瞬时清空提前退出。"""
+        db_path = tmp_path / "test_wait_render.db"
+        db = VlogDatabase(db_path=db_path)
+
+        # 准备 4 个预筛为 STATIC 的任务
+        for i in range(4):
+            start = f"20260901{i:02d}0000"
+            end = f"20260901{i:02d}0500"
+            fname = f"cam0_{start}_{end}.mp4"
+            db.add_file_task(fname, 0, "20260901", start, end, 300.0)
+            db.set_prescreen_result(fname, "STATIC")
+
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "prescreen_gpu_policy": "qsv_only"},
+            "render": {"batch_max_files": 2},
+            "detection": {"prescreen_parallel": 1, "analysis_max_workers": 1},
+        }
+        orch = StreamingOrchestrator(
+            db=db, date="20260901", cam_index=0, config=cfg, render_enabled=True, dashboard_enabled=False
+        )
+
+        render_done_flag = [False]
+
+        def _delayed_render(segs, bi, *args, **kwargs):
+            time.sleep(0.3)
+            render_done_flag[0] = True
+            return f"mock_batch_{bi}.mp4"
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=_delayed_render):
+                paths = orch.run()
+                # 只有当 batch 真正被渲染完且设置 render_finished_event 后，run 才能返回
+                assert render_done_flag[0] is True
+                assert len(paths) == 2
+                assert len(orch.batch_paths) == 2
+        finally:
+            db.close()
+
+

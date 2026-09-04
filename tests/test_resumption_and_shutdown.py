@@ -99,3 +99,32 @@ def test_streaming_orchestrator_immediate_abort_on_event(tmp_path):
         assert paths == []
     finally:
         db.close()
+
+
+def test_render_batch_error_preserves_batches_and_aborts_concat(tmp_path):
+    from src.pipeline import process_date_cam
+    db_path = tmp_path / 'test_fail_preserve.db'
+    db = VlogDatabase(db_path=db_path)
+    b0 = tmp_path / '_batch0_20260901_cam0.mp4'
+    b0.write_bytes(b'valid batch content')
+
+    try:
+        db.add_file_task('f1.mp4', 0, '20260901', '20260901000000', '20260901000500', 300.0)
+        with patch('src.pipeline.StreamingOrchestrator') as mock_orch_cls:
+            mock_orch = MagicMock()
+            mock_orch_cls.return_value = mock_orch
+            mock_orch.run.return_value = [b0]
+            mock_orch.error_lock = threading.Lock()
+            mock_orch.errors = ['render batch 1 failed on nv']
+
+            with patch('src.pipeline.concat_output_files') as mock_concat:
+                ok = process_date_cam(db, '20260901', 0, dashboard_enabled=False)
+                assert not ok
+                # 严禁执行 concat，严禁删除已成功产出的 batch 0
+                assert not mock_concat.called
+                assert b0.exists()
+                # 状态必须打标为 FAILED
+                assert not db.is_render_completed('20260901', 0)
+    finally:
+        db.close()
+

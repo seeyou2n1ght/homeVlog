@@ -411,7 +411,7 @@ class MotionDetector:
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
         _t_sem = time.monotonic()
-        _sem_ok = acquire_with_retry(io_sem)
+        _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
         sem_wait = round(time.monotonic() - _t_sem, 2)
         if not _sem_ok:
             logger.warning(
@@ -537,7 +537,7 @@ class MotionDetector:
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
         _t_sem = time.monotonic()
-        _sem_ok = acquire_with_retry(io_sem)
+        _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
         sem_wait = round(time.monotonic() - _t_sem, 2)
         if not _sem_ok:
             logger.warning(
