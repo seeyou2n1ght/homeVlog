@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from src.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args
-from src.scheduler import acquire_with_retry
+from src.scheduler import acquire_with_retry, VideoLease
 from src.utils import parse_res
 
 logger = logging.getLogger("homevlog")
@@ -35,7 +35,14 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
         vframes=1,
         gpu=gpu,
     )
-    result = run_ffmpeg(args, timeout=timeout)
+    from src.scheduler import get_qsv_semaphore, get_nv_semaphore
+    hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
+    if not acquire_with_retry(hardware):
+        return None
+    try:
+        result = run_ffmpeg(args, timeout=timeout)
+    finally:
+        hardware.release()
     if result.returncode != 0:
         logger.error("FFmpeg extract_frame failed for %s at %.1f: %s", filepath, timestamp, result.stderr_text[-500:])
         return None
@@ -51,8 +58,8 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
 def _calc_dynamic_threshold(base_threshold: float, mean_luma: float, is_prior_active: bool = False) -> float:
     """计算综合光照（暗光/强光）与时间邻域先验保护后的自适应判定阈值。"""
     if mean_luma < 50.0:
-        # 暗光 / 红外夜视低动态范围场景: 灵敏度上调 (阈值下调 60%)
-        dyn = max(2.0, base_threshold * 0.4)
+        # 暗光 / 红外夜视低动态范围场景: 提升灵敏度以捕捉微弱动态
+        dyn = max(2.0, base_threshold * 0.40)
     elif mean_luma > 180.0:
         # 逆光 / 强光噪点密集场景: 适当抑制噪点上浮
         dyn = base_threshold * 1.25
@@ -94,6 +101,7 @@ def _prescreen_keyframes(
     threshold: float,
     gpu: str = "qsv",
     is_prior_active: bool = False,
+    width: int = 320, height: int = 180, timeout: float = 120.0,
 ) -> dict:
     """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带自适应动态阈值与空间集中度早停机制。"""
     import av
@@ -114,7 +122,7 @@ def _prescreen_keyframes(
 
     effective_threshold = threshold
     try:
-        with av.open(str(filepath), options={"buffer_size": "2097152"}) as container:
+        with av.open(str(filepath), options={"buffer_size": "2097152"}, timeout=30.0) as container:
             if not container.streams.video:
                 return {"status": "FAILED", "error": "No video stream", "has_audio": 0}
             has_audio = 1 if len(container.streams.audio) > 0 else 0
@@ -126,9 +134,19 @@ def _prescreen_keyframes(
             concentrations: list[float] = []
             mean_lumas: list[float] = []
             k = 0
+            # 关键帧稀疏步长采样：按 max_keyframes 均匀稀疏采样（默认目标 20 帧），杜绝遍历上千关键帧
+            target_samples = max(10, max_keyframes) if max_keyframes > 0 else 20
+            est_keyframes = max(1, int(duration / 2.5))
+            kf_step = max(1, est_keyframes // target_samples)
+
             for frame in container.decode(stream):
-                y_raw = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape((frame.height, frame.width))
-                curr_frame = y_raw[::8, ::8]
+                k += 1
+                if k > 1 and (k - 1) % kf_step != 0:
+                    continue
+                y_raw = frame.to_ndarray(format="gray")
+                curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_AREA)
+                if time.monotonic() - _t_sem > timeout:
+                    return {"status": "SUSPICIOUS", "has_audio": has_audio, "error": "prescreen coverage timeout"}
 
                 t_frame = float(frame.pts * stream.time_base) if (frame.pts is not None and stream.time_base) else float(k)
                 sample_ts.append(t_frame)
@@ -157,17 +175,31 @@ def _prescreen_keyframes(
                 concentration = _calc_spatial_concentration(active_map)
                 concentrations.append(concentration)
 
-                # 空间集中度智能早停:
-                # 1. 突破阈值且具备局部高能集中性 (concentration >= 1.35)
-                # 2. 或绝对能量极大 (d >= current_threshold * 1.6)
+                # 空间集中度智能早停与双轨防漏检保护:
+                # 1. 时间邻域先验保护下放宽集中度门限至 1.15
+                # 2. 局部高能集中 (concentration >= conc_thresh)
+                # 3. 或全图绝对差分极大 (d >= current_threshold * 1.5)
+                # 4. 或任意 4x4 局部网格单点峰值突破安全门限 (max_cell_energy >= current_threshold * 1.8)
+                conc_thresh = 1.15 if is_prior_active else 1.35
+                h, w = active_map.shape[:2]
+                gh, gw = max(1, h // 4), max(1, w // 4)
+                max_cell_energy = max(
+                    [float(np.mean(active_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]))
+                     for r in range(4) for c in range(4)]
+                ) if active_map.size > 0 else 0.0
+
                 is_motion = False
                 if d > current_threshold:
-                    if concentration >= 1.35 or d >= current_threshold * 1.6:
+                    if (
+                        concentration >= conc_thresh
+                        or d >= current_threshold * 1.5
+                        or max_cell_energy >= current_threshold * 1.8
+                    ):
                         is_motion = True
                     else:
                         logger.debug(
-                            "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f",
-                            Path(filepath).name, d, current_threshold, concentration
+                            "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
+                            Path(filepath).name, d, current_threshold, concentration, max_cell_energy
                         )
 
                 if is_motion:
@@ -190,8 +222,7 @@ def _prescreen_keyframes(
 
                 prev_frame = curr_frame
                 k += 1
-                if k >= max_keyframes:
-                    break
+                # A negative decision requires reaching EOF, never just the first N keyframes.
     except Exception as e:
         logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
         return {"status": "FALLBACK", "error": str(e), "has_audio": has_audio}
@@ -199,7 +230,7 @@ def _prescreen_keyframes(
         io_sem.release()
 
     if not diffs:
-        return {"status": "STATIC", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "diffs": [], "early_stop": False, "sem_wait": sem_wait})}
+        return {"status": "SUSPICIOUS", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "reason": "insufficient_samples", "diffs": [], "sem_wait": sem_wait})}
 
     max_diff = max(diffs)
     # 所有检查帧均未满足局部动作条件（弥散光影已在循环中成功抑制），判定为静止
@@ -242,29 +273,18 @@ def prescreen_file(
         actual_dur = get_duration(filepath)
         if actual_dur is not None and actual_dur > 0:
             duration = actual_dur
-    if mode in ("keyframes", "stream_fps", "auto"):
+    if mode in ("keyframes", "auto"):
         kf_res = _prescreen_keyframes(
             filepath=filepath,
             duration=duration,
-            max_keyframes=min(segments, 15),
+            max_keyframes=segments,
+            width=width, height=height, timeout=det_cfg.get("prescreen_extract_timeout", 120.0),
             threshold=threshold,
             gpu=gpu,
             is_prior_active=is_prior_active,
         )
         if kf_res.get("status") != "FALLBACK":
             return kf_res
-        if mode == "stream_fps":
-            return _prescreen_stream_fps(
-                filepath,
-                duration,
-                segments,
-                width,
-                height,
-                threshold,
-                gpu,
-                timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
-                is_prior_active=is_prior_active,
-            )
     elif mode == "stream_fps":
         return _prescreen_stream_fps(
             filepath,
@@ -401,10 +421,10 @@ def _prescreen_stream_fps(
 
     if gpu == "qsv":
         from src.utils import get_qsv_semaphore
-        io_sem = get_qsv_semaphore()
+        io_sem = VideoLease(get_qsv_semaphore())
     else:
         from src.utils import get_nv_semaphore
-        io_sem = get_nv_semaphore()
+        io_sem = VideoLease(get_nv_semaphore())
 
     stderr_lines: list[str] = []
     diffs: list[float] = []
@@ -417,8 +437,11 @@ def _prescreen_stream_fps(
     if not acquire_with_retry(io_sem):
         logger.warning("prescreen stream_fps: io semaphore acquire timeout for %s", filepath)
         return {"status": "FAILED", "error": "io semaphore acquire timeout"}
+    from src.renderer import FFmpegProcessRegistry
+    process_key = f"prescreen:{filepath}:{time.monotonic()}"
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        FFmpegProcessRegistry.register(process_key, proc)
 
         def _read_stderr():
             if proc and proc.stderr:
@@ -515,7 +538,13 @@ def _prescreen_stream_fps(
                 proc.stderr.close()
             stderr_thread.join(timeout=2)
     finally:
-        io_sem.release()
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        finally:
+            FFmpegProcessRegistry.deregister(process_key)
+            io_sem.release()
 
     if proc and proc.returncode not in (0, None):
         err = "".join(stderr_lines[-5:])

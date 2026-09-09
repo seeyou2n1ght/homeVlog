@@ -12,7 +12,6 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
 
 # 确保项目根目录在 sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -81,8 +80,9 @@ def apply_custom_model_to_config(config_path: Path, model_path: Path) -> bool:
         data["yolo"]["enabled"] = True
         data["yolo"]["model_path"] = rel_model
 
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+        temporary = config_path.with_suffix(".yaml.tmp")
+        temporary.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        temporary.replace(config_path)
 
         logger.info("[Success] 成功更新 %s: yolo.model_path = %s", config_path.name, rel_model)
         return True
@@ -129,7 +129,7 @@ def run_training(
             epochs=epochs,
             batch=batch,
             imgsz=imgsz,
-            freeze=freeze,
+            freeze=10,
             device=device,
             amp=True,
             workers=2,
@@ -160,6 +160,27 @@ def run_training(
         return None
 
 
+def evaluate_candidate(base_model: Path, candidate: Path, validation_data: Path, training_data: Path | None = None) -> bool:
+    """A separately reviewed holdout is required before updating production config."""
+    import json
+    from ultralytics import YOLO
+    manifest = json.loads((validation_data.parent / "manifest.json").read_text(encoding="utf-8"))
+    validation = [r for r in manifest if r.get("split") == "val"]
+    if not validation or any(r.get("label_source") not in {"human_boxes", "human_negative"} for r in validation):
+        raise ValueError("Holdout requires human-reviewed boxes/negatives and provenance")
+    if training_data is None:
+        raise ValueError("Training provenance is required for an independent holdout")
+    training = json.loads((training_data.parent / "manifest.json").read_text(encoding="utf-8"))
+    if {r["source_video"] for r in training} & {r["source_video"] for r in validation}:
+        raise ValueError("Holdout source videos overlap with training data")
+    baseline = YOLO(str(base_model)).val(data=str(validation_data), split="val", verbose=False)
+    updated = YOLO(str(candidate)).val(data=str(validation_data), split="val", verbose=False)
+    passed = updated.box.mr >= baseline.box.mr and updated.box.mp >= baseline.box.mp
+    logger.info("Holdout recall %.4f -> %.4f, precision %.4f -> %.4f; accepted=%s",
+                baseline.box.mr, updated.box.mr, baseline.box.mp, updated.box.mp, passed)
+    return passed
+
+
 def main():
     parser = argparse.ArgumentParser(description="HomeVlog 专属机位 YOLO 小样本微调训练流")
     parser.add_argument("--data", type=Path, default=PROJECT_ROOT / "data" / "yolo_dataset" / "data.yaml", help="数据集 data.yaml 路径")
@@ -167,13 +188,16 @@ def main():
     parser.add_argument("--output-model", type=Path, default=PROJECT_ROOT / "models" / "yolo11_custom.pt", help="微调输出权重保存路径")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数 (默认 30)")
     parser.add_argument("--batch", type=int, default=16, help="批次大小 (默认 16)")
-    parser.add_argument("--freeze", type=int, default=10, help="冻结主干特征层数 (默认 10)")
+    parser.add_argument("--freeze", type=int, choices=[10], default=10, help="冻结主干特征层数 (强制 10)")
     parser.add_argument("--device", type=str, default="0", help="训练设备 (0 或 cpu)")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "settings.yaml", help="配置文件路径")
+    parser.add_argument("--validation-data", type=Path, help="Independent human-reviewed holdout data.yaml required by --apply")
     parser.add_argument("--apply", action="store_true", help="训练完成后自动热替换配置文件中的 yolo.model_path")
     parser.add_argument("--dry-run", action="store_true", help="仅验证环境与数据集，不实际启动训练")
 
     args = parser.parse_args()
+    if args.apply and not args.validation_data:
+        parser.error("--apply requires --validation-data (independent reviewed holdout)")
 
     print("\n" + "=" * 65)
     print(" [YOLO Fine-Tuning] HomeVlog 本地小样本迁移学习微调工具")
@@ -216,7 +240,7 @@ def main():
         print(f" 模型路径: {best_model_path}")
         print("=" * 65 + "\n")
 
-        if args.apply:
+        if args.apply and evaluate_candidate(args.base_model, best_model_path, args.validation_data, args.data):
             apply_custom_model_to_config(args.config, best_model_path)
     else:
         print("\n[!] 训练未完成或未生成有效权重。\n")

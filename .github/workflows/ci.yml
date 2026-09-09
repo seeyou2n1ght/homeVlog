@@ -1,0 +1,17 @@
+name: Regression
+on:
+  push:
+  pull_request:
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: choco install ffmpeg --yes --no-progress
+      - run: uv run ruff check main.py src scripts tests
+      - run: uv run python -m compileall main.py src scripts
+      - run: uv run python -m pytest tests/

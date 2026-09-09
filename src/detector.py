@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -8,9 +9,8 @@ import av
 import cv2
 import numpy as np
 
-from src.utils import parse_res, ts_to_unix
-from src.monitor import get_perf, PerfRecord
-from src.scheduler import acquire_with_retry
+from src.utils import parse_res
+from src.scheduler import acquire_with_retry, VideoLease
 from src.ffmpeg import run_ffmpeg
 
 # 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.filters 提供（单一实现，防漂移）。
@@ -35,6 +35,21 @@ __all__ = [
 logger = logging.getLogger("homevlog")
 
 
+def detect_audio_activity(filepath: str, duration: float, config: dict):
+    """Run the bounded audio-only gate used for visually static files.
+
+    This avoids a second video decode for files whose full-frame prescreen is
+    already static while preserving the conservative rule that an audio event
+    keeps the file on the analysis path.
+    """
+    detector = MotionDetector(config, decode_gpu="cpu")
+    detector.has_audio_detected = 1
+    features = detector._decode_audio_pipe(filepath, duration)
+    if not features.size:
+        return [], {}
+    return detector.vad.detect_events(features)
+
+
 class MotionDetector:
     def __init__(self, config: dict, decode_gpu: str = "cuda"):
         det = config.get("detection", {})
@@ -42,6 +57,7 @@ class MotionDetector:
         self.width, self.height = parse_res(det.get("analysis_resolution", "640x360"))
         self.fps = det.get("analysis_fps", 5)
         self.sensitivity = det.get("motion_sensitivity", 4.0)
+        self.min_motion_threshold = float(det.get("min_motion_threshold", 2.5))
         self.roi = det.get("roi_crop", [0.1, 0.12, 0.8, 0.85])
         self.min_motion_frames = det.get("min_motion_frames", 3)
         self.min_static_frames = det.get("min_static_frames", 5)
@@ -73,12 +89,6 @@ class MotionDetector:
         self.cell_noise_alpha = det.get("cell_noise_alpha", 0.02)
         self.base_noise_thresh = det.get("base_noise_thresh", 1.5)
         self.cluster_boost = det.get("cluster_boost", 1.2)
-
-        # R2: 早停与时空置信度衰减保护
-        self.early_term_enabled = det.get("analysis_early_term_enabled", True)
-        self.early_term_window = det.get("analysis_early_term_window", 30)
-        self.early_term_threshold = det.get("analysis_early_term_threshold", 2.0)
-        self.early_term_cooldown_guard = det.get("early_term_cooldown_guard", True)
 
         # R3: 音频 VAD 多模态事件唤醒 (Audio-Assisted Activity Detection)
         audio_cfg = config.get("audio_vad", {})
@@ -123,9 +133,11 @@ class MotionDetector:
 
         # YOLO 联动推理开关与采样参数
         yolo_cfg = config.get("yolo", {})
-        self.yolo_enabled = yolo_cfg.get("enabled", False)
+        self.yolo_enabled = yolo_cfg.get("enabled", False) and yolo_cfg.get("streaming_verify", True)
         self.yolo_sample_fps = float(yolo_cfg.get("sample_fps", 0.5))
+        self.yolo_max_frames = max(1, int(yolo_cfg.get("max_frames_per_file", 512)))
 
+        self.buffer_limit = int(det.get("analysis_buffer_mb", 256) * 1024 * 1024)
         self.last_perf: dict = {}
 
 
@@ -168,22 +180,13 @@ class MotionDetector:
         dt = 1.0 / effective_fps if effective_fps > 0 else 0.2
         frame_interval = dt
 
-        roi_x = int(self.width * self.roi[0])
-        roi_y = int(self.height * self.roi[1])
-        roi_w = int(self.width * self.roi[2])
-        roi_h = int(self.height * self.roi[3])
-
-        ema_model = self.create_ema_model()
-        grid_filter = self.create_grid_filter()
-        prev_gray: np.ndarray | None = None
-        consecutive_static = 0
+        from src.motion_trace import MotionTrace
         early_terminated = False
-        energies: list[float] = []
 
         # R3: Audio VAD event extraction if audio buffer provided
         audio_events: list[tuple[float, float, str]] = []
         vad_stats: dict = {}
-        if self.audio_vad_enabled and audio_data is not None and len(audio_data) > 0:
+        if self.audio_vad_enabled and audio_data is not None and audio_data.size > 0:
             vad_detector = AudioEnergyVAD(
                 sample_rate=audio_sample_rate,
                 window_ms=self.vad_window_ms,
@@ -196,82 +199,35 @@ class MotionDetector:
                 audio_data, start_offset=start_offset
             )
 
-        for i, frame in enumerate(frames):
-            t_curr = start_offset + min(i * frame_interval, file_duration if file_duration > 0 else 999999.0)
-
-            if len(frame.shape) == 3:
-                gray = cv2.cvtColor(
-                    cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_NEAREST),
-                    cv2.COLOR_RGB2GRAY if frame.shape[2] == 3 else cv2.COLOR_BGR2GRAY,
-                )
-            else:
-                gray = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-
-            roi = gray[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
-
-            if self.ema_enabled:
-                saliency, _, _ = ema_model.update(roi)
-            else:
-                if prev_gray is not None:
-                    saliency = cv2.absdiff(roi, prev_gray).astype(np.float32)
-                else:
-                    saliency = np.zeros_like(roi, dtype=np.float32)
-                prev_gray = roi
-
-            # is_night_mode 等新参数按默认值（白天模式）处理，保持最小变更
-            eff_energy, is_grid_motion, _ = grid_filter.process_frame(saliency, dt)
-            energies.append(eff_energy)
-
-            if is_grid_motion:
-                consecutive_static = 0
-            else:
-                consecutive_static += 1
-
-            # Early termination check with Audio VAD VETO
-            if self.early_term_enabled and len(energies) >= self.early_term_window:
-                is_audio_active_now = False
-                if audio_events:
-                    for ev_start, ev_end, _ in audio_events:
-                        if ev_end >= (t_curr - 0.2):
-                            is_audio_active_now = True
-                            break
-
-                if is_audio_active_now:
-                    # Audio VAD Veto: Do not early terminate while speech/audio is ongoing or upcoming
-                    can_term = False
-                elif self.early_term_cooldown_guard:
-                    can_term = grid_filter.can_early_terminate(
-                        consecutive_static=consecutive_static,
-                        term_window=self.early_term_window,
-                        current_energy=eff_energy,
-                        term_threshold=self.early_term_threshold,
-                    )
-                else:
-                    can_term = max(energies[-self.early_term_window:]) < self.early_term_threshold
-
-                if can_term:
-                    early_terminated = True
-                    break
-
-        if early_terminated and file_duration > 0 and energies:
-            energies.append(0.0)
+        trace = frames if isinstance(frames, MotionTrace) else MotionTrace(self, effective_fps)
+        if trace is not frames:
+            for frame in frames:
+                trace.append(frame)
+        energies = list(trace.energies)
+        confidences = list(trace.confidences)
 
         if len(energies) < 2:
             return [], {"audio_events": audio_events, "vad_stats": vad_stats}
 
-        if self.median_window >= 3:
-            energies = _median_filter(energies, self.median_window)
+        # Legacy frame counts describe durations at the configured base FPS.
+        median_window = max(1, int(round(self.median_window * effective_fps / self.fps)))
+        if median_window % 2 == 0:
+            median_window += 1
+        if median_window >= 3:
+            energies = _median_filter(energies, median_window)
 
         energies_arr = np.array(energies, dtype=np.float32)
         p5 = float(np.percentile(energies_arr, 5))
         p20 = float(np.percentile(energies_arr, 20))
         noise_spread = (p20 - p5) * 2.5
-        threshold = p5 + max(0.5, self.sensitivity * noise_spread)
+        threshold = max(self.min_motion_threshold, p5 + self.sensitivity * noise_spread)
 
         raw_labels = [bool(e > threshold) for e in energies]
 
         smoothed = _smooth_labels(
-            raw_labels, self.min_motion_frames, self.min_static_frames, self.noise_suppress
+            raw_labels, max(1, round(self.min_motion_frames * effective_fps / self.fps)),
+            max(1, round(self.min_static_frames * effective_fps / self.fps)),
+            max(1, round(self.noise_suppress * effective_fps / self.fps))
         )
 
         results = []
@@ -305,6 +261,7 @@ class MotionDetector:
                 "is_motion": is_motion,
                 "state": state,
                 "energy": float(energies[i]) if i < len(energies) else 0.0,
+                "confidence": float(confidences[i]) if i < len(confidences) else 0.0,
                 "is_audio_active": is_audio_active,
             })
 
@@ -318,11 +275,12 @@ class MotionDetector:
                     "is_motion": False,
                     "state": "STATIC",
                     "energy": 0.0,
+                    "confidence": 0.0,
                     "is_audio_active": False,
                 })
 
         meta = {
-            "has_audio": 1 if audio_events or (audio_data is not None and len(audio_data) > 0) else 0,
+            "has_audio": 1 if audio_events or (audio_data is not None and audio_data.size > 0) else 0,
             "audio_events": audio_events,
             "vad_stats": vad_stats,
             "early_terminated": early_terminated,
@@ -341,7 +299,7 @@ class MotionDetector:
             elif file_duration <= self.fps_tier_thresholds.get("long_max", 1800):
                 return self.fps_tiers["long"]
             else:
-                # 超长静止文件（夜间）降至 ultra_long 档，再省 30-40% 解码时间
+                # Explicit ultra-long tier; duration alone does not establish static content.
                 return self.fps_tiers.get("ultra_long", self.fps_tiers["long"])
         return self.fps
 
@@ -359,9 +317,16 @@ class MotionDetector:
             frames, yolo_buffer, meta = self._decode_file_pipe(
                 filepath, file_duration, effective_fps
             )
-            if frames:
-                full_audio = self._decode_audio_pipe(filepath, file_duration)
-                meta["has_audio"] = 1 if full_audio.size > 0 else 0
+            if meta.get("aborted"):
+                return [], {}, np.array([], dtype=np.float32), meta
+            if frames and meta.get("complete", False):
+                try:
+                    full_audio = self._decode_audio_pipe(filepath, file_duration)
+                except Exception as exc:
+                    logger.warning("Audio decode failed for %s: %s", filepath, exc)
+                    meta["complete"] = False
+                    return [], {}, np.array([], np.float32), meta
+                meta["has_audio"] = int(bool(full_audio.size) or bool(getattr(self, "has_audio_detected", 0)))
                 try:
                     self.has_audio_detected = meta["has_audio"]
                 except Exception:
@@ -369,10 +334,14 @@ class MotionDetector:
                 return frames, yolo_buffer, full_audio, meta
             if meta.get("aborted"):
                 return [], {}, np.array([], dtype=np.float32), meta
+            frames, yolo_buffer = [], {}
             logger.warning(
-                "pipe decode yielded 0 frames for %s, falling back to PyAV",
+                "pipe decode incomplete or yielded 0 frames for %s, falling back to PyAV",
                 Path(filepath).name,
             )
+        except MemoryError:
+            # A second full decode has the same storage bound and cannot recover.
+            raise
         except Exception as e:
             logger.warning(
                 "pipe decode failed for %s: %s; falling back to PyAV",
@@ -389,19 +358,23 @@ class MotionDetector:
         本路径解码侧在 GPU 完成 fps 过滤与缩放，仅 ~660 个 416x234 小帧经管道回传，
         实测可将单文件解码耗时从 ~240s 降至 ~15-30s。
         """
-        decoded_frames: list[np.ndarray] = []
+        from src.frame_pool import FramePool
+        from src.motion_trace import MotionTrace
+        decoded_frames = (MotionTrace(self, effective_fps) if getattr(self, "_stream_motion", False)
+                          else FramePool(self.buffer_limit // 2))
         yolo_buffer: dict[int, np.ndarray] = {}
+        jpeg_bytes = 0
         w, h = self.width, self.height
         frame_size = w * h  # 单通道灰度直通，IPC 管道数据量降低 66.7%
 
         if self.decode_gpu == "qsv":
             from src.utils import get_qsv_semaphore
-            io_sem = get_qsv_semaphore()
+            io_sem = VideoLease(get_qsv_semaphore())
             hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
             vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12"
         else:
             from src.utils import get_nv_semaphore
-            io_sem = get_nv_semaphore()
+            io_sem = VideoLease(get_nv_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12"
 
@@ -426,42 +399,60 @@ class MotionDetector:
             }
 
         yolo_sample_interval = max(
-            1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5))))
+            1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))),
+            int(np.ceil(max(1.0, file_duration * effective_fps) /
+                       max(1, getattr(self, "yolo_max_frames", 512))))
         )
-        watchdog_timeout = max(self.decode_timeout * 3, 60.0)
-        if file_duration > 0:
-            watchdog_timeout = max(watchdog_timeout, (file_duration / max(effective_fps, 0.1)) * 4)
+        # 解码弹性看门狗超时：至少 120s，长视频按 file_duration * 1.5 估算，上限放宽至 1800s (30分钟)，杜绝长录像误杀
+        watchdog_timeout = max(120.0, min(max(self.decode_timeout * 2, file_duration * 1.5), 1800.0))
 
         t_decode_start = time.monotonic()
         total_frames = 0
         proc: subprocess.Popen | None = None
+        watchdog_timer: threading.Timer | None = None
         from src.renderer import FFmpegProcessRegistry
+        from src.utils import TEMP_DIR
         pipe_key = f"pipe_decode_{Path(filepath).name}_{time.monotonic()}"
+        safe_stem = Path(filepath).stem.replace(" ", "_")
+        err_log = TEMP_DIR / f".pipe_decode_{safe_stem}_{os.getpid()}_{threading.get_ident()}.log"
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            FFmpegProcessRegistry.register(pipe_key, proc)
-            assert proc.stdout is not None
-            while True:
-                if time.monotonic() - t_decode_start > watchdog_timeout:
-                    logger.warning(
-                        "pipe decode timeout for %s (dur=%.1f, elapsed=%.1f)",
-                        Path(filepath).name, file_duration,
-                        time.monotonic() - t_decode_start,
-                    )
-                    proc.kill()
-                    break
-                raw = proc.stdout.read(frame_size)
-                if len(raw) < frame_size:
-                    break
-                gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+            with open(err_log, "wb") as f_err:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=f_err)
+                FFmpegProcessRegistry.register(pipe_key, proc)
+                assert proc.stdout is not None
 
-                if getattr(self, "yolo_enabled", False) and total_frames % yolo_sample_interval == 0:
-                    bgr_tmp = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                    ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    yolo_buffer[total_frames] = buf_jpg if ok_enc else bgr_tmp
+                def _kill_on_timeout():
+                    try:
+                        if proc and proc.poll() is None:
+                            logger.warning(
+                                "pipe decode watchdog timeout (%.1fs) for %s, terminating process",
+                                watchdog_timeout, Path(filepath).name,
+                            )
+                            proc.kill()
+                    except Exception:
+                        pass
 
-                decoded_frames.append(gray)
-                total_frames += 1
+                watchdog_timer = threading.Timer(watchdog_timeout, _kill_on_timeout)
+                watchdog_timer.daemon = True
+                watchdog_timer.start()
+
+                while True:
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+
+                    if getattr(self, "yolo_enabled", False) and total_frames % yolo_sample_interval == 0:
+                        bgr_tmp = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                        ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        item = buf_jpg if ok_enc else bgr_tmp
+                        jpeg_bytes += item.nbytes
+                        if jpeg_bytes > self.buffer_limit // 4:
+                            raise MemoryError("YOLO candidate budget exceeded")
+                        yolo_buffer[total_frames] = item
+
+                    decoded_frames.append(gray)
+                    total_frames += 1
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -475,6 +466,11 @@ class MotionDetector:
                         pass
                 raise
         finally:
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            if watchdog_timer:
+                watchdog_timer.cancel()
             FFmpegProcessRegistry.deregister(pipe_key)
             if proc and proc.stdout:
                 try:
@@ -482,18 +478,27 @@ class MotionDetector:
                 except OSError:
                     pass
             is_aborted = False
-            if proc and proc.stderr:
+            err_tail = ""
+            if err_log.exists():
                 try:
-                    if not decoded_frames and proc.returncode != 0:
-                        err_tail = proc.stderr.read().decode('utf-8', errors='ignore')[-300:]
-                        if "received signal 2" in err_tail or proc.returncode in (255, -2, 130):
-                            is_aborted = True
-                        elif err_tail.strip():
-                            logger.warning("pipe decode stderr for %s: %s", Path(filepath).name, err_tail.strip())
-                    proc.stderr.close()
+                    err_tail = err_log.read_bytes().decode('utf-8', errors='ignore')[-500:]
+                    err_log.unlink(missing_ok=True)
                 except Exception:
                     pass
+            if proc:
+                if "received signal 2" in err_tail or proc.returncode in (255, -2, 130) or FFmpegProcessRegistry.is_interrupted():
+                    is_aborted = True
+                elif not decoded_frames and proc.returncode != 0 and err_tail.strip():
+                    logger.warning("pipe decode stderr for %s: %s", Path(filepath).name, err_tail.strip())
             io_sem.release()
+
+            min_expected_frames = max(1, int(file_duration * effective_fps * 0.85))
+            is_complete = bool(
+                not is_aborted and total_frames > 0 and (
+                    (proc and proc.returncode == 0 and total_frames >= min_expected_frames) or
+                    total_frames >= max(1, file_duration * effective_fps - 2)
+                )
+            )
 
         meta = {
             "has_audio": 0,
@@ -502,25 +507,29 @@ class MotionDetector:
             "frames": total_frames,
             "sem_wait": sem_wait,
             "aborted": is_aborted,
+            "complete": is_complete,
         }
         return decoded_frames, yolo_buffer, meta
 
-    def _decode_audio_pipe(self, filepath: str, file_duration: float) -> np.ndarray:
-        """独立轻量音频通道：ffmpeg 提取 16kHz 单声道 f32le PCM 供 VAD 使用。"""
-        if not self.audio_vad_enabled:
-            return np.array([], dtype=np.float32)
-        try:
-            result = run_ffmpeg(
-                ["-vn", "-i", str(filepath),
-                 "-ac", "1", "-ar", str(self.vad_sample_rate),
-                 "-f", "f32le", "-"],
-                timeout=max(120.0, min(file_duration * 0.5, 600.0)),
-            )
-            if result.returncode == 0 and result.stdout:
-                return np.frombuffer(result.stdout, dtype=np.float32).copy()
-        except Exception as e:
-            logger.debug("audio pipe extraction failed for %s: %s", Path(filepath).name, e)
-        return np.array([], dtype=np.float32)
+    def _decode_audio_pipe(self, filepath: str, file_duration: float):
+        from src.audio_features import AudioFeatures
+        features = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
+        if not self.audio_vad_enabled or getattr(self, "has_audio_detected", None) == 0:
+            return features
+        pending = bytearray()
+        def consume(data):
+            pending.extend(data)
+            count = len(pending) // 4 * 4
+            if count:
+                features.append(np.frombuffer(bytes(pending[:count]), dtype=np.float32))
+                del pending[:count]
+        result = run_ffmpeg(
+            ["-vn", "-i", str(filepath), "-ac", "1", "-ar", str(self.vad_sample_rate), "-f", "f32le", "-"],
+            timeout=max(120, min(file_duration * .5, 1800)), stdout_consumer=consume,
+        )
+        if result.returncode != 0 or pending:
+            raise RuntimeError("Audio decode incomplete: " + result.stderr_text[-300:])
+        return features
 
     def _decode_file_pyav(
         self, filepath: str, file_duration: float = 0.0
@@ -529,16 +538,18 @@ class MotionDetector:
         Phase 1 (信号量保护): 硬件解码全部帧到内存缓冲区。
         返回 (grayscale_frames, yolo_buffer, audio_samples, metadata)。
         """
-        decoded_frames: list[np.ndarray] = []
+        from src.frame_pool import FramePool
+        decoded_frames = FramePool(self.buffer_limit // 2)
         yolo_buffer: dict[int, np.ndarray] = {}
+        jpeg_bytes = 0
 
         if self.decode_gpu == "qsv":
             from src.utils import get_qsv_semaphore
-            io_sem = get_qsv_semaphore()
+            io_sem = VideoLease(get_qsv_semaphore())
             hw_name = "qsv"
         else:
             from src.utils import get_nv_semaphore
-            io_sem = get_nv_semaphore()
+            io_sem = VideoLease(get_nv_semaphore())
             hw_name = "cuda"
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
@@ -558,12 +569,14 @@ class MotionDetector:
                 "sem_wait": sem_wait,
             }
 
-        audio_samples_list: list[np.ndarray] = []
+        from src.audio_features import AudioFeatures
+        audio_features = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
         audio_resampler = None
         has_audio = 0
         effective_fps = self.fps
         total_frames = 0
         video_frame_count = 0
+        decode_complete = False
 
         try:
             from av.audio.resampler import AudioResampler
@@ -584,7 +597,7 @@ class MotionDetector:
             if hw:
                 kwargs["hwaccel"] = hw
 
-            with av.open(str(filepath), **kwargs) as container:
+            with av.open(str(filepath), timeout=30.0, **kwargs) as container:
                 video_stream = container.streams.video[0] if container.streams.video else None
                 audio_stream = container.streams.audio[0] if container.streams.audio else None
 
@@ -616,17 +629,23 @@ class MotionDetector:
                     elif file_duration <= self.fps_tier_thresholds.get("long_max", 1800):
                         effective_fps = self.fps_tiers["long"]
                     else:
-                        # 超长静止文件（夜间）降至 ultra_long 档，再省 30-40% 解码时间
+                        # Explicit ultra-long tier; duration alone does not establish static content.
                         effective_fps = self.fps_tiers.get("ultra_long", self.fps_tiers["long"])
                 else:
                     effective_fps = self.fps
 
                 frame_step = max(1, int(round(video_fps / effective_fps)))
+                effective_fps = video_fps / frame_step
+                if getattr(self, "_stream_motion", False):
+                    from src.motion_trace import MotionTrace
+                    decoded_frames = MotionTrace(self, effective_fps)
 
                 # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
                 # 保证 yolo_buffer 帧键与分析阶段时间轴严格对齐
                 yolo_sample_interval = max(
-                    1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5))))
+                    1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))),
+                    int(np.ceil(max(1.0, file_duration * effective_fps) /
+                               max(1, getattr(self, "yolo_max_frames", 512))))
                 )
 
                 watchdog_timeout = max(self.decode_timeout * 3, 60.0)
@@ -637,19 +656,24 @@ class MotionDetector:
                 if self.audio_vad_enabled and audio_stream is not None:
                     streams_to_decode.append(audio_stream)
 
+                from src.renderer import FFmpegProcessRegistry
                 for frame in container.decode(*streams_to_decode):
+                    if FFmpegProcessRegistry.is_interrupted():
+                        break
                     if isinstance(frame, av.AudioFrame) or getattr(frame, "type", "") == "audio":
                         try:
                             if audio_resampler:
                                 resampled_frames = audio_resampler.resample(frame)
                                 if resampled_frames:
                                     for rf in resampled_frames:
-                                        audio_samples_list.append(rf.to_ndarray().flatten().astype(np.float32))
+                                        audio_features.append(rf.to_ndarray().flatten().astype(np.float32))
                             else:
                                 raw = frame.to_ndarray()
                                 if raw.ndim > 1:
                                     raw = np.mean(raw, axis=0)
-                                audio_samples_list.append(raw.flatten().astype(np.float32))
+                                audio_features.append(raw.flatten().astype(np.float32))
+                        except MemoryError:
+                            raise
                         except Exception as e:
                             logger.debug("Audio decode chunk failed: %s", e)
                         continue
@@ -673,11 +697,15 @@ class MotionDetector:
                             )
                         bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
                         ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        yolo_buffer[total_frames - 1] = buf_jpg if ok_enc else rgb_raw
+                        item = buf_jpg if ok_enc else bgr_tmp
+                        jpeg_bytes += item.nbytes
+                        if jpeg_bytes > self.buffer_limit // 4:
+                            raise MemoryError("YOLO candidate budget exceeded")
+                        yolo_buffer[total_frames - 1] = item
 
                     try:
                         if frame.planes:
-                            y_raw = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape((frame.height, frame.width))
+                            y_raw = frame.to_ndarray(format="gray")
                             gray = cv2.resize(y_raw, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
                         else:
                             gray = frame.to_ndarray(format="gray")
@@ -708,12 +736,18 @@ class MotionDetector:
                         )
                         break
 
+                else:
+                    decode_complete = (
+                        not FFmpegProcessRegistry.is_interrupted() and
+                        total_frames >= max(1, int(file_duration * effective_fps * 0.85))
+                    )
+
                 if audio_resampler:
                     try:
                         flushed = audio_resampler.resample(None)
                         if flushed:
                             for rf in flushed:
-                                audio_samples_list.append(rf.to_ndarray().flatten().astype(np.float32))
+                                audio_features.append(rf.to_ndarray().flatten().astype(np.float32))
                     except Exception:
                         pass
 
@@ -724,11 +758,12 @@ class MotionDetector:
 
         t_decode_end = time.monotonic()
 
-        full_audio = np.concatenate(audio_samples_list, axis=0) if audio_samples_list else np.array([], dtype=np.float32)
+        full_audio = audio_features
 
         meta = {
             "has_audio": has_audio,
             "effective_fps": effective_fps,
+            "complete": decode_complete,
             "decode_time": round(t_decode_end - t_decode_start, 3),
             "frames": total_frames,
             "sem_wait": sem_wait,
@@ -736,23 +771,51 @@ class MotionDetector:
         return decoded_frames, yolo_buffer, full_audio, meta
 
     def analyze(
-        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0
+        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0, has_audio: int | None = None
     ) -> tuple[list[dict], dict[int, np.ndarray]]:
         """
         全文件分析入口。
         Phase 1: 硬件解码到内存 (信号量保护，单槽位)
-        Phase 2: CPU 运动分析 (无信号量，长文件自动分片并行)
+        Phase 2: 连续 CPU 运动分析（由文件 worker 数限制并发）
 
         返回 (labels, yolo_buffer)：
         - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
         - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
+        if file_duration > 0 and has_audio is not None:
+            self.file_duration_detected = file_duration
+            self.has_audio_detected = int(has_audio)
+        else:
+            # Lazy container metadata belongs to Analysis, never the directory scanner.
+            from src.scheduler import get_disk_semaphore
+            disk = get_disk_semaphore()
+            if not acquire_with_retry(disk):
+                raise TimeoutError("Metadata I/O admission timed out")
+            try:
+                with av.open(str(filepath), timeout=30.0) as container:
+                    stream = container.streams.video[0]
+                    duration = (float(stream.duration * stream.time_base) if stream.duration
+                                else float(container.duration or 0) / av.time_base)
+                    if duration <= 0:
+                        raise ValueError("Missing video duration")
+                    file_duration = duration
+                    self.file_duration_detected = duration
+                    self.has_audio_detected = int(bool(container.streams.audio))
+            finally:
+                disk.release()
         # Phase 1: 解码
-        decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
+        from contextlib import nullcontext
+        lease = self.device_lease() if hasattr(self, "device_lease") else nullcontext(self.decode_gpu)
+        with lease as device:
+            self.decode_gpu = device
+            self._stream_motion = True
+            decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
         has_audio = decode_meta["has_audio"]
         effective_fps = decode_meta["effective_fps"]
         t_decode_end = time.monotonic()
 
+        if decode_meta.get("aborted") or not decode_meta.get("complete", True):
+            decoded_frames = []
         if not decoded_frames:
             self.last_perf = {
                 "decode_time": decode_meta["decode_time"],
@@ -766,69 +829,14 @@ class MotionDetector:
             }
             return [], yolo_buffer
 
-        # Audio VAD (全局音频事件检测)
-        audio_events: list[tuple[float, float, str]] = []
-        vad_stats: dict = {}
-        if self.audio_vad_enabled and full_audio.size > 0:
-            audio_events, vad_stats = self.vad.detect_events(full_audio, start_offset=start_offset)
-
-        # Phase 2: CPU 分析 — 长文件分片并行，短文件直通
-        CHUNK_THRESHOLD = 300.0
-        n_frames = len(decoded_frames)
+        # One continuous background model per file; the outer worker pool bounds CPU concurrency.
+        results, frames_meta = self.analyze_frames(
+            decoded_frames, start_offset=start_offset, file_duration=file_duration,
+            fps=effective_fps, audio_data=full_audio, audio_sample_rate=self.vad_sample_rate,
+        )
         early_term_any = False
-
-        if file_duration > CHUNK_THRESHOLD and n_frames > 100:
-            n_chunks = max(2, min(4, int(np.ceil(file_duration / CHUNK_THRESHOLD))))
-            chunk_size = n_frames // n_chunks
-            logger.info("Intra-File Chunking: %s (%.1fs, %d frames) -> %d chunks",
-                        Path(filepath).name, file_duration, n_frames, n_chunks)
-
-            from concurrent.futures import ThreadPoolExecutor
-            all_results: list[list[dict]] = [[] for _ in range(n_chunks)]
-            audio_sr = self.vad_sample_rate
-            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
-                futures = {}
-                for c_idx in range(n_chunks):
-                    f_start = c_idx * chunk_size
-                    f_end = (c_idx + 1) * chunk_size if c_idx < n_chunks - 1 else n_frames
-                    rel_start = (f_start / n_frames) * file_duration if n_frames > 0 else 0.0
-                    rel_end = (f_end / n_frames) * file_duration if n_frames > 0 else file_duration
-                    chunk_offset = start_offset + rel_start
-                    chunk_dur = rel_end - rel_start
-                    chunk_frames = decoded_frames[f_start:f_end]
-                    # 按 chunk 时间窗切片音频：避免全量音频重复 VAD（O(N^2)）
-                    # 及事件时间戳整体平移错位导致的 DYNAMIC_AUDIO 误判
-                    if full_audio.size > 0:
-                        a_start = int(rel_start * audio_sr)
-                        a_end = int(rel_end * audio_sr)
-                        chunk_audio = full_audio[a_start:a_end]
-                    else:
-                        chunk_audio = full_audio
-                    futures[pool.submit(
-                        self.analyze_frames, chunk_frames,
-                        start_offset=chunk_offset, file_duration=chunk_dur,
-                        fps=effective_fps, audio_data=chunk_audio
-                    )] = c_idx
-
-                for f in futures:
-                    c_idx = futures[f]
-                    try:
-                        chunk_results, chunk_meta = f.result()
-                        all_results[c_idx] = chunk_results
-                        if chunk_meta.get("early_terminated"):
-                            early_term_any = True
-                    except Exception as e:
-                        logger.error("Chunk %d analysis failed for %s: %s", c_idx, filepath, e)
-
-            results = []
-            for chunk_res in all_results:
-                results.extend(chunk_res)
-        else:
-            results, frames_meta = self.analyze_frames(
-                decoded_frames, start_offset=start_offset, file_duration=file_duration,
-                fps=effective_fps, audio_data=full_audio,
-            )
-            early_term_any = bool(frames_meta.get("early_terminated"))
+        audio_events = frames_meta.get("audio_events", [])
+        vad_stats = frames_meta.get("vad_stats", {})
 
         t_analysis_end = time.monotonic()
 
@@ -846,3 +854,4 @@ class MotionDetector:
             "sem_wait": decode_meta.get("sem_wait", 0.0),
         }
         return results, yolo_buffer
+

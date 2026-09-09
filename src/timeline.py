@@ -42,85 +42,93 @@ def calculate_speed_ramping_curve(
     has_ramp_in: bool,
     has_ramp_out: bool,
     ramp_duration_s: float = 1.0,
+    target_display_dur: float | None = None,
 ) -> SpeedRampInfo:
     """
-    Compute non-linear PTS speed ramping and easing curve parameters.
+    Compute non-linear PTS speed ramping and easing curve parameters with exact display duration conservation.
     
     Mathematical Model:
-    - v_fast: cruising fast-forward speed (e.g. 30x - 60x).
-    - At ramp-in boundary (t=0): speed starts at 1.0x (matching preceding dynamic segment).
-    - At ramp-out boundary (t=dur): speed ends at 1.0x (matching subsequent dynamic segment).
-    - Quadratic / polynomial PTS easing ensures C^1 continuous speed and strictly monotonic timestamps.
+    - target_disp_dur: Desired duration in the resulting Vlog (default: dur / v_fast).
+    - In the display timeline, ramp-in and ramp-out durations are budgeted as d_in and d_out:
+      d_ramp = min(ramp_duration_s * 0.5, target_disp_dur * 0.25).
+    - In FFmpeg setpts, PTS_out = d(s) where s = T - STARTT.
+      Accelerating (ramp-in): d(s) = s * (1.0 - k_in * s) with k_in = (1 - 1/v_c) / (2 * s_in).
+      At boundary s = s_in, d(s_in) = d_in = s_in * (v_c + 1) / (2 * v_c).
+      Hence s_in = d_in * 2 * v_c / (v_c + 1).
+    - Source conservation: dur = s_in + s_cruise + s_out = (d_in + d_out) * 2 * v_c / (v_c + 1) + d_c * v_c.
+      This forms an exact quadratic equation for cruising speed v_c:
+      d_c * v_c^2 + (d_c + 2 * d_ramp - dur) * v_c - dur = 0.
+    - Solving for v_c ensures total output duration is 100.00% invariant, eliminating segment dilation.
     """
     v_fast = max(1.0, v_fast)
+    if target_display_dur is None:
+        target_display_dur = dur / v_fast if v_fast > 0 else dur
+    target_disp_dur = max(0.05, min(target_display_dur, dur))
+
     if not has_ramp_in and not has_ramp_out:
-        disp_dur = dur / v_fast if v_fast > 0 else dur
+        eff_speed = dur / target_disp_dur if target_disp_dur > 0 else 1.0
         return SpeedRampInfo(
             has_ramp_in=False,
             has_ramp_out=False,
             ramp_in_src_dur=0.0,
             ramp_out_src_dur=0.0,
             cruise_src_dur=dur,
-            v_fast=v_fast,
-            target_display_dur=disp_dur,
-            effective_speed=v_fast,
-            pts_expr=f"(PTS-STARTPTS)/{v_fast:.4f}",
+            v_fast=eff_speed,
+            target_display_dur=target_disp_dur,
+            effective_speed=eff_speed,
+            pts_expr=f"(PTS-STARTPTS)/{eff_speed:.4f}",
         )
 
-    # Average speed in ramp zone accelerating/decelerating between 1.0x and v_fast
-    v_ramp_avg = (1.0 + v_fast) / 2.0
-    s_ramp_nominal = max(0.1, ramp_duration_s * v_ramp_avg)
+    # 缓入/缓出在成片展示时间轴上的预算
+    max_ramp_disp = min(ramp_duration_s * 0.5, target_disp_dur * 0.25)
+    d_in = max_ramp_disp if has_ramp_in else 0.0
+    d_out = max_ramp_disp if has_ramp_out else 0.0
+    d_ramp = d_in + d_out
+    d_c = max(0.0, target_disp_dur - d_ramp)
 
-    n_ramps = int(has_ramp_in) + int(has_ramp_out)
-    total_needed = n_ramps * s_ramp_nominal
-
-    if dur < total_needed:
-        # Scale ramp zones proportionally when segment is shorter than nominal ramp zones
-        s_ramp = dur / n_ramps
-        s_cruise = 0.0
+    if d_c <= 1e-6 or d_ramp <= 1e-6:
+        v_c = max(1.0, dur / target_disp_dur)
     else:
-        s_ramp = s_ramp_nominal
-        s_cruise = dur - total_needed
+        A = d_c
+        B = d_c + 2.0 * d_ramp - dur
+        C = -dur
+        disc = B * B - 4.0 * A * C
+        if disc < 0:
+            v_c = max(1.0, dur / target_disp_dur)
+        else:
+            v_c = max(1.0, (-B + math.sqrt(disc)) / (2.0 * A))
 
-    s_in = s_ramp if has_ramp_in else 0.0
-    s_out = s_ramp if has_ramp_out else 0.0
+    s_in = d_in * 2.0 * v_c / (v_c + 1.0) if d_in > 0 else 0.0
+    s_out = d_out * 2.0 * v_c / (v_c + 1.0) if d_out > 0 else 0.0
+    s_cruise = max(0.0, dur - s_in - s_out)
 
-    # Display durations under smooth quadratic PTS easing
-    disp_in = s_in * (1.0 + 1.0 / v_fast) / 2.0 if s_in > 0 else 0.0
-    disp_cruise = s_cruise / v_fast if s_cruise > 0 else 0.0
-    disp_out = s_out * (1.0 / v_fast + 1.0) / 2.0 if s_out > 0 else 0.0
-
-    target_disp_dur = disp_in + disp_cruise + disp_out
-    target_disp_dur = max(0.05, min(target_disp_dur, dur))
-    eff_speed = dur / target_disp_dur if target_disp_dur > 0 else 1.0
-
-    # Build FFmpeg non-linear PTS expression
+    inv_vc = 1.0 / v_c if v_c > 0 else 1.0
+    k_in = (1.0 - inv_vc) / (2.0 * s_in) if s_in > 0 else 0.0
+    k_out = (1.0 - inv_vc) / (2.0 * s_out) if s_out > 0 else 0.0
     s_mid = s_in + s_cruise
-    p_in = disp_in
-    p_mid = disp_in + disp_cruise
-    inv_v = 1.0 / v_fast
-
-    k_in = (1.0 - inv_v) / (2.0 * s_in) if s_in > 0 else 0.0
-    k_out = (1.0 - inv_v) / (2.0 * s_out) if s_out > 0 else 0.0
+    p_in = d_in
+    p_mid = d_in + (s_cruise / v_c if v_c > 0 else 0.0)
+    actual_disp_dur = p_mid + d_out
+    eff_speed = dur / actual_disp_dur if actual_disp_dur > 0 else 1.0
 
     if s_in > 0 and s_out > 0:
         pts_expr = (
             f"if(lt(T-STARTT,{s_in:.3f}),(T-STARTT)*(1.0-{k_in:.6f}*(T-STARTT)),"
-            f"if(lt(T-STARTT,{s_mid:.3f}),{p_in:.4f}+(T-STARTT-{s_in:.3f})*{inv_v:.6f},"
-            f"{p_mid:.4f}+(T-STARTT-{s_mid:.3f})*({inv_v:.6f}+{k_out:.6f}*(T-STARTT-{s_mid:.3f}))))/TB"
+            f"if(lt(T-STARTT,{s_mid:.3f}),{p_in:.4f}+(T-STARTT-{s_in:.3f})*{inv_vc:.6f},"
+            f"{p_mid:.4f}+(T-STARTT-{s_mid:.3f})*({inv_vc:.6f}+{k_out:.6f}*(T-STARTT-{s_mid:.3f}))))/TB"
         )
     elif s_in > 0:
         pts_expr = (
             f"if(lt(T-STARTT,{s_in:.3f}),(T-STARTT)*(1.0-{k_in:.6f}*(T-STARTT)),"
-            f"{p_in:.4f}+(T-STARTT-{s_in:.3f})*{inv_v:.6f})/TB"
+            f"{p_in:.4f}+(T-STARTT-{s_in:.3f})*{inv_vc:.6f})/TB"
         )
     elif s_out > 0:
         pts_expr = (
-            f"if(lt(T-STARTT,{s_mid:.3f}),(T-STARTT)*{inv_v:.6f},"
-            f"{p_mid:.4f}+(T-STARTT-{s_mid:.3f})*({inv_v:.6f}+{k_out:.6f}*(T-STARTT-{s_mid:.3f})))/TB"
+            f"if(lt(T-STARTT,{s_mid:.3f}),(T-STARTT)*{inv_vc:.6f},"
+            f"{p_mid:.4f}+(T-STARTT-{s_mid:.3f})*({inv_vc:.6f}+{k_out:.6f}*(T-STARTT-{s_mid:.3f})))/TB"
         )
     else:
-        pts_expr = f"(PTS-STARTPTS)/{v_fast:.4f}"
+        pts_expr = f"(PTS-STARTPTS)/{v_c:.4f}"
 
     return SpeedRampInfo(
         has_ramp_in=has_ramp_in,
@@ -128,8 +136,8 @@ def calculate_speed_ramping_curve(
         ramp_in_src_dur=s_in,
         ramp_out_src_dur=s_out,
         cruise_src_dur=s_cruise,
-        v_fast=v_fast,
-        target_display_dur=target_disp_dur,
+        v_fast=v_c,
+        target_display_dur=actual_disp_dur,
         effective_speed=eff_speed,
         pts_expr=pts_expr,
     )
@@ -140,6 +148,7 @@ def compute_display_plans(
     static_keyframe_interval: float = 30.0,
     keyframe_display_duration: float = 0.5,
     min_static_display_duration: float = 1.5,
+    max_static_display_duration: float | None = None,
     speed_ramping: bool = True,
     ramp_duration_s: float = 1.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
@@ -147,7 +156,7 @@ def compute_display_plans(
 
     返回 [(display_dur, ramp_info_or_None), ...]：
     - DYNAMIC/DYNAMIC_AUDIO: 展示时长 == 源时长，ramp_info 为 None；
-    - STATIC: 按全局抽帧倍率压缩，若相邻动态段且启用变速则返回 ramp_info。
+    - STATIC: 按全局抽帧倍率压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
     """
     kf_interval = max(static_keyframe_interval, 1.0)
     display_dur = max(keyframe_display_duration, 0.1)
@@ -162,6 +171,9 @@ def compute_display_plans(
             continue
         target = max(dur / global_speed_factor, min_static_display_duration)
         target = min(target, dur)
+        if max_static_display_duration is not None and max_static_display_duration > 0:
+            target = min(target, max_static_display_duration)
+
         v_fast = dur / target if target > 0 else 1.0
         has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
         has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
@@ -170,6 +182,7 @@ def compute_display_plans(
                 dur=dur, v_fast=v_fast,
                 has_ramp_in=has_in, has_ramp_out=has_out,
                 ramp_duration_s=ramp_duration_s,
+                target_display_dur=target,
             )
             plans.append((info.target_display_dur, info))
         else:
@@ -292,6 +305,7 @@ def generate_timecode_subtitles(
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
         keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
         min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
+        max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
         speed_ramping=render_cfg.get("speed_ramping_enabled", True),
         ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
     )
@@ -463,10 +477,11 @@ def build_timeline_from_rows(
         elif row.get("segments"):
             segs = []
             for s_rec in row["segments"]:
-                manual = s_rec.get("manual_label")
-                if manual in ("CONFIRMED_MOTION", "MISSED_MOTION"):
+                # 人工审核绝对优先 (AGENTS.md 铁律): human_label 严格高于 algo_status (FP 强制重置为静态，FN 强制重置为动态)
+                manual = str(s_rec.get("manual_label") or s_rec.get("human_label") or "").strip().upper()
+                if manual in ("CONFIRMED_MOTION", "MISSED_MOTION", "VERIFIED_MOTION", "FN", "TP", "DYNAMIC"):
                     eff_state = "DYNAMIC"
-                elif manual in ("FALSE_ALARM", "CONFIRMED_STATIC"):
+                elif manual in ("FALSE_ALARM", "CONFIRMED_STATIC", "FP", "TN", "STATIC"):
                     eff_state = "STATIC"
                 else:
                     eff_state = s_rec.get("state", "STATIC")
@@ -562,7 +577,8 @@ def build_timeline_from_rows(
     filtered = _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
 
     # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
-    macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True)
+    reviews = [r for row in rows for r in row.get("human_reviews", [])]
+    macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True) and not reviews
     if macro_collapse_enabled:
         collapsed_filtered = []
         for s in filtered:
@@ -589,6 +605,8 @@ def build_timeline_from_rows(
 
     # 严格按物理文件边界切分，防止跨文件批次渲染时超出物理文件时长
     split_segs = split_segments_at_file_boundaries(filtered, files_meta)
+    from src.feedback import overlay_reviews
+    split_segs = overlay_reviews(split_segs, reviews)
 
     # 若指定 target_files，则快速局部过滤出目标文件的切片
     target_set = set(target_files) if target_files is not None else None
@@ -649,6 +667,7 @@ def build_concat_filter(
     static_keyframe_interval: float = 30.0,
     keyframe_display_duration: float = 0.5,
     min_static_display_duration: float = 1.5,
+    max_static_display_duration: float | None = None,
     audio_sample_rate: int = 48000,
     gap_tolerance: float = 0.5,
     scale_mode: str = "cpu",
@@ -659,6 +678,13 @@ def build_concat_filter(
     timecode_font_size: int = 24,
     timecode_font_color: str = "white",
     base_date: str | None = None,
+    preselected_static: bool = False,
+    concat_demuxer: bool = False,
+    simple_dynamic: bool = False,
+    sparse_mixed: bool = False,
+    static_sample_window_s: float = 0.25,
+    audio_input_offset: int = 0,
+    source_timeline: list[TimelineSegment] | None = None,
 ) -> str:
     """
     Build a complex FFmpeg filtergraph string for the entire timeline.
@@ -697,7 +723,29 @@ def build_concat_filter(
         scale_core = "null"
     else:
         scale_core = f"scale={output_width}:{output_height}"
-    scale_filter = f"{scale_core},fps={output_fps}"
+    # A virtual concat input already contains only the source ranges that must
+    # be rendered.  Keep its sparse static timestamps intact until the
+    # per-segment speed transform; an early fps filter would expand the gaps
+    # back to full-frame video and erase the decode saving.
+    scale_filter = scale_core if preselected_static else f"{scale_core},fps={output_fps}"
+
+    if simple_dynamic and len(timeline) == 1 and timeline[0].state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+        seg = timeline[0]
+        dur = max(0.04, seg.end_in_file - seg.start_in_file)
+        row = next((r for r in rows if r.get("filepath") == seg.filepath), None)
+        has_audio = bool(row and row.get("has_audio"))
+        video = (
+            f"[0:v]trim=start={seg.start_in_file:.3f}:end={seg.end_in_file:.3f},"
+            f"setpts=PTS-STARTPTS,{scale_core},fps={output_fps}[v]"
+        )
+        if has_audio:
+            audio = (
+                f"[0:a]atrim=start={seg.start_in_file:.3f}:end={seg.end_in_file:.3f},"
+                f"asetpts=PTS-STARTPTS,aformat=sample_rates={audio_sample_rate}[a]"
+            )
+        else:
+            audio = f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a]"
+        return f"{video};{audio}"
 
 
     use_keyframe_slideshow = (scale_mode == "cpu")
@@ -724,7 +772,7 @@ def build_concat_filter(
     # 当某输入文件在本批次内全部为 STATIC 段且各段时长 >= 2*kf_interval 时，
     # 在解码侧以 select 按 kf_interval 抽帧，置于 scale/hwdownload 之前——
     # 仅被选中的帧进入缩放与显存回下载，消除静态段全帧解码的渲染瓶颈。
-    # 短静态段（与动态段混排的文件）维持全帧链，保证 trim 区间必有帧可用。
+    # 混合文件按区间分支；短静态段维持全帧链，保证 trim 区间必有帧可用。
     segs_by_file: dict[int, list[TimelineSegment]] = {}
     for seg in timeline:
         segs_by_file.setdefault(seg.input_index, []).append(seg)
@@ -739,18 +787,41 @@ def build_concat_filter(
         file_segs = segs_by_file.get(idx, [])
         all_static = all(s.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
         min_src_dur = min((s.end_in_file - s.start_in_file) for s in file_segs) if file_segs else 0.0
-        use_kf_fastpath = all_static and min_src_dur >= 2.0 * kf_interval
+        use_kf_fastpath = (
+            not preselected_static
+            and all_static
+            and min_src_dur >= 2.0 * kf_interval
+        )
+        has_dynamic = any(s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
+        has_static = any(s.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
+        use_sparse_mixed = sparse_mixed and has_dynamic and has_static
 
-        if use_kf_fastpath:
+        input_v = f"[{idx}:v]"
+
+        if use_sparse_mixed:
+            sample_half = max(0.04, float(static_sample_window_s) * 0.5)
+            keep_terms = []
+            for file_seg in file_segs:
+                if file_seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+                    start = max(0.0, file_seg.start_in_file - 0.05)
+                    end = file_seg.end_in_file + 0.05
+                else:
+                    midpoint = (file_seg.start_in_file + file_seg.end_in_file) * 0.5
+                    start = max(file_seg.start_in_file, midpoint - sample_half)
+                    end = min(file_seg.end_in_file, midpoint + sample_half)
+                keep_terms.append(f"between(t\\,{start:.3f}\\,{end:.3f})")
+            select_expr = "+".join(keep_terms)
+            scale_parts.append(f"{input_v}select='{select_expr}',{scale_core}[scaled_{idx}]")
+        elif use_kf_fastpath:
             # 快路径剥离文件链尾部 fps：稀疏关键帧直接进入段级 trim/setpts，
             # 段级 fps 过滤器负责将每帧铺陈为 keyframe_display_duration 时长
             sel = f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{kf_interval:.1f})'"
-            scale_parts.append(f"[{idx}:v]{sel},{scale_core}[scaled_{idx}]")
+            scale_parts.append(f"{input_v}{sel},{scale_core}[scaled_{idx}]")
             n_keyframe_fast += 1
         elif scale_filter is not None:
-            scale_parts.append(f"[{idx}:v]{scale_filter}[scaled_{idx}]")
+            scale_parts.append(f"{input_v}{scale_filter}[scaled_{idx}]")
         else:
-            scale_parts.append(f"[{idx}:v]null[skip_{idx}]")
+            scale_parts.append(f"{input_v}null[skip_{idx}]")
         base_label = f"scaled_{idx}" if (scale_filter is not None or use_kf_fastpath) else f"skip_{idx}"
 
         if n_segs > 1:
@@ -770,11 +841,15 @@ def build_concat_filter(
 
     # --- Step 3: Per-segment trim from scaled/split stream ---
     # 展示时长计划与字幕墙钟映射共用同一来源，杜绝两套时长计算漂移
+    source_timeline = source_timeline or timeline
+    if len(source_timeline) != len(timeline):
+        raise ValueError("source_timeline must align one-to-one with render timeline")
     display_plans = compute_display_plans(
-        timeline,
+        source_timeline,
         static_keyframe_interval=static_keyframe_interval,
         keyframe_display_duration=keyframe_display_duration,
         min_static_display_duration=min_static_display_duration,
+        max_static_display_duration=max_static_display_duration,
         speed_ramping=bool(speed_ramping),
         ramp_duration_s=ramp_duration_s,
     )
@@ -787,15 +862,19 @@ def build_concat_filter(
 
     for i, seg in enumerate(timeline):
         idx = seg.input_index
+        audio_idx = idx + audio_input_offset
         s = seg.start_in_file
         e = seg.end_in_file
-        dur = e - s
+        source_seg = source_timeline[i]
+        source_s = source_seg.start_in_file
+        source_e = source_seg.end_in_file
+        dur = source_e - source_s
+
+        is_dynamic = seg.state in ("DYNAMIC", "DYNAMIC_AUDIO")
 
         src_k = file_split_counter[idx]
         src_label = file_split_labels[idx][src_k]
         file_split_counter[idx] = src_k + 1
-
-        is_dynamic = seg.state in ("DYNAMIC", "DYNAMIC_AUDIO")
 
         # Timecode OSD filter if enabled
         osd_filter_str = ""
@@ -806,7 +885,7 @@ def build_concat_filter(
                 file_start_unix = ts_to_unix(row["file_start_time"])
             elif base_date:
                 file_start_unix = ts_to_unix(base_date + "000000")
-            seg_start_unix = file_start_unix + s
+            seg_start_unix = file_start_unix + source_s
             default_font = "C:/Windows/Fonts/arial.ttf" if (os.name == "nt" and Path("C:/Windows/Fonts/arial.ttf").exists()) else None
             osd_filter = build_timecode_drawtext_filter(
                 start_unix=seg_start_unix,
@@ -829,7 +908,7 @@ def build_concat_filter(
                 else:
                     afade_str = ""
                 parts_a.append(
-                    f"[{idx}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS{afade_str},"
+                    f"[{audio_idx}:a]atrim=start={source_s:.3f}:end={source_e:.3f},asetpts=PTS-STARTPTS{afade_str},"
                     f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
                 )
             else:
@@ -837,13 +916,29 @@ def build_concat_filter(
         else:
             # Static segment speed scaling and speed ramping (与字幕映射同源)
             actual_display_dur, ramp_info = display_plans[i]
-            if ramp_info is not None:
+            if preselected_static:
+                # Sparse representatives no longer span the source duration;
+                # normalize their compact PTS and let tpad own the exact
+                # display duration from the source timeline plan.
+                pts_filter = "PTS-STARTPTS"
+            elif ramp_info is not None:
                 pts_filter = ramp_info.pts_expr.replace(",", "\\,")
             else:
                 v_fast = dur / actual_display_dur if actual_display_dur > 0 else 1.0
                 pts_filter = f"(PTS-STARTPTS)/{v_fast:.4f}"
 
-            fps_filter = f",fps=fps={output_fps}" if use_keyframe_slideshow else ""
+            if preselected_static or use_sparse_mixed:
+                # A sparse EDL may contain only one picture for a static
+                # interval.  Clone its final frame to the exact display-plan
+                # duration before the segment enters concat; otherwise FFmpeg
+                # has no following timestamp from which to infer duration.
+                fps_filter = (
+                    f",tpad=stop_mode=clone:stop_duration={actual_display_dur:.3f}"
+                    f",fps=fps={output_fps},trim=duration={actual_display_dur:.3f}"
+                    ",setpts=PTS-STARTPTS"
+                )
+            else:
+                fps_filter = f",fps=fps={output_fps}" if use_keyframe_slideshow else ""
             parts_v.append(
                 f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
                 f"setpts={pts_filter}"

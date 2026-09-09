@@ -37,7 +37,47 @@ def get_archive_dirs(custom_archive_dir: Path | None = None) -> tuple[Path, Path
     return archive_dir, images_dir, manifest_path
 
 
-def extract_and_archive_frame(
+class FrameArchiver:
+    """Fault-isolated feedback archiving with a bounded recent JPEG fallback."""
+    from collections import OrderedDict
+    _cache = OrderedDict()
+    _lock = threading.Lock()
+    _bytes = 0
+
+    @classmethod
+    def remember(cls, filepath, timestamp, jpeg):
+        payload = bytes(jpeg)
+        if len(payload) > 1024 * 1024:
+            return
+        with cls._lock:
+            key = (str(filepath), float(timestamp))
+            cls._bytes -= len(cls._cache.pop(key, b""))
+            cls._cache[key] = payload
+            cls._bytes += len(payload)
+            while cls._bytes > 8 * 1024 * 1024 or len(cls._cache) > 64:
+                cls._bytes -= len(cls._cache.popitem(last=False)[1])
+
+    @classmethod
+    def cached(cls, filepath, timestamp):
+        with cls._lock:
+            candidates = [(abs(t-timestamp), payload) for (fp,t),payload in cls._cache.items()
+                          if fp == str(filepath) and abs(t-timestamp) <= 2.0]
+            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    @staticmethod
+    def archive(db, segment_id, archive_dir=None):
+        try:
+            return _extract_and_archive_frame(db, segment_id, archive_dir)
+        except Exception as exc:
+            logger.warning("Feedback archive unavailable for segment %s: %s", segment_id, exc)
+            return None
+
+
+def extract_and_archive_frame(db, segment_id, archive_dir=None):
+    return FrameArchiver.archive(db, segment_id, archive_dir)
+
+
+def _extract_and_archive_frame(
     db: VlogDatabase,
     segment_id: int,
     archive_dir: Path | None = None,
@@ -72,7 +112,12 @@ def extract_and_archive_frame(
     source_fp = Path(segment.get("filepath", ""))
     extracted = False
 
-    if source_fp.exists() and source_fp.stat().st_size > 0:
+    try:
+        source_available = source_fp.exists() and source_fp.stat().st_size > 0
+    except OSError as exc:
+        logger.warning("Source unavailable; trying cached frame: %s", exc)
+        source_available = False
+    if source_available:
         cmd = [
             "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
             "-ss", f"{local_mid:.3f}",
@@ -82,7 +127,8 @@ def extract_and_archive_frame(
             str(target_img),
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, timeout=12)
+            from src.ffmpeg import run_ffmpeg
+            res = run_ffmpeg(cmd[1:], capture_output=True, timeout=12)
             if res.returncode == 0 and target_img.exists() and target_img.stat().st_size > 0:
                 extracted = True
         except Exception as e:
@@ -105,6 +151,14 @@ def extract_and_archive_frame(
                 except Exception as e:
                     logger.debug("从缓存复制归档帧失败: %s", e)
 
+    if not extracted:
+        cached = FrameArchiver.cached(str(source_fp), local_mid)
+        if cached:
+            logger.warning("Source unavailable; archiving memory frame for segment %s", segment_id)
+            temporary = target_img.with_suffix(".jpg.tmp")
+            temporary.write_bytes(cached)
+            temporary.replace(target_img)
+            extracted = True
     if not extracted or not target_img.exists():
         logger.warning(
             "未能成功抽取或归档帧: segment_id=%d, fp=%s, t=%.2f",
@@ -134,9 +188,16 @@ def extract_and_archive_frame(
         "archived_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
 
+    import os
+    payload = (json.dumps(meta_record, ensure_ascii=False) + "\n").encode("utf-8")
     with _manifest_lock:
-        with open(manifest_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
+        fd = os.open(manifest_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            if os.write(fd, payload) != len(payload):
+                raise OSError("Incomplete manifest append")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     db.set_segment_archived_path(segment_id, rel_path)
     logger.info("已归档切片帧: %s (label=%s)", filename, manual_label)

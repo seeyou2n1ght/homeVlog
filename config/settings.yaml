@@ -1,5 +1,5 @@
 # ===========================================================================
-# HomeVlog 极限性能配置文件 (Target: Intel i5-12600K + NVIDIA RTX 3060Ti)
+# HomeVlog 生产配置文件 (Target: Intel i5-12600K + NVIDIA RTX 3060Ti)
 # ===========================================================================
 
 paths:
@@ -20,25 +20,29 @@ cameras:
   # 7811DC654321: "front_door"    # 门口机位示例
 
 hardware:
-  # 全局硬件加速设备: ["cuda:0", "cpu", "openvino"]
+  # YOLO 计算设备与 NVDEC 借调开关依据: ["cuda:0", "cpu"]；视频解码策略独立配置
   # RTX 3060Ti 专职负责 YOLO 张量批推理与 Pass 2 (NVENC) 硬件视频编码
   device: "cuda:0"
 
   # 并发控制 (信号量隔离)
-  # 消费级 NVIDIA 显卡限制并发会话: 设为 2 (3060Ti 8GB 显存黄金并发，留出 2GB 安全空间，杜绝换页)
+  # 本项目生产安全上限；这是作业槽位，不是驱动会话数或显存保证
   max_nv_concurrency: 2
-  # QSV 硬件解码并发数 (Intel UHD 770 双 Gen12 VDBox 支撑 8 并发解码)
+  # QSV 作业槽位；与渲染共享，实际吞吐需压测
   max_qsv_concurrency: 8
-  # 全局最大 IO 并发数 (控制同时打开的远程 SMB/本地文件句柄数)
-  max_io_concurrency: 8
+  # 全局输入文件 I/O 预算（渲染按输入文件数计费，并为分析 worker 预留槽位）
+  max_io_concurrency: 32
 
 
 pipeline:
   # 渲染启动延迟 (秒): 等待分析队列积累素材，以便形成更大的渲染批次
   render_start_delay: 2
   # 预筛 GPU 分配策略: ["qsv_only", "alternating", "cuda_only"]
-  # 默认 qsv_only: 预筛 100% 走 UHD 770，完全释放 RTX 3060Ti
+  # 仅控制 FFmpeg 回退路径；默认 keyframes 预筛使用 PyAV 软件解码
   prescreen_gpu_policy: "qsv_only"
+  # 渲染硬件分配策略: ["nv_only", "qsv_only", "heterogeneous"]
+  # 统一同构编码铁律：各批次成片最后通过 -c copy 无损拼接，必须保持相同硬件编码器与 SPS/PPS 参数集。
+  # 生产默认统一采用 nv_only (RTX 3060Ti NVENC)，彻底杜绝 QSV 与 NVENC 异构码流混拼引发的解码画面冻结。
+  render_gpu_policy: "nv_only"
 
 scheduler:
   # 自适应工作窃取水位线 (Adaptive Work-Stealing Watermarks)
@@ -47,12 +51,13 @@ scheduler:
   # 队列积压低水位线: 当待分析文件数 <= 该值时，NVDEC 退出协同，回归 QSV 独占解码
   watermark_low: 3
   # 是否启用 NVDEC 协同解码 (与 QSV 协同抽干积压队列)
-  nvdec_cooperative: true
+  # 同一实拍文件 QSV/CUDA 灰度链产生 47/629 帧分类差异；固定 QSV 保证可复现
+  nvdec_cooperative: false
   # NVDEC 最大协同解码并发数 (建议 1，避免争用显存与 PCIe 带宽)
   max_nv_decoders: 1
-  # 冷启动破冰: 渲染任务就绪前优先用 NVDEC 加速分析队列消费 (实测 NVDEC 解码速度是 QSV 的 2-3 倍)
+  # 冷启动：渲染启动前允许借调 NVDEC；不抢占已运行任务
   cold_start_burst: true
-  # 显存安全保护阈值 (MB): 物理显存已用超过此阈值时强制抑制 NVDEC 借调，让步 QSV 独占，保障 >=1.5GB 留白
+  # 显存安全保护阈值 (MB): 物理显存已用超过此阈值时强制抑制 NVDEC 借调，让步 QSV 独占，预留余量；不保证后续推理峰值
   vram_watermark_mb: 6200
 
 recovery:
@@ -71,18 +76,19 @@ detection:
   prescreen_parallel: 8
   prescreen_segments: 10
   prescreen_resolution: "320x180"
-  prescreen_diff_threshold: 8.0
+  prescreen_diff_threshold: 8.5
 
   prescreen_extract_timeout: 120.0
 
   # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
-  analysis_resolution: "416x234" # 完美对齐 YOLO 推理尺寸
+  analysis_resolution: "416x234" # 灰度分析与候选尺寸；小目标召回需单独评估
   analysis_max_workers: 8
+  analysis_buffer_mb: 256  # 每任务候选、音频及诊断帧池预算；正式运动分析按帧消费
 
   
   # 自适应 FPS: 长文件降低采样率以减少解码开销
-  # 超长静止文件 (夜间) 降至 0.5fps 可再省 30-40% 解码时间，室内监控动作速度下不会漏检
+  # 沿用当前基线；低采样率存在短动作漏检风险，需按标注集评估
   analysis_fps_adaptive: true
   analysis_fps_tiers:
     short: 5
@@ -94,12 +100,6 @@ detection:
     medium_max: 600
     long_max: 1800
 
-  # 早停与时空置信度衰减 (Anti-Miss Early Termination)
-  analysis_early_term_enabled: true
-  analysis_early_term_window: 20
-  analysis_early_term_threshold: 0.2
-  early_term_cooldown_guard: true
-  
   # R2: 时域滑动背景模型 (EMA Background)
   ema_background_enabled: true
   ema_alpha_bg: 0.05
@@ -118,22 +118,28 @@ detection:
 
   # 检测算法调优
   motion_sensitivity: 1.0
+  min_motion_threshold: 2.5
   roi_crop: [0.1, 0.12, 0.8, 0.85]
   min_motion_frames: 3
   min_static_frames: 5
   noise_suppress_frames: 2
   median_filter_window: 7
+  timestamp_margin: 0.5      # 预筛选关键帧抽取安全容差 (秒)
 
 
 audio_vad:
   # R3: 音频 VAD 多模态配置 (Voice Activity Detection & Multimodal Decision)
   enabled: true
-  noise_margin_db: 12.0      # 相对底噪容限 (dB)
-  min_dbfs: -42.0            # 绝对最低激活能量 (dBFS)
+  noise_margin_db: 14.0      # 相对底噪容限 (dB)
+  min_dbfs: -38.0            # 绝对最低激活能量 (dBFS)
   window_ms: 50              # 短时 RMS 能量分帧窗口 (ms)
-  speech_min_dur: 0.3        # 声音事件最小有效持续时间 (s)
+  speech_min_dur: 0.5        # 声音事件最小有效持续时间 (s)
+  sample_rate: 16000         # 音频 VAD 重采样标准率 (Hz)
+  prescreen_audio_gate: false # 预筛阶段是否对画面纯静态素材强制执行音频重筛 (默认关闭，避免底噪杂音将纯静态推入全量 AI 分析)
 
 segment:
+  # 切片短时长拓扑平滑滤波开关
+  apply_smoothing: true
   # 最小运动片段时长 (秒): 短于此值的动作片段将被平滑吸收
   min_motion_duration: 2.0
   # 最小静止片段时长 (秒): 短于此值的微小停顿将自动保持常速，避免眨眼式跳跃
@@ -144,33 +150,52 @@ segment:
   pre_roll: 1.0
   post_roll: 1.5
   # 静态片段抽帧基准与过渡参数 (优化后：快进浓缩比提升，杜绝微小静态段膨胀成片)
-  static_keyframe_interval: 45.0
-  keyframe_display_duration: 0.35
-  min_static_display_duration: 0.4
+  static_keyframe_interval: 55.0
+  keyframe_display_duration: 0.25
+  min_static_display_duration: 0.3
+  max_static_display_duration: 1.5
   min_segment_duration: 0.1
   macro_collapse_static: true
 
 yolo:
   enabled: true
   streaming_verify: true
-  # 触发式推理: 如果动作能量超过此值，认为显著运动，直接跳过 YOLO 推理
-  skip_energy_threshold: 12.0
   # 模型选型说明:
-  # - models/yolo11n.pt: 2.6M 参数，显存 ~270MB，单帧 2.38ms (极速低负载)
-  # - models/yolo11s.pt: 9.4M 参数，显存 ~480MB，单帧 3.63ms (黄金平衡档，推荐默认)
-  # - models/yolo11m.pt: 20.1M 参数，显存 ~920MB，单帧 6.67ms (大算力高精档)
+  # n/s/m 依次增大；实际显存、吞吐与召回取决于输入尺寸、批大小和素材
+  # 当前保留 m 权重，改型前用同一人工验证集比较
   model_path: "models/yolo11m.pt"
   device: "cuda:0"
   # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
   target_classes: [0, 1, 2, 3, 15, 16]
   confidence: 0.3
-  sample_fps: 0.5
+  sample_fps: 2
+  batch_size: 4  # 实际分批送入模型，限制显存峰值
+  max_frames_per_file: 512  # 长文件均匀覆盖上限，避免候选 JPEG 无界增长
 
 render:
 
   # 静态片段处理模式: hybrid_keyframe (幻灯片抽帧，极低解码压力)
   static_mode: "hybrid_keyframe"
-  batch_max_files: 8
+  # 单文件 EDL 批次：每路渲染仅持有一个活动解码上下文；两路 NVENC 合计两路
+  batch_max_files: 1
+  max_concurrency: 3
+  virtual_concat_enabled: true
+  # 混合文件 EDL 灰度开关；启用前必须通过真实长文件的时长与音频闭环验证
+  virtual_concat_mixed_enabled: true
+  # EDL覆盖率过高时软件跳读收益不足，自动回退CUDA连续稀疏链
+  virtual_concat_max_decode_ratio: 0.80
+  # 混合文件保持单次连续解码，但在缩放/回下载前丢弃静态区间的冗余帧
+  mixed_sparse_enabled: true
+  # NAS 顺序读取到本地后再执行多区间 seek；单文件完成即删除，避免 SMB 随机寻址长尾
+  local_staging_enabled: true
+  # 静态区间保留代表画面；concat duration 仍覆盖完整源时间轴
+  static_sample_window_s: 10.0
+  # 相邻动态岛之间的短静态间隙直接顺序解码，减少重复开文件/解码器重建
+  dynamic_coalesce_gap_s: 120.0
+  dynamic_window_max_s: 600.0
+  qsv_timeout_s: 360         # QSV 硬件批次压制最大超时看门狗 (秒)
+  startup_inactivity_timeout_s: 600.0 # 多输入 NAS 文件初始化阶段无进展阈值；首帧后立即切回严格阈值
+  inactivity_timeout_s: 120.0 # 批次压制无进度停滞看门狗 (秒)，杜绝卡死挂起
   # R4: 动态变速过渡 (Speed Ramping)
   speed_ramping_enabled: true
   ramp_duration_s: 1.0
@@ -187,7 +212,7 @@ output:
   fps: 20
 
   # 极限性能编码参数
-  # cq 32: 在 1080p DailyVlog 浓缩场景下画质足够，比 cq 30 编码速度快 10-15%
+  # 编码质量/速度折中，需通过同素材对照评估
   nv:
     codec: "hevc_nvenc"
     preset: "p1"

@@ -4,7 +4,6 @@
 """
 
 import io
-import os
 import csv
 import json
 import time
@@ -41,10 +40,15 @@ class AuditService:
                 "SELECT COUNT(*) FROM segments WHERE manual_label IS NOT NULL"
             ).fetchone()[0]
 
-            label_counts = dict(self.db.conn.execute(
+            raw_counts = dict(self.db.conn.execute(
                 "SELECT manual_label, COUNT(*) FROM segments WHERE manual_label IS NOT NULL GROUP BY manual_label"
             ).fetchall())
 
+            from src.feedback import normalize_label
+            label_counts = {}
+            for label, count in raw_counts.items():
+                normalized = normalize_label(label)
+                label_counts[normalized] = label_counts.get(normalized, 0) + count
             # 混淆矩阵统计
             # TP: DYNAMIC 被确认为有效动态
             tp = label_counts.get("CONFIRMED_MOTION", 0)
@@ -55,9 +59,9 @@ class AuditService:
             # TN: 原判定为 STATIC，且确认为 CONFIRMED_STATIC
             tn = label_counts.get("CONFIRMED_STATIC", 0)
 
-            precision = (tp / (tp + fp)) * 100 if (tp + fp) > 0 else 100.0
-            recall = (tp / (tp + fn)) * 100 if (tp + fn) > 0 else 100.0
-            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 100.0
+            precision = (tp / (tp + fp)) * 100 if (tp + fp) > 0 else None
+            recall = (tp / (tp + fn)) * 100 if (tp + fn) > 0 else None
+            f1 = (2 * tp / (2 * tp + fp + fn)) * 100 if (2 * tp + fp + fn) else None
 
             return {
                 "total_files": total_files,
@@ -71,9 +75,9 @@ class AuditService:
                     "tn": tn,
                 },
                 "metrics": {
-                    "precision": round(precision, 1),
-                    "recall": round(recall, 1),
-                    "f1_score": round(f1, 1),
+                    "precision": round(precision, 1) if precision is not None else None,
+                    "recall": round(recall, 1) if recall is not None else None,
+                    "f1_score": round(f1, 1) if f1 is not None else None,
                 }
             }
 
@@ -129,8 +133,28 @@ class AuditService:
         cam_index: int | None = None,
         limit: int = 60,
     ) -> list[dict[str, Any]]:
-        """获取疑难/争议切片优先队列 (Active Learning)，支持分类过滤。"""
-        return self.db.get_anomaly_segments(category=category, date=date, cam_index=cam_index, limit=limit)
+        """获取疑难/争议切片优先队列 (Active Learning)，支持分类过滤并附带人眼可读绝对时间戳。"""
+        rows = self.db.get_anomaly_segments(category=category, date=date, cam_index=cam_index, limit=limit)
+        for item in rows:
+            st = float(item.get("start_time", 0.0))
+            et = float(item.get("end_time", 0.0))
+            dt_str = item.get("date", "")
+            base_unix = 0.0
+            if dt_str and len(dt_str) == 8:
+                try:
+                    from src.utils import ts_to_unix
+                    base_unix = ts_to_unix(dt_str + "000000")
+                except Exception:
+                    pass
+            if base_unix > 0:
+                item["wall_start_str"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base_unix + st))
+                item["wall_end_str"] = time.strftime("%H:%M:%S", time.localtime(base_unix + et))
+            else:
+                item["wall_start_str"] = f"+{st:.1f}s"
+                item["wall_end_str"] = f"+{et:.1f}s"
+            item["in_file_start"] = round(max(0.0, st - float(item.get("file_start_offset", 0.0))), 2)
+            item["in_file_end"] = round(max(0.0, et - float(item.get("file_start_offset", 0.0))), 2)
+        return rows
 
     def _resolve_local_timestamp(self, filepath: str, timestamp: float) -> tuple[float, float]:
         """将绝对秒数或相对秒数换算为安全的视频文件内相对秒数，并返回 (local_t, file_duration)。"""

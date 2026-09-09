@@ -15,10 +15,13 @@ from src.utils import reset_semaphores
 
 @pytest.fixture(autouse=True)
 def clean_semaphores():
-    """Reset hardware semaphores before and after each test for test isolation."""
+    """Reset hardware semaphores and registry interruption before and after each test for test isolation."""
+    from src.renderer import FFmpegProcessRegistry
     reset_semaphores()
+    FFmpegProcessRegistry.reset_interrupted()
     yield
     reset_semaphores()
+    FFmpegProcessRegistry.reset_interrupted()
 
 
 @pytest.fixture

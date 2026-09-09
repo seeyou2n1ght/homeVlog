@@ -146,13 +146,28 @@ def generate_yolo_labels_for_item(
     2. CONFIRMED_MOTION / VERIFIED_MOTION / MISSED_MOTION (正样本):
        若有 yolo_model，运行推理获取目标的边界框并保存。
     """
-    lbl = item.manual_label.upper()
+    from src.feedback import normalize_label, NEGATIVE_LABELS
+    lbl = normalize_label(item.manual_label)
 
     # 1. 困难负样本：必须写入空文本文件（0 目标）
-    if lbl == "FALSE_ALARM":
+    if lbl in NEGATIVE_LABELS:
         target_txt_path.write_text("", encoding="utf-8")
         return 0
 
+    # Prefer manually reviewed box sidecars over pseudo-labels.
+    sidecar = item.image_path.with_suffix(".txt")
+    if sidecar.exists():
+        content = sidecar.read_text(encoding="utf-8").strip()
+        lines = content.splitlines()
+        for line in lines:
+            fields = line.split()
+            if (len(fields) != 5 or fields[0] not in {"0", "15", "16"} or
+                    any(not 0 <= float(v) <= 1 for v in fields[1:]) or
+                    float(fields[3]) <= 0 or float(fields[4]) <= 0):
+                raise ValueError(f"Invalid reviewed box: {sidecar}")
+        if lines:
+            target_txt_path.write_text(content + "\n", encoding="utf-8")
+            return len(lines)
     # 2. 正样本：检测并生成目标框 (class_id x y w h)
     box_lines: list[str] = []
     if yolo_model is not None:
@@ -172,7 +187,7 @@ def generate_yolo_labels_for_item(
                         if cls_id == 0:
                             target_cls = 0  # person
                         elif cls_id in (15, 16):
-                            target_cls = 1  # pet
+                            target_cls = cls_id  # preserve COCO cat/dog IDs
                         else:
                             continue
 
@@ -182,6 +197,9 @@ def generate_yolo_labels_for_item(
         except Exception as e:
             logger.debug("YOLO 预测生成标签异常: %s", e)
 
+    if not box_lines:
+        logger.warning("Positive sample needs box annotation; excluded: %s", item.image_path)
+        return -1
     # 写入标签文件
     content = "\n".join(box_lines)
     target_txt_path.write_text(content, encoding="utf-8")
@@ -217,67 +235,50 @@ def build_yolo_dataset(
         except Exception as e:
             logger.warning("未能加载 YOLO 预测模型，将生成默认标签: %s", e)
 
-    # 区分正负样本分层抽样，保证 train 和 val 中正负样本比例均衡
-    neg_items = [it for it in items if it.manual_label.upper() == "FALSE_ALARM"]
-    pos_items = [it for it in items if it.manual_label.upper() != "FALSE_ALARM"]
-
-    random.seed(42)
-    random.shuffle(neg_items)
-    random.shuffle(pos_items)
-
-    def split_list(lst: list[DatasetItem], ratio: float):
-        n_val = int(len(lst) * ratio)
-        return lst[n_val:], lst[:n_val]
-
-    train_neg, val_neg = split_list(neg_items, val_ratio)
-    train_pos, val_pos = split_list(pos_items, val_ratio)
-
-    train_set = train_neg + train_pos
-    val_set = val_neg + val_pos
-    random.shuffle(train_set)
-    random.shuffle(val_set)
-
-    logger.info("数据集划分完成: 训练集 %d 张 (正%d/负%d), 验证集 %d 张 (正%d/负%d)",
-                len(train_set), len(train_pos), len(train_neg),
-                len(val_set), len(val_pos), len(val_neg))
-
-    stats = {
-        "train_images": len(train_set),
-        "val_images": len(val_set),
-        "train_boxes": 0,
-        "val_boxes": 0,
-        "negatives": len(neg_items),
-        "positives": len(pos_items),
-    }
-
-    # 输出训练集
-    for it in train_set:
-        dest_img = img_train_dir / it.image_path.name
-        shutil.copy2(str(it.image_path), str(dest_img))
-        dest_lbl = lbl_train_dir / f"{it.image_path.stem}.txt"
+    from src.feedback import normalize_label, NEGATIVE_LABELS, POSITIVE_LABELS
+    import hashlib
+    if not 0 < val_ratio < 1:
+        raise ValueError("val_ratio must be between 0 and 1")
+    if any(any(d.iterdir()) for d in (img_train_dir, img_val_dir, lbl_train_dir, lbl_val_dir)):
+        raise ValueError("Use a new empty dataset directory to avoid stale labels")
+    groups = sorted({it.source_video for it in items})
+    random.Random(42).shuffle(groups)
+    n_val = max(1, round(len(groups) * val_ratio)) if len(groups) > 1 else 0
+    val_groups = set(groups[:n_val])
+    stats = {"train_images": 0, "val_images": 0, "train_boxes": 0, "val_boxes": 0,
+             "negatives": 0, "positives": 0, "excluded": 0}
+    manifest = []
+    for it in items:
+        label = normalize_label(it.manual_label)
+        if label not in NEGATIVE_LABELS | POSITIVE_LABELS:
+            stats["excluded"] += 1
+            continue
+        split = "val" if it.source_video in val_groups else "train"
+        suffix = hashlib.sha256(str(it.image_path.resolve()).encode()).hexdigest()[:12]
+        name = it.image_path.stem + "_" + suffix
+        dest_lbl = output_dir / "labels" / split / (name + ".txt")
         n_boxes = generate_yolo_labels_for_item(it, dest_lbl, yolo_model)
-        stats["train_boxes"] += n_boxes
-
-    # 输出验证集
-    for it in val_set:
-        dest_img = img_val_dir / it.image_path.name
-        shutil.copy2(str(it.image_path), str(dest_img))
-        dest_lbl = lbl_val_dir / f"{it.image_path.stem}.txt"
-        n_boxes = generate_yolo_labels_for_item(it, dest_lbl, yolo_model)
-        stats["val_boxes"] += n_boxes
+        if n_boxes < 0:
+            stats["excluded"] += 1
+            continue
+        dest_img = output_dir / "images" / split / (name + it.image_path.suffix)
+        shutil.copy2(it.image_path, dest_img)
+        stats[split + "_images"] += 1
+        stats[split + "_boxes"] += n_boxes
+        stats["negatives" if label in NEGATIVE_LABELS else "positives"] += 1
+        manifest.append({"image": str(dest_img.relative_to(output_dir)), "source_video": it.source_video,
+                         "label": label, "split": split, "label_source": "human_negative" if label in NEGATIVE_LABELS else "human_boxes" if it.image_path.with_suffix(".txt").exists() else "pseudo"})
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 生成 data.yaml
     data_yaml_path = output_dir / "data.yaml"
     # 使用规范的绝对或正斜杠相对路径
-    yaml_content = f"""# HomeVlog 专属机位微调数据集配置
-path: {str(output_dir.resolve()).replace('\\', '/')}
-train: images/train
-val: images/val
-
-names:
-  0: person
-  1: pet
-"""
+    import yaml
+    import ultralytics
+    coco = yaml.safe_load((Path(ultralytics.__file__).parent / "cfg" / "datasets" / "coco.yaml").read_text(encoding="utf-8"))
+    yaml_content = yaml.safe_dump({"path": str(output_dir.resolve()).replace("\\", "/"),
+                                   "train": "images/train", "val": "images/val", "names": coco["names"]},
+                                  allow_unicode=True, sort_keys=False)
     data_yaml_path.write_text(yaml_content, encoding="utf-8")
     logger.info("已生成数据集配置文件: %s", data_yaml_path)
 
@@ -291,6 +292,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "yolo_dataset", help="YOLO 数据集导出目录")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集切分比例 (默认 0.2)")
     parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models" / "yolo11n.pt", help="基础 YOLO 模型路径")
+    parser.add_argument("--camera", help="Camera MAC or configured alias")
     parser.add_argument("--dry-run", action="store_true", help="仅预览可用样本数，不执行文件生成")
 
     args = parser.parse_args()
@@ -305,6 +307,11 @@ def main():
         logger.info("归档目录无数据，回退扫描数据库...")
         items = load_db_fallback_items(args.db)
 
+    if args.camera:
+        from src.utils import load_config
+        aliases = load_config().get("cameras", {})
+        camera = next((mac for mac, alias in aliases.items() if alias == args.camera), args.camera)
+        items = [it for it in items if camera.casefold() in it.source_video.casefold()]
     if not items:
         print("[!] 未找到任何已打标的复核样本。")
         print("[i] 请先在 Web 审核平台 (uv run python scripts/audit_tool/app.py) 中标记若干疑难切片。")

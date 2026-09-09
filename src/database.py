@@ -1,6 +1,7 @@
 import sqlite3
 import threading
 import logging
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from src.utils import DB_PATH
@@ -46,6 +47,10 @@ CREATE TABLE IF NOT EXISTS segments (
     avg_confidence REAL DEFAULT 0.0,
     file_start_offset REAL DEFAULT 0.0,
 
+    -- 疑难/无法判定场景打标 (Active Learning)
+    needs_review INTEGER DEFAULT 0,
+    review_reason TEXT,
+
     -- 人工审核打标与反向纠偏
     manual_label TEXT,
     review_notes TEXT,
@@ -67,6 +72,25 @@ CREATE TABLE IF NOT EXISTS render_tasks (
     UNIQUE(date, cam_index)
 );
 
+CREATE TABLE IF NOT EXISTS camera_registry (
+    camera_id TEXT PRIMARY KEY, cam_index INTEGER NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS human_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, filepath TEXT NOT NULL,
+    start_time REAL NOT NULL, end_time REAL NOT NULL, manual_label TEXT NOT NULL,
+    review_notes TEXT, reviewed_at TEXT, archived_frame_path TEXT,
+    UNIQUE(filepath, start_time, end_time)
+);
+CREATE TRIGGER IF NOT EXISTS preserve_human_review AFTER UPDATE ON segments
+WHEN NEW.manual_label IS NOT NULL
+BEGIN
+    INSERT INTO human_reviews(filepath,start_time,end_time,manual_label,review_notes,reviewed_at,archived_frame_path)
+    VALUES(NEW.filepath,NEW.start_time,NEW.end_time,NEW.manual_label,NEW.review_notes,NEW.reviewed_at,NEW.archived_frame_path)
+    ON CONFLICT(filepath,start_time,end_time) DO UPDATE SET
+        manual_label=excluded.manual_label,review_notes=excluded.review_notes,
+        reviewed_at=excluded.reviewed_at,archived_frame_path=excluded.archived_frame_path;
+END;
+
 CREATE INDEX IF NOT EXISTS idx_file_tasks_date ON file_tasks(date, cam_index);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_prescreen ON file_tasks(prescreen_status);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_analysis ON file_tasks(analysis_status);
@@ -80,7 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_render_tasks_status ON render_tasks(status);
 
 class VlogDatabase:
     def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DB_PATH
+        self.db_path = Path(db_path) if db_path is not None else DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -90,32 +114,88 @@ class VlogDatabase:
 
     def _migrate(self):
         with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
             cursor = self.conn.execute("PRAGMA table_info(file_tasks)")
             columns = [row["name"] for row in cursor.fetchall()]
             if "has_audio" not in columns:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN has_audio INTEGER DEFAULT 0")
+            if "processing_fingerprint" not in columns:
+                self.conn.execute("ALTER TABLE file_tasks ADD COLUMN processing_fingerprint TEXT")
 
             cursor_seg = self.conn.execute("PRAGMA table_info(segments)")
             seg_columns = [row["name"] for row in cursor_seg.fetchall()]
             if "archived_frame_path" not in seg_columns:
                 self.conn.execute("ALTER TABLE segments ADD COLUMN archived_frame_path TEXT")
+            if "needs_review" not in seg_columns:
+                self.conn.execute("ALTER TABLE segments ADD COLUMN needs_review INTEGER DEFAULT 0")
+            if "review_reason" not in seg_columns:
+                self.conn.execute("ALTER TABLE segments ADD COLUMN review_reason TEXT")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_needs_review ON segments(needs_review)")
+            self.conn.execute("""INSERT OR IGNORE INTO human_reviews
+                (filepath,start_time,end_time,manual_label,review_notes,reviewed_at,archived_frame_path)
+                SELECT filepath,start_time,end_time,manual_label,review_notes,reviewed_at,archived_frame_path
+                FROM segments WHERE manual_label IS NOT NULL""")
+            if "camera_id" not in columns:
+                self.conn.execute("ALTER TABLE file_tasks ADD COLUMN camera_id TEXT")
+            from src.scanner import camera_key
+            for row in self.conn.execute("SELECT id,filepath,cam_index,date FROM file_tasks WHERE camera_id IS NULL ORDER BY id").fetchall():
+                identity = camera_key(row["filepath"], row["cam_index"])
+                index = self._camera_index(identity, row["cam_index"])
+                self.conn.execute("UPDATE file_tasks SET camera_id=?,cam_index=? WHERE id=?", (identity,index,row["id"]))
+                if index != row["cam_index"]:
+                    self.conn.execute("UPDATE segments SET cam_index=? WHERE file_id=?", (index,row["id"]))
+                    self.conn.execute("UPDATE render_tasks SET status='PENDING' WHERE date=?", (row["date"],))
             self.conn.commit()
+
+    def _camera_index(self, identity, preferred):
+        row = self.conn.execute("SELECT cam_index FROM camera_registry WHERE camera_id=?", (identity,)).fetchone()
+        if row:
+            return row[0]
+        used = {r[0] for r in self.conn.execute("SELECT cam_index FROM camera_registry")}
+        index = preferred if preferred not in used else max(used, default=-1) + 1
+        self.conn.execute("INSERT INTO camera_registry VALUES (?,?)", (identity,index))
+        return index
+
+    def set_processing_fingerprint(self, filepath, fingerprint):
+        with self._lock:
+            self.conn.execute("UPDATE file_tasks SET processing_fingerprint=? WHERE filepath=?", (fingerprint,filepath))
+            self.conn.commit()
+
+    def invalidate_stale_results(self, date, cam_index, config):
+        from src.render_cache import processing_fingerprint
+        rows = self.get_all_file_tasks_for_date(date, cam_index)
+        stale = [r["filepath"] for r in rows if r["prescreen_status"] in ("STATIC", "SUSPICIOUS")
+                 and r.get("processing_fingerprint") != processing_fingerprint(r["filepath"], config)]
+        with self._lock:
+            self.conn.executemany("""UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING',
+                                  analysis_segments=NULL, retry_count=0 WHERE filepath=?""", [(p,) for p in stale])
+            if stale:
+                self.conn.execute("UPDATE render_tasks SET status='PENDING' WHERE date=? AND cam_index=?", (date,cam_index))
+            self.conn.commit()
+        return len(stale)
+
+    @property
+    def is_closed(self) -> bool:
+        return self._conn is None
 
     @property
     def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         return self._conn
 
-    def set_file_metadata(self, filepath: str, has_audio: int):
+    def set_file_metadata(self, filepath: str, has_audio: int, duration: float | None = None):
         with self._lock:
             try:
                 self.conn.execute(
-                    "UPDATE file_tasks SET has_audio=? WHERE filepath=?",
-                    (has_audio, str(filepath))
+                    "UPDATE file_tasks SET has_audio=?, file_duration=COALESCE(?,file_duration) WHERE filepath=?",
+                    (has_audio, duration, str(filepath))
                 )
                 self.conn.commit()
             except Exception as e:
                 logger.error("DB error in set_file_metadata: %s", e)
                 self.conn.rollback()
+                raise
 
     def add_file_task(
         self,
@@ -128,14 +208,20 @@ class VlogDatabase:
     ) -> bool:
         with self._lock:
             try:
-                self.conn.execute(
+                from src.scanner import camera_key
+                identity = camera_key(filepath, cam_index)
+                # Serialize identity allocation across independent SQLite connections.
+                if not self.conn.in_transaction:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                cam_index = self._camera_index(identity, cam_index)
+                cursor = self.conn.execute(
                     """INSERT OR IGNORE INTO file_tasks
-                       (filepath, cam_index, date, file_start_time, file_end_time, file_duration)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (str(filepath), cam_index, date, file_start_time, file_end_time, file_duration),
+                       (filepath, cam_index, date, file_start_time, file_end_time, file_duration, camera_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (str(filepath), cam_index, date, file_start_time, file_end_time, file_duration, identity),
                 )
                 self.conn.commit()
-                return True
+                return cursor.rowcount > 0
             except Exception as e:
                 logger.error("DB error in add_file_task for %s: %s", filepath, e)
                 self.conn.rollback()
@@ -162,11 +248,17 @@ class VlogDatabase:
             except Exception as e:
                 logger.error("DB error in set_prescreen_result for %s: %s", filepath, e)
                 self.conn.rollback()
+                raise
 
-    def set_analysis_result(self, filepath: str, status: str, segments: list | str = ""):
+    def set_analysis_result(self, filepath: str, status: str | list = "ANALYZED", segments: list | str = ""):
         with self._lock:
             try:
                 import json
+                # 兼容 set_analysis_result(filepath, segments) 的双参数调用形式
+                if isinstance(status, (list, tuple)) or (isinstance(status, str) and status.strip().startswith("[") and not segments):
+                    segments = status
+                    status = "ANALYZED"
+
                 segments_list = []
                 segments_json = ""
                 if isinstance(segments, str):
@@ -179,7 +271,7 @@ class VlogDatabase:
                 elif isinstance(segments, list):
                     segments_list = segments
                     try:
-                        dict_list = [s.to_dict() if hasattr(s, "to_dict") else dict(s) for s in segments]
+                        dict_list = [asdict(s) if is_dataclass(s) else s.to_dict() if hasattr(s, "to_dict") else dict(s) for s in segments]
                         segments_json = json.dumps(dict_list)
                     except Exception:
                         segments_json = ""
@@ -215,6 +307,8 @@ class VlogDatabase:
                             energy = float(getattr(s, "max_energy", 0.0) or 0.0)
                             conf = float(getattr(s, "avg_confidence", 0.0) or 0.0)
                             offset = float(getattr(s, "file_start_offset", 0.0) or 0.0)
+                            needs_review = 1 if bool(getattr(s, "needs_review", False)) else 0
+                            review_reason = str(getattr(s, "review_reason", "") or "")
                         elif isinstance(s, dict):
                             st = float(s.get("start_time", s.get("start", 0.0)))
                             et = float(s.get("end_time", s.get("end", 0.0)))
@@ -222,21 +316,25 @@ class VlogDatabase:
                             energy = float(s.get("max_energy", 0.0) or 0.0)
                             conf = float(s.get("avg_confidence", 0.0) or 0.0)
                             offset = float(s.get("file_start_offset", 0.0) or 0.0)
+                            needs_review = 1 if bool(s.get("needs_review", False)) else 0
+                            review_reason = str(s.get("review_reason", "") or "")
                         else:
                             continue
 
                         dur = max(et - st, 0.0)
                         records.append((
                             file_id, str(filepath), cam_index, date_val,
-                            st, et, dur, state, energy, conf, offset
+                            st, et, dur, state, energy, conf, offset,
+                            needs_review, review_reason,
                         ))
 
                     if records:
                         self.conn.executemany(
                             """INSERT OR REPLACE INTO segments
                                (file_id, filepath, cam_index, date, start_time, end_time, duration,
-                                state, max_energy, avg_confidence, file_start_offset)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                state, max_energy, avg_confidence, file_start_offset,
+                                needs_review, review_reason)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             records,
                         )
 
@@ -244,6 +342,7 @@ class VlogDatabase:
             except Exception as e:
                 logger.error("DB error in set_analysis_result for %s: %s", filepath, e)
                 self.conn.rollback()
+                raise
 
     def get_segments_for_file(self, filepath: str) -> list[dict]:
         with self._lock:
@@ -330,6 +429,7 @@ class VlogDatabase:
 
         Categories:
             - 'all': 召回所有争议疑难切片
+            - 'needs_review': 算法自动打标的不确定/待审典型场景
             - 'fp_suspect': 疑似误报 (算法判定 DYNAMIC，但 YOLO 无目标且能量偏低，疑似光影/微尘)
             - 'fn_suspect': 疑似漏报 (算法判定 STATIC，但能量接近临界阈值，疑似微动漏检)
             - 'jitter': 极短毛刺 (时长 < 3.0s 的动态突变碎片)
@@ -340,7 +440,9 @@ class VlogDatabase:
                 where_clauses = []
                 params = []
 
-                if category == "fp_suspect":
+                if category == "needs_review":
+                    where_clauses.append("(needs_review = 1)")
+                elif category == "fp_suspect":
                     where_clauses.append("(state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)")
                 elif category == "fn_suspect":
                     where_clauses.append("(state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0)")
@@ -350,7 +452,8 @@ class VlogDatabase:
                     where_clauses.append("manual_label IS NOT NULL")
                 else:  # 'all' 或默认
                     where_clauses.append(
-                        "((state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0) "
+                        "((needs_review = 1) "
+                        "OR (state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0) "
                         "OR (state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0) "
                         "OR (duration < 3.0 AND state = 'DYNAMIC'))"
                     )
@@ -366,7 +469,7 @@ class VlogDatabase:
                 query = f"""
                     SELECT * FROM segments
                     WHERE {where_str}
-                    ORDER BY (manual_label IS NULL) DESC, max_energy DESC
+                    ORDER BY (manual_label IS NULL) DESC, needs_review DESC, max_energy DESC
                     LIMIT ?
                 """
                 params.append(limit)
@@ -375,10 +478,25 @@ class VlogDatabase:
                 results = []
                 for r in rows:
                     item = dict(r)
-                    # 语义化标记错检原因
+                    # 语义化标记错检原因与人工复核指引
                     if item.get("manual_label"):
                         item["anomaly_type"] = "reviewed"
                         item["reason_desc"] = f"已复核 ({item['manual_label']})"
+                    elif item.get("review_reason"):
+                        item["reason_desc"] = item["review_reason"]
+                        r_r = item["review_reason"]
+                        if "MULTIMODAL" in r_r:
+                            item["anomaly_type"] = "multimodal_conflict"
+                        elif "BORDERLINE_CONFIDENCE" in r_r:
+                            item["anomaly_type"] = "borderline_confidence"
+                        elif "HIGH_ENERGY" in r_r:
+                            item["anomaly_type"] = "high_energy_no_target"
+                        elif "BORDERLINE_MICRO_MOTION" in r_r:
+                            item["anomaly_type"] = "fn_suspect"
+                        elif "BURST_JITTER" in r_r:
+                            item["anomaly_type"] = "jitter"
+                        else:
+                            item["anomaly_type"] = "needs_review"
                     elif item.get("state") == "DYNAMIC" and float(item.get("avg_confidence", 0.0)) == 0.0 and float(item.get("max_energy", 0.0)) < 8.0:
                         item["anomaly_type"] = "fp_suspect"
                         item["reason_desc"] = "疑似光影刚性 (无目标置信度)"
@@ -406,6 +524,8 @@ class VlogDatabase:
         避免坏文件造成无限重跑。返回各类重置数量。
         """
         with self._lock:
+            if self._conn is None:
+                return {"prescreen": 0, "analysis": 0}
             try:
                 cur = self.conn.execute(
                     """UPDATE file_tasks
@@ -427,8 +547,13 @@ class VlogDatabase:
                 n_ana = cur.rowcount
                 self.conn.commit()
             except Exception as e:
+                if self._conn is None:
+                    return {"prescreen": 0, "analysis": 0}
                 logger.error("DB error in reset_failed_tasks: %s", e)
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 return {"prescreen": 0, "analysis": 0}
         if n_pre or n_ana:
             logger.info(
@@ -437,8 +562,24 @@ class VlogDatabase:
             )
         return {"prescreen": n_pre, "analysis": n_ana}
 
+    def get_file_task_summary(self, filepath: str) -> dict | None:
+        with self._lock:
+            if self._conn is None:
+                return None
+            try:
+                row = self.conn.execute(
+                    "SELECT id, filepath, prescreen_status, analysis_segments FROM file_tasks WHERE filepath=?",
+                    (str(filepath),)
+                ).fetchone()
+                return dict(row) if row else None
+            except Exception as e:
+                logger.error("DB error in get_file_task_summary: %s", e)
+                return None
+
     def get_all_file_tasks_for_date(self, date: str, cam_index: int) -> list[dict]:
         with self._lock:
+            if self._conn is None:
+                return []
             try:
                 rows = self.conn.execute(
                     """SELECT * FROM file_tasks
@@ -446,13 +587,41 @@ class VlogDatabase:
                        ORDER BY file_start_time""",
                     (date, cam_index),
                 ).fetchall()
-                return [dict(r) for r in rows]
+                result = [dict(r) for r in rows]
+                if not result:
+                    return []
+
+                # 一次性批量预加载全部 segments 与 human_reviews，避免 140 次循环串行查询引发 N+1 性能雪崩
+                from collections import defaultdict
+                segs_by_file = defaultdict(list)
+                seg_rows = self.conn.execute(
+                    """SELECT * FROM segments WHERE date=? AND cam_index=? ORDER BY file_id, start_time""",
+                    (date, cam_index),
+                ).fetchall()
+                for sr in seg_rows:
+                    segs_by_file[sr["file_id"]].append(dict(sr))
+
+                reviews_by_file = defaultdict(list)
+                rev_rows = self.conn.execute(
+                    """SELECT * FROM human_reviews ORDER BY reviewed_at, id"""
+                ).fetchall()
+                for rr in rev_rows:
+                    reviews_by_file[rr["filepath"]].append(dict(rr))
+
+                for row in result:
+                    row["segments"] = segs_by_file.get(row["id"], [])
+                    row["human_reviews"] = reviews_by_file.get(row["filepath"], [])
+                return result
             except Exception as e:
+                if self._conn is None:
+                    return []
                 logger.error("DB error in get_all_file_tasks_for_date: %s", e)
                 return []
 
     def upsert_render_task(self, date: str, cam_index: int, status: str = "PENDING"):
         with self._lock:
+            if self._conn is None:
+                return
             try:
                 self.conn.execute(
                     """INSERT INTO render_tasks (date, cam_index, status, updated_at)
@@ -463,11 +632,18 @@ class VlogDatabase:
                 )
                 self.conn.commit()
             except Exception as e:
+                if self._conn is None:
+                    return
                 logger.error("DB error in upsert_render_task: %s", e)
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
 
     def set_render_status(self, date: str, cam_index: int, status: str, output_file: str = ""):
         with self._lock:
+            if self._conn is None:
+                return
             try:
                 self.conn.execute(
                     """INSERT INTO render_tasks
@@ -481,11 +657,18 @@ class VlogDatabase:
                 )
                 self.conn.commit()
             except Exception as e:
+                if self._conn is None:
+                    return
                 logger.error("DB error in set_render_status: %s", e)
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
 
     def is_render_completed(self, date: str, cam_index: int) -> bool:
         with self._lock:
+            if self._conn is None:
+                return False
             try:
                 row = self.conn.execute(
                     "SELECT status FROM render_tasks WHERE date=? AND cam_index=?",
@@ -493,11 +676,15 @@ class VlogDatabase:
                 ).fetchone()
                 return row is not None and row["status"] == "COMPLETED"
             except Exception as e:
+                if self._conn is None:
+                    return False
                 logger.error("DB error in is_render_completed: %s", e)
                 return False
 
     def get_pending_file_count_for_date(self, date: str, cam_index: int) -> int:
         with self._lock:
+            if self._conn is None:
+                return 0
             try:
                 row = self.conn.execute(
                     """SELECT COUNT(*) as cnt FROM file_tasks
@@ -507,6 +694,8 @@ class VlogDatabase:
                 ).fetchone()
                 return row["cnt"] if row else 0
             except Exception as e:
+                if self._conn is None:
+                    return 0
                 logger.error("DB error in get_pending_file_count_for_date: %s", e)
                 return 0
 

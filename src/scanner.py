@@ -20,6 +20,15 @@ CAMERA_DIR_RE = re.compile(
 )
 
 
+def camera_key(filepath: str, channel: int = 0) -> str:
+    """Directory MAC is physical identity; retain channel for multi-channel exports."""
+    from pathlib import PureWindowsPath
+    parent = PureWindowsPath(str(filepath)).parent
+    match = CAMERA_DIR_RE.search(str(parent))
+    identity = match.group("mac").upper() if match else str(parent).replace("\\", "/").casefold()
+    return f"{identity}:channel{channel}"
+
+
 def parse_camera_dir(dir_path: str) -> dict:
     """
     解析小米摄像头在 NAS 上自动创建的目录命名：XiaomiCamera_CameraID_CameraMAC

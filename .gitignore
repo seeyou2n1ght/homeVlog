@@ -25,6 +25,8 @@ wheels/
 .installed.cfg
 *.egg
 .pytest_cache/
+.test-tmp/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -51,6 +53,7 @@ output/
 logs/
 data/
 temp/
+scratch/
 reports/
 inspect_out*/
 *.db
@@ -58,6 +61,7 @@ inspect_out*/
 *.db-wal
 *.sqlite
 *.sqlite3
+*.prof
 
 # ==========================================
 # Large Binary Models & Weights

@@ -1,154 +1,131 @@
-# 系统架构设计 (Architecture)
+﻿# HomeVlog 系统架构、数据契约与架构决策全景 (System Architecture & ADRs)
 
-HomeVlog 是面向家庭 NAS 与本地主机的长视频智能浓缩系统。系统输入全天或多日的家庭室内监控视频（通常为 4K H.265 编码），自动识别有效动态与声音事件，压缩大段时间的静止画面，输出高保真、平滑过渡的家庭 DailyVlog。
-
----
-
-## 1. 全局数据流拓扑
-
-系统遵循 **单次解码 (Single-Pass)** 与 **零零碎磁盘 IO (Zero-IO)** 原则，数据流分为三级流式流水线：
-
-`	ext
-[NAS / 本地监控录像] (4K H.265 / MP4)
-         │
-         ▼
- ┌───────────────────────────────────────────────────────────┐
- │ 1. 预筛选 (Pass 1: Prescreen)                             │
- │    - FFmpeg 关键帧跳跃读取 (I 帧直出)                      │
- │    - 自适应动态阈值 + 4x4 网格空间集中度算子              │
- │    - 剔除纯静态时段 (漫反射光影/车灯抑制)                  │
- └─────────────────────────┬─────────────────────────────────┘
-                           │ 候选可疑切片 (SUSPICIOUS)
-                           ▼
- ┌───────────────────────────────────────────────────────────┐
- │ 2. 精细分析 (Pass 1.5: Analysis)                          │
- │    - FFmpeg 管道解码出 80x45 单通道灰度流                  │
- │    - EMA 选择性滑动背景更新 + 8x8 连通域抗噪滤波          │
- │    - 短时音频 RMS 能量包络与一阶自相关 (AudioEnergyVAD)    │
- │    - 内存 JPEG 切片压缩池 (Zero-IO 候选帧流转)            │
- └─────────────────────────┬─────────────────────────────────┘
-                           │ 触发运动判定
-                           ▼
- ┌───────────────────────────────────────────────────────────┐
- │ 3. 语义验证 (Pass 1.8: YOLO Verification)                 │
- │    - 内存中动态组装 Batch，送入 Tensor Core YOLOv11       │
- │    - 人体/宠物目标置信度核验，彻底过滤假动作              │
- └─────────────────────────┬─────────────────────────────────┘
-                           │ 结构化切片与时间轴映射
-                           ▼
- ┌───────────────────────────────────────────────────────────┐
- │ 4. 硬件渲染 (Pass 2: Render)                              │
- │    - 动态段 1x 原速原声 (afade 音频平滑过渡)              │
- │    - 静态段 30x~60x 快速缩放过渡 (C¹ 连续 PTS 曲线)       │
- │    - 双路 NVENC 硬件并发编码，原子切片输出与无损合并      │
- └─────────────────────────┬─────────────────────────────────┘
-                           │
-                           ▼
-              [最终 DailyVlog 视频成片]
-`
+本文档为 HomeVlog 系统的**架构单一真实来源 (Single Source of Truth)**，严格对照生产代码实现编写，包含系统流水线拓扑、数据契约、硬件并发调度规约以及历次关键架构决策（ADR）。
 
 ---
 
-## 2. 异构硬件调度与并发控制 (src/scheduler.py)
+## 一、系统架构总览
 
-系统设计运行于兼具 Intel 核显（QSV）与 NVIDIA 独显（CUDA/NVENC）的混合异构平台（如 i5-12600K + RTX 3060Ti）。
+HomeVlog 的核心工程哲学为：**单次解码 (Single-Pass)**、**零临时落盘 (Zero-IO)**、**容错重于完美** 以及 **确定性物理对账**。
 
-### 2.1 硬件分工与信号量限制
-- **Intel UHD 770 (QSV)**: 专职负责 Pass 1 粗筛与 Pass 1.5 灰度管道解码，充分利用双 Gen12 VDBox 的高并发吞吐。
-- **NVIDIA RTX 3060Ti (NVENC/CUDA)**: 专职负责 YOLOv11 批推理加速与 Pass 2 最终成片的 NVENC 视频编码。
-- **硬件并发信号量**:
-  - 
-v_sem: 限制 NVENC 并发编码上限（当前基线为 2，防止显存溢出与驱动层拒绝会话）。
-  - qsv_sem: 限制 QSV 解码并发句柄数（默认 4~8），防止驱动句柄耗尽。
-  - **释放单次原则**: 所有信号量获取后必须在 	ry...finally 的 inally 块中且仅释放一次，禁止在代码路径分支中多重释放。
-
-### 2.2 工作窃取与动态让步机制 (WorkStealingManager)
-1. **动态租借**: 当 QSV 解码队列积压达到高水位时，调度器动态向 CUDA 申请空闲 NVDEC 槽位协助解码。
-2. **渲染抢占与让步 (RENDER_PREEMPTION_YIELD)**: 当批次渲染阶段启动需要使用 NVENC/CUDA 算力时，调度器发出让步信号，解码端立即归还借调的 NV 槽位，保障渲染流水线拥有绝对优先算力，杜绝硬件争用死锁。
-
----
-
-
-### 2.3 批次调度与收尾物理对账
-- **Heavy / Light 双队列**: 批次按运动密集度分流进入 heavy_queue（含动态，优先 NVENC 压制）与 light_queue（纯静态，快速压制）。
-- **哨兵安全语义**: _render_worker 中投递的 None 哨兵仅作为唤醒信号；Worker 退出的充要条件为 ll_dispatched && heavy.empty() && light.empty()，防止 heavy 抽空时遗留 light 静态批次。
-- **物理收尾对账**: 流水线退出前强制校验 dispatched_batch_ids 与实际落盘批次（produced | terminal）的差集，确保零静默丢批。
-- **静态段渲染快路径**: 纯静态且时长满足阈值的切片，在 FFmpeg 滤镜链中使用 select 按关键帧抽帧，置于 scale/hwdownload 之前，消灭纯静态段全帧硬解的显存回传瓶颈。
-- **展示时长计划与墙钟字幕单一来源**: 	imeline.compute_display_plans() 输出统一的展示计划，Filtergraph 滤镜图与 SRT 字幕共用该数据结构；字幕时间戳通过 src_offset_at_display() 按变速曲线逆映射还原真实墙钟时间。
-
-## 3. 动静识别算法体系 (src/filters.py, src/prescreen.py)
-
-### 3.1 预筛选空间集中度算子 (_calc_spatial_concentration)
-针对家庭摄像头常见的全画幅光影干扰（如早晚太阳漫反射、窗帘大面积受风微动、夜间车灯扫过）：
-- 将关键帧差分图划分为 4x4 空间网格（共 16 个单元）。
-- 计算局部最高网格能量与全图平均能量的比值：
-  Concentration = max(GridEnergy) / (MeanEnergy + epsilon)
-- **判定逻辑**：当全图变化能量超过阈值，但 Concentration < 1.35（能量均匀弥散在整个画幅）时，判定为环境光变化，予以直接压制；仅当 Concentration >= 1.35 时才判定为有局部主体移动（人体/宠物入画）。
-
-### 3.2 自适应 EMA 背景更新与 8x8 连通域网格
-- **EMA 背景建模**: 双差分显著图融合，前景区域低速吸收，背景区域高速更新，兼顾快速动态捕获与人体静坐微动保留。
-- **8x8 连通域滤波 (SpatialGridMotionFilter)**: 动态追踪 64 个网格单元底噪，8-邻域连通分量过滤孤立红外夜视噪点，聚类放大连续肢体动作。
-- **音频 VAD 唤醒 (AudioEnergyVAD)**: 在短时 50ms 窗口计算音频 RMS 能量与一阶自相关，家庭对话、婴儿哭声等声音事件可直接唤醒 1x 原速保留。
+```mermaid
+graph TD
+    A["NAS 目录扫描 (scanner.py)<br/>仅解析文件名/时间戳/机位 MAC"] --> B["SQLite: file_tasks + camera_registry"]
+    B --> C["[Pass 1] 快速关键帧预筛 (prescreen.py)<br/>PyAV 关键帧稀疏采样 / 光影空间连通滤波"]
+    C -->|纯静态且无音频| D["纯静态轻队列 (light_queue)<br/>Intel UHD 770 QSV / NVENC 快路径"]
+    C -->|疑似动作/关键音频/暗光噪点| E["[Pass 1.5] 灰度直通多模态精析 (detector.py)<br/>大文件优先队列 (AnalysisQueue)"]
+    E --> F["时域滑动背景 (EmaBackgroundModel)<br/>+ 8x8 空间连通域过滤 (SpatialGrid)"]
+    E --> G["音频活动检测 (AudioEnergyVAD)"]
+    E --> H["零拷贝内存池 (Zero-IO JPEG Pool)<br/>+ YOLO 批推理流式验证"]
+    F & G & H --> I["生成切片并存入 DB (segments 表)<br/>+ 计算 processing_fingerprint"]
+    I --> J["构建全天展示时长计划 (compute_display_plans)<br/>人工打标优先反向纠偏"]
+    J --> K["[Pass 2] 同构流式渲染 (StreamingOrchestrator)<br/>单文件原子批次 (_batchX.tmp.mp4)"]
+    D --> K
+    K --> M["NVENC 双 Worker 消费全量批次<br/>+ 纯动态短路 / 强制 IDR 序列隔离"]
+    M --> N["确定性物理对账 (dispatched vs produced)<br/>+ 原子合并为最终 Vlog MP4"]
+    I -.-> O["[主动学习] 疑难切片召回 (get_anomaly_segments)<br/>独立 Web 审核工作台交互打标"]
+    O -.->|反向纠偏| J
+    O -.->|物理帧抽取| P["安全机位微调导出 (export_dataset.py)"]
+```
 
 ---
 
-## 4. 人机协同与 Active Learning 闭环
+## 二、核心数据契约与存储架构 (Data Contracts)
 
-`	ext
-[日常流水线运行] ──> [data/vlog.db (segments 表)]
-                            │
-                            ▼
-               [Web 审核工作台 (scripts/audit_tool)]
-                            │
-             ┌──────────────┴──────────────┐
-             ▼                             ▼
-       [疑难样本主动挖掘]             [人工打标 TP/FP/FN/TN]
-     (光影假阳 / 微动假阴)                  │
-                                           ├─> [物理原图归档 data/archives/]
-                                           ├─> [秒级时间轴修正重浓缩]
-                                           └─> [专属机位数据集导出]
-                                                           │
-                                                           ▼
-                                            [YOLO11 骨干冻结本地微调]
-                                            (scripts/train_yolo.py)
-`
+系统元数据统一持久化存储于 SQLite (`data/vlog.db`)，并启用 WAL 模式保障多线程并发安全：
 
-1. **疑难样本排查**：Web 工作台自动检索判定为 DYNAMIC 但 YOLO 置信度为 0（疑似光影误报），或判定为 STATIC 但能量处于临界区（疑似微动漏判）的切片置顶。
-2. **物理帧归档 (src/archiver.py)**：标记切片时，自动从原始高清视频抽取发生变动瞬间的原图与差分图，保存至 data/archives/{camera}/{date}/，并原子追加更新 manifest.jsonl 索引。
-3. **秒级重浓缩 (scripts/audit_tool/api)**：人工修正打标（如将误报段标记为 FALSE_ALARM）后，直接更新 DB 中的时间轴标记。调用重浓缩接口可跳过 Pass 1 与 Pass 1.5 解码，仅重走 Pass 2 渲染，数十秒内输出修正后的新成片。
-4. **模型微调闭环 (scripts/train_yolo.py)**：基于归档的难样本自动生成 8:2 训练验证集与 YOLO 格式标注（包括负样本空标注），冻结主干网络（reeze=10）进行轻量微调，生成机位专属权重，实现识别准确率自我演进。
+1. **`file_tasks` 表 (素材任务清单)**:
+   - 记录监控素材全局状态，字段包含 `filepath`, `cam_index`, `date`, `file_start_time`, `file_duration`, `prescreen_status`, `analysis_status`, `processing_fingerprint` 等。
+   - **Lazy Metadata 铁律**: 禁止在 `scanner.py` 中执行任何阻塞式探测（如 ffprobe）；所有媒体时长与元数据均由 `prescreen.py` 或 `detector.py` 懒加载回填。
+
+2. **`segments` 表 (细粒度切片关系表)**:
+   - 彻底解耦存储素材的细分动作/静止切片，包含 `start_time`, `end_time`, `state` (`STATIC` / `DYNAMIC` / `DYNAMIC_AUDIO`), `max_energy`, `avg_confidence`, `manual_label`, `review_reason` 等。
+   - `get_all_file_tasks_for_date()` 采用单次批量预加载查询（Batch Prefetch），消除 $N+1$ 性能雪崩；`get_file_task_summary()` 提供微秒级主键单行读取。
+
+3. **`human_reviews` 与 `camera_registry` 表**:
+   - `human_reviews`: 按物理路径与原始时间区间永久记录人工打标事实，算法重跑时不被冲掉。
+   - `camera_registry`: 维护摄像头物理 MAC 地址到逻辑机位编号与友好别名（如 `baby_room`）的确定性映射。
+
+4. **处理指纹契约 (`processing_fingerprint`)**:
+   - 包含素材文件大小、mtime、检测参数、VAD 配置、分段阈值、YOLO 权重版本。
+   - 指纹不符或配置更新时触发 `invalidate_stale_results()` 重置分析，但保留人工事实。
 
 ---
 
-## 5. 数据库结构设计与断点续传
+## 三、硬件调度与并发铁律 (Hardware Discipline)
 
-系统使用 SQLite WAL 模式管理核心状态 (data/vlog.db)，主要包含三张业务表：
+1. **多级并发信号量 (`src.scheduler`)**:
+   - `get_nv_semaphore()`: 上限 2，独显并发硬门限（RTX 3060Ti 8GB 显存与单 NVENC 单元的安全边界）。
+   - `get_qsv_semaphore()`: 上限 8，核显并发槽位（Intel UHD 770 算力解耦）。
+   - `get_disk_semaphore()`: 上限 32，全局 I/O 预算，防止大量并发把 NAS 打满。
+   - **信号量释放单次原则**: `io_sem.release()` 必须且仅在 `finally` 块中执行一次，禁止提前释放或重复释放导致计数膨胀。
 
-### 5.1 	asks 表
-记录素材扫描与文件级处理状态：
-- ile_path: 原始素材绝对物理路径（主键）。
-- camera_id: 摄像头 MAC 地址（如 B888805AA3CD）。
-- date: 素材录制日期（YYYYMMDD）。
-- duration: 视频总时长（秒）。
-- status: PENDING -> ANALYZING -> ANALYZED -> RENDERING -> COMPLETED。
+2. **显存安全水位线与自适应借调 (`WorkStealingManager`)**:
+   - 实时探测 RTX 3060Ti 物理显存占用。超过 `vram_watermark_mb: 6200` 时，强制禁止 NVDEC 协同解码借调，确保 YOLO 推理和 NVENC 渲染拥有足够的显存裕量。
 
-### 5.2 segments 表
-记录切片级动静态判定与人工审核标注：
-- id: 自增主键。
-- ile_path: 关联的素材路径。
-- start_time / end_time: 切片在文件内的相对起止时间戳。
-- lgo_status: 算法原始判定（DYNAMIC 或 STATIC）。
-- human_label: 人工审核标注（TP, FP, FN, TN，未审核时为 NULL）。
-- max_energy: 动作能量峰值。
-- yolo_max_conf: YOLO 目标检测最高置信度。
-- rchived_frame_path: 关联归档帧的高清图片相对路径。
-
-### 5.3 perf_records 表
-记录每阶段（Prescreen、Analysis、Render）的硬件耗时、CPU/GPU 占用、吞吐倍速与丢帧指标，供基准测试与性能诊断。
+3. **子进程注册与优雅退出 (`FFmpegProcessRegistry`)**:
+   - 所有 FFmpeg 子进程必须通过 `FFmpegProcessRegistry.register()` 注册并在 `finally` 块注销。
+   - 用户触发 Ctrl+C 中断时，`kill_all()` 瞬间切断所有子进程，释放 GPU 会话，杜绝孤儿进程与显存泄露。
 
 ---
 
-## 6. 进程与容灾规范
+## 四、展示时长计划与时间轴规范 (Timeline Discipline)
 
-1. **子进程托管注册表 (FFmpegProcessRegistry)**：所有通过 subprocess.Popen 派生的后台 FFmpeg 进程必须显式注册。收到终端中断（SIGINT/SIGTERM）时，统一执行 kill_all() 强力释放硬件解码上下文与 NVENC 会话，杜绝产生孤儿进程。
-2. **原子批次替换**：批次渲染文件先写入 _batchX.tmp.mp4，校验退出码与非空尺寸后原子重命名为 _batchX.mp4；任务意外中断重启时，校验成功的历史批次直接复用，保障随时中断随时秒级续跑。
+1. **单一真相来源**:
+   - `timeline.compute_display_plans()` 为渲染滤镜图与 SRT 字幕生成的唯一真相来源。
+   - 静态段以关键帧抽帧压缩，展示时长受压缩比与 `[min_static_display_duration, max_static_display_duration]`（0.3s~1.5s）严格钳制。
+
+2. **平滑过渡 (Speed Ramping)**:
+   - 静态段向动态段过渡时，注入 1.0 秒线性速度渐变（Speed Ramping）和 0.25 秒音频淡入淡出（Cross-Fade），杜绝突兀眩晕。
+
+3. **时间轴绝对闭环与对账**:
+   - `src/detector.py` 的分析返回值最后一帧必须严格等于 `start_offset + file_duration`。
+   - `StreamingOrchestrator` 退出必须等待 `all_dispatched_event`，并完成派发批次（`dispatched_batch_ids`）与已落盘批次（`produced | terminal`）100% 对账闭环。
+
+---
+
+## 五、核心架构决策全集 (Architecture Decision Records)
+
+### ADR 0001: 单次硬件解码灰度直通与零拷贝候选池流转
+- **状态**: Accepted (已采纳)
+- **背景**: 家庭监控录像全天素材多达 140+ 文件，旧版存在预筛多次 Seek、RGB 解码后 CPU 重复转灰度、YOLO 二次解码、零碎图片频繁写盘等严重问题，单日耗时突破 60 分钟。
+- **决策**:
+  1. **解码管道灰度直通**: 底层通过 PyAV / FFmpeg 硬件加速直接输出 `-pix_fmt gray` 单通道灰度流（分辨率如 416x234），映射为单通道 `np.ndarray`，彻底消灭 CPU 色彩空间转换。
+  2. **零落盘内存候选池 (Zero-IO)**: 对疑似运动帧在内存中通过 `cv2.imencode(".jpg", ...)` 压缩，以 `{frame_idx: bytes}` 字典形式流转，受 256MB 内存上限保护，YOLO 直接从内存解码批推理。
+  3. **时域滑动 EMA 双差分**: 灰度流直接进入 `EmaBackgroundModel`，结合 8x8 空间连通域完成初筛。
+- **影响**: NAS 单文件读取次数降为 1 次，分析帧吞吐提升 3.5 倍以上，单日分析壁钟压缩至 10 分钟以内。
+
+---
+
+### ADR 0002: 同构硬件渲染、参数集对齐与并发隔离
+- **状态**: Accepted (演进定案)
+- **背景**: 宿主机同时配备 Intel 核显（UHD 770）与 NVIDIA 独显（RTX 3060Ti）。早期设计曾尝试将静态轻批次分配给 QSV 编码，动态重批次分配给 NVENC 编码（即异构分配）。但在实际生产中发现：不同硬件编码器生成的 HEVC（H.265）VPS/SPS/PPS 参数集与像素格式（`nv12` vs `yuv420p`）存在底层二进制冲突。最终通过 `-c copy` 流拷贝合并时，MP4 容器仅保留首批次的参数集，导致播放器在跨批次切换点（如第二秒）解码器崩溃，丢弃后续上万帧，造成画面永久卡死。
+- **决策**:
+  1. **同构渲染铁律 (`render_gpu_policy: "nv_only"`)**: 生产环境渲染批次 100% 统一由 RTX 3060Ti 的 NVENC 硬件编码器处理，严格保持统一的分辨率、像素格式（`yuv420p`）与 SPS/PPS 参数集。
+  2. **强制 IDR 序列隔离**: 在 NVENC 编码参数中显式追加 `"-forced-idr", "1"`，保证批次首帧与 GOP 关键帧均为自包含的 IDR 帧，杜绝跨批次参考错位。
+  3. **双并发信号量隔离**: 通过 `get_nv_semaphore()` 控制 2 路 NVENC 并发槽位，结合 `WorkStealingManager` 在渲染启动时主动让步 NVDEC 解码，预留 6200MB 显存安全裕量。
+- **影响**: 彻底根除了成片在批次切换点画面卡死的物理缺陷；得益于第 7 代 NVENC 的双引擎高吞吐，纯静态批次压制仅需 1~2 秒，单日 103 个批次总渲染耗时由 35 分钟压缩至 18 分钟以内。
+
+---
+
+### ADR 0003: 人机协同主动学习与审核工作台闭环
+- **状态**: Accepted (已采纳)
+- **背景**: 复杂家庭场景下的光影突变、红外噪点与微弱动态易造成传统 CV 算法误报或漏检，单纯调阈值会导致漏检关键事件。
+- **决策**:
+  1. **5 类疑难切片主动召回**: 系统自动从海量切片中挖掘 `fp_suspect`（无置信度高能量）、`fn_suspect`（临界微动）、`multimodal_conflict`（音画冲突）、`borderline_confidence`（临界置信度）、`jitter`（状态突变）。
+  2. **独立 Web 审核工作台 (`scripts/audit_tool`)**: 原生轻量服务提供双轨时间轴视图（算法轨 vs 人工轨）、高保真抽帧比对与即时增量重浓缩引擎（`ReRenderManager`）。
+  3. **人工打标绝对优先**: 在 `timeline.py` 中，人工标签（`manual_label`）优先级严格高于算法状态，纠偏后即时生效。
+  4. **负样本安全微调**: 导出机位训练集（`export_dataset.py`）时强制包含纯静态（TN）与误报（FP）作为负样本，微调训练（`train_yolo.py`）强制冻结骨干网络（`freeze=10`），杜绝模型产生泛化虚警。
+- **影响**: 建立了从算法判定到人工修正、再到模型微调的数据闭环，保证系统在特定家庭机位下越用越准。
+
+---
+
+### ADR 0004: 流式原子批次渲染、速度平滑过渡与时间轴闭环
+- **状态**: Accepted (已采纳)
+- **背景**: 整日 24 小时大视频单次压制风险极高，中途断电即前功尽弃；动态与静态过渡生硬跳跃会导致眩晕感；时间戳计算不闭环会引发跳秒黑帧。
+- **决策**:
+  1. **单文件原子批次**: `render.batch_max_files: 1` 确保每路渲染仅持有一个解码上下文；通过 `_batchX.tmp.mp4` 临时文件原子写入并校验大小，通过后重命名为正式批次。
+  2. **断点续跑零损耗**: `cleanup_temp_artifacts(clean_batches=False)` 默认保留有效批次，随时中断随时秒级恢复。
+  3. **展示时长计划唯一源**: `timeline.compute_display_plans()` 为滤镜图与 SRT 字幕的单一来源；静态段向动态段过渡注入 1.0s Speed Ramping 渐变与 0.25s 音频淡入淡出；通过 `src_offset_at_display()` 逆映射还原真实墙钟时间。
+  4. **严格时间轴闭环与对账**: `detector.py` 最后一帧时间戳严格闭合到 `start_offset + file_duration`；`StreamingOrchestrator` 退出必须完成派发与落盘批次的 100% 对账校验。
+- **影响**: 具备极强的抗中断能力；成片具有流畅自然的平滑过渡与精准墙钟映射；杜绝了渲染空洞与丢批。

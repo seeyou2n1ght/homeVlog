@@ -71,7 +71,8 @@ def test_export_dataset_structure_and_negative_labels(tmp_path):
 
     total_images = len(list((dataset_dir / "images" / "train").glob("*.jpg"))) + \
                    len(list((dataset_dir / "images" / "val").glob("*.jpg")))
-    assert total_images == 5
+    assert total_images == 3
+    assert stats["excluded"] == 2  # Missing positive boxes never become background.
 
     # 2. 验证困难负样本 (FALSE_ALARM) 生成空 txt 标注
     # 查找任一负样本 label 文件
@@ -88,7 +89,8 @@ def test_export_dataset_structure_and_negative_labels(tmp_path):
     assert cfg["train"] == "images/train"
     assert cfg["val"] == "images/val"
     assert cfg["names"][0] == "person"
-    assert cfg["names"][1] == "pet"
+    assert cfg["names"][15] == "cat"
+    assert cfg["names"][16] == "dog"
 
 
 def test_generate_yolo_labels_with_mock_model(tmp_path):

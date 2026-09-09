@@ -317,7 +317,7 @@ async function loadOverview() {
     const fnEl = document.getElementById('metric-fn');
     if (fnEl) fnEl.innerText = data.labels.fn;
     const precRecEl = document.getElementById('metric-prec-rec');
-    if (precRecEl) precRecEl.innerText = `${data.metrics.precision}% / ${data.metrics.recall}%`;
+    if (precRecEl) precRecEl.innerText = `${data.metrics.precision == null ? "N/A" : data.metrics.precision + "%"} / ${data.metrics.recall == null ? "N/A" : data.metrics.recall + "%"}`;
 
     const pct = data.total_segments > 0 ? (data.reviewed_segments / data.total_segments) * 100 : 0;
     const barEl = document.getElementById('metric-progress-bar');

@@ -7,6 +7,7 @@
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
 
 logger = logging.getLogger("homevlog")
@@ -17,6 +18,89 @@ _qsv_semaphore: threading.Semaphore | None = None
 _io_lock = threading.Lock()
 _nvml_initialized: bool = False
 _nvml_lock = threading.Lock()
+
+
+def _interrupted():
+    from src.renderer import FFmpegProcessRegistry
+    return FFmpegProcessRegistry.is_interrupted()
+
+
+def _acquire_native(sem, timeout):
+    deadline = time.monotonic() + timeout
+    while not _interrupted():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if sem.acquire(timeout=min(.5, remaining)):
+            return True
+    return False
+
+
+class FileBudget:
+    """Atomic weighted admission avoids deadlock between multi-input render jobs."""
+    resource_name = "input I/O"
+    def __init__(self, limit):
+        self.limit = max(1, int(limit))
+        self.available = self.limit
+        self.condition = threading.Condition()
+        from collections import deque
+        self.waiters = deque()
+
+    def acquire(self, timeout=30.0, weight=1):
+        if weight > self.limit:
+            raise ValueError("Batch exceeds max_io_concurrency; reduce batch_max_files")
+        with self.condition:
+            ticket = object()
+            self.waiters.append(ticket)
+            try:
+                deadline = time.monotonic() + timeout
+                while self.waiters[0] is not ticket or self.available < weight:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or _interrupted():
+                        return False
+                    self.condition.wait(timeout=min(.5, remaining))
+                self.available -= weight
+                return True
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
+
+    def release(self, weight=1):
+        with self.condition:
+            if self.available + weight > self.limit:
+                raise ValueError("I/O budget released twice")
+            self.available += weight
+            self.condition.notify_all()
+
+
+class VideoLease:
+    """Acquire hardware then shared file I/O in the same order on every video path."""
+    def __init__(self, hardware, inputs=1):
+        self.hardware = hardware
+        self.disk = None
+        self.inputs = max(1, inputs)
+
+    def acquire(self, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        self.resource_name = getattr(self.hardware, "resource_name", "video hardware")
+        if not _acquire_native(self.hardware, timeout):
+            return False
+        self.disk = get_disk_semaphore()
+        self.resource_name = f"input I/O ({self.inputs} files)"
+        try:
+            if self.disk.acquire(timeout=max(0, deadline-time.monotonic()), weight=self.inputs):
+                return True
+        except BaseException:
+            self.hardware.release()
+            raise
+        self.hardware.release()
+        return False
+
+    def release(self):
+        try:
+            self.disk.release(weight=self.inputs)
+        finally:
+            self.hardware.release()
 
 
 def get_nv_vram_used_mb(gpu_index: int = 0) -> int | None:
@@ -59,11 +143,17 @@ def acquire_with_retry(
     """
     max_attempts = max(1, int(retries))
     for attempt in range(1, max_attempts + 1):
-        if sem.acquire(timeout=timeout):
+        if _interrupted():
+            return False
+        acquired = (sem.acquire(timeout=timeout) if isinstance(sem, (FileBudget, VideoLease))
+                    else _acquire_native(sem, timeout))
+        if acquired:
             return True
+        if _interrupted():
+            return False
         logger.warning(
-            "semaphore acquire timeout after %.1fs (attempt %d/%d)",
-            timeout, attempt, max_attempts,
+            "semaphore acquire timeout: %s after %.1fs (attempt %d/%d)",
+            getattr(sem, "resource_name", type(sem).__name__), timeout, attempt, max_attempts,
         )
     logger.error("semaphore acquire failed after %d attempts", max_attempts)
     return False
@@ -87,7 +177,7 @@ def get_disk_semaphore() -> threading.Semaphore:
                 from src.utils import load_config
                 config = load_config()
                 limit = config.get("hardware", {}).get("max_io_concurrency", 8)
-                _disk_semaphore = threading.Semaphore(limit)
+                _disk_semaphore = FileBudget(limit)
     return _disk_semaphore
 
 
@@ -99,8 +189,9 @@ def get_nv_semaphore() -> threading.Semaphore:
             if _nv_semaphore is None:
                 from src.utils import load_config
                 config = load_config()
-                limit = config.get("hardware", {}).get("max_nv_concurrency", 3)
+                limit = config.get("hardware", {}).get("max_nv_concurrency", 2)
                 _nv_semaphore = threading.Semaphore(limit)
+                _nv_semaphore.resource_name = "NV hardware"
     return _nv_semaphore
 
 
@@ -114,6 +205,7 @@ def get_qsv_semaphore() -> threading.Semaphore:
                 config = load_config()
                 limit = config.get("hardware", {}).get("max_qsv_concurrency", 8)
                 _qsv_semaphore = threading.Semaphore(limit)
+                _qsv_semaphore.resource_name = "QSV hardware"
     return _qsv_semaphore
 
 
@@ -152,6 +244,7 @@ class WorkStealingManager:
             hw_cfg.get("vram_watermark_mb", 6200),
         )
         self._vram_probe_fn = get_nv_vram_used_mb
+        self._last_vram_warn_time = 0.0
 
         self._lock = threading.Lock()
         self._render_active_count = 0
@@ -170,11 +263,14 @@ class WorkStealingManager:
         try:
             used_mb = self._vram_probe_fn()
             if used_mb is not None and used_mb >= self.vram_watermark_mb:
-                logger.warning(
-                    "WorkStealing: VRAM usage (%d MB) exceeded watermark (%d MB), triggering VRAM_PRESSURE_YIELD",
-                    used_mb,
-                    self.vram_watermark_mb,
-                )
+                now = time.monotonic()
+                if now - getattr(self, "_last_vram_warn_time", 0.0) >= 60.0:
+                    self._last_vram_warn_time = now
+                    logger.warning(
+                        "WorkStealing: VRAM usage (%d MB) exceeded watermark (%d MB), yielding NVDEC decode to QSV to prevent OOM (dGPU YOLO & NVENC remain active)",
+                        used_mb,
+                        self.vram_watermark_mb,
+                    )
                 return True
         except Exception as e:
             logger.debug("WorkStealing: VRAM probe error: %s", e)
@@ -219,7 +315,7 @@ class WorkStealingManager:
         with self._lock:
             return self._active_nv_decoders
 
-    def get_analysis_device(self, queue_size: int, is_render_active: bool | None = None) -> str:
+    def get_analysis_device(self, queue_size: int, is_render_active: bool | None = None, prescreen_idle: bool = False) -> str:
         """
         根据队列水位与渲染状态决策当前分析任务的解码硬件设备。
         
@@ -230,8 +326,8 @@ class WorkStealingManager:
                 is_render_active if is_render_active is not None else (self._render_active_count > 0)
             )
 
-            if render_active:
-                self._state = "RENDER_PREEMPTION_YIELD"
+            if render_active or prescreen_idle:
+                self._state = "RENDER_PREEMPTION_YIELD" if render_active else "NORMAL_DECOUPLED"
                 return "qsv"
 
             if not self.nvdec_cooperative or "cuda" not in self.device.lower():
@@ -243,8 +339,12 @@ class WorkStealingManager:
                 self._state = "VRAM_PRESSURE_YIELD"
                 return "qsv"
 
-            # 冷启动破冰协同条件：显式启用了 cold_start_burst 且队列非空且无渲染运行
-            is_cold_burst = (self.cold_start_burst and self._render_active_count == 0 and queue_size >= 1)
+            # 冷启动破冰协同条件：显式启用了 cold_start_burst 且队列有一定积压 (> watermark_low) 且无渲染运行
+            is_cold_burst = (
+                self.cold_start_burst
+                and self._render_active_count == 0
+                and queue_size > self.watermark_low
+            )
             is_queue_backlog = (queue_size >= self.watermark_high)
 
             if is_cold_burst or is_queue_backlog:
@@ -280,9 +380,9 @@ class WorkStealingManager:
             self._active_nv_decoders = max(0, self._active_nv_decoders - 1)
 
     @contextmanager
-    def lease_device(self, queue_size: int):
+    def lease_device(self, queue_size: int, prescreen_idle: bool = False):
         """上下文管理器：自动决策解码设备并在使用 CUDA 时安全管理 NVDEC 槽位生命周期。"""
-        device = self.get_analysis_device(queue_size)
+        device = self.get_analysis_device(queue_size, prescreen_idle=prescreen_idle)
         acquired_slot = False
         if device == "cuda":
             if self.acquire_nvdec_slot():

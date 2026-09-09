@@ -27,7 +27,10 @@ def run_ffmpeg(
     timeout: float | None = None,
     capture_output: bool = True,
     log_stderr: bool = False,
+    stdout_consumer=None,
 ) -> FFmpegResult:
+    if stdout_consumer is not None and not capture_output:
+        raise ValueError("stdout_consumer requires capture_output=True")
     cmd = ["ffmpeg", "-hide_banner", "-y", "-nostdin"] + args
     kwargs = {"stdin": subprocess.DEVNULL}
     if capture_output:
@@ -38,6 +41,9 @@ def run_ffmpeg(
     io_sem = get_disk_semaphore()
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     if not acquire_with_retry(io_sem):
+        from src.renderer import FFmpegProcessRegistry
+        if FFmpegProcessRegistry.is_interrupted():
+            return FFmpegResult(-1, b"", b"interrupted")
         logger.warning("run_ffmpeg: io semaphore acquire timeout")
         return FFmpegResult(
             returncode=-1,
@@ -47,15 +53,60 @@ def run_ffmpeg(
             duration=0.0,
         )
     t0 = _time.monotonic()
+    from src.renderer import FFmpegProcessRegistry
+    proc = None
+    key = f"ffmpeg:{id(args)}:{t0}"
     try:
         proc = subprocess.Popen(cmd, **kwargs)
+        FFmpegProcessRegistry.register(key, proc)
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            if stdout_consumer is None:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            else:
+                import threading
+                from collections import deque
+                errors = deque(maxlen=128)
+                expired = threading.Event()
+                def drain_errors():
+                    while True:
+                        block = proc.stderr.read(4096)
+                        if not block:
+                            break
+                        errors.append(block)
+                def expire():
+                    expired.set()
+                    proc.kill()
+                reader = threading.Thread(target=drain_errors, daemon=True)
+                timer = threading.Timer(timeout or 600, expire)
+                timer.daemon = True
+                reader.start()
+                timer.start()
+                try:
+                    while True:
+                        chunk = proc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        stdout_consumer(chunk)
+                    proc.wait(timeout=5)
+                    if expired.is_set():
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                finally:
+                    timer.cancel()
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    reader.join(timeout=5)
+                    proc.stdout.close()
+                    proc.stderr.close()
+                stdout, stderr = b"", b"".join(errors)
             returncode = proc.returncode
             timed_out = False
         except subprocess.TimeoutExpired:
             proc.kill()
-            stdout, stderr = proc.communicate()
+            if stdout_consumer is None:
+                stdout, stderr = proc.communicate()
+            else:
+                stdout, stderr = b"", b"stream timed out"
             returncode = -9
             timed_out = True
     except OSError as e:
@@ -68,7 +119,13 @@ def run_ffmpeg(
             duration=_time.monotonic() - t0,
         )
     finally:
-        io_sem.release()
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        finally:
+            FFmpegProcessRegistry.deregister(key)
+            io_sem.release()
 
     elapsed = _time.monotonic() - t0
 

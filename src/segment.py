@@ -8,9 +8,11 @@ class Segment:
     end_time: float
     state: str  # "DYNAMIC" | "STATIC" | "DYNAMIC_AUDIO"
     source_file: str
-    file_start_offset: float
+    file_start_offset: float = 0.0
     max_energy: float = 0.0
     avg_confidence: float = 0.0
+    needs_review: bool = False
+    review_reason: str = ""
 
     @property
     def is_dynamic(self) -> bool:
@@ -53,7 +55,7 @@ def build_segments(
     for i in range(1, len(frame_labels)):
         cur_state = _resolve_state(frame_labels[i])
         if cur_state != seg_state:
-            seg_end = frame_labels[i - 1]["time"]
+            seg_end = frame_labels[i]["time"]
             segments.append(Segment(
                 start_time=seg_start,
                 end_time=seg_end,
@@ -127,9 +129,14 @@ def build_segments(
             segments = new_segments
 
     merged = _merge_same_state(segments, gap_tolerance)
-    if apply_smoothing:
-        return _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance)
-    return merged
+    res_segs = _filter_short(merged, min_motion_dur, min_static_dur, gap_tolerance) if apply_smoothing else merged
+
+    for s in res_segs:
+        if s.state == "STATIC" and 2.2 <= s.max_energy <= 3.5 and not s.needs_review:
+            s.needs_review = True
+            s.review_reason = f"BORDERLINE_MICRO_MOTION: 疑似微动作临界(energy={s.max_energy:.2f})"
+
+    return res_segs
 
 
 def _can_merge(a: Segment, b: Segment, gap_tolerance: float = 0.5) -> bool:
@@ -145,6 +152,11 @@ def _merge_same_state(segments: list[Segment], gap_tolerance: float = 0.5) -> li
         if _can_merge(result[-1], seg, gap_tolerance):
             result[-1].end_time = seg.end_time
             result[-1].max_energy = max(result[-1].max_energy, seg.max_energy)
+            result[-1].avg_confidence = max(result[-1].avg_confidence, seg.avg_confidence)
+            if seg.needs_review:
+                result[-1].needs_review = True
+                if seg.review_reason and seg.review_reason not in result[-1].review_reason:
+                    result[-1].review_reason = f"{result[-1].review_reason}; {seg.review_reason}".strip("; ")
         else:
             result.append(seg)
     return result
@@ -179,6 +191,11 @@ def _filter_short(
             if i > 0 and segments[i - 1].state != segments[i].state:
                 segments[i - 1].end_time = segments[i].end_time
                 segments[i - 1].max_energy = max(segments[i - 1].max_energy, segments[i].max_energy)
+                segments[i - 1].avg_confidence = max(segments[i - 1].avg_confidence, segments[i].avg_confidence)
+                if segments[i].needs_review:
+                    segments[i - 1].needs_review = True
+                    if segments[i].review_reason and segments[i].review_reason not in segments[i - 1].review_reason:
+                        segments[i - 1].review_reason = f"{segments[i - 1].review_reason}; {segments[i].review_reason}".strip("; ")
                 segments.pop(i)
                 changed = True
                 continue
@@ -187,6 +204,11 @@ def _filter_short(
             if i + 1 < len(segments) and segments[i + 1].state != segments[i].state:
                 segments[i + 1].start_time = segments[i].start_time
                 segments[i + 1].max_energy = max(segments[i + 1].max_energy, segments[i].max_energy)
+                segments[i + 1].avg_confidence = max(segments[i + 1].avg_confidence, segments[i].avg_confidence)
+                if segments[i].needs_review:
+                    segments[i + 1].needs_review = True
+                    if segments[i].review_reason and segments[i].review_reason not in segments[i + 1].review_reason:
+                        segments[i + 1].review_reason = f"{segments[i + 1].review_reason}; {segments[i].review_reason}".strip("; ")
                 segments.pop(i)
                 changed = True
                 continue
@@ -202,6 +224,11 @@ def _filter_short(
                 else:
                     merged[-1].end_time = seg.end_time
                     merged[-1].max_energy = max(merged[-1].max_energy, seg.max_energy)
+                    merged[-1].avg_confidence = max(merged[-1].avg_confidence, seg.avg_confidence)
+                    if seg.needs_review:
+                        merged[-1].needs_review = True
+                        if seg.review_reason and seg.review_reason not in merged[-1].review_reason:
+                            merged[-1].review_reason = f"{merged[-1].review_reason}; {seg.review_reason}".strip("; ")
             segments = merged
 
     # Merge adjacent same-state segments
@@ -212,6 +239,11 @@ def _filter_short(
         else:
             filtered[-1].end_time = seg.end_time
             filtered[-1].max_energy = max(filtered[-1].max_energy, seg.max_energy)
+            filtered[-1].avg_confidence = max(filtered[-1].avg_confidence, seg.avg_confidence)
+            if seg.needs_review:
+                filtered[-1].needs_review = True
+                if seg.review_reason and seg.review_reason not in filtered[-1].review_reason:
+                    filtered[-1].review_reason = f"{filtered[-1].review_reason}; {seg.review_reason}".strip("; ")
 
     return filtered
 
@@ -231,6 +263,8 @@ def segments_to_json(segments: list[Segment]) -> str:
             "file_start_offset": s.file_start_offset,
             "max_energy": s.max_energy,
             "avg_confidence": s.avg_confidence,
+            "needs_review": s.needs_review,
+            "review_reason": s.review_reason,
         }
         for s in segments
     ])
@@ -249,9 +283,11 @@ def segments_from_json(json_str: str) -> list[Segment]:
                 end_time=d["end_time"],
                 state=d["state"],
                 source_file=d.get("source_file"),
-                file_start_offset=d.get("file_start_offset"),
+                file_start_offset=d.get("file_start_offset", 0.0),
                 max_energy=d.get("max_energy", 0.0),
                 avg_confidence=d.get("avg_confidence", 0.0),
+                needs_review=bool(d.get("needs_review", False)),
+                review_reason=str(d.get("review_reason", "")),
             )
             for d in data
             if isinstance(d, dict) and "start_time" in d and "end_time" in d and "state" in d
@@ -317,6 +353,9 @@ def split_segments_at_file_boundaries(
                     source_file=fp,
                     file_start_offset=f_start,
                     max_energy=seg.max_energy,
+                    avg_confidence=seg.avg_confidence,
+                    needs_review=seg.needs_review,
+                    review_reason=seg.review_reason,
                 ))
 
     return split_result

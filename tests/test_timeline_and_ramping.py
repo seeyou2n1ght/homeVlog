@@ -170,11 +170,12 @@ class TestDisplayPlanAndRampingInverse:
         )
         s_in = info.ramp_in_src_dur
         s_mid = s_in + info.cruise_src_dur
-        inv_v = 1.0 / v_fast
+        v_c = info.v_fast
+        inv_v = 1.0 / v_c
         k_in = (1.0 - inv_v) / (2.0 * s_in) if s_in > 0 else 0.0
         k_out = (1.0 - inv_v) / (2.0 * info.ramp_out_src_dur) if info.ramp_out_src_dur > 0 else 0.0
         p_in = s_in * (1.0 + inv_v) / 2.0
-        p_mid = p_in + info.cruise_src_dur / v_fast
+        p_mid = p_in + info.cruise_src_dur / v_c
 
         def forward(s: float) -> float:
             if s < s_in:

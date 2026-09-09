@@ -32,10 +32,10 @@ def test_error_log_and_jsonl_separation(tmp_path):
     """验证主日志、独立错误日志及 JSONL 事件流的三路分离机制。"""
     setup_logging()
 
-    # 寻找最新的日志文件集合
-    main_logs = sorted(LOGS_DIR.glob("homevlog_*.log"), key=lambda p: p.stat().st_mtime)
-    err_logs = sorted(LOGS_DIR.glob("error_*.log"), key=lambda p: p.stat().st_mtime)
-    jsonl_logs = sorted(LOGS_DIR.glob("events_*.jsonl"), key=lambda p: p.stat().st_mtime)
+    # 寻找最新的日志文件集合（支持子目录分区）
+    main_logs = sorted(LOGS_DIR.rglob("homevlog_*.log"), key=lambda p: p.stat().st_mtime)
+    err_logs = sorted(LOGS_DIR.rglob("error_*.log"), key=lambda p: p.stat().st_mtime)
+    jsonl_logs = sorted(LOGS_DIR.rglob("events_*.jsonl"), key=lambda p: p.stat().st_mtime)
 
     assert len(main_logs) > 0
     assert len(err_logs) > 0

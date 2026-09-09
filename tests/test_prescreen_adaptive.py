@@ -81,12 +81,14 @@ def test_prescreen_night_motion_not_dropped_as_static():
     # 构造 PyAV mock 解码
     mock_av_frame1 = MagicMock()
     mock_av_frame1.planes = [fake_frame1.tobytes()]
+    mock_av_frame1.to_ndarray.return_value = fake_frame1
     mock_av_frame1.width = 320
     mock_av_frame1.height = 180
     mock_av_frame1.pts = 0
 
     mock_av_frame2 = MagicMock()
     mock_av_frame2.planes = [fake_frame2.tobytes()]
+    mock_av_frame2.to_ndarray.return_value = fake_frame2
     mock_av_frame2.width = 320
     mock_av_frame2.height = 180
     mock_av_frame2.pts = 1000
@@ -126,12 +128,14 @@ def test_prescreen_diffuse_light_suppressed_as_static():
 
     mock_av_frame1 = MagicMock()
     mock_av_frame1.planes = [fake_frame1.tobytes()]
+    mock_av_frame1.to_ndarray.return_value = fake_frame1
     mock_av_frame1.width = 320
     mock_av_frame1.height = 180
     mock_av_frame1.pts = 0
 
     mock_av_frame2 = MagicMock()
     mock_av_frame2.planes = [fake_frame2.tobytes()]
+    mock_av_frame2.to_ndarray.return_value = fake_frame2
     mock_av_frame2.width = 320
     mock_av_frame2.height = 180
     mock_av_frame2.pts = 1000

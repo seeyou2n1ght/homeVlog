@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from src.utils import PROJECT_ROOT, OUTPUT_DIR, TEMP_DIR, load_config
+from src.utils import OUTPUT_DIR, load_config
 from src.database import VlogDatabase
 from src.timeline import build_timeline, partition_timeline_by_batches
 from src.renderer import build_batch_render, concat_output_files, FFmpegProcessRegistry
@@ -186,10 +186,10 @@ class ReRenderManager:
             # 4. 批次切分
             seg_cfg = config.get("segment", {})
             out_cfg = config.get("output", {})
-            audio_cfg = config.get("audio", {})
+            audio_cfg = out_cfg.get("audio", {})
             render_cfg = config.get("render", {})
 
-            batch_max_files = seg_cfg.get("batch_max_files", 36)
+            batch_max_files = render_cfg.get("batch_max_files", 8)
             batches = partition_timeline_by_batches(timeline, batch_max_files=batch_max_files)
             total_batches = len(batches)
             update_state(total_batches=total_batches, current_batch=0, progress=15)
@@ -211,8 +211,8 @@ class ReRenderManager:
             # 6. 执行批次渲染
             batch_outputs = []
             fps = out_cfg.get("fps", 20)
-            width = out_cfg.get("width", 1920)
-            height = out_cfg.get("height", 1080)
+            from src.utils import parse_res
+            width, height = parse_res(out_cfg.get("resolution", "1920x1080"))
             encoder = render_cfg.get("encoder", "nv")
 
             for bi, b_segs in enumerate(batches):

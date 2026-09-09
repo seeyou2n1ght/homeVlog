@@ -50,7 +50,7 @@ def test_extract_and_archive_frame_lifecycle(tmp_path):
             mock_res.returncode = 0
             return mock_res
 
-        with patch("subprocess.run", side_effect=fake_ffmpeg_run):
+        with patch("src.ffmpeg.run_ffmpeg", side_effect=fake_ffmpeg_run):
             saved_path = extract_and_archive_frame(db, seg_id, archive_dir=archive_dir)
             assert saved_path is not None
             assert saved_path.exists()
@@ -111,7 +111,7 @@ def test_batch_archive_all_reviewed(tmp_path):
             mock_res.returncode = 0
             return mock_res
 
-        with patch("subprocess.run", side_effect=fake_ffmpeg_run):
+        with patch("src.ffmpeg.run_ffmpeg", side_effect=fake_ffmpeg_run):
             summary = batch_archive_all_reviewed(db, archive_dir=archive_dir)
             assert summary["total"] == 2
             assert summary["archived"] == 2

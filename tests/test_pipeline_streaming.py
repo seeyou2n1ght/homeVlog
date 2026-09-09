@@ -17,6 +17,18 @@ import pytest
 
 from src.database import VlogDatabase
 from src.pipeline import StreamingOrchestrator, process_date_cam
+from src.pipeline import AnalysisQueue
+
+
+def test_analysis_queue_prioritizes_long_files_when_enabled():
+    q = AnalysisQueue()
+    q.cost_priority = True
+    q.put({"filepath": "short.mp4", "file_duration": 300.0, "file_start_time": "20260901000000"})
+    q.put({"filepath": "long.mp4", "file_duration": 3600.0, "file_start_time": "20260901010000"})
+    assert q.get()["filepath"] == "long.mp4"
+    q.task_done()
+    q.get()
+    q.task_done()
 
 
 class TestStreamingOrchestratorLifecycle:
@@ -123,6 +135,8 @@ class TestProcessDateCamPipeline:
             "output": {"naming": "DailyVlog_{date}_cam{index}.mp4", "fps": 20},
             "segment": {},
         }
+        from src.render_cache import processing_fingerprint
+        db.set_processing_fingerprint(fname, processing_fingerprint(fname, cfg_patch))
         try:
             with patch("src.pipeline.StreamingOrchestrator", return_value=mock_orch), \
                  patch("src.pipeline.load_config", return_value=cfg_patch), \
@@ -213,6 +227,75 @@ class TestProcessDateCamPipeline:
             assert all("mock_batch_" in p.name for _, p in orch.batch_paths)
         finally:
             db.close()
+
+    def test_single_file_batches_render_ready_files_without_head_blocking(self, tmp_path):
+        db = VlogDatabase(db_path=tmp_path / "immediate.db")
+        files = [f"f{i}.mp4" for i in range(3)]
+        for i, filepath in enumerate(files):
+            db.add_file_task(
+                filepath, 0, "20260901", f"202609010{i}0000",
+                f"202609010{i}1000", 600.0,
+            )
+            db.set_prescreen_result(filepath, "STATIC")
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
+            "render": {"batch_max_files": 1, "max_concurrency": 1},
+        }
+        orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+        # f0 is deliberately absent: f2 must not wait for the chronological head.
+        orch.render_batch_queue.put({"filepath": files[2], "status": "STATIC"})
+        orch.render_batch_queue.put({"filepath": files[1], "status": "STATIC"})
+        orch.stop_event.set()
+        calls = []
+
+        def render(_segs, batch_id, _gpu, *_args, **_kwargs):
+            calls.append(batch_id)
+            return str(tmp_path / f"batch{batch_id}.mp4")
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=render):
+                orch._render_manager()
+            assert calls == [2, 1]
+            assert sorted(batch_id for batch_id, _ in orch.batch_paths) == [1, 2]
+            assert not orch.errors
+        finally:
+            db.close()
+
+    def test_collapsed_static_batch_reconciles_cleanly(self, tmp_path):
+        """验证被时间轴宏观折叠跳过的静态素材批次能作为终端状态干净对账，不触发虚假 DYNAMIC 膨胀兜底。"""
+        db_path = tmp_path / "test_collapsed.db"
+        db = VlogDatabase(db_path=db_path)
+
+        fname = "cam0_20260901010000_20260901011000.mp4"
+        db.add_file_task(fname, 0, "20260901", "20260901010000", "20260901011000", 600.0)
+        db.set_prescreen_result(fname, "SUSPICIOUS")
+        db.set_analysis_result(fname, "ANALYZED", "[]")  # 分析确认纯静态
+
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "prescreen_gpu_policy": "qsv_only"},
+            "render": {"batch_max_files": 1},
+            "detection": {"prescreen_parallel": 1, "analysis_max_workers": 1},
+        }
+        orch = StreamingOrchestrator(
+            db=db, date="20260901", cam_index=0, config=cfg, render_enabled=True, dashboard_enabled=False
+        )
+
+        try:
+            # 模拟 build_timeline_from_rows 因宏观折叠返回空列表
+            with patch("src.timeline.build_timeline_from_rows", return_value=[]):
+                orch.render_batch_queue.put({"filepath": fname, "status": "ANALYZED"})
+                t = threading.Thread(target=orch._render_manager)
+                t.start()
+                orch.stop_event.set()
+                t.join(timeout=10.0)
+                assert not t.is_alive()
+
+            # 验证：批次应作为终端状态对账闭环，没有报告错误或丢批
+            assert len(orch.errors) == 0
+            assert len(orch.batch_paths) == 0  # 折叠批次无需物理渲染
+        finally:
+            db.close()
+
 
     def test_light_batches_not_stranded_by_sentinels(self, tmp_path):
         """回归: 纯静态轻批次在哨兵投递后滞留 light 队列时不得被 stranded。
@@ -305,3 +388,24 @@ class TestProcessDateCamPipeline:
             db.close()
 
 
+def test_prescreen_audio_gate_disabled_by_default(tmp_path):
+    db = VlogDatabase(db_path=tmp_path / "audio_gate.db")
+    filepath = "cam0_audio_gate_test.mp4"
+    db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901001000", 600.0)
+
+    cfg = {
+        "pipeline": {"render_start_delay": 0},
+        "audio_vad": {"prescreen_audio_gate": False},
+        "detection": {"prescreen_parallel": 1, "analysis_max_workers": 1},
+    }
+    orch = StreamingOrchestrator(db=db, date="20260901", cam_index=0, config=cfg, render_enabled=False, dashboard_enabled=False)
+    orch.prescreen_queue.put({"filepath": filepath, "file_duration": 600.0})
+    orch.stop_event.set()
+
+    with patch("src.pipeline.prescreen_file", return_value={"status": "STATIC", "has_audio": True, "result_json": "{}"}), \
+         patch("src.pipeline.detect_audio_activity") as mock_vad:
+            orch._prescreen_worker("cpu")
+            mock_vad.assert_not_called()
+            row = db.conn.execute("SELECT prescreen_status FROM file_tasks WHERE filepath = ?", (filepath,)).fetchone()
+            assert row[0] == "STATIC"
+    db.close()

@@ -20,10 +20,10 @@ class EmaBackgroundModel:
           - alpha(x, y) = alpha_fg (~0.005) when |I_t(x, y) - B_{t-1}(x, y)| > fg_threshold (foreground motion)
           - alpha(x, y) = alpha_bg (~0.05) when pixel is static background
 
-    Dual-difference Motion Saliency:
+    Gated Dual-difference Motion Saliency:
         D_frame(x, y) = |I_t(x, y) - I_{t-1}(x, y)|
         D_bg(x, y)    = |I_t(x, y) - B_t(x, y)|
-        M_t(x, y)     = max(D_frame(x, y), beta * D_bg(x, y))  (beta ~ 0.6)
+        M_t(x, y)     = D_frame(x, y) + beta * min(D_frame(x, y), D_bg(x, y))  (beta ~ 0.6)
     """
 
     def __init__(
@@ -75,8 +75,10 @@ class EmaBackgroundModel:
         # 4. Posterior background difference: D_bg = |I_t - B_t|
         d_bg = np.abs(roi_float - self.background)
 
-        # 5. Dual-difference motion saliency fusion: M_t = max(D_frame, beta * D_bg)
-        saliency_map = np.maximum(d_frame, self.beta * d_bg)
+        # 5. Gated dual-difference motion saliency: Frame difference (temporal motion)
+        # is the primary driver. Background difference (presence) boosts moving foreground
+        # without hallucinating false motion when an object or person is stationary.
+        saliency_map = d_frame + self.beta * np.minimum(d_frame, d_bg)
 
         self.prev_frame = roi_float
         return saliency_map, d_frame, d_bg
@@ -131,19 +133,18 @@ class SpatialGridMotionFilter:
 
     def extract_grid_energies(self, saliency_map: np.ndarray) -> np.ndarray:
         """Partition saliency map into grid_rows x grid_cols and compute per-cell mean energy."""
+        import cv2
         h, w = saliency_map.shape[:2]
         row_edges = np.linspace(0, h, self.grid_rows + 1, dtype=int)
         col_edges = np.linspace(0, w, self.grid_cols + 1, dtype=int)
-        energies = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
-
-        for r in range(self.grid_rows):
-            r_start, r_end = row_edges[r], row_edges[r + 1]
-            for c in range(self.grid_cols):
-                c_start, c_end = col_edges[c], col_edges[c + 1]
-                cell = saliency_map[r_start:r_end, c_start:c_end]
-                energies[r, c] = float(np.mean(cell)) if cell.size > 0 else 0.0
-
-        return energies
+        # One native pass replaces 64 Python/NumPy reductions per frame.
+        # Preserve linspace boundaries, including empty cells in tiny ROIs.
+        integral = cv2.integral(saliency_map, sdepth=cv2.CV_64F)
+        corners = integral[np.ix_(row_edges, col_edges)]
+        sums = corners[1:, 1:] - corners[:-1, 1:] - corners[1:, :-1] + corners[:-1, :-1]
+        areas = np.diff(row_edges)[:, None] * np.diff(col_edges)[None, :]
+        means = np.divide(sums, areas, out=np.zeros_like(sums), where=areas > 0)
+        return means.astype(np.float32)
 
     def find_connected_components(self, binary_grid: np.ndarray) -> list[set[tuple[int, int]]]:
         """Extract 8-connected components from a 2D boolean grid."""
@@ -225,6 +226,9 @@ class SpatialGridMotionFilter:
                 (1.0 - self.cell_noise_alpha) * self.noise_floor_grid[inactive_mask]
                 + self.cell_noise_alpha * energies[inactive_mask]
             )
+            # 底噪限幅保护：防止传感器高 ISO 热噪过度抬高底噪门限而淹没真实人体微动
+            max_allowed_floor = float(self.base_noise_thresh * 2.2) if not is_night_mode else float(self.base_noise_thresh * 1.8)
+            self.noise_floor_grid = np.minimum(self.noise_floor_grid, max_allowed_floor)
 
         # 4. Spatial-temporal confidence decay grid C_{r,c}(t)
         decay_factor = (
@@ -325,6 +329,10 @@ class AudioEnergyVAD:
         if not self.enabled or audio.size == 0:
             return np.array([], dtype=np.float32), np.array([], dtype=np.float32), -140.0
 
+        if hasattr(audio, "dbfs_windows"):
+            values = audio.dbfs_windows()
+            times = start_offset + np.arange(len(values), dtype=np.float64) * self.window_samples / self.sample_rate
+            return times, values, float(np.percentile(values, 15)) if len(values) else -140.0
         n_samples = len(audio)
         w_size = self.window_samples
         n_windows = n_samples // w_size
@@ -370,13 +378,18 @@ class AudioEnergyVAD:
                 "events_count": 0,
             }
 
+        effective_min_dbfs = max(self.min_dbfs, -38.0) if noise_floor_db < -60.0 else self.min_dbfs
         is_relative_active = (dbfs_vec >= (noise_floor_db + self.noise_margin_db)) & (
-            dbfs_vec >= self.min_dbfs
+            dbfs_vec >= effective_min_dbfs
         )
 
         n_windows = len(dbfs_vec)
         w_size = self.window_samples
-        if noise_floor_db >= -38.0 and n_windows > 0 and len(audio) >= n_windows * w_size:
+        if hasattr(audio, "voiced_windows"):
+            active_mask = is_relative_active.copy()
+            if noise_floor_db >= -38.0:
+                active_mask |= (dbfs_vec >= max(self.min_dbfs, -35.0)) & audio.voiced_windows()
+        elif noise_floor_db >= -38.0 and n_windows > 0 and len(audio) >= n_windows * w_size:
             candidate_idx = np.where(~is_relative_active & (dbfs_vec >= max(self.min_dbfs, -35.0)))[0]
             if len(candidate_idx) > 0:
                 truncated = audio[: n_windows * w_size].reshape((n_windows, w_size)).astype(np.float32)

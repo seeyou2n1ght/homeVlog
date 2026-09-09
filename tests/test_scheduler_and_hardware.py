@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+from unittest.mock import MagicMock, patch
 
 from src.utils import (
     WorkStealingManager,
@@ -36,6 +37,7 @@ class TestWorkStealingScheduler:
         }
         mgr = WorkStealingManager(config=cfg)
         mgr.disable_cold_start_burst()
+        mgr.set_vram_probe_fn(lambda: 3000)
 
         # 1. 低于高水位线时，默认 QSV 解耦独占
         assert mgr.get_analysis_device(queue_size=5) == "qsv"
@@ -107,6 +109,7 @@ class TestWorkStealingScheduler:
         }
         mgr = WorkStealingManager(config=cfg)
         mgr.disable_cold_start_burst()
+        mgr.set_vram_probe_fn(lambda: 3000)
 
         # 在高水位下租用设备
         with mgr.lease_device(queue_size=10) as dev1:
@@ -172,3 +175,50 @@ class TestSystemMonitoring:
         dump_path = tmp_path / "perf.json"
         perf.dump(dump_path)
         assert dump_path.exists()
+
+    def test_cold_start_burst_requires_backlog(self):
+        """测试冷启动破冰只在队列有积压 (> watermark_low) 时启用，尾部任务绝不滥用独显 NVDEC。"""
+        cfg = {
+            "scheduler": {"watermark_high": 10, "watermark_low": 3, "nvdec_cooperative": True, "max_nv_decoders": 1},
+            "hardware": {"device": "cuda:0"},
+        }
+        mgr = WorkStealingManager(config=cfg)
+        mgr.enable_cold_start_burst()
+        mgr.set_vram_probe_fn(lambda: 3000)
+
+        # 尾部少量任务 (1 <= queue_size <= 3): 即使冷启动也不借调 CUDA，全部由 QSV 处理
+        assert mgr.get_analysis_device(queue_size=1) == "qsv"
+        assert mgr.get_analysis_device(queue_size=2) == "qsv"
+        assert mgr.get_analysis_device(queue_size=3) == "qsv"
+        assert mgr.state == "NORMAL_DECOUPLED"
+
+        # 队列积压超过 watermark_low (queue_size=4 > 3): 触发破冰借调 CUDA
+        assert mgr.get_analysis_device(queue_size=4) == "cuda"
+        assert mgr.state == "COOPERATIVE_BURST"
+
+
+def test_pipe_decode_watchdog_terminates_hang(tmp_path):
+    """测试 _decode_file_pipe 在子进程挂死时被独立硬看门狗主动终止，且信号量安全释放。"""
+    from src.detector import MotionDetector
+    from src.utils import get_qsv_semaphore
+
+    det = MotionDetector(config={"detection": {"decode_timeout": 1.0}}, decode_gpu="qsv")
+    io_sem = get_qsv_semaphore()
+
+    # 模拟一个会输出海量 stderr 且挂起的子进程
+    # 验证无论 stderr 有多少数据，均不会发生管道写满死锁，且定时器超时后子进程被杀灭
+    fake_video = tmp_path / "hang.mp4"
+    fake_video.write_bytes(b"fake video data")
+
+    t0 = time.monotonic()
+    # 传入极小 duration 触发 60s 硬看门狗（或者通过 mock 缩短看门狗）
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.stdout.read.side_effect = lambda size: time.sleep(0.5) or b""
+        mock_proc.poll.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        frames, yolo_buf, meta = det._decode_file_pipe(str(fake_video), file_duration=10.0, effective_fps=1.0)
+        assert len(frames) == 0
+        assert meta["frames"] == 0

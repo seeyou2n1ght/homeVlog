@@ -143,7 +143,9 @@ class Monitor:
         """采样 Intel iGPU 各引擎利用率 (%)，通过 Windows typeperf 单次读取。
 
         counter 路径为通配符形式（新版 Windows 无 pid_0 聚合实例），
-        输出列与进程实例一一对应，需按引擎类型分组求和。
+        输出列与进程实例一一对应。同一物理引擎会因不同进程产生多个
+        实例，Windows 已为每个实例给出引擎忙碌百分比；这里取最大值，
+        避免把共享引擎的进程实例相加后生成超过 100% 的伪指标。
         """
         if not self._igpu_available:
             return {}
@@ -185,7 +187,7 @@ class Monitor:
                     val = max(0.0, float(values[i]))
                 except (ValueError, TypeError):
                     continue
-                result_dict[disp] = result_dict.get(disp, 0.0) + val
+                result_dict[disp] = max(result_dict.get(disp, 0.0), min(100.0, val))
             return result_dict
         except Exception:
             return {}
@@ -316,9 +318,9 @@ class Monitor:
 
 @dataclass
 class PerfRecord:
-    stage: str          # "prescreen" | "analysis" | "render"
+    stage: str          # prescreen | analysis | render_stage | render_enc | render | final_concat
     file: str           # short filename
-    gpu: str            # "cuda" | "qsv" | "nv" | "qsv_enc" | "cpu"
+    gpu: str            # cuda | qsv | nv | qsv_enc | cpu
     duration: float     # seconds
     frames: int = 0
     fps: float = 0.0

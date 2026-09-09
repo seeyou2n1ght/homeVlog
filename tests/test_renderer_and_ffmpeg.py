@@ -15,6 +15,10 @@ import pytest
 
 from src.renderer import (
     FFmpegProcessRegistry,
+    _startup_watchdog_timeout,
+    build_compact_virtual_concat_plan,
+    build_virtual_concat_plan,
+    _normalize_file_timeline,
     build_concat_filter,
     concat_output_files,
 )
@@ -23,6 +27,18 @@ from src.timeline import (
     partition_timeline_by_batches,
 )
 from tests.helpers import verify_filtergraph_labels_closure
+
+
+class TestRenderWatchdog:
+    def test_multi_input_startup_gets_longer_grace(self):
+        assert _startup_watchdog_timeout(8, 120.0, 600.0, 4800.0) == 600.0
+
+    def test_startup_grace_never_exceeds_config_or_render_timeout(self):
+        assert _startup_watchdog_timeout(8, 120.0, 300.0, 4800.0) == 300.0
+        assert _startup_watchdog_timeout(8, 120.0, 600.0, 240.0) == 240.0
+
+    def test_startup_grace_never_weaker_than_steady_state(self):
+        assert _startup_watchdog_timeout(1, 120.0, 30.0, 3600.0) == 120.0
 
 
 class TestFFmpegProcessRegistry:
@@ -138,6 +154,110 @@ class TestFiltergraphGenerationAndClosure:
         )
         assert "select='isnan(prev_selected_t)" not in filter_str
 
+    def test_sparse_mixed_drops_static_frames_before_scale(self):
+        segs = [
+            TimelineSegment("mix.mp4", 0, 0.0, 120.0, "STATIC", 120.0),
+            TimelineSegment("mix.mp4", 0, 120.0, 150.0, "DYNAMIC", 30.0),
+            TimelineSegment("mix.mp4", 0, 150.0, 270.0, "STATIC", 120.0),
+        ]
+        graph = build_concat_filter(
+            timeline=segs,
+            rows=[{"filepath": "mix.mp4", "has_audio": 1}],
+            output_fps=20,
+            output_width=1920,
+            output_height=1080,
+            scale_mode="cuda_passthrough",
+            sparse_mixed=True,
+            static_sample_window_s=0.25,
+        )
+        assert "between(t\\,119.950\\,150.050)" in graph
+        assert graph.index("select=") < graph.index("scale_cuda=")
+        assert "tpad=stop_mode=clone" in graph
+        assert "trim=duration=" in graph
+        is_closed, reason = verify_filtergraph_labels_closure(graph)
+        assert is_closed, f"Filtergraph not closed: {reason}"
+
+    def test_virtual_concat_plan_preserves_dynamic_and_sparsifies_static(self):
+        segs = [
+            TimelineSegment("clip.mp4", 0, 10.0, 130.0, "STATIC", 120.0),
+            TimelineSegment("clip.mp4", 0, 130.0, 140.0, "DYNAMIC", 10.0),
+        ]
+        plan = build_virtual_concat_plan(
+            segs, static_sample_window_s=0.25,
+        )
+        assert plan.entries == 2
+        assert plan.static_entries == 1
+        assert "duration 120.000000" in plan.text
+        assert "inpoint 130.000000" in plan.text
+        assert "outpoint 140.000000" in plan.text
+
+    def test_compact_virtual_plan_maps_sparse_source_to_dense_pts(self):
+        segs = [
+            TimelineSegment("clip.mp4", 0, 0.0, 120.0, "STATIC", 120.0),
+            TimelineSegment("clip.mp4", 0, 120.0, 130.0, "DYNAMIC", 10.0),
+            TimelineSegment("clip.mp4", 0, 130.0, 250.0, "STATIC", 120.0),
+        ]
+        plan = build_compact_virtual_concat_plan(
+            segs, static_sample_window_s=10.0, dynamic_coalesce_gap_s=0.0,
+        )
+        assert plan.entries == 4
+        assert plan.static_entries == 2
+        assert [round(s.end_in_file - s.start_in_file, 3) for s in plan.mapped_timeline] == [10.0, 10.0, 10.0]
+        assert plan.mapped_timeline[0].start_in_file == pytest.approx(10.0)
+        assert [s.duration for s in plan.source_timeline] == [120.0, 10.0, 120.0]
+        graph = build_concat_filter(
+            list(plan.mapped_timeline),
+            [{"filepath": "clip.mp4", "has_audio": 1}],
+            preselected_static=True,
+            concat_demuxer=True,
+            audio_input_offset=1,
+            source_timeline=list(plan.source_timeline),
+        )
+        assert "trim=start=20.000:end=30.000" in graph
+        assert "[1:a]atrim=start=120.000:end=130.000" in graph
+
+    def test_normalize_file_timeline_clips_historical_overlap(self):
+        segs = [
+            TimelineSegment("clip.mp4", 0, 0.0, 0.5, "STATIC", 0.5),
+            TimelineSegment("clip.mp4", 0, 0.0, 375.0, "STATIC", 375.0),
+            TimelineSegment("clip.mp4", 0, 375.0, 378.5, "DYNAMIC_AUDIO", 3.5),
+        ]
+        normalized = _normalize_file_timeline(segs)
+        assert [(s.start_in_file, s.end_in_file) for s in normalized] == [
+            (0.0, 375.0), (375.0, 378.5)
+        ]
+
+    def test_virtual_concat_filter_selects_demuxer_ranges_before_scale(self):
+        segs = [
+            TimelineSegment("clip.mp4", 0, 0.0, 120.0, "STATIC", 120.0),
+            TimelineSegment("clip.mp4", 0, 120.0, 130.0, "DYNAMIC", 10.0),
+        ]
+        graph = build_concat_filter(
+            timeline=segs,
+            rows=[{"filepath": "clip.mp4", "has_audio": 1}],
+            scale_mode="cuda_passthrough",
+            preselected_static=True,
+            concat_demuxer=True,
+            audio_input_offset=1,
+        )
+        # Concat inpoints include GOP preroll; segment metadata clips it before
+        # scale and the timeline trim owns final segment boundaries.
+        assert "select=concatdec_select" not in graph
+        assert "[1:a]atrim=" in graph
+        assert "select='isnan(prev_selected_t)" not in graph
+        assert "tpad=stop_mode=clone" in graph
+        assert "trim=duration=" in graph
+
+    def test_simple_dynamic_filter_bypasses_concat_graph(self):
+        seg = TimelineSegment("clip.mp4", 0, 0.0, 30.0, "DYNAMIC", 30.0)
+        graph = build_concat_filter(
+            [seg], [{"filepath": "clip.mp4", "has_audio": 0}],
+            scale_mode="cuda_passthrough", simple_dynamic=True,
+        )
+        assert "concat=n=" not in graph
+        assert "split=" not in graph
+        assert "scale_cuda=1920:1080" in graph
+
         short_static = [
             TimelineSegment(
                 filepath="short.mp4", input_index=0,
@@ -201,5 +321,5 @@ class TestConcatOutputFiles:
             cam_index=0,
             batch_idx=0,
         )
-        assert res == str(fake_batch)
+        assert res is None  # Size alone never authorizes reuse of a corrupt video.
 

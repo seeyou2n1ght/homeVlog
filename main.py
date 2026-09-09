@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--date", type=str, help="process specific date (YYYYMMDD)")
     parser.add_argument("--cam", type=int, help="process specific camera index")
     parser.add_argument("--clean-temp", action="store_true", help="force clean all temporary batch video files before starting")
+    parser.add_argument("--reanalyze", action="store_true", help="force re-analysis of suspicious video clips with updated detection models")
     parser.add_argument("--no-tui", action="store_true", help="disable interactive live dashboard and use plain output")
     parser.add_argument("--debug", action="store_true", help="enable verbose debug logging")
     args = parser.parse_args()
@@ -53,8 +54,31 @@ def main():
     input_dirs = [args.input_dir] if args.input_dir else get_input_dirs(config)
     dashboard_enabled = not args.no_tui
 
-    # 启动前清理临时脚本与破损文件；仅当显式指定 --clean-temp 时才清空已渲染批次
+    # 启动前清理临时脚本与破损文件；当显式指定 --clean-temp 或 --reanalyze 时清空已渲染批次
     cleanup_temp_artifacts(clean_batches=args.clean_temp)
+
+    if args.reanalyze:
+        db = VlogDatabase()
+        try:
+            cam = args.cam if args.cam is not None else 0
+            if args.date:
+                db.conn.execute(
+                    "UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING', analysis_segments=NULL WHERE date=? AND cam_index=?",
+                    (args.date, cam),
+                )
+                db.conn.execute(
+                    "DELETE FROM segments WHERE date=? AND cam_index=?",
+                    (args.date, cam),
+                )
+            else:
+                db.conn.execute(
+                    "UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING', analysis_segments=NULL"
+                )
+                db.conn.execute("DELETE FROM segments")
+            db.conn.commit()
+            console.print("[bold cyan]ℹ 已重置分析缓存，将基于最新识别模型与算法重新精析并渲染。[/bold cyan]")
+        finally:
+            db.close()
 
     try:
         if args.scan:
@@ -106,9 +130,10 @@ def main():
         console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}")
 
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]⚠ 用户中断 (Ctrl+C)。已平稳终止子进程与硬件会话，当前已分析任务与批次已安全落盘。下次启动将自动断点续传。[/bold yellow]")
         from src.renderer import FFmpegProcessRegistry
+        FFmpegProcessRegistry.mark_interrupted()
         FFmpegProcessRegistry.kill_all()
+        console.print("\n[bold yellow]⚠ 用户中断 (Ctrl+C)。已平稳终止子进程与硬件会话，当前已分析任务与批次已安全落盘。下次启动将自动断点续传。[/bold yellow]")
         cleanup_resources()
         sys.exit(130)
 

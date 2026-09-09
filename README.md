@@ -1,140 +1,121 @@
 # HomeVlog
 
-HomeVlog 是专为家庭 NAS 与本地主机打造的室内监控智能浓缩工具。它可以自动扫描并处理全天的 4K H.265/MP4 监控视频，利用硬件加速过滤纯静止与弥散光影时段，精细保留人物/宠物的动态与家庭声音，最终生成平滑过渡的家庭 DailyVlog 成片。
+将家庭摄像头备份素材浓缩为按日期、机位分组的 DailyVlog：动态与有效声音常速保留，静态按展示时长计划快进。面向 Windows、NAS、Intel 核显 QSV 与 NVIDIA 显卡；当前开发主机为 i5-12600K + RTX 3060 Ti 8GB。
 
-系统基于 Intel 核显 (QSV) 与 NVIDIA 独显 (CUDA/NVENC) 异构协同，配合 Active Learning 质检审核平台，支持秒级时间轴修正与专属机位模型自进化。
+识别采用关键帧预筛、连续灰度运动分析和 YOLO 候选验证。采样、遮挡、夜视和模型误检都可能导致漏检，因此不能把它作为原始录像的替代品，也不承诺事件 100% 保留。
 
----
+## 安装与首次运行
 
-## 硬件表现与实测战报
+需要 Python 3.12+、uv、支持 QSV/NVENC/CUDA 滤镜的 FFmpeg，以及可用的 Intel/NVIDIA 驱动。FFmpeg 必须在 PATH 中。核显需要启用。项目使用 uv.lock 固定依赖，PyTorch 使用配置中的 CUDA 索引。
 
-测试平台：Intel i5-12600K + Intel UHD 770 (核显) + NVIDIA RTX 3060Ti (8GB 独显)
-
-- **全天监控处理耗时**: 24 小时 (89,500+ 秒) 4K 监控素材平均处理耗时 **16.5 分钟** (实测 13.4 ~ 22.7 分钟)，等效处理倍速 **81x ~ 110x**。
-- **高压缩率与保真度**: 24 小时 40GB~60GB 监控录像浓缩为 **2.3GB ~ 3.8GB** 成片；有效动态与对话事件 100% 原速原声保留，静态段 30x~60x 平滑快进。
-- **高稳态自动化测试**: 125 项全量核心测试用例自动化回归约 9 秒全绿。
-
----
-
-## 快速上手
-
-### 1. 安装依赖
-
-本项目使用 uv 管理虚拟环境与依赖（已预置 PyTorch CUDA 12.4 支持）：
-
-`powershell
-uv sync
-`
-
-### 2. 运行主流水线
-
-默认启动流式浓缩流水线，并展示 Rich 终端动态仪表盘：
-
-`powershell
-uv run python main.py
-`
-
-常用命令行参数：
-`powershell
-# 仅扫描素材目录并输出机位与日期清单，不执行分析渲染
+```powershell
+uv sync --locked
+ffmpeg -version
 uv run python main.py --scan
-
-# 指定处理特定日期与机位 (camera_id 支持 MAC 后缀或别名)
-uv run python main.py --date 20260901 --cam 0
-
-# 无 TUI 终端模式 (适合作为后台 Windows 服务或无头任务运行)
 uv run python main.py --no-tui
+```
 
-# 开启调试详细日志
-uv run python main.py --debug
-`
+运行前在 [config/settings.yaml](config/settings.yaml) 设置 `paths.input_dirs`，确认 `yolo.model_path` 指向已有本地权重。输出默认位于 `output/`，数据库在 `data/vlog.db`。素材文件名需符合 `00_YYYYMMDDhhmmss_YYYYMMDDhhmmss.mp4`；当前扫描器读取输入目录的直接文件，不递归扫描。
 
----
+机位使用目录 MAC（无 MAC 时用目录路径）和通道生成持久身份。数据库为每个身份分配唯一 `cam_index`，后续按 `--scan` 显示的索引操作；不同目录内的同名通道不再混成同一日视频。
 
-## 质检审核与秒级重浓缩平台
+## 常用命令
 
-系统自带独立的 Web 端人工质检审核工作台，用于复核识别结果、挖掘难样本并实现零重复解码的秒级重新渲染。
+```powershell
+# 指定日期与数据库机位索引
+uv run python main.py --date 20260321 --cam 0 --no-tui
 
-### 启动审核平台
-`powershell
+# 只分析，不渲染
+uv run python main.py --no-render --no-tui
+
+# 指定配置与输入目录
+uv run python main.py --config config/settings.yaml --input-dir D:\CameraBackup
+
+# 强制重新预筛、分析；持久人工修正仍在原时间范围生效
+uv run python main.py --date 20260321 --cam 0 --reanalyze --no-tui
+
+# 显式清理全部历史批次；通常不需要
+uv run python main.py --clean-temp
+
+uv run python main.py --help
+```
+
+`recovery.skip_today` 可跳过尚未备份完整的当天素材。周末批处理可使用无 TUI 命令运行；不要同时启动多个处理相同日期/机位的主程序进程，当前硬件预算和进程注册表为进程内共享。
+
+## 处理流程与资源预算
+
+1. **预筛**：默认 `keyframes` 用 PyAV 软件解码关键帧，发现疑似动作即可进入精析；判定静态前必须读到 EOF。采样不足或预算到期转入精析。关键帧间的短事件仍有漏检风险。
+2. **精析**：通过 QSV/NVDEC 输出单通道灰度，不为 YOLO 再开视频解码。整文件持续分析，不以开头静态推断未来静态。分析容器元数据懒加载后回填数据库。
+3. **YOLO**：复用内存 JPEG 候选，显式传入低置信度入口阈值，逐个小批推理。没有帧、只有不足的阴性证据或推理失败时保留动态并标记复核；画外声音不因缺少画内目标而自动快进。
+4. **渲染**：保序组织批次，默认两路 NVENC，QSV 保留给分析；展示时长和字幕使用同一计划。纯静态长片段在缩放前稀疏选帧。
+
+生产配置保留 `max_nv_concurrency: 2`，它是本项目安全作业预算，不是驱动会话上限或显存保证。QSV 作业也共用一个硬件预算；I/O 按输入文件数原子申请，渲染批次不会绕过 NAS 预算。
+
+生产配置为 8 个分析 worker，按录制时间优先处理较早文件，避免后续短文件阻塞首批渲染。运动特征在解码时连续计算，不保存完整灰度帧序列；每帧能量与置信度占 16 字节，另保留固定大小的背景模型。每任务 `analysis_buffer_mb` 约束 JPEG 候选、音频特征与诊断帧池，不能视为整个进程的 RSS 上限。`render.max_concurrency` 控制实际渲染 worker 数，硬件信号量仍独立限制在途作业。
+
+当前性能证据、完整复测和测试条件见 [2026-09-08 性能记录](docs/PERFORMANCE_20260908.md)。
+
+`yolo.batch_size` 控制真正送入模型的小批大小。提高并发或模型大小前，应同时测显存、CPU、NAS 吞吐与人工事件召回；高 GPU 占用率本身不是优化目标。
+
+## 恢复、配置变化与人工修正
+
+- 批次先写 `.tmp.mp4`，验证容器、视频流和展示时长后原子替换；合法的小 MP4 不受固定 512 KiB 门槛限制。
+- 批次与最终成片都有指纹清单。素材大小/mtime、配置、模型版本或时间轴变化后不复用旧结果。
+- 检测配置、模型或素材变化会重置旧分析状态。第一次使用本次修复版本会重建无指纹的历史分析；旧成片在新结果成功替换前保留。
+- 解码不完整、取消或 DB 写入失败不再伪装为分析成功。坏文件按重试策略降级跳过；渲染批次失败阻止合并，保留已成功批次。
+- 人工标签独立存于 `human_reviews`，按原始素材和时间范围覆盖算法结果；重分析改变切片边界也不会扩大或丢掉人工修正。
+- 所有直接启动的 FFmpeg 子进程纳入注册表；取消会终止进程，资源等待也会响应中断。
+
+## 审核、数据导出与微调
+
+```powershell
 uv run python scripts/audit_tool/app.py
-`
-- 服务默认启动在 http://127.0.0.1:8765 并自动打开浏览器。
-- 可选参数：--port 8888，--no-browser。
+uv run python scripts/inspect_detection.py "path/to/sample.mp4" --csv
+uv run python scripts/verify_accuracy.py --report-out docs/latest_quality.md
 
-### 平台主要功能
-1. **疑难样本排查 (Active Learning)**：自动筛选并置顶疑似光影误报段（动态但无目标）与疑似微动漏判段（能量临界区）。
-2. **快捷键一键标注**：
-   - 1: 标记为确认有效动态 (TP)
-   - 2: 标记为误判假动态 (FP - 窗帘/树影/光斑)
-   - 3: 标记为漏判微动 (FN - 实际有人)
-   - 4: 标记为确认纯静止 (TN)
-   - J / K (或上下方向键): 快速切换前后切片
-3. **真实反馈帧物理归档**：标注时自动从 4K 原片抽取变动瞬间原图与差分图，写入 data/archives/ 目录与 manifest.jsonl，用于算法优化。
-4. **秒级即时重浓缩**：在界面直接点击「即时重浓缩成片」，系统复用数据库已分析的时间轴与人工修正结果，直接调用 Pass 2 NVENC 硬件渲染，数十秒内生成修正版成片。
+# 按日期、机位、预筛状态分层抽取原始时间窗，包含预筛静态区域
+uv run python scripts/sample_accuracy.py --count 100 --output data/review_windows.csv
 
----
+# 导出到新的空目录，可按 MAC 或配置别名过滤
+uv run python scripts/export_dataset.py --output-dir data/datasets/my_cam --camera B888805AA3CD
+uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epochs 15
+```
 
-## 专属机位模型微调与调参闭环
+审核快捷键与界面操作以当前工作台为准，TP/FP/FN/TN 短码和完整标签统一归一化。`FrameArchiver` 将反馈帧保存到 `data/feedback_archive/images/` 并追加 `manifest.jsonl`；原片不可达时尝试近期内存帧及已有审核缓存，失败记录 Warning。
 
-针对特定机位特有的复杂光影、晃动窗帘或特殊视角，系统支持全流程无代码自进化闭环：
+TN/FP 导出空标注，正样本缺少可信框时排除并记录，不能当作背景训练。注意“静态”不等于“没有人”：静坐人物仍需要 person 框，标注负样本前必须确认没有目标。已人工校正的同名 `.txt` 框文件优先于伪标签。类别沿用 COCO 的 person=0、cat=15、dog=16，避免自定义类别与基础模型错位。
 
-### 1. 导出机位标注数据集
-将人工审核打标的历史切片与归档原图导出为标准 YOLO 数据集（包含 8:2 划分与负样本支持）：
-`powershell
-uv run python scripts/export_dataset.py --output data/datasets/my_cam --camera B888805AA3CD
-`
+训练/验证按源视频隔离并记录 provenance。导出的伪标签验证集不能证明真实准确率。训练强制 `freeze=10`；要自动应用新模型，必须另提供与训练素材不重叠、人工校正的 holdout，并通过召回与精度不退化检查：
 
-### 2. 本地微调 YOLOv11 权重
-使用本地 RTX 3060Ti 对骨干网络执行冻结微调（reeze=10, AMP 混合精度），训练机位专属权重：
-`powershell
-# 训练 15 个 epoch，并在训练完成后直接热替换更新当前系统的模型
-uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epochs 15 --apply
-`
+```powershell
+uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epochs 15 --apply --validation-data data/datasets/holdout/data.yaml
+```
 
-### 3. 预筛选超参数寻优
-根据标注结果自动通过网格搜索调优当前机位的最佳时空预筛选阈值：
-`powershell
-uv run python scripts/tune_thresholds.py --camera B888805AA3CD
-`
+`--apply` 写配置，并非运行中热切换。新任务加载所选权重。无人工标注时审核指标显示 N/A；自动疑似 FP/FN 仅为待审线索。
 
----
+## 开发验证与性能评估
 
-## 核心文档导航
+```powershell
+uv run ruff check main.py src scripts tests
+uv run python -m compileall main.py src scripts
+uv run python -m pytest tests/
 
-- **[AGENTS.md](file:///c:/Users/seeyo/code/homeVlog/AGENTS.md)**：AI Agent 开发守则、硬件信号量单次原则、优雅停机与时间轴闭环铁律。
-- **[docs/ARCHITECTURE.md](file:///c:/Users/seeyo/code/homeVlog/docs/ARCHITECTURE.md)**：系统三级流式流水线拓扑、异构工作窃取调度器、EMA/VAD 动静识别算子与 SQLite 表结构设计。
-- **[docs/BENCHMARK.md](file:///c:/Users/seeyo/code/homeVlog/docs/BENCHMARK.md)**：连续 5 天 120 小时生产环境实测数据、各演进阶段性能瓶颈定位与 RCA 记录。
+# 本机真实 QSV/NVDEC/NVENC 与本地 YOLO 权重冒烟测试
+$env:HOMEVLOG_HARDWARE_TESTS = '1'
+uv run python -m pytest tests/test_hardware_smoke.py
 
----
+uv run python scripts/analyze_perf.py --top 5
+uv run python scripts/benchmark.py --all
+```
 
-## 项目结构
+CI 在 Windows 执行 locked 依赖同步、Ruff、语法检查和回归。Ruff 当前启用致命错误与未定义名称规则，尚未实施全仓库严格类型检查。硬件测试显式开启，普通单元测试不能替代真实硬件验收。
 
-`	ext
-config/settings.yaml              系统核心参数配置
-main.py                           主流水线 CLI 入口
-models/                           目标检测模型权重仓库 (内置 yolo11n / yolo11s / yolo11m)
-data/
-  ├── vlog.db                     SQLite WAL 任务状态与切片标记数据库
-  └── archives/                   真实人工反馈原图归档仓库与索引清单
-src/
-  ├── pipeline.py                 流式并发编排引擎 (StreamingOrchestrator)
-  ├── scheduler.py                异构硬件调度器与并发信号量管理
-  ├── prescreen.py                Pass 1 关键帧跳跃粗筛 (自适应空间集中度算子)
-  ├── detector.py                 Pass 1.5 解码驱动与 EMA/连通域检测
-  ├── filters.py                  EMA 背景建模、8x8 连通域抗噪与 AudioEnergyVAD
-  ├── yolo_verifier.py            Pass 1.8 Tensor Core YOLO 动态批验证
-  ├── timeline.py                 平滑变速 PTS 曲线、重浓缩时间轴修正与滤镜构建
-  ├── renderer.py                 Pass 2 多批次并发硬件渲染与拼接
-  ├── archiver.py                 真实反馈帧原图抽取与原子归档模块
-  ├── database.py                 SQLite WAL 任务管理与 segments 切片持久化
-  ├── ui.py                       Rich 终端动态仪表盘
-  └── ffmpeg.py                   FFmpeg 子进程封装与生命周期托管注册表
-scripts/
-  ├── audit_tool/                 人机协同 Web 二次审核与秒级重浓缩平台
-  ├── export_dataset.py           审核样本与归档帧导出 YOLO 数据集工具
-  ├── train_yolo.py               专属机位 YOLOv11 本地轻量微调工具
-  └── tune_thresholds.py          预筛选超参数网格搜索寻优脚本
-tests/                            125 项自动化业务测试套件
-docs/                             系统架构设计与性能基准测试文档
-`
+2026-09-08 修复验证与限制见 [实施记录](docs/IMPLEMENTATION_20260908.md)。[历史基准](docs/BENCHMARK.md) 来自旧算法与素材分布，不能作为新版速度或召回保证；修复预筛/早停后处理量可能上升，应重新测量。
+
+## 文档导航
+
+- [架构与数据契约](docs/ARCHITECTURE.md)
+- [开发约束](AGENTS.md)
+- [审查发现与原始复现](docs/REVIEW_20260908.md)
+- [实施及验收记录](docs/IMPLEMENTATION_20260908.md)
+- [历史质量线索](docs/ACCURACY_AUDIT_REPORT.md)

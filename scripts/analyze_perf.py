@@ -3,7 +3,7 @@
 将每日 perf JSON 汇总为瓶颈评估视图：
 1. 单日头条：处理倍速 (speedup_x)、浓缩率、产出体积；
 2. 分阶段耗时分布与估算墙钟占比（识别当前瓶颈阶段）；
-3. 分析阶段 decode/analysis 拆解 与 渲染 encode_speed_x 统计；
+3. 分析阶段 decode/analysis 拆解、渲染 staging/编码与最终合并统计；
 4. 信号量等待 (sem_wait) 汇总（饥饿探测）；
 5. 各阶段 Top-N 最慢记录（长尾定位）。
 
@@ -63,14 +63,14 @@ def analyze_file(path: Path, top_n: int) -> None:
         + (f"  │  iGPU {igpu}" if igpu else "")
     )
 
-    # 分阶段统计
-    print(f"   {'stage':<12} {'n':>4} {'total':>9} {'avg':>8} {'p95':>8} {'max':>9}")
-    for st in ("prescreen", "analysis", "render", "render_enc"):
+    # 分阶段统计 (注: 累计工时为各 Worker 并发总时长，由于多路并行，该和值大于端到端壁钟总耗时)
+    print(f"   {'阶段 (Stage)':<16} {'数量(n)':>6} {'累计工时(Worker)':>16} {'均值(avg)':>10} {'P95':>10} {'最大(max)':>10}")
+    for st in ("prescreen", "analysis", "render_stage", "render_enc", "render", "final_concat"):
         s = summary.get(st)
         if s:
             print(
-                f"   {st:<12} {s['count']:>4} {_fmt_s(s['total']):>9}"
-                f" {_fmt_s(s['avg']):>8} {_fmt_s(s['p95']):>8} {_fmt_s(s['max']):>9}"
+                f"   {st:<16} {s['count']:>6} {_fmt_s(s['total']):>16}"
+                f" {_fmt_s(s['avg']):>10} {_fmt_s(s['p95']):>10} {_fmt_s(s['max']):>10}"
             )
 
     # 分析阶段 decode/analysis 拆解
@@ -115,10 +115,10 @@ def analyze_file(path: Path, top_n: int) -> None:
 def main():
     ap = argparse.ArgumentParser(description="HomeVlog perf 聚合瓶颈分析")
     ap.add_argument("--top", type=int, default=5, help="各阶段展示最慢记录数")
-    ap.add_argument("--glob", default="logs/perf_*.json", help="perf JSON 匹配模式")
+    ap.add_argument("--glob", default="logs/**/perf_*.json", help="perf JSON 匹配模式")
     args = ap.parse_args()
 
-    files = sorted(glob.glob(args.glob))
+    files = sorted(glob.glob(args.glob, recursive=True))
     if not files:
         print(f"未找到 perf 文件: {args.glob}")
         return
