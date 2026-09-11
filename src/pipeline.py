@@ -360,6 +360,15 @@ class StreamingOrchestrator:
     ):
         from src.segment import build_segments, segments_to_json
 
+        if self.dashboard is not None:
+            dur = float(task.get("file_duration") or 0.0)
+            dur_label = f"({dur/60:.1f}m)" if dur > 60 else (f"({dur:.0f}s)" if dur > 0 else "")
+            self.dashboard.update_analysis(
+                completed=self.dashboard.analysis_done,
+                latest_file=Path(filepath).name,
+                speed_str=f"正在分析 {dur_label}".strip(),
+            )
+
         labels, yolo_buffer = detector.analyze(
             filepath,
             start_offset=file_start_offset,
@@ -1049,13 +1058,16 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     total_files = len(all_tasks)
     total_input_dur = sum(float(t.get("file_duration") or 300.0) for t in all_tasks)
 
-    # Rich 启动 Banner (含机位别名解析)
+    # Rich 启动 Banner (含机位别名与高度自定义成片命名解析)
     out_cfg = config.get("output", {})
-    output_name = out_cfg.get("naming", "DailyVlog_{date}_cam{index}.mp4").replace("{date}", date).replace("{index}", str(cam_index))
+    naming_template = out_cfg.get("naming", "DailyVlog_{date}_{mac}.mp4")
+    sample_filepath = all_tasks[0]["filepath"] if all_tasks else None
+    from src.scanner import resolve_output_filename, resolve_camera_identity
+    output_name = resolve_output_filename(naming_template, date, cam_index, sample_filepath=sample_filepath, config=config)
+
     cam_display = None
     try:
-        from src.scanner import resolve_camera_identity
-        sample_dir = str(Path(all_tasks[0]["filepath"]).parent) if all_tasks else ""
+        sample_dir = str(Path(sample_filepath).parent) if sample_filepath else ""
         cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=config)
     except Exception:
         cam_display = None

@@ -75,6 +75,32 @@ class TestFilenameParsingAndScanner:
         assert disp == "Cam 3"
         assert fid == "cam3"
 
+    def test_resolve_output_filename_custom_templates(self):
+        from src.scanner import resolve_output_filename
+        mock_cfg = {"cameras": {"B888805AA3CD": "baby_room"}}
+        sample_path = r"\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD\00_20260402000000_20260402000500.mp4"
+
+        # 默认模式：{date}_{mac}
+        name1 = resolve_output_filename("DailyVlog_{date}_{mac}.mp4", "20260402", 0, sample_path, mock_cfg)
+        assert name1 == "DailyVlog_20260402_B888805AA3CD.mp4"
+
+        # 语义机位模式：{date}_{camera}
+        name2 = resolve_output_filename("DailyVlog_{date}_{camera}.mp4", "20260402", 0, sample_path, mock_cfg)
+        assert name2 == "DailyVlog_20260402_baby_room.mp4"
+
+        # 传统编号模式：{date}_cam{index}
+        name3 = resolve_output_filename("DailyVlog_{date}_cam{index}.mp4", "20260402", 0, sample_path, mock_cfg)
+        assert name3 == "DailyVlog_20260402_cam0.mp4"
+
+        # 自由组合模式：{date}_{camera}_{mac}_#cam{index}
+        name4 = resolve_output_filename("{date}_{camera}_{mac}_#cam{index}.mp4", "20260402", 0, sample_path, mock_cfg)
+        assert name4 == "20260402_baby_room_B888805AA3CD_#cam0.mp4"
+
+        # 无 MAC 兜底降级
+        fallback_path = "C:/Footage/regular_folder/00_20260402000000_20260402000500.mp4"
+        name5 = resolve_output_filename("DailyVlog_{date}_{mac}.mp4", "20260402", 1, fallback_path, mock_cfg)
+        assert name5 == "DailyVlog_20260402_cam1.mp4"
+
     def test_get_input_dirs_polymorphic(self):
         from src.utils import get_input_dirs
         # 1. 列表格式

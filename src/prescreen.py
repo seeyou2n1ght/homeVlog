@@ -37,22 +37,26 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
     )
     from src.scheduler import get_qsv_semaphore, get_nv_semaphore
     hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
-    if not acquire_with_retry(hardware):
-        return None
-    try:
-        result = run_ffmpeg(args, timeout=timeout)
-    finally:
-        hardware.release()
-    if result.returncode != 0:
-        logger.error("FFmpeg extract_frame failed for %s at %.1f: %s", filepath, timestamp, result.stderr_text[-500:])
-        return None
-    raw = result.stdout
     expected = width * height * 3
-    if len(raw) < expected:
-        logger.error("FFmpeg extract_frame too small for %s at %.1f: got %d, expected %d", filepath, timestamp, len(raw), expected)
-        return None
-    frame = np.frombuffer(raw[:expected], dtype=np.uint8).reshape((height, width, 3))
-    return frame
+    for attempt in range(2):
+        if not acquire_with_retry(hardware):
+            return None
+        try:
+            result = run_ffmpeg(args, timeout=timeout)
+        finally:
+            hardware.release()
+        if result.returncode == 0 and len(result.stdout) >= expected:
+            frame = np.frombuffer(result.stdout[:expected], dtype=np.uint8).reshape((height, width, 3))
+            return frame
+        if attempt == 0:
+            import time
+            time.sleep(0.1)
+
+    if result.returncode != 0:
+        logger.warning("FFmpeg extract_frame failed for %s at %.1f: %s", filepath, timestamp, result.stderr_text[-500:])
+    elif len(result.stdout) < expected:
+        logger.warning("FFmpeg extract_frame too small for %s at %.1f: got %d, expected %d", filepath, timestamp, len(result.stdout), expected)
+    return None
 
 
 def _calc_dynamic_threshold(base_threshold: float, mean_luma: float, is_prior_active: bool = False) -> float:
@@ -190,17 +194,31 @@ def _prescreen_keyframes(
 
                 is_motion = False
                 if d > current_threshold:
-                    if (
-                        concentration >= conc_thresh
-                        or d >= current_threshold * 1.5
-                        or max_cell_energy >= current_threshold * 1.8
-                    ):
-                        is_motion = True
+                    if mean_luma < 50.0:
+                        # 暗光/红外防噪点专项逻辑：严格剔除弥漫型全图白噪点
+                        # 必须具备局部能量聚集 (concentration >= 1.25 且局部块达到有效能量 6.5)，或局部出现显著动作 (max_cell_energy >= 12.0)
+                        if (concentration >= 1.25 and max_cell_energy >= 6.5) or max_cell_energy >= 12.0:
+                            is_motion = True
+                        else:
+                            logger.debug(
+                                "Prescreen night diffuse noise suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
+                                Path(filepath).name, d, current_threshold, concentration, max_cell_energy,
+                            )
                     else:
-                        logger.debug(
-                            "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
-                            Path(filepath).name, d, current_threshold, concentration, max_cell_energy
-                        )
+                        if (
+                            concentration >= conc_thresh
+                            or d >= current_threshold * 1.5
+                            or max_cell_energy >= current_threshold * 1.8
+                        ):
+                            is_motion = True
+                        else:
+                            logger.debug(
+                                "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
+                                Path(filepath).name, d, current_threshold, concentration, max_cell_energy,
+                            )
+                elif max_cell_energy >= max(14.0, current_threshold * 2.2):
+                    # [双轨防漏检保护] 远距离/角落局部小目标剧烈运动：即使全图均值 d 被大背景稀释，单点能量爆发依然强制唤醒
+                    is_motion = True
 
                 if is_motion:
                     return {

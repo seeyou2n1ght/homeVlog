@@ -31,20 +31,46 @@ def processing_fingerprint(filepath, config):
 def valid_video(path, expected_duration=None):
     """Reject empty/corrupt output, not legitimate small videos."""
     import av
+    import logging
+    _log = logging.getLogger("homevlog")
     try:
-        if Path(path).stat().st_size <= 0:
+        p = Path(path)
+        if not p.exists() or p.stat().st_size <= 0:
+            _log.warning("valid_video: file %s does not exist or is 0 bytes", path)
             return False
         with av.open(str(path), timeout=10.0) as container:
             if not container.streams.video:
+                _log.warning("valid_video: file %s has no video stream", path)
                 return False
             stream = container.streams.video[0]
             duration = (float(stream.duration * stream.time_base) if stream.duration
                         else float(container.duration or 0) / av.time_base)
-            if duration <= 0 or next(container.decode(stream), None) is None:
+            if duration <= 0:
+                _log.warning("valid_video: file %s has invalid duration %.3fs", path, duration)
                 return False
-            return (expected_duration is None or
-                    abs(duration - expected_duration) <= max(5.0, expected_duration * 0.05))
-    except Exception:
+            try:
+                first_frame = next(container.decode(stream), None)
+                if first_frame is None:
+                    _log.warning("valid_video: file %s could not decode first frame", path)
+                    return False
+            except Exception as dec_err:
+                _log.warning("valid_video: file %s decode error: %s", path, dec_err)
+                return False
+
+            if expected_duration is not None:
+                # 监控摄像头录像末尾常因物理丢包或分段截断提前数秒 EOF，且静态段变速平滑存在微小浮点累计误差。
+                # 保持短视频 5.0s 下限拦截结构性坏片，将长视频自适应门限从 5% 适度放宽至 11%（允许约 10% 监控切片末尾波动）。
+                tol = max(5.0, expected_duration * 0.11)
+                diff = abs(duration - expected_duration)
+                if diff > tol:
+                    _log.warning(
+                        "valid_video: file %s duration mismatch: actual=%.3fs, expected=%.3fs (diff=%.3fs > tol=%.3fs)",
+                        path, duration, expected_duration, diff, tol,
+                    )
+                    return False
+            return True
+    except Exception as e:
+        _log.warning("valid_video: file %s validation exception: %s", path, e, exc_info=True)
         return False
 
 

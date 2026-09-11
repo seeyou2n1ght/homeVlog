@@ -97,6 +97,36 @@ def resolve_camera_identity(dir_path: str, cam_index: int = 0, config: dict | No
     return f"Cam {cam_index}", f"cam{cam_index}"
 
 
+def resolve_output_filename(
+    template: str,
+    date: str,
+    cam_index: int,
+    sample_filepath: str | None = None,
+    config: dict | None = None,
+) -> str:
+    """自适应格式化成片文件名，支持 {date}, {mac}, {camera}, {index} 占位符。
+    
+    占位符定义:
+    - {date}: 日期字符串 (如 '20260402')
+    - {mac}: 摄像机物理 MAC 地址 (如 'B888805AA3CD'，若无则自适应降级为 'cam{cam_index}')
+    - {camera}: 语义机位别名 (如 'baby_room'，未设置别名时降级为 MAC，再无则降级为 'cam{cam_index}')
+    - {index}: 摄像机逻辑编号数字 (如 0)
+    """
+    if config is None:
+        config = load_config()
+    sample_dir = str(Path(sample_filepath).parent) if sample_filepath else ""
+    cam_info = parse_camera_dir(sample_dir)
+    mac = cam_info.get("mac") or f"cam{cam_index}"
+    _, identifier = resolve_camera_identity(sample_dir, cam_index=cam_index, config=config)
+    camera = identifier
+
+    name = template.replace("{date}", str(date))
+    name = name.replace("{mac}", str(mac))
+    name = name.replace("{camera}", str(camera))
+    name = name.replace("{index}", str(cam_index))
+    return name
+
+
 @dataclass
 class ScanResult:
     added: int

@@ -800,18 +800,45 @@ def build_concat_filter(
 
         if use_sparse_mixed:
             sample_half = max(0.04, float(static_sample_window_s) * 0.5)
-            keep_terms = []
+            raw_intervals: list[tuple[float, float]] = []
             for file_seg in file_segs:
                 if file_seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
-                    start = max(0.0, file_seg.start_in_file - 0.05)
-                    end = file_seg.end_in_file + 0.05
+                    s = max(0.0, file_seg.start_in_file - 0.05)
+                    e = file_seg.end_in_file + 0.05
                 else:
                     midpoint = (file_seg.start_in_file + file_seg.end_in_file) * 0.5
-                    start = max(file_seg.start_in_file, midpoint - sample_half)
-                    end = min(file_seg.end_in_file, midpoint + sample_half)
-                keep_terms.append(f"between(t\\,{start:.3f}\\,{end:.3f})")
-            select_expr = "+".join(keep_terms)
-            scale_parts.append(f"{input_v}select='{select_expr}',{scale_core}[scaled_{idx}]")
+                    s = max(file_seg.start_in_file, midpoint - sample_half)
+                    e = min(file_seg.end_in_file, midpoint + sample_half)
+                if e > s:
+                    raw_intervals.append((s, e))
+            raw_intervals.sort(key=lambda x: x[0])
+
+            merged_intervals: list[tuple[float, float]] = []
+            for s, e in raw_intervals:
+                if merged_intervals and s <= merged_intervals[-1][1] + 1.0:
+                    merged_intervals[-1] = (merged_intervals[-1][0], max(merged_intervals[-1][1], e))
+                else:
+                    merged_intervals.append((s, e))
+
+            # 当碎片区间过多时(>30)，跳帧开销超越线性解码且易导致 FFmpeg 表达式解析爆栈，安全降级为常规全帧解码
+            if len(merged_intervals) > 30:
+                logger.info(
+                    "sparse_mixed: %d intervals on file %d exceeds safety limit, fallback to continuous decode",
+                    len(merged_intervals), idx,
+                )
+                if scale_filter is not None:
+                    scale_parts.append(f"{input_v}{scale_filter}[scaled_{idx}]")
+                else:
+                    scale_parts.append(f"{input_v}null[skip_{idx}]")
+            else:
+                keep_terms = [f"between(t\\,{s:.3f}\\,{e:.3f})" for s, e in merged_intervals]
+                def _balance_add(terms: list[str]) -> str:
+                    if len(terms) == 1:
+                        return terms[0]
+                    mid = len(terms) // 2
+                    return f"({_balance_add(terms[:mid])}+{_balance_add(terms[mid:])})"
+                select_expr = _balance_add(keep_terms)
+                scale_parts.append(f"{input_v}select='{select_expr}',{scale_core}[scaled_{idx}]")
         elif use_kf_fastpath:
             # 快路径剥离文件链尾部 fps：稀疏关键帧直接进入段级 trim/setpts，
             # 段级 fps 过滤器负责将每帧铺陈为 keyframe_display_duration 时长

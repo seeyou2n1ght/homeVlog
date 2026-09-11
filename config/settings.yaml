@@ -207,7 +207,12 @@ render:
   generate_subtitles: false
 
 output:
-  naming: "DailyVlog_{date}_cam{index}.mp4"
+  # 成片命名模板（高度自定义，支持热修改）：
+  #   {date}   - 日期字符串 (如 20260402)
+  #   {mac}    - 摄像机物理 MAC 地址 (如 B888805AA3CD)
+  #   {camera} - 语义机位别名 (如 baby_room，未设置别名时自适应降级为 MAC 或 cam{index})
+  #   {index}  - 摄像机逻辑编号数字 (如 0)
+  naming: "DailyVlog_{date}_{mac}.mp4"
   resolution: "1920x1080"
   fps: 20
 
