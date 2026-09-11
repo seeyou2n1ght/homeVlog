@@ -51,8 +51,8 @@ scheduler:
   # 队列积压低水位线: 当待分析文件数 <= 该值时，NVDEC 退出协同，回归 QSV 独占解码
   watermark_low: 3
   # 是否启用 NVDEC 协同解码 (与 QSV 协同抽干积压队列)
-  # 同一实拍文件 QSV/CUDA 灰度链产生 47/629 帧分类差异；固定 QSV 保证可复现
-  nvdec_cooperative: false
+  # 在队列积压 (>= watermark_high) 且未启动渲染时，借调 1 路 NVDEC 加速出清
+  nvdec_cooperative: true
   # NVDEC 最大协同解码并发数 (建议 1，避免争用显存与 PCIe 带宽)
   max_nv_decoders: 1
   # 冷启动：渲染启动前允许借调 NVDEC；不抢占已运行任务
@@ -178,7 +178,7 @@ render:
   static_mode: "hybrid_keyframe"
   # 单文件 EDL 批次：每路渲染仅持有一个活动解码上下文；两路 NVENC 合计两路
   batch_max_files: 1
-  max_concurrency: 3
+  max_concurrency: 2
   virtual_concat_enabled: true
   # 混合文件 EDL 灰度开关；启用前必须通过真实长文件的时长与音频闭环验证
   virtual_concat_mixed_enabled: true

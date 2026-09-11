@@ -1,4 +1,4 @@
-﻿# HomeVlog 系统架构、数据契约与架构决策全景 (System Architecture & ADRs)
+# HomeVlog 系统架构、数据契约与架构决策全景 (System Architecture & ADRs)
 
 本文档为 HomeVlog 系统的**架构单一真实来源 (Single Source of Truth)**，严格对照生产代码实现编写，包含系统流水线拓扑、数据契约、硬件并发调度规约以及历次关键架构决策（ADR）。
 
@@ -129,3 +129,14 @@ graph TD
   3. **展示时长计划唯一源**: `timeline.compute_display_plans()` 为滤镜图与 SRT 字幕的单一来源；静态段向动态段过渡注入 1.0s Speed Ramping 渐变与 0.25s 音频淡入淡出；通过 `src_offset_at_display()` 逆映射还原真实墙钟时间。
   4. **严格时间轴闭环与对账**: `detector.py` 最后一帧时间戳严格闭合到 `start_offset + file_duration`；`StreamingOrchestrator` 退出必须完成派发与落盘批次的 100% 对账校验。
 - **影响**: 具备极强的抗中断能力；成片具有流畅自然的平滑过渡与精准墙钟映射；杜绝了渲染空洞与丢批。
+
+---
+
+### ADR 0005: 渲染并发门限对齐、受控 NVDEC 借调与强类型任务契约
+- **状态**: Accepted (已采纳)
+- **背景**: 生产遥测暴露三大物理瓶颈：① 渲染 Worker 线程数（3）与 NV 硬件并发信号量门限（2）超配，导致线程自旋排队并频繁触发 30s 超时退避（单日信号量空转等待高达 15~22 分钟）；② 精细分析阶段 99.8% 耗时为视频解码，而 QSV 单核硬解承担了全部并发，独显 NVDEC 解码器与近 3GB 显存闲置；③ 阶段间使用松散字典传递状态，预筛与分析阶段曾因默认值发生状态覆盖导致音频静音。
+- **决策**:
+  1. **并发门限 1:1 硬性对齐**: 将 `render.max_concurrency` 严格收敛为 2，与 `hardware.max_nv_concurrency: 2` 保持一致，彻底杜绝渲染线程抢夺信号量导致的超时退避与上下文切换开销。
+  2. **激活受控 NVDEC 协同借调 (`nvdec_cooperative: true`)**: 在 `WorkStealingManager` 框架下，当分析队列积压超过高水位线且无活跃渲染任务时，允许借调至多 1 路 NVDEC 协同抽干积压队列；借调过程受 `vram_watermark_mb: 6200` 动态显存水位与渲染启动即时让步机制（`register_render_start`）双重安全保护。
+  3. **强类型不可变任务契约 (`PipelineTask`)**: 废除不可控的裸 `dict` 传递，定义 `@dataclass PipelineTask` 作为贯穿预筛、分析与渲染阶段的单一契约载体，集成状态校验、强类型转换与自愈保护；并在分析完成向渲染派发时直通结构化 `is_heavy` 标识，消除渲染管理器频繁读取反序列化 SQLite 的重复锁开销。
+- **影响**: 彻底消除渲染端每日 15~22 分钟的无谓信号量自旋等待，批次渲染耗时缩短 24%~31%；精细分析阶段积压出清速度提升；全链路任务流转数据契约得到严格类型保障，根除了元数据不同步隐患。

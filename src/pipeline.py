@@ -27,9 +27,56 @@ from src.utils import (
     unregister_dashboard,
     WorkStealingManager,
 )
+from dataclasses import dataclass, field
 from src.monitor import get_monitor, get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
+
+
+@dataclass
+class PipelineTask:
+    """Strongly-typed task contract flowing through prescreen, analysis, and render."""
+    filepath: str
+    cam_index: int = 0
+    date: str = ""
+    file_start_time: str = ""
+    file_end_time: str = ""
+    file_duration: float = 0.0
+    has_audio: int = 0
+    prescreen_status: str = "PENDING"
+    analysis_status: str = "PENDING"
+    analysis_segments: str = ""
+    id: int | None = None
+
+    def __getitem__(self, item):
+        return getattr(self, item)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    @classmethod
+    def from_dict(cls, data) -> "PipelineTask":
+        if isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            return data
+        return cls(
+            filepath=str(data.get("filepath", "")),
+            cam_index=int(data.get("cam_index", 0)),
+            date=str(data.get("date", "")),
+            file_start_time=str(data.get("file_start_time", "")),
+            file_end_time=str(data.get("file_end_time", "")),
+            file_duration=float(data.get("file_duration") or 0.0),
+            has_audio=int(data.get("has_audio") or 0),
+            prescreen_status=str(data.get("prescreen_status", "PENDING")),
+            analysis_status=str(data.get("analysis_status", "PENDING")),
+            analysis_segments=str(data.get("analysis_segments", "")),
+            id=data.get("id"),
+        )
+
 
 
 class AnalysisQueue(queue.Queue):
@@ -397,8 +444,9 @@ class StreamingOrchestrator:
                     },
                 )
             )
+            has_dynamic = any(getattr(s, "is_dynamic", False) or s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in segments)
             self.render_batch_queue.put(
-                {"filepath": filepath, "status": "ANALYZED"}
+                {"filepath": filepath, "status": "ANALYZED", "is_heavy": has_dynamic}
             )
         else:
             self.db.set_analysis_result(filepath, "FAILED", "")
@@ -530,19 +578,29 @@ class StreamingOrchestrator:
         dispatch_sequence = 0
         dispatch_lock = threading.Lock()
 
+        ready_heavy: dict[str, bool] = {}
+
         def _is_heavy_batch(files_to_batch: list[str]) -> bool:
             """检查批次中是否包含需复杂处理的 DYNAMIC 动作片段。"""
             if self.abort_event.is_set() or getattr(self.db, "is_closed", False):
                 return False
+            if files_to_batch and all(fp in ready_heavy for fp in files_to_batch):
+                return any(ready_heavy[fp] for fp in files_to_batch)
             try:
                 for fp in files_to_batch:
+                    if fp in ready_heavy:
+                        if ready_heavy[fp]:
+                            return True
+                        continue
                     r = self.db.get_file_task_summary(fp)
                     if not r:
                         continue
                     if r.get("prescreen_status") == "SUSPICIOUS":
                         raw_segs = r.get("analysis_segments")
                         if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
+                            ready_heavy[fp] = True
                             return True
+                    ready_heavy[fp] = False
             except Exception:
                 pass
             return False
@@ -787,6 +845,8 @@ class StreamingOrchestrator:
 
             filepath = msg.get("filepath")
             if filepath is not None:
+                if "is_heavy" in msg:
+                    ready_heavy[filepath] = bool(msg["is_heavy"])
                 status = msg.get("status", "FAILED")
                 if immediate_file_batches and filepath in order_index:
                     # Each output now owns exactly one physical file.  Its
@@ -842,7 +902,8 @@ class StreamingOrchestrator:
 
 
     def run(self):
-        all_tasks = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+        raw_tasks = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+        all_tasks = [PipelineTask.from_dict(t) for t in raw_tasks]
         for i, t in enumerate(all_tasks):
             if i > 0:
                 self._prev_task_map[t["filepath"]] = all_tasks[i - 1]["filepath"]
