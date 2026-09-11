@@ -250,4 +250,20 @@ class TestReRenderWorkflow:
         finally:
             db.close()
 
+    def test_rerender_output_filename_resolution(self):
+        from src.scanner import resolve_output_filename
+        mock_cfg = {"cameras": {"B888805AA3CD": "living_room"}}
+        sample_path = r"\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD\00_20260402000000_20260402000500.mp4"
+
+        base = resolve_output_filename("DailyVlog_{date}_{mac}.mp4", "20260402", 0, sample_path, mock_cfg)
+        assert base == "DailyVlog_20260402_B888805AA3CD.mp4"
+
+        # 校验带版本标识的重浓缩派生命名
+        from pathlib import Path
+        output_version = "v2"
+        stem = Path(base).stem
+        suffix = Path(base).suffix
+        final_name = f"{stem}_{output_version}{suffix}"
+        assert final_name == "DailyVlog_20260402_B888805AA3CD_v2.mp4"
+
 

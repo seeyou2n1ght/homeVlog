@@ -197,8 +197,10 @@ class ReRenderManager:
             # 5. 渲染输出路径
             out_dir = OUTPUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
-            naming = out_cfg.get("naming", "DailyVlog_{date}_cam{index}.mp4")
-            base_name = naming.replace("{date}", date).replace("{index}", str(cam_index))
+            naming = out_cfg.get("naming", "DailyVlog_{date}_{mac}.mp4")
+            sample_path = healthy_rows[0]["filepath"] if healthy_rows else (file_tasks[0]["filepath"] if file_tasks else None)
+            from src.scanner import resolve_output_filename
+            base_name = resolve_output_filename(naming, date, cam_index, sample_filepath=sample_path, config=config)
             if output_version:
                 stem = Path(base_name).stem
                 suffix = Path(base_name).suffix

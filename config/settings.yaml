@@ -13,7 +13,7 @@ paths:
 
 # 机位识别与人类友好别名映射
 # 系统自动根据素材目录名解析小米摄像头 MAC 地址 (如 XiaomiCamera_01_B888805AA3CD 提取出 B888805AA3CD)
-# 可以在此处将 MAC 地址映射为人类可读的机位名称，成片将自动命名为 DailyVlog_{date}_{camera}.mp4
+# 可以在此处将 MAC 地址映射为人类可读的机位名称；若命名模板包含 {camera}，成片将自动使用该别名（未配置时降级为 MAC 或 cam{index}）
 cameras:
   B888805AA3CD: "baby_room"       # 婴儿房机位 (红外微光夜视敏感模式)
   # 6490C12345EF: "living_room"   # 客厅机位示例

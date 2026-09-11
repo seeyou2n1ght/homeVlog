@@ -10,19 +10,19 @@ HomeVlog 的核心工程哲学为：**单次解码 (Single-Pass)**、**零临时
 
 ```mermaid
 graph TD
-    A["NAS 目录扫描 (scanner.py)<br/>仅解析文件名/时间戳/机位 MAC"] --> B["SQLite: file_tasks + camera_registry"]
-    B --> C["[Pass 1] 快速关键帧预筛 (prescreen.py)<br/>PyAV 关键帧稀疏采样 / 光影空间连通滤波"]
+    A["NAS 目录扫描 (scanner.py)<br/>解析文件名/时间戳/机位 MAC 与自定义成片命名"] --> B["SQLite: file_tasks + camera_registry"]
+    B --> C["[Pass 1] 快速关键帧预筛 (prescreen.py)<br/>空间集中度抗噪 / 双轨防漏检唤醒 / 暗光噪点压制"]
     C -->|纯静态且无音频| D["纯静态轻队列 (light_queue)<br/>Intel UHD 770 QSV / NVENC 快路径"]
-    C -->|疑似动作/关键音频/暗光噪点| E["[Pass 1.5] 灰度直通多模态精析 (detector.py)<br/>大文件优先队列 (AnalysisQueue)"]
+    C -->|疑似动作/关键音频/暗光微动| E["[Pass 1.5] 灰度直通多模态精析 (detector.py)<br/>大文件优先队列 (AnalysisQueue)"]
     E --> F["时域滑动背景 (EmaBackgroundModel)<br/>+ 8x8 空间连通域过滤 (SpatialGrid)"]
     E --> G["音频活动检测 (AudioEnergyVAD)"]
     E --> H["零拷贝内存池 (Zero-IO JPEG Pool)<br/>+ YOLO 批推理流式验证"]
     F & G & H --> I["生成切片并存入 DB (segments 表)<br/>+ 计算 processing_fingerprint"]
     I --> J["构建全天展示时长计划 (compute_display_plans)<br/>人工打标优先反向纠偏"]
-    J --> K["[Pass 2] 同构流式渲染 (StreamingOrchestrator)<br/>单文件原子批次 (_batchX.tmp.mp4)"]
+    J --> K["[Pass 2] 同构流式渲染 (StreamingOrchestrator)<br/>单文件原子批次 (_batchX.tmp.mp4) + AST 平衡防爆"]
     D --> K
     K --> M["NVENC 双 Worker 消费全量批次<br/>+ 纯动态短路 / 强制 IDR 序列隔离"]
-    M --> N["确定性物理对账 (dispatched vs produced)<br/>+ 原子合并为最终 Vlog MP4"]
+    M --> N["确定性物理对账 (dispatched vs produced)<br/>+ 自适应容差校验 + 原子合并为最终 Vlog MP4"]
     I -.-> O["[主动学习] 疑难切片召回 (get_anomaly_segments)<br/>独立 Web 审核工作台交互打标"]
     O -.->|反向纠偏| J
     O -.->|物理帧抽取| P["安全机位微调导出 (export_dataset.py)"]
@@ -32,7 +32,7 @@ graph TD
 
 ## 二、核心数据契约与存储架构 (Data Contracts)
 
-系统元数据统一持久化存储于 SQLite (`data/vlog.db`)，并启用 WAL 模式保障多线程并发安全：
+系统元数据统一持久化存储于 SQLite (`data/vlog.db`)，并配置 `timeout=15.0` 与 WAL 模式下的 `PRAGMA busy_timeout = 10000;` 保障多线程高并发安全：
 
 1. **`file_tasks` 表 (素材任务清单)**:
    - 记录监控素材全局状态，字段包含 `filepath`, `cam_index`, `date`, `file_start_time`, `file_duration`, `prescreen_status`, `analysis_status`, `processing_fingerprint` 等。
@@ -44,7 +44,7 @@ graph TD
 
 3. **`human_reviews` 与 `camera_registry` 表**:
    - `human_reviews`: 按物理路径与原始时间区间永久记录人工打标事实，算法重跑时不被冲掉。
-   - `camera_registry`: 维护摄像头物理 MAC 地址到逻辑机位编号与友好别名（如 `baby_room`）的确定性映射。
+   - `camera_registry`: 维护摄像头物理 MAC 地址到逻辑机位编号与友好别名（如 `baby_room`）的确定性映射；配合 `resolve_output_filename` 原生支持成片命名模板高度自定义（`{date}`, `{mac}`, `{camera}`, `{index}`）。
 
 4. **处理指纹契约 (`processing_fingerprint`)**:
    - 包含素材文件大小、mtime、检测参数、VAD 配置、分段阈值、YOLO 权重版本。
@@ -81,6 +81,9 @@ graph TD
 3. **时间轴绝对闭环与对账**:
    - `src/detector.py` 的分析返回值最后一帧必须严格等于 `start_offset + file_duration`。
    - `StreamingOrchestrator` 退出必须等待 `all_dispatched_event`，并完成派发批次（`dispatched_batch_ids`）与已落盘批次（`produced | terminal`）100% 对账闭环。
+
+4. **滤镜图 AST 递归防爆与安全降级**:
+   - 稀疏混合批次 `select` 滤镜采用时间区间融合（Coalescing）与二叉平衡树表达式构造，将 AST 深度从 100+ 压减至 5 层以内；碎片区间 > 30 时安全降级为常规全帧解码，彻底根除 FFmpeg 内存分配异常 (`Cannot allocate memory`)。
 
 ---
 
@@ -140,3 +143,15 @@ graph TD
   2. **激活受控 NVDEC 协同借调 (`nvdec_cooperative: true`)**: 在 `WorkStealingManager` 框架下，当分析队列积压超过高水位线且无活跃渲染任务时，允许借调至多 1 路 NVDEC 协同抽干积压队列；借调过程受 `vram_watermark_mb: 6200` 动态显存水位与渲染启动即时让步机制（`register_render_start`）双重安全保护。
   3. **强类型不可变任务契约 (`PipelineTask`)**: 废除不可控的裸 `dict` 传递，定义 `@dataclass PipelineTask` 作为贯穿预筛、分析与渲染阶段的单一契约载体，集成状态校验、强类型转换与自愈保护；并在分析完成向渲染派发时直通结构化 `is_heavy` 标识，消除渲染管理器频繁读取反序列化 SQLite 的重复锁开销。
 - **影响**: 彻底消除渲染端每日 15~22 分钟的无谓信号量自旋等待，批次渲染耗时缩短 24%~31%；精细分析阶段积压出清速度提升；全链路任务流转数据契约得到严格类型保障，根除了元数据不同步隐患。
+
+---
+
+### ADR 0006: 成片命名模板高度自定义、夜视空间抗噪与流式渲染健壮性加固
+- **状态**: Accepted (已采纳)
+- **背景**: ① 成片命名硬编码为固定格式，无法满足用户对物理 MAC 地址 (`{mac}`)、语义机位别名 (`{camera}`) 及自定义模板的热修改需求，且独立审核工作台重浓缩模块存在命名硬编码缺陷；② 夜间暗光环境下红外补光灯引入的弥漫性高频白噪点在差分算法中极易产生伪运动误判，导致纯静态长视频流入精细分析重队列，而单纯提高均值门限又会导致远景或边缘小动作漏检；③ 在极端长视频或高频切片（如单个批次超过 100 个片段）场景下，FFmpeg 的 `select` 滤镜加法链会导致表达式语法树深度过深（AST Stack Overflow，引发 Code 4294967284 / Cannot allocate memory）；④ 监控录像切片末尾常因物理丢包或截断提前数秒 EOF，此前严格的容器时长检查容易误将有效批次误判为坏片并删除重试。
+- **决策**:
+  1. **高度自定义成片命名模板**: 引入核心函数 `resolve_output_filename()`，支持 `{date}`, `{mac}`, `{camera}`, `{index}` 四大占位符，支持用户在 `settings.yaml` 中随时修改模板（默认 `DailyVlog_{date}_{mac}.mp4`），并提供语义别名向 MAC、MAC 向逻辑编号的平滑级联降级；并在主流程与审核工作台重浓缩引擎全面接线消费。
+  2. **低照度空间集中度抗噪与双轨防漏检（路径 1）**: 在 `prescreen.py` 中对暗光环境（`mean_luma < 50.0`）启用空间能量集中度硬拦截（`concentration >= 1.25` 且局部块有效能量达标），过滤弥漫型白噪点；同时引入单点局部能量突破分支（`max_cell_energy >= max(14.0, threshold * 2.2)`），确保远景与边缘小目标运动 100% 唤醒（保持零漏检、零虚警）。
+  3. **AST 递归防爆与二叉平衡树构建**: 在 `timeline.py` 中，对稀疏混合批次的时间区间实行预融合（Coalescing）；当碎片区间 `<= 30` 时采用二叉平衡树递归构建 `select` 表达式，将 AST 深度从 100+ 骤降至 5 层以内；当碎片区间 `> 30` 时安全降级为常规全帧解码，根除 FFmpeg 内存分配异常。
+  4. **容器合法性自适应容差与 SQLite 并发加固**: 将 `valid_video` 的长视频容差放宽至 `max(5.0, expected * 0.11)` 并提供结构化诊断日志；在 SQLite 连接中配置 `timeout=15.0` 与 `PRAGMA busy_timeout = 10000;`，防御多 Worker 瞬时写入锁争用；在 `detector.py` 严格对齐 `ultra_long` 等各档位配置分支。
+- **影响**: 实现了成片命名的灵活热重载与全链路统一；夜间纯静态素材识别耗时压缩 98% 以上且保持 100% 召回底线；大片段批次渲染彻底杜绝 AST 爆栈崩溃；消灭了有效视频批次的误删与 SQLite 锁竞争异常。

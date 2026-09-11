@@ -71,9 +71,11 @@ class MotionDetector:
 
         # 核心性能开关
         self.adaptive_fps_enabled = det.get("analysis_fps_adaptive", True)
-        self.fps_tiers = det.get("analysis_fps_tiers", {"short": 5, "medium": 3, "long": 2})
+        self.fps_tiers = det.get(
+            "analysis_fps_tiers", {"short": 5, "medium": 2, "long": 1, "ultra_long": 0.5}
+        )
         self.fps_tier_thresholds = det.get(
-            "analysis_fps_tier_thresholds", {"short_max": 120, "medium_max": 600}
+            "analysis_fps_tier_thresholds", {"short_max": 120, "medium_max": 600, "long_max": 1800}
         )
 
         # R2: 时域滑动背景模型 (EMA Background)
