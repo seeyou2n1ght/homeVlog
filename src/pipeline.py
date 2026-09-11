@@ -226,7 +226,10 @@ class StreamingOrchestrator:
                         )
                         res["status"] = "SUSPICIOUS"
                 result_json = res.get("result_json", "")
-                self.db.set_prescreen_result(filepath, res["status"], result_json, has_audio=res.get("has_audio"))
+                prescreen_has_audio = res.get("has_audio")
+                self.db.set_prescreen_result(filepath, res["status"], result_json, has_audio=prescreen_has_audio)
+                if prescreen_has_audio is not None:
+                    task["has_audio"] = int(prescreen_has_audio)
                 if res["status"] in ("STATIC", "SUSPICIOUS"):
                     from src.render_cache import processing_fingerprint
                     self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
@@ -319,7 +322,8 @@ class StreamingOrchestrator:
         
         gpu = getattr(detector, "decode_gpu", gpu)
         if hasattr(detector, 'has_audio_detected'):
-            self.db.set_file_metadata(filepath, detector.has_audio_detected, getattr(detector, "file_duration_detected", None))
+            final_has_audio = max(int(task.get("has_audio") or 0), int(detector.has_audio_detected or 0))
+            self.db.set_file_metadata(filepath, final_has_audio, getattr(detector, "file_duration_detected", None))
 
         if labels:
             seg_cfg = self.config.get("segment", {})

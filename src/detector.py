@@ -782,9 +782,9 @@ class MotionDetector:
         - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
         - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
-        if file_duration > 0 and has_audio is not None:
+        if file_duration > 0 and has_audio is not None and int(has_audio) == 1:
             self.file_duration_detected = file_duration
-            self.has_audio_detected = int(has_audio)
+            self.has_audio_detected = 1
         else:
             # Lazy container metadata belongs to Analysis, never the directory scanner.
             from src.scheduler import get_disk_semaphore
@@ -793,13 +793,14 @@ class MotionDetector:
                 raise TimeoutError("Metadata I/O admission timed out")
             try:
                 with av.open(str(filepath), timeout=30.0) as container:
-                    stream = container.streams.video[0]
-                    duration = (float(stream.duration * stream.time_base) if stream.duration
-                                else float(container.duration or 0) / av.time_base)
-                    if duration <= 0:
-                        raise ValueError("Missing video duration")
-                    file_duration = duration
-                    self.file_duration_detected = duration
+                    if file_duration <= 0:
+                        stream = container.streams.video[0]
+                        duration = (float(stream.duration * stream.time_base) if stream.duration
+                                    else float(container.duration or 0) / av.time_base)
+                        if duration <= 0:
+                            raise ValueError("Missing video duration")
+                        file_duration = duration
+                    self.file_duration_detected = file_duration
                     self.has_audio_detected = int(bool(container.streams.audio))
             finally:
                 disk.release()
