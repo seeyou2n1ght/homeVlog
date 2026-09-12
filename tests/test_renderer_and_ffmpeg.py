@@ -323,3 +323,46 @@ class TestConcatOutputFiles:
         )
         assert res is None  # Size alone never authorizes reuse of a corrupt video.
 
+
+class TestBuildEncArgs:
+    """测试异构编码参数对齐与 dump_extra 带内参数集注入。"""
+
+    def test_nvenc_enc_args_aligned_and_dump_extra(self):
+        from src.renderer import _build_enc_args
+        out_cfg = {
+            "nv": {"preset": "p1", "cq": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+            "qsv": {"preset": "fast", "global_quality": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+        }
+        nv_args = _build_enc_args("nv", out_cfg)
+        assert "-c:v" in nv_args
+        assert "hevc_nvenc" in nv_args
+        assert "-pix_fmt" in nv_args
+        idx_pix = nv_args.index("-pix_fmt")
+        assert nv_args[idx_pix + 1] == "nv12"
+        assert "-bsf:v" in nv_args
+        idx_bsf = nv_args.index("-bsf:v")
+        assert nv_args[idx_bsf + 1] == "dump_extra"
+        assert "-forced-idr" in nv_args
+        assert nv_args[nv_args.index("-forced-idr") + 1] == "1"
+        assert "-g" in nv_args
+        assert nv_args[nv_args.index("-g") + 1] == "60"
+
+    def test_qsv_enc_args_aligned_and_dump_extra(self):
+        from src.renderer import _build_enc_args
+        out_cfg = {
+            "nv": {"preset": "p1", "cq": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+            "qsv": {"preset": "fast", "global_quality": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+        }
+        qsv_args = _build_enc_args("qsv", out_cfg)
+        assert "-c:v" in qsv_args
+        assert "hevc_qsv" in qsv_args
+        assert "-pix_fmt" in qsv_args
+        idx_pix = qsv_args.index("-pix_fmt")
+        assert qsv_args[idx_pix + 1] == "nv12"
+        assert "-bsf:v" in qsv_args
+        idx_bsf = qsv_args.index("-bsf:v")
+        assert qsv_args[idx_bsf + 1] == "dump_extra"
+        assert "-forced_idr" in qsv_args
+        assert qsv_args[qsv_args.index("-forced_idr") + 1] == "1"
+        assert "-g" in qsv_args
+        assert qsv_args[qsv_args.index("-g") + 1] == "60"

@@ -53,7 +53,7 @@ uv run python main.py --help
 
 生产配置为 8 个分析 worker，按录制时间优先处理较早文件，避免后续短文件阻塞首批渲染。运动特征在解码时连续计算，不保存完整灰度帧序列；每帧能量与置信度占 16 字节，另保留固定大小的背景模型。每任务 `analysis_buffer_mb` 约束 JPEG 候选、音频特征与诊断帧池，不能视为整个进程的 RSS 上限。`render.max_concurrency` 控制实际渲染 worker 数，硬件信号量仍独立限制在途作业。
 
-当前性能证据、完整复测和测试条件见 [2026-09-08 性能记录](docs/PERFORMANCE_20260908.md)。
+生产实测遥测与物理瓶颈见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 `yolo.batch_size` 控制真正送入模型的小批大小。提高并发或模型大小前，应同时测显存、CPU、NAS 吞吐与人工事件召回；高 GPU 占用率本身不是优化目标。
 
@@ -110,12 +110,12 @@ uv run python scripts/benchmark.py --all
 
 CI 在 Windows 执行 locked 依赖同步、Ruff、语法检查和回归。Ruff 当前启用致命错误与未定义名称规则，尚未实施全仓库严格类型检查。硬件测试显式开启，普通单元测试不能替代真实硬件验收。
 
-2026-09-08 修复验证与限制见 [实施记录](docs/IMPLEMENTATION_20260908.md)。[历史基准](docs/BENCHMARK.md) 来自旧算法与素材分布，不能作为新版速度或召回保证；修复预筛/早停后处理量可能上升，应重新测量。
+生产基准实测遥测与多日数据见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
 ## 文档导航
 
-- [架构与数据契约](docs/ARCHITECTURE.md)
-- [开发约束](AGENTS.md)
-- [审查发现与原始复现](docs/REVIEW_20260908.md)
-- [实施及验收记录](docs/IMPLEMENTATION_20260908.md)
-- [历史质量线索](docs/ACCURACY_AUDIT_REPORT.md)
+- [开发约束与治理规则](AGENTS.md)
+- [系统架构与数据契约](docs/ARCHITECTURE.md)
+- [重大架构决策记录 (ADR)](docs/DECISIONS.md)
+- [项目进度与实测遥测](docs/PROGRESS.md)
+- [测试策略与质量验收规范](docs/TESTING.md)

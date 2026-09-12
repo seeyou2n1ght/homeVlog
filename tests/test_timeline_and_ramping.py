@@ -59,6 +59,29 @@ class TestSegmentClusteringAndSmoothing:
         dyn = [s for s in segs if s.is_dynamic]
         assert len(dyn) == 0
 
+    def test_energy_gated_static_absorption(self):
+        from src.segment import _filter_short
+        # Case A: 强动作 (energy=35.0)，中间短静止 (5s < min_static=8.0s) 被吸收成一个连贯大动态
+        segs_strong = [
+            Segment(0.0, 10.0, "DYNAMIC", source_file="clip.mp4", max_energy=35.0),
+            Segment(10.0, 15.0, "STATIC", source_file="clip.mp4"),
+            Segment(15.0, 25.0, "DYNAMIC", source_file="clip.mp4", max_energy=40.0),
+        ]
+        res_strong = _filter_short(segs_strong, min_motion=2.0, min_static=8.0, motion_absorb_energy_threshold=12.0)
+        assert len(res_strong) == 1
+        assert (res_strong[0].end_time - res_strong[0].start_time) == 25.0
+        assert res_strong[0].state == "DYNAMIC"
+
+        # Case B: 弱动作/噪点 (energy=5.0 < 12.0)，中间静止段保持独立，绝不被微弱噪点多米诺吞噬
+        segs_weak = [
+            Segment(0.0, 10.0, "DYNAMIC", source_file="clip.mp4", max_energy=5.0),
+            Segment(10.0, 15.0, "STATIC", source_file="clip.mp4"),
+            Segment(15.0, 25.0, "DYNAMIC", source_file="clip.mp4", max_energy=6.0),
+        ]
+        res_weak = _filter_short(segs_weak, min_motion=2.0, min_static=8.0, motion_absorb_energy_threshold=12.0)
+        assert len(res_weak) == 3
+        assert res_weak[1].state == "STATIC"
+
 
 
     def test_merge_cross_file_contiguous_states(self):

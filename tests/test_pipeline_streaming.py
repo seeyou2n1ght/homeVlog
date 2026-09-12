@@ -20,14 +20,14 @@ from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
 
 
-def test_analysis_queue_prioritizes_long_files_when_enabled():
+def test_analysis_queue_prioritizes_short_files_when_enabled():
     q = AnalysisQueue()
     q.cost_priority = True
-    q.put({"filepath": "short.mp4", "file_duration": 300.0, "file_start_time": "20260901000000"})
     q.put({"filepath": "long.mp4", "file_duration": 3600.0, "file_start_time": "20260901010000"})
-    assert q.get()["filepath"] == "long.mp4"
+    q.put({"filepath": "short.mp4", "file_duration": 300.0, "file_start_time": "20260901000000"})
+    assert q.get()["filepath"] == "short.mp4"
     q.task_done()
-    q.get()
+    assert q.get()["filepath"] == "long.mp4"
     q.task_done()
 
 

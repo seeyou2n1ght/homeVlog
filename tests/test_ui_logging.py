@@ -162,3 +162,135 @@ def test_pipeline_dashboard_lifecycle():
     assert dash.render_queue_size == 2
     assert dash.scheduler_state == "COOPERATIVE_BURST"
     assert len(dash.recent_alerts) >= 1
+
+
+def test_cli_parser_and_date_normalization():
+    """验证 CLI 解析器配置、日期容差格式归一化与日期范围计算。"""
+    from src.ui import (
+        build_arg_parser,
+        normalize_date_string,
+        parse_date_range,
+        get_recent_dates,
+        resolve_cli_dates,
+    )
+    import datetime
+
+    # 1. 常见日期格式容差归一化
+    assert normalize_date_string("20260320") == "20260320"
+    assert normalize_date_string("2026-03-20") == "20260320"
+    assert normalize_date_string("2026/03/20") == "20260320"
+    assert normalize_date_string(" 2026.03.20 ") == "20260320"
+
+    with pytest.raises(ValueError):
+        normalize_date_string("not_a_date")
+
+    # 2. 日期范围解析
+    dates = parse_date_range("20260320..20260322")
+    assert dates == ["20260320", "20260321", "20260322"]
+
+    # 倒序输入自适应调正
+    dates_rev = parse_date_range("20260322:20260320")
+    assert dates_rev == ["20260320", "20260321", "20260322"]
+
+    # 3. 相对最近 N 天计算
+    base = datetime.date(2026, 3, 22)
+    recent = get_recent_dates(3, base_date=base)
+    assert recent == ["20260320", "20260321", "20260322"]
+
+    # 4. 参数解析器测试
+    parser = build_arg_parser()
+    args1 = parser.parse_args(["--date", "2026-03-20", "--dry-run", "--stage", "analyze"])
+    assert args1.date == "2026-03-20"
+    assert args1.dry_run is True
+    assert args1.stage == "analyze"
+    assert resolve_cli_dates(args1) == ["20260320"]
+
+    args2 = parser.parse_args(["--date-range", "20260320..20260321", "--doctor", "--clean-temp"])
+    assert args2.doctor is True
+    assert args2.clean_temp is True
+    assert resolve_cli_dates(args2) == ["20260320", "20260321"]
+
+
+def test_system_doctor_and_report():
+    """验证环境体检医生模块数据采集与报告面板呈现。"""
+    from src.ui import run_system_doctor, print_doctor_report
+    report = run_system_doctor()
+    assert "python" in report
+    assert "ffmpeg" in report
+    assert "gpu" in report
+    assert "storage" in report
+    assert "model" in report
+
+    # 打印报告卡片不崩溃
+    ok = print_doctor_report()
+    assert isinstance(ok, bool)
+
+
+def test_batch_summary_table_and_status_table(tmp_path):
+    """验证多日批处理全景大表与数据库任务状态大表正常渲染。"""
+    from src.ui import print_batch_summary_table, print_status_table
+    from src.database import VlogDatabase
+
+    # 1. 批量全景表
+    mock_batch = [
+        {
+            "date": "20260320",
+            "cam_index": 0,
+            "cam_name": "baby_room",
+            "total_files": 142,
+            "input_duration_s": 89280.0,
+            "vlog_duration_s": 1302.0,
+            "condensation_ratio": 68.6,
+            "output_size_mb": 2850.0,
+            "wall_clock_s": 1302.0,
+            "speedup_x": 68.6,
+            "status": "SUCCESS",
+        },
+        {
+            "date": "20260321",
+            "cam_index": 0,
+            "cam_name": "baby_room",
+            "total_files": 140,
+            "input_duration_s": 83880.0,
+            "vlog_duration_s": 1670.0,
+            "condensation_ratio": 50.3,
+            "output_size_mb": 3200.0,
+            "wall_clock_s": 1670.0,
+            "speedup_x": 50.3,
+            "status": "SUCCESS",
+        }
+    ]
+    print_batch_summary_table(mock_batch)
+    print_batch_summary_table([])  # 空表安全
+
+    # 2. 状态总览表
+    db_file = tmp_path / "test_status.db"
+    db = VlogDatabase(db_path=db_file)
+    try:
+        db.add_file_task(
+            filepath="C:/dummy/01_20260320100000_20260320101000.mp4",
+            cam_index=0,
+            date="20260320",
+            file_start_time="20260320100000",
+            file_end_time="20260320101000",
+            file_duration=600.0,
+        )
+        print_status_table(db, camera_display_names={0: "baby_room (B888805AA3CD)"})
+    finally:
+        db.close()
+
+
+def test_plain_progress_tracker():
+    """验证无头模式流式进度心跳器触发无异常。"""
+    from src.ui import PlainProgressTracker
+    tracker = PlainProgressTracker(date="20260320", cam_index=0, total_files=100, interval_s=0.01)
+    tracker.heartbeat(
+        prescreen_done=50,
+        prescreen_total=100,
+        analysis_done=10,
+        analysis_total=20,
+        render_done=2,
+        render_total=5,
+        force=True,
+    )
+

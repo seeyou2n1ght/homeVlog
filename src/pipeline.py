@@ -17,15 +17,22 @@ from src.scanner import scan_directory, get_date_cam_groups
 from src.prescreen import prescreen_file
 from src.detector import MotionDetector, detect_audio_activity
 from src.renderer import build_batch_render, concat_output_files
-from src.utils import (
+from src.config import (
     load_config,
     OUTPUT_DIR,
     LOGS_DIR,
+)
+from src.scheduler import (
+    WorkStealingManager,
+    RenderBatchItem,
+    DualEndedBatchQueue,
+)
+from src.ffmpeg import FFmpegProcessRegistry
+from src.utils import (
     cleanup_resources,
     check_disk_space,
     register_dashboard,
     unregister_dashboard,
-    WorkStealingManager,
 )
 from dataclasses import dataclass, field
 from src.monitor import get_monitor, get_perf, PerfRecord
@@ -83,7 +90,8 @@ class AnalysisQueue(queue.Queue):
     """Priority queue for detailed analysis.
 
     Single-file render batches no longer depend on chronological analysis
-    completion, so long clips are admitted first to avoid a multi-minute tail.
+    completion. Short clips are admitted first (Shortest Job First / SJF)
+    to immediately produce render batches and eliminate early-stage NVENC starvation.
     Multi-file batches retain chronological order for compatibility.
     """
     def _init(self, maxsize):
@@ -94,7 +102,8 @@ class AnalysisQueue(queue.Queue):
     def _put(self, task):
         import heapq
         if self.cost_priority:
-            priority = (-float(task.get("file_duration") or 0.0), task.get("file_start_time") or "")
+            # SJF: 短作业优先（时长升序），让 300s 标准切片以秒级出清迅速喂饱渲染编队
+            priority = (float(task.get("file_duration") or 0.0), task.get("file_start_time") or "")
         else:
             priority = (0.0, task.get("file_start_time") or "")
         heapq.heappush(self.queue, (priority, self.sequence, task))
@@ -176,11 +185,21 @@ class StreamingOrchestrator:
         self.batch_lock = threading.Lock()
         self.error_lock = threading.Lock()
         self.errors: list[str] = []
+        self.render_worker_stats: dict[str, dict] = {}
 
         # 时间邻域先验保护状态追踪
         self._prev_task_map: dict[str, str] = {}
         self._prescreen_results: dict[str, str] = {}
         self._prescreen_results_lock = threading.Lock()
+
+        # 冷启动预热保护：避免启动瞬间队列无积压导致 SJF 短作业优先失效
+        self._analysis_warmup_event = threading.Event()
+
+        # 异步前瞻预分期与编队动态竞价追踪
+        self._prefetch_queue = queue.Queue()
+        self._prefetched_files = set()
+        self._prefetched_lock = threading.Lock()
+        self._active_nv_renders = 0
 
         # Rich 仪表盘 (tqdm 已下线，统一由 PipelineDashboard 呈现)
         self.dashboard_enabled = dashboard_enabled
@@ -221,8 +240,27 @@ class StreamingOrchestrator:
             self.work_stealing.max_nv_decoders,
         )
 
-    def _prescreen_worker(self, gpu: str = "qsv"):
+    def _lookahead_prefetch_worker(self):
+        """后台异步 I/O Worker：超前拉取即将压制的源文件至本地 SSD，消除 GPU 串行 I/O 等待气泡。"""
+        from src.renderer import _stage_source_for_render
+        while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self._prefetch_queue.empty()):
+            try:
+                fp = self._prefetch_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if fp is None:
+                self._prefetch_queue.task_done()
+                break
+            try:
+                _stage_source_for_render(fp)
+            except Exception:
+                pass
+            finally:
+                self._prefetch_queue.task_done()
+
+    def _prescreen_worker(self, gpu: str = "qsv", worker_id: str = ""):
         """预筛 Worker：将扫描到的文件进行快速筛选。"""
+        worker_name = worker_id or f"pre_{gpu}"
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.prescreen_queue.empty()):
             try:
                 task = self.prescreen_queue.get(timeout=0.5)
@@ -289,18 +327,25 @@ class StreamingOrchestrator:
                 except (json.JSONDecodeError, TypeError):
                     if res.get("error"):
                         extra["error"] = res["error"]
+                t_done = time.monotonic()
                 get_perf().add(
                     PerfRecord(
                         stage="prescreen",
                         file=Path(filepath).name,
                         gpu=gpu,
-                        duration=round(time.monotonic() - t0, 3),
+                        duration=round(t_done - t0, 3),
                         extra=extra,
+                        start_time=round(t0, 3),
+                        end_time=round(t_done, 3),
+                        worker=worker_name,
                     )
                 )
 
                 if res["status"] == "SUSPICIOUS":
                     self.analysis_queue.put(task)
+                    if not self._analysis_warmup_event.is_set():
+                        if self.analysis_queue.qsize() >= 6 or self.prescreen_queue.empty():
+                            self._analysis_warmup_event.set()
                     if self.dashboard is not None:
                         self.dashboard.update_analysis(
                             completed=self.dashboard.analysis_done,
@@ -331,13 +376,17 @@ class StreamingOrchestrator:
                 logger.exception("Streaming: prescreen failed for %s", filepath)
                 self.db.set_prescreen_result(filepath, "FAILED", "")
                 self._add_error(f"prescreen failed: {Path(filepath).name}")
+                t_err = time.monotonic()
                 get_perf().add(
                     PerfRecord(
                         stage="prescreen",
                         file=Path(filepath).name,
                         gpu=gpu,
-                        duration=round(time.monotonic() - t0, 3),
+                        duration=round(t_err - t0, 3),
                         extra={"status": "ERROR"},
+                        start_time=round(t0, 3),
+                        end_time=round(t_err, 3),
+                        worker=worker_name,
                     )
                 )
                 # 必须回传 FAILED 消息推进渲染保序滑窗，否则窗口停摆导致整条流水线死锁
@@ -346,6 +395,8 @@ class StreamingOrchestrator:
                 )
             finally:
                 self.prescreen_queue.task_done()
+        if not self._analysis_warmup_event.is_set():
+            self._analysis_warmup_event.set()
 
     def _execute_analysis_task(
         self,
@@ -357,6 +408,7 @@ class StreamingOrchestrator:
         gpu: str,
         perf,
         t0: float,
+        worker_id: str = "",
     ):
         from src.segment import build_segments, segments_to_json
 
@@ -383,6 +435,7 @@ class StreamingOrchestrator:
 
         if labels:
             seg_cfg = self.config.get("segment", {})
+            motion_absorb_threshold = float(seg_cfg.get("motion_absorb_energy_threshold", 12.0))
             segments = build_segments(
                 labels,
                 filepath,
@@ -393,10 +446,12 @@ class StreamingOrchestrator:
                 apply_smoothing=seg_cfg.get("apply_smoothing", False),
                 pre_roll=seg_cfg.get("pre_roll", 1.0),
                 post_roll=seg_cfg.get("post_roll", 1.5),
+                motion_absorb_energy_threshold=motion_absorb_threshold,
             )
             
             yolo_before = len(segments)
             is_yolo_active = False
+            yolo_telemetry = {}
             if yolo_verifier:
                 is_yolo_active = True
                 yolo_device = self.config.get("hardware", {}).get("device", "cpu")
@@ -405,6 +460,7 @@ class StreamingOrchestrator:
                 segments = yolo_verifier.verify(
                     filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
                 )
+                yolo_telemetry = getattr(yolo_verifier, "last_telemetry", {})
                 from src.segment import _merge_same_state, _filter_short
                 segments = _merge_same_state(segments, gap_tolerance=seg_cfg.get("gap_tolerance", 1.5))
                 if seg_cfg.get("apply_smoothing", True):
@@ -413,6 +469,7 @@ class StreamingOrchestrator:
                         min_motion=seg_cfg.get("min_motion_duration", 2.0),
                         min_static=seg_cfg.get("min_static_duration", 8.0),
                         gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+                        motion_absorb_energy_threshold=motion_absorb_threshold,
                     )
             if (yolo_verifier is None or not getattr(yolo_verifier, "enabled", True)) and self.config.get("yolo", {}).get("enabled", False):
                 for seg in segments:
@@ -436,30 +493,76 @@ class StreamingOrchestrator:
             from src.render_cache import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
 
+            t_ana_done = time.monotonic()
+            dur_total = round(t_ana_done - t0, 3)
             lp = detector.last_perf if hasattr(detector, "last_perf") else {}
+            decode_time = lp.get("decode_time", 0.0)
+            analysis_time = lp.get("analysis_time", 0.0)
+            yolo_time = yolo_telemetry.get("yolo_duration", 0.0)
+            yolo_lock_wait = yolo_telemetry.get("yolo_lock_wait", 0.0)
+            yolo_infer = yolo_telemetry.get("yolo_infer_time", 0.0)
+            frames_count = lp.get("frames", 0)
+            overhead = max(0.0, round(dur_total - decode_time - analysis_time - yolo_time, 3))
+
             perf.add(
                 PerfRecord(
                     stage="analysis",
                     file=Path(filepath).name,
                     gpu=gpu,
-                    duration=round(time.monotonic() - t0, 3),
-                    frames=lp.get("frames", 0),
+                    duration=dur_total,
+                    frames=frames_count,
+                    fps=round(frames_count / max(0.001, dur_total), 1),
                     extra={
                         "status": "ANALYZED",
                         "segments_before_yolo": yolo_before,
                         "segments_after_yolo": yolo_after,
                         "yolo_streaming_verify": is_yolo_active,
+                        "decode_time_s": decode_time,
+                        "analysis_time_s": analysis_time,
+                        "yolo_time_s": yolo_time,
+                        "yolo_lock_wait_s": yolo_lock_wait,
+                        "yolo_infer_s": yolo_infer,
+                        "overhead_s": overhead,
+                        "decode_fps": round(frames_count / max(0.001, decode_time), 1) if decode_time > 0 else 0.0,
+                        "motion_fps": round(frames_count / max(0.001, analysis_time), 1) if analysis_time > 0 else 0.0,
                         **lp,
+                        **yolo_telemetry,
                     },
+                    start_time=round(t0, 3),
+                    end_time=round(t_ana_done, 3),
+                    worker=worker_id or "ana",
                 )
             )
-            has_dynamic = any(getattr(s, "is_dynamic", False) or s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in segments)
+            dynamic_duration = sum(
+                (s.end_time - s.start_time)
+                for s in segments
+                if getattr(s, "is_dynamic", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
+            )
+            has_dynamic = dynamic_duration > 0
             self.render_batch_queue.put(
-                {"filepath": filepath, "status": "ANALYZED", "is_heavy": has_dynamic}
+                {
+                    "filepath": filepath,
+                    "status": "ANALYZED",
+                    "is_heavy": has_dynamic,
+                    "dynamic_duration": dynamic_duration,
+                }
             )
         else:
             self.db.set_analysis_result(filepath, "FAILED", "")
             self._add_error(f"analysis produced no labels: {Path(filepath).name}")
+            t_ana_fail = time.monotonic()
+            perf.add(
+                PerfRecord(
+                    stage="analysis",
+                    file=Path(filepath).name,
+                    gpu=gpu,
+                    duration=round(t_ana_fail - t0, 3),
+                    extra={"status": "NO_LABELS"},
+                    start_time=round(t0, 3),
+                    end_time=round(t_ana_fail, 3),
+                    worker=worker_id or "ana",
+                )
+            )
             self.render_batch_queue.put(
                 {"filepath": filepath, "status": "FAILED"}
             )
@@ -479,7 +582,7 @@ class StreamingOrchestrator:
             )
             self._sync_queue_levels()
 
-    def _analysis_worker(self, fixed_gpu: str | None = None):
+    def _analysis_worker(self, fixed_gpu: str | None = None, worker_id: str = ""):
         """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
         detectors: dict[str, MotionDetector] = {
             "qsv": MotionDetector(self.config, decode_gpu="qsv"),
@@ -499,6 +602,10 @@ class StreamingOrchestrator:
                 self._add_error("YOLO unavailable; motion retained and marked for review")
             
         perf = get_perf()
+
+        # 冷启动预热保护：等待预筛先形成候选积压，确保 SJF 短作业优先正常排序出清
+        if not self._analysis_warmup_event.is_set():
+            self._analysis_warmup_event.wait(timeout=8.0)
 
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
             try:
@@ -526,7 +633,7 @@ class StreamingOrchestrator:
                     else:
                         detector = detectors["qsv"]
                     self._execute_analysis_task(
-                        task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0
+                        task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0, worker_id=worker_id
                     )
                 else:
                     q_size = self.analysis_queue.qsize()
@@ -534,13 +641,26 @@ class StreamingOrchestrator:
                     detector = detectors["qsv"]
                     detector.device_lease = lambda: self.work_stealing.lease_device(q_size, prescreen_idle=prescreen_idle)
                     self._execute_analysis_task(
-                        task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0
+                        task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id
                     )
 
             except Exception:
                 logger.exception("Streaming: analysis failed for %s", filepath)
                 self.db.set_analysis_result(filepath, "FAILED", "")
                 self._add_error(f"analysis failed: {Path(filepath).name}")
+                t_ana_err = time.monotonic()
+                perf.add(
+                    PerfRecord(
+                        stage="analysis",
+                        file=Path(filepath).name,
+                        gpu=gpu if 'gpu' in locals() else "adaptive",
+                        duration=round(t_ana_err - t0, 3),
+                        extra={"status": "ERROR"},
+                        start_time=round(t0, 3),
+                        end_time=round(t_ana_err, 3),
+                        worker=worker_id or "ana",
+                    )
+                )
                 self.render_batch_queue.put({"filepath": filepath, "status": "FAILED"})
             finally:
                 self.analysis_queue.task_done()
@@ -554,6 +674,9 @@ class StreamingOrchestrator:
         width, height = parse_res(out_cfg.get("resolution", "1920x1080"))
         seg_cfg = self.config.get("segment", {})
         audio_cfg = out_cfg.get("audio", {})
+        render_cfg = self.config.get("render", {})
+        render_hw_policy = self.config.get("pipeline", {}).get("render_gpu_policy", "heterogeneous")
+        max_qsv_dynamic_s = float(render_cfg.get("max_qsv_dynamic_duration_s", 200.0))
 
         # ---- In-Order Sliding Window：按物理录制时间严格保序的批次调度 ----
         # 乱序到达的完成消息（STATIC/ANALYZED/FAILED）经滑动窗口重排：
@@ -565,6 +688,25 @@ class StreamingOrchestrator:
         ]
         ordered_set = set(ordered_files)
         order_index = {filepath: idx for idx, filepath in enumerate(ordered_files)}
+        ready_heavy: dict[str, bool] = {}
+        dynamic_duration_by_file: dict[str, float] = {}
+        for r in all_rows:
+            fp = r["filepath"]
+            raw_segs = r.get("analysis_segments")
+            if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
+                try:
+                    from src.timeline import segments_from_json
+                    segs = segments_from_json(raw_segs)
+                    dyn_dur = sum((s.end_time - s.start_time) for s in segs if getattr(s, "is_dynamic", False))
+                    dynamic_duration_by_file[fp] = dyn_dur
+                    ready_heavy[fp] = (dyn_dur > 0)
+                except Exception:
+                    dynamic_duration_by_file[fp] = 0.0
+            else:
+                dynamic_duration_by_file[fp] = 0.0
+                if r.get("prescreen_status") == "STATIC":
+                    ready_heavy[fp] = False
+
         render_cost_by_file = {
             r["filepath"]: float(r.get("file_duration") or 0.0)
             for r in all_rows
@@ -578,7 +720,7 @@ class StreamingOrchestrator:
         dispatched_batch_ids: list[int] = []
         if not immediate_file_batches:
             time.sleep(max(0, self.render_delay))
-        heavy_queue = queue.PriorityQueue()
+        heavy_queue = DualEndedBatchQueue()
         light_queue = queue.Queue()
         all_dispatched_event = threading.Event()
         render_start_t: list[float] = []
@@ -586,8 +728,6 @@ class StreamingOrchestrator:
         terminal_batch_ids: set[int] = set()
         dispatch_sequence = 0
         dispatch_lock = threading.Lock()
-
-        ready_heavy: dict[str, bool] = {}
 
         def _is_heavy_batch(files_to_batch: list[str]) -> bool:
             """检查批次中是否包含需复杂处理的 DYNAMIC 动作片段。"""
@@ -614,227 +754,317 @@ class StreamingOrchestrator:
                 pass
             return False
 
-        def _render_worker(gpu: str):
+        def _render_worker(gpu: str, worker_id: str = ""):
+            worker_name = worker_id or gpu
             nonlocal dispatch_sequence
-            from src.renderer import FFmpegProcessRegistry
-            while not self.abort_event.is_set() and not FFmpegProcessRegistry.is_interrupted():
-                item = None
-                if gpu == "nv":
-                    # NVENC (3060Ti) 专职优先消费 heavy 动态任务，空闲时协助消费 light 任务
-                    try:
-                        _priority, _sequence, item = heavy_queue.get_nowait()
-                    except queue.Empty:
-                        try:
-                            item = light_queue.get(timeout=0.5)
-                        except queue.Empty:
-                            if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
-                                break
-                            continue
-                else:
-                    # Heterogeneous mode reserves QSV for light batches. A long
-                    # dynamic batch can occupy this worker for most of the day run.
-                    try:
-                        item = light_queue.get_nowait()
-                    except queue.Empty:
-                        try:
-                            source = light_queue if render_hw_policy == "heterogeneous" else heavy_queue
-                            fetched = source.get(timeout=0.5)
-                            item = fetched if source is light_queue else fetched[2]
-                        except queue.Empty:
-                            if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
-                                break
-                            continue
+            t_worker_start = time.monotonic()
+            busy_time = 0.0
+            batches_count = 0
+            dynamic_sec_total = 0.0
+            qsv_light_count = 0
+            qsv_stolen_count = 0
+            qsv_steal_rejected = 0
 
-                if item is None:
-                    if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+            try:
+                while not self.abort_event.is_set() and not FFmpegProcessRegistry.is_interrupted():
+                    item = None
+                    is_stolen = False
+                    is_light = False
+                    if gpu == "nv":
+                        # NVENC (3060Ti) 专职优先消费 heavy 动态任务 (LPT 最长优先)，空闲时协助消费 light 任务
+                        item = heavy_queue.pop_heaviest(timeout=0.5)
+                        if item is None:
+                            try:
+                                item = light_queue.get(timeout=0.5)
+                                if item is not None:
+                                    is_light = True
+                            except queue.Empty:
+                                if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                                    break
+                                continue
+                    else:
+                        # QSV Worker (Intel UHD 770):
+                        # 1. 专职优先消费 light_queue (纯静态抽帧秒级批次)
+                        try:
+                            item = light_queue.get_nowait()
+                            if item is not None:
+                                is_light = True
+                        except queue.Empty:
+                            # 2. 当 light_queue 为空时，在异构模式下逆向窃取消费中轻度动态批次 (SPT 最短优先)
+                            try:
+                                if render_hw_policy == "heterogeneous":
+                                    with self.batch_lock:
+                                        active_nv = self._active_nv_renders
+                                    q_len = heavy_queue.qsize()
+                                    # 收尾硬屏障 (Tail Guard):
+                                    # 当所有素材派发完毕，且队列剩余批次 <= 1 并且 NVENC 正在处理任务时退出，避免抢占最后单卡任务反噬
+                                    if all_dispatched_event.is_set() and q_len <= 1 and active_nv >= 1:
+                                        break
+
+                                    # 实时 Makespan 竞价模型 (Cost-Based ETA Bidding) + 队列收尾平滑衰减:
+                                    # 双路 NVENC 平均耗时 ~42s/批次，预估 NVENC 编队清空当前所有排队批次所需的剩余完工时间 (T_nv_eta)：
+                                    # T_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * 42.0)
+                                    # 结合队列深度与完工期：队列充裕时放宽至 max_qsv_dynamic_s (180s) 高效分流；
+                                    # 随队列收敛，门限平滑向 60s 靠拢，确保末端长动态大批次 (如 200s+) 始终由独显 NVENC 以 5x 倍率快速收口
+                                    t_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * 42.0)
+                                    allowed_dyn_s = min(max_qsv_dynamic_s, max(60.0, min(t_nv_eta * 1.8, q_len * 35.0)))
+                                    item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
+                                    if item is None:
+                                        if not heavy_queue.empty():
+                                            qsv_steal_rejected += 1
+                                        time.sleep(0.5)
+                                        continue
+                                    else:
+                                        is_stolen = True
+                                else:
+                                    item = heavy_queue.pop_heaviest(timeout=0.5)
+                            except Exception:
+                                pass
+
+                    if item is None:
+                        if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                            break
+                        continue
+
+                    if is_light:
+                        qsv_light_count += 1
+                    elif is_stolen:
+                        qsv_stolen_count += 1
+
+                    if isinstance(item, RenderBatchItem):
+                        b_idx, files_to_batch = item.b_idx, item.files
+                    else:
+                        b_idx, files_to_batch = item
+                    if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                         break
-                    continue
-
-                b_idx, files_to_batch = item
-                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
-                    break
-                if not render_start_t:
-                    render_start_t.append(time.monotonic())
-                t_r0 = time.monotonic()
-                logger.info("render batch %d started on %s (%d files)", b_idx, gpu, len(files_to_batch))
-                if gpu == "nv":
-                    self.work_stealing.register_render_start()
-                try:
-                    all_rows = []
+                    if not render_start_t:
+                        render_start_t.append(time.monotonic())
+                    t_r0 = time.monotonic()
+                    logger.info("render batch %d started on %s (%d files, worker=%s)", b_idx, gpu, len(files_to_batch), worker_name)
+                    if gpu == "nv":
+                        with self.batch_lock:
+                            self._active_nv_renders += 1
+                        self.work_stealing.register_render_start()
                     try:
-                        if self.abort_event.is_set() or getattr(self.db, "is_closed", False):
-                            break
-                        all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
-                    except Exception as e:
-                        if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
-                            break
-                        logger.warning("DB query failed for batch %d: %s", b_idx, e)
-                    from src.timeline import build_timeline_from_rows
-                    batch_segs = build_timeline_from_rows(
-                        all_rows, self.date, target_files=files_to_batch, config=self.config
-                    )
+                        all_rows = []
+                        try:
+                            if self.abort_event.is_set() or getattr(self.db, "is_closed", False):
+                                break
+                            all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+                        except Exception as e:
+                            if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                                break
+                            logger.warning("DB query failed for batch %d: %s", b_idx, e)
+                        from src.timeline import build_timeline_from_rows
+                        batch_segs = build_timeline_from_rows(
+                            all_rows, self.date, target_files=files_to_batch, config=self.config
+                        )
 
-                    if not batch_segs:
-                        from src.timeline import TimelineSegment
-                        rows_by_path = {r["filepath"]: r for r in all_rows}
+                        if not batch_segs:
+                            from src.timeline import TimelineSegment
+                            rows_by_path = {r["filepath"]: r for r in all_rows}
 
-                        # 检查批次文件是否已被宏观折叠（Macro-collapse）或分析确认无需画面输出
-                        is_all_collapsed_or_skipped = True
-                        for filepath in files_to_batch:
-                            row = rows_by_path.get(filepath)
-                            if not row:
+                            # 检查批次文件是否已被宏观折叠（Macro-collapse）或分析确认无需画面输出
+                            is_all_collapsed_or_skipped = True
+                            for filepath in files_to_batch:
+                                row = rows_by_path.get(filepath)
+                                if not row:
+                                    is_all_collapsed_or_skipped = False
+                                    break
+                                ana_status = row.get("analysis_status")
+                                pre_status = row.get("prescreen_status")
+                                if pre_status == "STATIC" or ana_status in ("ANALYZED", "COMPLETED"):
+                                    raw_segs = row.get("analysis_segments") or ""
+                                    if "DYNAMIC" not in raw_segs and "DYNAMIC_AUDIO" not in raw_segs:
+                                        continue
                                 is_all_collapsed_or_skipped = False
                                 break
-                            ana_status = row.get("analysis_status")
-                            pre_status = row.get("prescreen_status")
-                            if pre_status == "STATIC" or ana_status in ("ANALYZED", "COMPLETED"):
-                                raw_segs = row.get("analysis_segments") or ""
-                                if "DYNAMIC" not in raw_segs and "DYNAMIC_AUDIO" not in raw_segs:
+
+                            if is_all_collapsed_or_skipped:
+                                logger.info(
+                                    "render batch %d skipped: static footage collapsed by timeline (%d file(s))",
+                                    b_idx, len(files_to_batch),
+                                )
+                                with self.batch_lock:
+                                    terminal_batch_ids.add(b_idx)
+                                if self.dashboard is not None:
+                                    self.dashboard.render_batch_finished(len(files_to_batch))
+                                continue
+
+                            # 若确实存在未提交分段的异常竞争，采用保守兜底，但绝对禁止盲目将静态段提升为 DYNAMIC
+                            for fallback_idx, filepath in enumerate(files_to_batch):
+                                row = rows_by_path.get(filepath)
+                                if not row:
                                     continue
-                            is_all_collapsed_or_skipped = False
-                            break
-
-                        if is_all_collapsed_or_skipped:
-                            logger.info(
-                                "render batch %d skipped: static footage collapsed by timeline (%d file(s))",
-                                b_idx, len(files_to_batch),
-                            )
-                            with self.batch_lock:
-                                terminal_batch_ids.add(b_idx)
-                            if self.dashboard is not None:
-                                self.dashboard.render_batch_finished(len(files_to_batch))
-                            continue
-
-                        # 若确实存在未提交分段的异常竞争，采用保守兜底，但绝对禁止盲目将静态段提升为 DYNAMIC
-                        for fallback_idx, filepath in enumerate(files_to_batch):
-                            row = rows_by_path.get(filepath)
-                            if not row:
+                                duration = float(row.get("file_duration") or 0.0)
+                                if duration <= 0:
+                                    continue
+                                raw_segs = row.get("analysis_segments") or ""
+                                has_dynamic = ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs)
+                                state = "DYNAMIC" if has_dynamic else "STATIC"
+                                batch_segs.append(TimelineSegment(
+                                    filepath=filepath, input_index=fallback_idx,
+                                    start_in_file=0.0, end_in_file=duration,
+                                    state=state, duration=duration,
+                                ))
+                            if batch_segs:
+                                logger.warning(
+                                    "render batch %d had no committed segments; conservative fallback for %d file(s)",
+                                    b_idx, len(batch_segs),
+                                )
+                            else:
+                                logger.warning("render batch %d has no usable timeline or metadata", b_idx)
+                                with self.batch_lock:
+                                    terminal_batch_ids.add(b_idx)
+                                if self.dashboard is not None:
+                                    self.dashboard.render_batch_finished(len(files_to_batch))
                                 continue
-                            duration = float(row.get("file_duration") or 0.0)
-                            if duration <= 0:
+
+                        # 异构长尾保护：QSV 仅消费中轻量动态任务，若真实切片包含超过门限的 DYNAMIC 动作则交还 NVENC
+                        if gpu == "qsv" and render_hw_policy == "heterogeneous":
+                            dynamic_dur = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
+                            if dynamic_dur > max_qsv_dynamic_s:
+                                logger.info(
+                                    "render batch %d on qsv contains %.1fs dynamic motion (exceeds %.1fs), offloading to nv heavy queue",
+                                    b_idx, dynamic_dur, max_qsv_dynamic_s,
+                                )
+                                heavy_queue.put(b_idx, files_to_batch, dynamic_dur)
                                 continue
-                            raw_segs = row.get("analysis_segments") or ""
-                            has_dynamic = ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs)
-                            state = "DYNAMIC" if has_dynamic else "STATIC"
-                            batch_segs.append(TimelineSegment(
-                                filepath=filepath, input_index=fallback_idx,
-                                start_in_file=0.0, end_in_file=duration,
-                                state=state, duration=duration,
-                            ))
-                        if batch_segs:
-                            logger.warning(
-                                "render batch %d had no committed segments; conservative fallback for %d file(s)",
-                                b_idx, len(batch_segs),
-                            )
-                        else:
-                            logger.warning("render batch %d has no usable timeline or metadata", b_idx)
-                            with self.batch_lock:
-                                terminal_batch_ids.add(b_idx)
-                            if self.dashboard is not None:
-                                self.dashboard.render_batch_finished(len(files_to_batch))
-                            continue
 
-                    # 异构保护铁律：QSV 绝对专职轻静态任务，若批次包含较长 DYNAMIC 动作则立即交由 NVENC 消费
-                    if gpu == "qsv" and render_hw_policy == "heterogeneous":
-                        dynamic_dur = sum(s.duration for s in batch_segs if s.state == "DYNAMIC")
-                        if dynamic_dur > 20.0:
-                            logger.info(
-                                "render batch %d on qsv contains %.1fs dynamic motion, offloading to nv heavy queue",
-                                b_idx, dynamic_dur,
-                            )
-                            with dispatch_lock:
-                                seq = dispatch_sequence
-                                dispatch_sequence += 1
-                            heavy_queue.put((-dynamic_dur, seq, (b_idx, files_to_batch)))
-                            continue
-
-                    res_path = build_batch_render(
-                        batch_segs, b_idx, gpu, fps, width, height,
-                        seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
-                        all_rows
-                    )
-                    r_dur = round(time.monotonic() - t_r0, 3)
-                    logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, gpu, r_dur, bool(res_path))
-                    if res_path:
-                        with self.batch_lock:
-                            self.batch_paths.append((b_idx, Path(res_path)))
-                        get_perf().add(
-                            PerfRecord(
-                                stage="render",
-                                file=f"batch_{b_idx}.mp4",
-                                gpu=gpu,
-                                duration=r_dur,
-                                extra={"batch_files": len(files_to_batch), "segments": len(batch_segs)},
-                            )
+                        res_path = build_batch_render(
+                            batch_segs, b_idx, gpu, fps, width, height,
+                            seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
+                            all_rows
                         )
-                        if self.dashboard is not None:
-                            self.dashboard.render_batch_finished(len(files_to_batch))
-                            # 精准渲染阶段自身计时与剩余预估
-                            t_start = render_start_t[0] if render_start_t else t_r0
-                            el_sec = max(0.1, time.monotonic() - t_start)
-                            n_done = self.dashboard.render_done + 1
-                            n_total = max(n_done, self.dashboard.render_total)
-                            avg_s = el_sec / max(1, n_done)
-                            enc_name = "NVENC" if gpu == "nv" else gpu.upper()
-                            self.dashboard.update_render(
-                                completed=n_done,
-                                latest_batch=f"批次 {b_idx}（{enc_name} 编码）",
-                                speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
+                        r_dur = round(time.monotonic() - t_r0, 3)
+                        busy_time += r_dur
+                        batches_count += 1
+                        batch_dyn = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
+                        dynamic_sec_total += batch_dyn
+                        logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, gpu, r_dur, bool(res_path))
+                        if res_path:
+                            with self.batch_lock:
+                                self.batch_paths.append((b_idx, Path(res_path)))
+                            get_perf().add(
+                                PerfRecord(
+                                    stage="render",
+                                    file=f"batch_{b_idx}.mp4",
+                                    gpu=gpu,
+                                    duration=r_dur,
+                                    extra={
+                                        "batch_files": len(files_to_batch),
+                                        "segments": len(batch_segs),
+                                        "dynamic_duration_s": round(batch_dyn, 2),
+                                        "is_stolen": is_stolen,
+                                        "is_light": is_light,
+                                    },
+                                    start_time=round(t_r0, 3),
+                                    end_time=round(time.monotonic(), 3),
+                                    worker=worker_name,
+                                )
                             )
-                            self._sync_queue_levels()
-                    else:
+                            if self.dashboard is not None:
+                                self.dashboard.render_batch_finished(len(files_to_batch))
+                                # 精准渲染阶段自身计时与剩余预估
+                                t_start = render_start_t[0] if render_start_t else t_r0
+                                el_sec = max(0.1, time.monotonic() - t_start)
+                                n_done = self.dashboard.render_done + 1
+                                n_total = max(n_done, self.dashboard.render_total)
+                                avg_s = el_sec / max(1, n_done)
+                                enc_name = "NVENC" if gpu == "nv" else gpu.upper()
+                                self.dashboard.update_render(
+                                    completed=n_done,
+                                    latest_batch=f"批次 {b_idx}（{enc_name} 编码）",
+                                    speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
+                                )
+                                self._sync_queue_levels()
+                        else:
+                            if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                                break
+                            self._add_error(f"render batch {b_idx} returned no output")
+                            with self.batch_lock:
+                                terminal_batch_ids.add(b_idx)
+                            if self.dashboard is not None:
+                                self.dashboard.render_batch_finished(len(files_to_batch))
+                    except Exception:
                         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                             break
-                        self._add_error(f"render batch {b_idx} returned no output")
+                        logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
+                        self._add_error(f"render batch {b_idx} failed on {gpu}")
                         with self.batch_lock:
                             terminal_batch_ids.add(b_idx)
                         if self.dashboard is not None:
                             self.dashboard.render_batch_finished(len(files_to_batch))
-                except Exception:
-                    if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
-                        break
-                    logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
-                    self._add_error(f"render batch {b_idx} failed on {gpu}")
-                    with self.batch_lock:
-                        terminal_batch_ids.add(b_idx)
-                    if self.dashboard is not None:
-                        self.dashboard.render_batch_finished(len(files_to_batch))
-                finally:
-                    if gpu == "nv":
-                        self.work_stealing.register_render_end()
+                    finally:
+                        if gpu == "nv":
+                            with self.batch_lock:
+                                self._active_nv_renders = max(0, self._active_nv_renders - 1)
+                            self.work_stealing.register_render_end()
+            finally:
+                t_worker_total = max(0.001, time.monotonic() - t_worker_start)
+                idle_time = max(0.0, t_worker_total - busy_time)
+                with self.batch_lock:
+                    self.render_worker_stats[worker_name] = {
+                        "gpu": gpu,
+                        "worker_id": worker_name,
+                        "total_time_s": round(t_worker_total, 2),
+                        "busy_time_s": round(busy_time, 2),
+                        "idle_time_s": round(idle_time, 2),
+                        "utilization_pct": round(busy_time / t_worker_total * 100, 1),
+                        "batches_rendered": batches_count,
+                        "dynamic_sec_rendered": round(dynamic_sec_total, 1),
+                        "qsv_light_batches": qsv_light_count,
+                        "qsv_stolen_batches": qsv_stolen_count,
+                        "qsv_steal_rejected": qsv_steal_rejected,
+                    }
 
-        # 启动渲染编队：各批次成片最后经 -c copy 拼接，必须严格保证相同硬件编码器同构输出。
-        # 默认统一分配 nv (RTX 3060Ti NVENC)，彻底根除 QSV/NVENC 异构混拼参数集冲突引发的画面卡死
+        # 启动渲染编队：异构模式下采用 2 NVENC + 1 QSV 三路并行
         render_threads = []
-        render_hw_policy = self.config.get("pipeline", {}).get("render_gpu_policy", "nv_only")
         if render_hw_policy == "nv_only":
             render_gpus = ["nv"] * self.render_workers
         elif render_hw_policy == "qsv_only":
             render_gpus = ["qsv"] * self.render_workers
         else:
-            logger.warning(
-                "render_gpu_policy='heterogeneous' mixes QSV and NVENC streams. "
-                "Final -c copy concat may produce incompatible parameter sets resulting in frozen frames. "
-                "Recommendation: use 'nv_only'."
+            logger.info(
+                "Streaming: render_gpu_policy='heterogeneous' active with %d workers: deploying "
+                "2 NVENC + 1 QSV with in-band parameter set injection (-bsf:v dump_extra).",
+                self.render_workers,
             )
-            render_gpus = ["nv"] if self.render_workers == 1 else ["nv"] * (self.render_workers - 1) + ["qsv"]
+            render_gpus = ["nv"] if self.render_workers == 1 else ["nv"] * min(2, self.render_workers - 1) + ["qsv"]
+        worker_counts: dict[str, int] = {}
         for gpu in render_gpus:
-            t = threading.Thread(target=self._guard_worker, args=(_render_worker, gpu), daemon=True)
+            idx = worker_counts.get(gpu, 0)
+            worker_counts[gpu] = idx + 1
+            w_id = f"{gpu}_{idx}"
+            t = threading.Thread(target=self._guard_worker, args=(_render_worker, gpu, w_id), daemon=True)
             t.start()
             render_threads.append(t)
 
+        prefetch_thread = None
+        local_staging_enabled = bool(render_cfg.get("local_staging_enabled", render_cfg.get("local_staging", True)))
+        if local_staging_enabled:
+            prefetch_thread = threading.Thread(
+                target=self._guard_worker, args=(self._lookahead_prefetch_worker,), daemon=True
+            )
+            prefetch_thread.start()
 
-        def _estimate_render_cost(files: list[str]) -> float:
-            """Estimate current full-decode render cost without probing files."""
-            return sum(render_cost_by_file.get(fp, 0.0) for fp in files)
+        def _estimate_dynamic_duration(files: list[str]) -> float:
+            """估算批次的真实动态时长，用于 LPT/SPT 双端队列精准定价。"""
+            return sum(dynamic_duration_by_file.get(fp, 0.0) for fp in files)
 
         def _enqueue_batch(b_idx: int, files: list[str]):
-            nonlocal dispatch_sequence
-            with dispatch_lock:
-                seq = dispatch_sequence
-                dispatch_sequence += 1
-            if _is_heavy_batch(files):
-                heavy_queue.put((-_estimate_render_cost(files), seq, (b_idx, files)))
+            if local_staging_enabled and files:
+                for fp in files:
+                    with self._prefetched_lock:
+                        if fp not in self._prefetched_files:
+                            self._prefetched_files.add(fp)
+                            self._prefetch_queue.put(fp)
+
+            dyn_dur = _estimate_dynamic_duration(files)
+            if dyn_dur > 0 or _is_heavy_batch(files):
+                if dyn_dur <= 0:
+                    dyn_dur = 60.0
+                heavy_queue.put(b_idx, files, dyn_dur)
             else:
                 light_queue.put((b_idx, files))
             dispatched_batch_ids.append(b_idx)
@@ -854,8 +1084,12 @@ class StreamingOrchestrator:
 
             filepath = msg.get("filepath")
             if filepath is not None:
+                if "dynamic_duration" in msg:
+                    dynamic_duration_by_file[filepath] = float(msg["dynamic_duration"])
                 if "is_heavy" in msg:
                     ready_heavy[filepath] = bool(msg["is_heavy"])
+                elif filepath in dynamic_duration_by_file:
+                    ready_heavy[filepath] = (dynamic_duration_by_file[filepath] > 0)
                 status = msg.get("status", "FAILED")
                 if immediate_file_batches and filepath in order_index:
                     # Each output now owns exactly one physical file.  Its
@@ -886,12 +1120,13 @@ class StreamingOrchestrator:
                 pending_files = []
 
             all_dispatched_event.set()
+            heavy_queue.notify_all()
+
+            if prefetch_thread is not None:
+                self._prefetch_queue.put(None)
+                prefetch_thread.join(timeout=5.0)
 
             for _ in render_threads:
-                with dispatch_lock:
-                    seq = dispatch_sequence
-                    dispatch_sequence += 1
-                heavy_queue.put((float("inf"), seq, None))
                 light_queue.put(None)
             for t in render_threads:
                 t.join()
@@ -957,6 +1192,10 @@ class StreamingOrchestrator:
             else:
                 self.render_batch_queue.put({"filepath": task["filepath"], "status": "FAILED"})
 
+        # 若无需执行预筛（例如断点续跑），或预热队列已积压足量任务，即刻解除预热门控
+        if not pending_prescreen or len(pending_analysis) >= 6:
+            self._analysis_warmup_event.set()
+
         threads = []
         requested_prescreen_parallel = int(self.config.get("detection", {}).get("prescreen_parallel", 8))
         # Keep analysis admission possible while prescreen workers are reading
@@ -974,13 +1213,15 @@ class StreamingOrchestrator:
                 gpu = "qsv" if i % 2 == 0 else "cuda"
             elif prescreen_gpu_policy == "cuda_only":
                 gpu = "cuda"
-            t = threading.Thread(target=self._guard_worker, args=(self._prescreen_worker, gpu), daemon=True)
+            w_id = f"pre_{i}"
+            t = threading.Thread(target=self._guard_worker, args=(self._prescreen_worker, gpu, w_id), daemon=True)
             t.start()
             threads.append(t)
 
         analysis_max_workers = self.analysis_workers
-        for _ in range(analysis_max_workers):
-            t = threading.Thread(target=self._guard_worker, args=(self._analysis_worker,), daemon=True)
+        for i in range(analysis_max_workers):
+            w_id = f"ana_{i}"
+            t = threading.Thread(target=self._guard_worker, args=(self._analysis_worker, None, w_id), daemon=True)
             t.start()
             threads.append(t)
 
@@ -998,6 +1239,7 @@ class StreamingOrchestrator:
 
         try:
             _wait_queue_interruptible(self.prescreen_queue)
+            self._analysis_warmup_event.set()
             _wait_queue_interruptible(self.analysis_queue)
             if self.render_enabled:
                 _wait_queue_interruptible(self.render_batch_queue)
@@ -1127,7 +1369,7 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         )
         db.set_render_status(date, cam_index, "FAILED")
         elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
         return False
 
     db.upsert_render_task(date, cam_index, "RENDERING")
@@ -1146,34 +1388,37 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
                 logger.error("concat_output_files failed for %s cam%d", date, cam_index)
                 db.set_render_status(date, cam_index, "FAILED")
                 elapsed_wall = time.monotonic() - t_start
-                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall)
+                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
                 return False
     except Exception:
         logger.exception("finalize render output failed")
         db.set_render_status(date, cam_index, "FAILED")
         return False
 
+    t_concat_done = time.monotonic()
     get_perf().add(PerfRecord(
         stage="final_concat", file=output_path.name, gpu="cpu",
-        duration=round(time.monotonic() - concat_t0, 3),
+        duration=round(t_concat_done - concat_t0, 3),
         extra={"batch_count": len(batch_paths)},
+        start_time=round(concat_t0, 3),
+        end_time=round(t_concat_done, 3),
+        worker="concat",
     ))
 
     save_manifest(output_path, final_fingerprint())
 
-    # 生成外挂 SRT 字幕：播放时间轴 → 真实监控墙钟时间映射（含 ramping 非线性还原）
-    if config.get("render", {}).get("generate_subtitles", False):
-        try:
-            from src.timeline import build_timeline, save_timecode_subtitles
-            full_timeline = build_timeline(db, date, cam_index)
-            save_timecode_subtitles(
-                full_timeline,
-                output_path.with_suffix(".srt"),
-                rows=db.get_all_file_tasks_for_date(date, cam_index),
-                base_date=date,
-            )
-        except Exception as e:
-            logger.warning("save_timecode_subtitles failed: %s", e)
+    # 生成标准化成片伴随资产包：.srt 现实世界时间码字幕 + .meta.json 结构化清单
+    _save_vlog_companion_assets(
+        output_path=output_path,
+        date=date,
+        cam_index=cam_index,
+        cam_display=cam_display,
+        total_files=total_files,
+        total_input_dur=total_input_dur,
+        elapsed_wall=time.monotonic() - t_start,
+        db=db,
+        config=config,
+    )
 
     db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
     # End-to-end means the final container, manifest, optional subtitles and DB
@@ -1192,17 +1437,35 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
     logger.info("Pipeline %s cam%d finished in %.1fs", date, cam_index, elapsed_wall)
 
     _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-               headline=_build_headline(output_path, total_input_dur, elapsed_wall))
+               headline=_build_headline(output_path, total_input_dur, elapsed_wall),
+               worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+
+    # 自动回收本地预暂存文件，释放磁盘存储空间
+    from src.utils import cleanup_staging_files, cleanup_temp_artifacts
+    cleanup_staging_files()
+    if config.get("render", {}).get("cleanup_batches_on_success", False):
+        cleanup_temp_artifacts(clean_batches=True)
     return True
 
 
-def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float, headline: dict | None = None):
+def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float, headline: dict | None = None, worker_stats: dict | None = None):
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         perf_dir = LOGS_DIR / "perf"
         perf_dir.mkdir(parents=True, exist_ok=True)
         perf_path = perf_dir / f"perf_{date}_cam{cam_index}_{timestamp}.json"
-        metadata = {"date": date, "cam": cam_index, "pipeline_duration": round(pipeline_duration, 2), "monitor_summary": monitor.stages_data(), "perf_summary": perf.summary_by_stage()}
+        yolo_sum = perf.yolo_summary() if hasattr(perf, "yolo_summary") else {}
+        metadata = {
+            "date": date,
+            "cam": cam_index,
+            "pipeline_duration": round(pipeline_duration, 2),
+            "monitor_summary": monitor.stages_data(),
+            "perf_summary": perf.summary_by_stage(),
+        }
+        if worker_stats:
+            metadata["worker_stats"] = worker_stats
+        if yolo_sum:
+            metadata["yolo_summary"] = yolo_sum
         if headline:
             metadata["headline"] = headline
         perf.dump(perf_path, metadata=metadata)
@@ -1233,6 +1496,99 @@ def _build_headline(output_path: Path, total_input_dur: float, elapsed_wall: flo
     return headline
 
 
+def _save_vlog_companion_assets(
+    output_path: Path,
+    date: str,
+    cam_index: int,
+    cam_display: str,
+    total_files: int,
+    total_input_dur: float,
+    elapsed_wall: float,
+    db: VlogDatabase,
+    config: dict,
+) -> None:
+    """生成同名标准交付资产包：.srt 现实世界时间码字幕 + .meta.json 自描述结构化清单。"""
+    try:
+        from src.timeline import build_timeline, save_timecode_subtitles, compute_display_plans
+        rows = db.get_all_file_tasks_for_date(date, cam_index)
+        full_timeline = build_timeline(db, date, cam_index)
+
+        # 1. 生成伴随 .srt 字幕（默认开启，可在配置中显式关闭）
+        srt_path = output_path.with_suffix(".srt")
+        if config.get("render", {}).get("generate_subtitles", True):
+            try:
+                save_timecode_subtitles(
+                    full_timeline,
+                    srt_path,
+                    rows=rows,
+                    base_date=date,
+                )
+            except Exception as e:
+                logger.warning("save_timecode_subtitles failed: %s", e)
+
+        # 2. 生成伴随 .meta.json 结构化清单
+        meta_path = output_path.with_suffix(".meta.json")
+        vlog_size = output_path.stat().st_size if output_path.exists() else 0
+        from src.ffmpeg import get_duration
+        vlog_dur = get_duration(str(output_path)) or 0.0
+
+        dyn_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"))
+        sta_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") == "STATIC")
+
+        # 提取动态高光片段（用于下游相册/Web 秒级定位）
+        highlights = []
+        cur_vlog_pos = 0.0
+        plans = compute_display_plans(full_timeline)
+        for seg, (disp_dur, _) in zip(full_timeline, plans):
+            start_vlog = cur_vlog_pos
+            end_vlog = cur_vlog_pos + disp_dur
+            cur_vlog_pos = end_vlog
+            if getattr(seg, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"):
+                highlights.append({
+                    "vlog_start_s": round(start_vlog, 2),
+                    "vlog_end_s": round(end_vlog, 2),
+                    "vlog_duration_s": round(disp_dur, 2),
+                    "state": seg.state,
+                    "source_file": Path(getattr(seg, "filepath", getattr(seg, "source_file", ""))).name,
+                    "max_energy": round(float(getattr(seg, "max_energy", 0.0) or 0.0), 1),
+                    "avg_confidence": round(float(getattr(seg, "avg_confidence", 0.0) or 0.0), 2),
+                })
+
+        from src.scanner import camera_key
+        first_fp = rows[0]["filepath"] if rows else ""
+        cam_id = rows[0].get("camera_id") if rows and rows[0].get("camera_id") else (camera_key(first_fp, cam_index) if first_fp else f"cam_{cam_index}")
+
+        manifest_data = {
+            "version": "1.0",
+            "date": date,
+            "camera": {
+                "id": cam_id,
+                "name": cam_display,
+                "cam_index": cam_index,
+            },
+            "metrics": {
+                "raw_duration_s": round(total_input_dur, 2),
+                "vlog_duration_s": round(vlog_dur, 2),
+                "condensation_ratio": round(total_input_dur / max(vlog_dur, 0.1), 2),
+                "dynamic_duration_s": round(dyn_dur, 2),
+                "static_duration_s": round(sta_dur, 2),
+                "total_source_files": total_files,
+                "output_size_bytes": vlog_size,
+                "output_size_mb": round(vlog_size / (1024 * 1024), 2),
+            },
+            "timeline_highlights": highlights,
+            "performance": {
+                "wall_clock_s": round(elapsed_wall, 2),
+                "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+        meta_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("Saved vlog companion assets: %s, %s", srt_path.name, meta_path.name)
+    except Exception as e:
+        logger.warning("Failed to save vlog companion assets for %s: %s", output_path.name, e)
+
+
 def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True) -> dict:
     from src.utils import cleanup_temp_artifacts
     cleanup_temp_artifacts()
@@ -1256,12 +1612,16 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
         )
 
         ok, failed = 0, 0
+        batch_summary_list = []
         for date, cam_index in groups:
             if not check_disk_space(OUTPUT_DIR, min_gb=20):
                 break
+            t0 = time.monotonic()
+            success = False
             try:
                 if process_date_cam(db, date, cam_index, skip_render=skip_render, dashboard_enabled=dashboard_enabled):
                     ok += 1
+                    success = True
                 else:
                     failed += 1
             except KeyboardInterrupt:
@@ -1273,7 +1633,45 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
             except Exception:
                 logger.exception("pipeline crash")
                 failed += 1
+            finally:
+                wall_s = time.monotonic() - t0
+                tasks = db.get_all_file_tasks_for_date(date, cam_index)
+                sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else ""
+                from src.scanner import resolve_camera_identity, resolve_output_filename
+                disp, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=load_config())
+                out_name = resolve_output_filename(
+                    load_config().get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),
+                    date, cam_index, tasks[0]["filepath"] if tasks else None, config=load_config()
+                )
+                out_p = Path(OUTPUT_DIR) / out_name
+                meta_p = out_p.with_suffix(".meta.json")
+                item = {
+                    "date": date,
+                    "cam_index": cam_index,
+                    "cam_name": disp,
+                    "total_files": len(tasks),
+                    "input_duration_s": sum(t.get("file_duration", 0.0) or 0.0 for t in tasks),
+                    "vlog_duration_s": 0.0,
+                    "output_size_mb": round(out_p.stat().st_size / (1024 * 1024), 2) if out_p.exists() else 0.0,
+                    "wall_clock_s": round(wall_s, 2),
+                    "status": "SUCCESS" if success else "FAILED",
+                }
+                if meta_p.exists():
+                    try:
+                        m_d = json.loads(meta_p.read_text(encoding="utf-8"))
+                        m_m = m_d.get("metrics", {})
+                        item["vlog_duration_s"] = m_m.get("vlog_duration_s", 0.0)
+                        item["condensation_ratio"] = m_m.get("condensation_ratio", 0.0)
+                        item["speedup_x"] = m_d.get("performance", {}).get("speedup_x", 0.0)
+                    except Exception:
+                        pass
+                batch_summary_list.append(item)
             cleanup_resources()
+
+        if len(groups) > 1:
+            from src.ui import print_batch_summary_table
+            print_batch_summary_table(batch_summary_list)
+
         return {"total": len(groups), "ok": ok, "failed": failed}
     finally:
         monitor.shutdown()
