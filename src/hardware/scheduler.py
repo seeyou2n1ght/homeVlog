@@ -168,13 +168,14 @@ _nvdec_semaphore = None
 
 def reset_semaphores() -> None:
     """重置缓存的信号量，支持热重载配置或单元测试隔离。"""
-    global _disk_semaphore, _nv_semaphore, _nvenc_semaphore, _nvdec_semaphore, _qsv_semaphore
+    global _disk_semaphore, _nv_semaphore, _nvenc_semaphore, _nvdec_semaphore, _qsv_semaphore, _qsv_render_semaphore
     with _io_lock:
         _disk_semaphore = None
         _nv_semaphore = None
         _nvenc_semaphore = None
         _nvdec_semaphore = None
         _qsv_semaphore = None
+        _qsv_render_semaphore = None
 
 
 def get_disk_semaphore() -> threading.Semaphore:
@@ -222,17 +223,34 @@ def get_nv_semaphore() -> threading.Semaphore:
     return get_nvenc_semaphore()
 
 
+_qsv_render_semaphore = None
+
 def get_qsv_semaphore() -> threading.Semaphore:
-    """获取 Intel QSV 硬件解码并发信号量 (默认上限 8，针对 12600K 双 VDBox 优化)。"""
+    """获取 Intel QSV 硬件分析解码并发信号量 (默认上限 max_qsv_concurrency - 1，保留通道供渲染)。"""
     global _qsv_semaphore
     if _qsv_semaphore is None:
         with _io_lock:
             if _qsv_semaphore is None:
                 config = load_config()
-                limit = config.get("hardware", {}).get("max_qsv_concurrency", 8)
+                hw_cfg = config.get("hardware", {})
+                total_limit = hw_cfg.get("max_qsv_concurrency", 8)
+                limit = hw_cfg.get("max_qsv_analysis_concurrency", max(1, total_limit - 1))
                 _qsv_semaphore = threading.Semaphore(limit)
-                _qsv_semaphore.resource_name = "QSV hardware"
+                _qsv_semaphore.resource_name = "QSV analysis hardware"
     return _qsv_semaphore
+
+
+def get_qsv_render_semaphore() -> threading.Semaphore:
+    """获取 Intel QSV 硬件渲染专用并发信号量 (独立通道，避免分析解码打满导致渲染排队超时)。"""
+    global _qsv_render_semaphore
+    if _qsv_render_semaphore is None:
+        with _io_lock:
+            if _qsv_render_semaphore is None:
+                config = load_config()
+                limit = config.get("hardware", {}).get("max_qsv_render_concurrency", 1)
+                _qsv_render_semaphore = threading.Semaphore(limit)
+                _qsv_render_semaphore.resource_name = "QSV render hardware"
+    return _qsv_render_semaphore
 
 
 class WorkStealingManager:

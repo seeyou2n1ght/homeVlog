@@ -27,8 +27,10 @@ hardware:
   # 并发控制 (信号量隔离)
   # 本项目生产安全上限；这是作业槽位，不是驱动会话数或显存保证
   max_nv_concurrency: 2
-  # QSV 作业槽位；与渲染共享，实际吞吐需压测
+  # QSV 总作业槽位；自动为渲染保留 1 槽独立特权通道，其余供分析 Worker 并发解码
   max_qsv_concurrency: 8
+  max_qsv_analysis_concurrency: 7
+  max_qsv_render_concurrency: 1
   # 全局输入文件 I/O 预算（渲染按输入文件数计费，并为分析 worker 预留槽位）
   max_io_concurrency: 32
 
@@ -117,6 +119,9 @@ detection:
   cell_noise_alpha: 0.02
   base_noise_thresh: 1.5
   cluster_boost: 1.2
+  ambient_drift_suppress: true       # 白天大面积慢速光影漫射/日出日落均匀偏转软抑制
+  ambient_drift_active_ratio: 0.35   # 激活网格覆盖率门限 (>=35% 全画幅激活)
+  ambient_drift_max_energy: 5.0      # 显著运动安全上限 (<5.0 低能量漫射方可抑制，严防漏检真实动作)
 
   # 检测算法调优
   motion_sensitivity: 1.0
@@ -167,6 +172,12 @@ presence:
   speed_factor: 4.0           # 有人静止陪伴播放倍速 (4x 温和快进)
   max_presence_gap_s: 180.0   # 人物驻留停顿最大容差 (秒)
   person_conf_threshold: 0.20 # 激活驻留状态的人物置信度下限
+  night_stationary_enabled: true
+  night_hours: [23, 7]        # 夜间熟睡时间段 (23:00 至 次日 07:00)
+  night_speed_factor: 16.0    # 睡眠平稳期缩时倍速 (16x 延时，兼顾睡姿变迁与浓缩比)
+  stationary_energy_max: 2.5  # 静止能量上限判定
+  min_stationary_duration_s: 180.0 # 持续静止时长门限 (秒)
+
 
 micro_motion:
   # R5: 夜间微动与事件驱动锚点保全 (Night Micro-Motion & Event Anchor)

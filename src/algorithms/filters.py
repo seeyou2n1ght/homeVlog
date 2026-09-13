@@ -109,6 +109,9 @@ class SpatialGridMotionFilter:
         sens_multiplier: float = 1.5,
         base_noise_thresh: float = 1.5,
         cluster_boost: float = 1.2,
+        ambient_drift_suppress: bool = True,
+        ambient_drift_active_ratio: float = 0.35,
+        ambient_drift_max_energy: float = 5.0,
     ):
         self.grid_rows = int(grid_rows)
         self.grid_cols = int(grid_cols)
@@ -118,6 +121,9 @@ class SpatialGridMotionFilter:
         self.sens_multiplier = float(sens_multiplier)
         self.base_noise_thresh = float(base_noise_thresh)
         self.cluster_boost = float(cluster_boost)
+        self.ambient_drift_suppress = bool(ambient_drift_suppress)
+        self.ambient_drift_active_ratio = float(ambient_drift_active_ratio)
+        self.ambient_drift_max_energy = float(ambient_drift_max_energy)
 
         self.confidence_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
         self.noise_floor_grid = np.full((self.grid_rows, self.grid_cols), self.base_noise_thresh, dtype=np.float32)
@@ -170,7 +176,7 @@ class SpatialGridMotionFilter:
                                     if binary_grid[nr, nc] and not visited[nr, nc]:
                                         visited[nr, nc] = True
                                         queue.append((nr, nc))
-                    components.append(comp)
+                            components.append(comp)
         return components
 
     def process_frame(
@@ -214,10 +220,29 @@ class SpatialGridMotionFilter:
                         if energies[r, c] > cell_thresholds[r, c] * isolated_multiplier:
                             filtered_active[r, c] = True
 
+        # 白天大面积慢速光影干扰（Sunrise/Sunset Ambient Drift）检测与软抑制：
+        # 当激活网格占比较大 (>= 35%)，但全局网格方差系数极低（光照均匀漂移无局部焦点），
+        # 且全图最高单元能量低于显著运动阈值 (< 5.0) 时，判定为自然光照漫射偏转，避免触发数分钟虚假动态审核。
+        is_ambient_drift = False
+        num_raw_active = int(np.sum(filtered_active))
+        if (
+            self.ambient_drift_suppress
+            and not is_night_mode
+            and num_raw_active >= int(total_cells * self.ambient_drift_active_ratio)
+        ):
+            max_cell_e = float(np.max(energies))
+            if max_cell_e < self.ambient_drift_max_energy:
+                active_vals = energies[filtered_active]
+                mean_act = float(np.mean(active_vals)) if active_vals.size > 0 else 0.0
+                std_act = float(np.std(active_vals)) if active_vals.size > 0 else 0.0
+                focal_ratio = max_cell_e / (mean_act + 1e-4)
+                cov = std_act / (mean_act + 1e-4)
+                if focal_ratio < 1.75 and cov < 0.35:
+                    is_ambient_drift = True
+                    filtered_active.fill(False)
+
         self.active_grid = filtered_active
         num_active_cells = int(np.sum(filtered_active))
-
-
 
         # 3. Adaptive noise floor tracking on inactive cells
         inactive_mask = ~filtered_active
@@ -256,6 +281,7 @@ class SpatialGridMotionFilter:
             "max_cell_energy": float(np.max(energies)),
             "effective_energy": effective_energy,
             "is_global_flash": is_global_flash,
+            "is_ambient_drift": is_ambient_drift,
         }
         return effective_energy, is_motion, stats
 

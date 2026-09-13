@@ -426,11 +426,16 @@ src.scheduler
 ```text
 NVENC semaphore
 NVDEC semaphore
-QSV semaphore
+QSV semaphore (Analysis)
+QSV render semaphore (Render Worker Exclusive)
 Disk I/O semaphore
 ```
 
 NVENC 与 NVDEC 被视为独立硬件资源，不再通过单一 NV semaphore 串行化。
+
+QSV 硬件资源实行阶段间物理槽位隔离（ADR 0014）：
+- `get_qsv_render_semaphore()`: 独占槽位（上限 1），专供 `qsv_0` 渲染 Worker 使用，不受分析阶段并发挤占；
+- `get_qsv_semaphore()`: 分析阶段共享槽位，上限自动收敛为 `max(1, max_qsv_concurrency - 1)`，根除跨阶段硬件租约饥饿与排队告警。
 
 `get_nv_semaphore()` 仅承担兼容性职责，不应作为新的通用 NV 资源模型继续扩展。
 
@@ -642,14 +647,15 @@ $$\text{local\_t} = \max\left(0.0, \min\left(\text{start\_time} - \text{file\_of
 
 ---
 
-## 10.6 Four-Tier Adaptive Rate Contract (四级自适应阶梯浓缩模型)
+## 10.6 Five-Tier Adaptive Rate Contract (五级自适应阶梯浓缩模型)
 
-为了根除将“有人静止陪伴”或“夜间睡眠微动作”粗暴当作纯静态抽帧丢弃导致的 P0 级严重漏检，同时避免成片时长失控膨胀，系统确立了四级自适应浓缩契约：
+为了根除将“有人静止陪伴”或“夜间睡眠微动作”粗暴当作纯静态抽帧丢弃导致的 P0 级严重漏检，同时避免成片被夜间熟睡过度膨胀（实测 62.3% 的驻留时间为夜间睡眠），系统确立了五级自适应浓缩契约：
 
 | 状态标识 (`state`) | 播放倍速与呈现模式 | 触发与识别条件 | 适用场景与业务目标 |
 | :--- | :--- | :--- | :--- |
 | **`DYNAMIC`** / **`DYNAMIC_AUDIO`** | **1.0x 常速原画** (无损保全) | YOLO 置信度达标目标或音频能量触发 | 行走、抱起、走动互动、有声事件（核心高光） |
-| **`PRESENCE`** | **4.0x 温和快进** (实体解码保留) | 两次活动事件间 $\le 180\text{s}$ 静止停顿，且具主体因果证据 | 家长看护坐定、静止陪伴、看书、看手机（防丢弃） |
+| **`PRESENCE`** | **4.0x 温和快进** (实体解码保留) | 白天两次活动事件间 $\le 180\text{s}$ 静止停顿，且具主体因果证据 | 家长看护坐定、静止陪伴、看书、看手机（防丢弃） |
+| **`NIGHT_STATIONARY`** | **16.0x 高倍浓缩** (平滑变速过渡) | 夜间 23:00~07:00 睡眠静止或全天持续低能量 $\ge 180\text{s}$ 极低能量静止 | 夜间熟睡期、长时卧床休息（去虚胖，保留呼吸节奏） |
 | **`MICRO_MOTION`** | **16.0x 巡航 + 3.0s 锚点** | 差分能量 $\ge 2.5$，YOLO 虽未框选但具有物理运动 | 夜间睡眠翻身、微弱手足活动、遮挡动作（事件保全） |
 | **`STATIC`** | **55.0s 抽 1 帧** (幻灯片快进) | 差分能量 $< 2.5$，无人无声，深度睡眠静止 | 纯静态空房间背景、深夜平稳深度睡眠期（极限浓缩） |
 
@@ -659,9 +665,25 @@ $$\text{local\_t} = \max\left(0.0, \min\left(\text{start\_time} - \text{file\_of
 
 ### 渲染端活动实体集集合契约
 ```text
-ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"}
+ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"}
 ```
 所有属于 `ACTIVE_STATES` 的切片均进入实体音视频解码流，严禁将其作为静态抽帧忽略。
+
+---
+
+## 10.7 Filter Graph Duration Invariance and EOF Clamping (滤镜图时长硬截断不变量)
+
+在非连续稀疏混合解码（`sparse_mixed`）或关键帧抽帧渲染模式下，输入视频流经 `select` 过滤器跳过了长时间静态区间。
+此时，`trim=start=s:end=e` 滤镜在区间末端发射 EOF 时，其携带的流内 `eof_pts` 可能会直接跳跃至后续下一个被选中区间的起始时间戳。
+
+**架构铁律**：
+在 FFmpeg `concat=n=N:v=1:a=1` 滤镜图中，单段展示时长取 `max(video_duration, audio_duration)`。若非纯静态段后挂载 `fps` 滤镜，下游 `fps` 滤镜会依据外溢的跳跃 `eof_pts` 疯狂克隆末帧数十至数百次，导致批次实际展示时长严重超越计划时长并触发渲染丢弃。
+
+因此，所有非纯静态段必须强制执行时长硬截断：
+```text
+trim=duration={actual_display_dur:.3f},setpts=PTS-STARTPTS
+```
+保证无论上游源视频 PTS 如何跳跃，流出该段滤镜链的时间戳跨度与帧数绝对不超越 `compute_display_plans` 的数学计划值。
 
 ---
 

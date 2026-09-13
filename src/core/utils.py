@@ -41,6 +41,7 @@ def __getattr__(name):
         "get_nvenc_semaphore",
         "get_nvdec_semaphore",
         "get_qsv_semaphore",
+        "get_qsv_render_semaphore",
         "WorkStealingManager",
         "RenderBatchItem",
         "DualEndedBatchQueue",

@@ -16,7 +16,7 @@ from src.monitor import get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
 
-ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
 
 _FFMPEG_PROGRESS_RE = re.compile(
 
@@ -601,6 +601,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         speed_ramping=render_cfg.get("speed_ramping_enabled", True),
         ramp_duration_s=render_cfg.get("ramp_duration_s", 1.0),
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+        night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     ))
@@ -733,8 +734,8 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
-        from src.utils import get_qsv_semaphore
-        io_sem = VideoLease(get_qsv_semaphore(), 1 if input_args is not None else len(input_files))
+        from src.utils import get_qsv_render_semaphore
+        io_sem = VideoLease(get_qsv_render_semaphore(), 1 if input_args is not None else len(input_files))
     else:
         from src.utils import get_nvenc_semaphore
         io_sem = VideoLease(get_nvenc_semaphore(), 1 if input_args is not None else len(input_files))

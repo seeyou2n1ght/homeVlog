@@ -69,6 +69,10 @@ Superseded by: ADR xxxx
 | ADR 0009 | 双端渲染工作窃取与基于真实成本的调度 | Accepted | 2026-04 | Evolves ADR 0008 |
 | ADR 0010 | Analysis SJF 与 QSV 弹性窃取策略 | Accepted | 2026-04 | Evolves ADR 0009 |
 | ADR 0011 | 进程生命周期下沉、配置解耦与架构瘦身治理 | Accepted | 2026-04 | 解耦 FFmpegProcessRegistry 与配置加载器 |
+| ADR 0012 | 四级自适应阶梯速率模型与防漏检保全 | Accepted | 2026-09 | — |
+| ADR 0013 | 五级自适应睡眠浓缩与滤镜图硬截断不变量 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0012 |
+| ADR 0014 | 异构分析与渲染 QSV 硬件信号量池隔离 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0010 |
+| ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
 
 ---
 
@@ -860,7 +864,97 @@ end-to-end pipeline makespan
 
 ---
 
-# 15. Current Decision Hierarchy
+# 15. ADR 0013 — Five-Tier Adaptive Sleep Compression and Filter Graph Duration Invariance
+
+**Status:** Accepted  
+**Date:** 2026-09  
+**Evolves:** ADR 0004, ADR 0012
+
+## Context
+
+在多日真实生产素材（2026-03-20 至 2026-04-05，共 384.3 小时 4K 素材）连续实测中暴露两大关键设计痛点：
+
+1. **夜间熟睡过度膨胀成片 (Sleep Inflation)**：
+   实测数据显示，全量日均 55.3 小时的 `TARGET_PERSISTENCE` 中有 **62.3%（38.11 小时）发生于夜间 23:00~07:00**。按照原四级速率模型的 `PRESENCE`（4.0x 温和快进）渲染，导致每天产出 60~90 分钟的静止熟睡录像，每日成片膨胀至 5~7 小时（单片 6~8 GB），极大地降低了家庭 Vlog 的观赏价值与流媒体分享便利性。
+2. **稀疏混合解码中的 FFmpeg EOF 时间戳外溢 (EOF PTS Leakage Bug)**：
+   在 20260331 渲染 Batch 113 时，切片因输入流经 `sparse_mixed` 跳过了无运动区间，非纯静态段（`PRESENCE` / `MICRO_MOTION`）后续挂载 `fps` 滤镜时，`trim=start=s:end=e` 遇到跳跃区间发射 EOF 时将下游链路的 `eof_pts` 传递为跳跃后的未来时间戳，导致 `fps` 滤镜克隆末帧数百次（单段异常膨胀 16.6 秒），造成整批展示时长超限被 `valid_video` 丢弃并中断全日合成。
+
+## Decision
+
+1. **演进五级自适应阶梯浓缩模型 (Five-Tier Adaptive Rate Model)**：
+   - `DYNAMIC` / `DYNAMIC_AUDIO`: **1.0x 常速原画**（运动与声音核心事件，无损保全）；
+   - `PRESENCE`: **4.0x 温和快进**（白天有人陪伴、静坐看护状态）；
+   - `NIGHT_STATIONARY`: **16.0x 高倍浓缩**（夜间 23:00~07:00 熟睡静止或全天持续低能量 $\ge 180$s 静止，兼具 speed ramping 平滑缓入缓出）；
+   - `MICRO_MOTION`: **16.0x 巡航 + 3.0s 动作锚点**（翻身、肢体微动事件驱动保留）；
+   - `STATIC`: **55.0s 抽 1 帧**（真正无人静止）。
+2. **时间轴滤镜图时长硬截断不变量 (Duration Clamping Invariant)**：
+   在 `src/stages/timeline.py:build_concat_filter` 中，对于所有非纯静态段，在 `fps` 滤镜之后显式追加 `trim=duration={actual_display_dur:.3f},setpts=PTS-STARTPTS`，硬性切断 FFmpeg 的 EOF 时间戳外溢，确保成片时长与 `compute_display_plans` 达到毫秒级数学同源。
+
+## Consequences
+
+- **成片虚胖彻底根治**：多日全量回测显示，4,295 个夜间熟睡段落（38.11 小时）成功升级为 `NIGHT_STATIONARY`，成片累计节省 7.15 小时无效熟睡视频（减少 46.7% 的驻留时长），每日成片精炼至 1.5~2.5 小时。
+- **20260331 断点无损恢复**：修复后 Batch 113 渲染精确度达到 100.0%，并一键成功合成了缺失的 `DailyVlog_20260331_B888805AA3CD.mp4`（6.87 GB）。
+
+---
+
+# 16. ADR 0014 — Dedicated QSV Hardware Semaphore Slot Isolation
+
+**Status:** Accepted  
+**Date:** 2026-09  
+**Evolves:** ADR 0008, ADR 0010
+
+## Context
+
+在多日生产压测中，分析阶段配置为 `detection.analysis_max_workers: 8`，硬件配置为 `hardware.max_qsv_concurrency: 8`。当 8 个分析 Worker 全速并发且遇到密集 4K 解码时，全局 QSV 信号量租约完全耗尽，导致 `qsv_0` 渲染 Worker 无法申请到解码租约，频繁在日志中产生 30s~90s 的超时排队告警，严重拖慢了流水线的端到端吞吐。
+
+## Decision
+
+1. **信号量槽位物理隔离**：
+   在 `src/hardware/scheduler.py` 中拆分 QSV 信号量域：
+   - 导出 `get_qsv_render_semaphore()`（上限固定为 1），专门供 `qsv_0` 渲染 Worker 独占；
+   - 将分析阶段使用的 `get_qsv_semaphore()` 上限定为 `max(1, max_qsv_concurrency - 1) = 7`。
+2. **保底租约优先权**：
+   无论分析 Worker 并发多么饱和，始终为渲染通道保留至少 1 个硬件上下文，根除跨阶段硬件锁死排队。
+
+## Consequences
+
+- 渲染与分析实现真正的错峰流水线并行，消除 30s/90s 超时排队告警。
+- 系统在 NAS 和高压 4K 批次下保持高度线性的 56.6x 稳态渲染吞吐。
+
+---
+
+# 17. ADR 0015 — Ambient Light Drift Soft-Suppression and Absorbed Motion Audit Preservation
+
+**Status:** Accepted  
+**Date:** 2026-09  
+**Evolves:** ADR 0006, ADR 0012
+
+## Context
+
+1. **日出日落大面积慢速光影干扰**：
+   生产日志审计发现，全量数据中存在 101 起 `YOLO_NEGATIVE_REQUIRES_AUDIT` 审核疑点（6.29 小时），其中 **60.8% 集中于朝阳（06:00~09:00）与夕阳（16:00~19:00）**，平均单段长达 211.8 秒。这是由于太阳偏转或云层掠过造成全屋大面积、低频且均匀的漫射光变化，触发了运动检测但 YOLO 无法识别到人体。
+2. **静态吸收短动态的静默漏审风险**：
+   当短于 `min_motion_duration`（2.0s）的短运动被静态段吸收时，静态段继承了该运动的 `max_energy`（甚至 $\ge 6.0$），但原算法未将其标记为 `needs_review`，导致高能瞬态动作在审核后台不可见。
+
+## Decision
+
+1. **动态空间网格慢速漫射光影软抑制**：
+   在 `SpatialGridMotionFilter` 中新增漫射光影检测：
+   - 当激活网格占比 $\ge 35\%$ 且非夜间模式；
+   - 全局网格能量最高值 $< 5.0$（安全红线：任何真实人体动作必定 $\ge 6.0 \sim 25.0$）；
+   - 空间网格变异系数 $\text{CoV} < 0.35$ 且聚焦比 $< 1.75$（均匀漫射无局部运动焦点）；
+   判定为 `is_ambient_drift` 并软抑制，促使底噪与 EMA 背景模型迅速自适应光线，杜绝虚假动态段落生成。
+2. **吸收短动态审计保全铁律**：
+   任何静态段若吸收了能量 $\ge 2.2$ 的动作，必须打上 `needs_review = 1` 并在后台显示明确的 `review_reason`（`ABSORBED_HIGH_ENERGY_MOTION` 或 `BORDERLINE_MICRO_MOTION`），保证人机协同审核队列对所有异常切片 100% 穿透。
+
+## Consequences
+
+- 日出日落漫射光影误报大幅压降，审核队列信噪比显著提升。
+- 历史与实时数据库全量回测确证：$P0 = 0$ 致命漏检为 0，高能静态切片漏审为 0。
+
+---
+
+# 18. Current Decision Hierarchy
 
 当前几个调度 ADR 的关系为：
 

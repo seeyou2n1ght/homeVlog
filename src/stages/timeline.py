@@ -12,6 +12,8 @@ from src.utils import load_config, ts_to_unix
 
 logger = logging.getLogger("homevlog")
 
+ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
+
 
 @dataclass
 class TimelineSegment:
@@ -145,13 +147,14 @@ def calculate_speed_ramping_curve(
 
 def compute_display_plans(
     timeline: list[TimelineSegment],
-    static_keyframe_interval: float = 30.0,
+    static_keyframe_interval: float = 12.0,
     keyframe_display_duration: float = 0.5,
     min_static_display_duration: float = 1.5,
     max_static_display_duration: float | None = None,
     speed_ramping: bool = True,
     ramp_duration_s: float = 1.0,
     presence_speed_factor: float = 4.0,
+    night_stationary_speed_factor: float = 16.0,
     micro_motion_anchor_s: float = 3.0,
     micro_motion_cruise_speed: float = 16.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
@@ -160,6 +163,7 @@ def compute_display_plans(
     返回 [(display_dur, ramp_info_or_None), ...]：
     - DYNAMIC/DYNAMIC_AUDIO: 1x 常速，展示时长 == 源时长，ramp_info 为 None；
     - PRESENCE: 有人驻留静止陪伴，以 4x (presence_speed_factor) 平滑快进；
+    - NIGHT_STATIONARY: 夜间熟睡或长时低能量静止，以 16x (night_stationary_speed_factor) 高倍平滑快进；
     - MICRO_MOTION: 夜间微动或未确认目标，事件驱动锚点提取（动作保留 3s，其余 16x 巡航）；
     - STATIC: 纯静态抽帧压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
     """
@@ -178,8 +182,25 @@ def compute_display_plans(
             target = max(0.25, dur / max(1.0, presence_speed_factor))
             target = min(target, dur)
             v_fast = dur / target if target > 0 else 1.0
-            has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
-            has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
+            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
+            if speed_ramping and (has_in or has_out):
+                info = calculate_speed_ramping_curve(
+                    dur=dur, v_fast=v_fast,
+                    has_ramp_in=has_in, has_ramp_out=has_out,
+                    ramp_duration_s=ramp_duration_s,
+                    target_display_dur=target,
+                )
+                plans.append((info.target_display_dur, info))
+            else:
+                plans.append((target, None))
+            continue
+        elif seg.state == "NIGHT_STATIONARY":
+            target = max(0.25, dur / max(1.0, night_stationary_speed_factor))
+            target = min(target, dur)
+            v_fast = dur / target if target > 0 else 1.0
+            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
+            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
             if speed_ramping and (has_in or has_out):
                 info = calculate_speed_ramping_curve(
                     dur=dur, v_fast=v_fast,
@@ -197,8 +218,8 @@ def compute_display_plans(
             target = anchor + (cruise_dur / max(1.0, micro_motion_cruise_speed))
             target = min(max(target, 0.25), dur)
             v_fast = dur / target if target > 0 else 1.0
-            has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
-            has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
+            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
             if speed_ramping and (has_in or has_out):
                 info = calculate_speed_ramping_curve(
                     dur=dur, v_fast=v_fast,
@@ -217,8 +238,8 @@ def compute_display_plans(
             target = min(target, max_static_display_duration)
 
         v_fast = dur / target if target > 0 else 1.0
-        has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
-        has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+        has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
+        has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
         if speed_ramping and (has_in or has_out):
             info = calculate_speed_ramping_curve(
                 dur=dur, v_fast=v_fast,
@@ -343,6 +364,8 @@ def generate_timecode_subtitles(
     cfg = load_config()
     seg_cfg = cfg.get("segment", {})
     render_cfg = cfg.get("render", {})
+    presence_cfg = cfg.get("presence", {})
+    micro_cfg = cfg.get("micro_motion", {})
     plans = compute_display_plans(
         timeline,
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
@@ -351,6 +374,10 @@ def generate_timecode_subtitles(
         max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
         speed_ramping=render_cfg.get("speed_ramping_enabled", True),
         ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
+        presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+        night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
+        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
+        micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     )
 
     is_ass = format_type.lower() in ("ass", "ssa")
@@ -585,9 +612,22 @@ def build_timeline_from_rows(
     )
 
     from src.segment import resolve_presence_segments
-    presence_gap = float(config.get("presence", {}).get("max_presence_gap_s", 180.0))
-    presence_conf = float(config.get("presence", {}).get("person_conf_threshold", 0.25))
-    filtered = resolve_presence_segments(filtered, max_presence_gap_s=presence_gap, person_conf_threshold=presence_conf)
+    presence_cfg = config.get("presence", {})
+    presence_gap = float(presence_cfg.get("max_presence_gap_s", 180.0))
+    presence_conf = float(presence_cfg.get("person_conf_threshold", 0.25))
+    night_enabled = bool(presence_cfg.get("night_stationary_enabled", True))
+    night_hours = tuple(presence_cfg.get("night_hours", [23, 7]))
+    stationary_energy_max = float(presence_cfg.get("stationary_energy_max", 2.5))
+    min_stationary_duration_s = float(presence_cfg.get("min_stationary_duration_s", 180.0))
+    filtered = resolve_presence_segments(
+        filtered,
+        max_presence_gap_s=presence_gap,
+        person_conf_threshold=presence_conf,
+        night_stationary_enabled=night_enabled,
+        night_hours=night_hours,
+        stationary_energy_max=stationary_energy_max,
+        min_stationary_duration_s=min_stationary_duration_s,
+    )
 
     # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
     reviews = [r for row in rows for r in row.get("human_reviews", [])]
@@ -810,7 +850,7 @@ def build_concat_filter(
             and all_static
             and min_src_dur >= 2.0 * kf_interval
         )
-        has_dynamic = any(s.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION") for s in file_segs)
+        has_dynamic = any(s.state in ACTIVE_STATES for s in file_segs)
         has_static = any(s.state == "STATIC" for s in file_segs)
         use_sparse_mixed = sparse_mixed and has_dynamic and has_static
 
@@ -820,7 +860,7 @@ def build_concat_filter(
             sample_half = max(0.04, float(static_sample_window_s) * 0.5)
             raw_intervals: list[tuple[float, float]] = []
             for file_seg in file_segs:
-                if file_seg.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"):
+                if file_seg.state in ACTIVE_STATES:
                     s = max(0.0, file_seg.start_in_file - 0.05)
                     e = file_seg.end_in_file + 0.05
                 else:
@@ -901,6 +941,7 @@ def build_concat_filter(
         speed_ramping=bool(speed_ramping),
         ramp_duration_s=ramp_duration_s,
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+        night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     )
@@ -991,7 +1032,17 @@ def build_concat_filter(
                     ",setpts=PTS-STARTPTS"
                 )
             else:
-                fps_filter = f",fps=fps={output_fps}" if use_keyframe_slideshow else ""
+                if use_keyframe_slideshow:
+                    # In sparse_mixed or hybrid_keyframe modes, cap duration to prevent EOF PTS jump from expanding duplicate frames
+                    fps_filter = (
+                        f",fps=fps={output_fps}"
+                        f",trim=duration={actual_display_dur:.3f}"
+                        ",setpts=PTS-STARTPTS"
+                    )
+                elif use_sparse_mixed or preselected_static:
+                    fps_filter = f",trim=duration={actual_display_dur:.3f},setpts=PTS-STARTPTS"
+                else:
+                    fps_filter = ""
             parts_v.append(
                 f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
                 f"setpts={pts_filter}"

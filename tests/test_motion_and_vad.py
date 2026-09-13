@@ -180,6 +180,38 @@ class TestTemporalSmoothingAndEarlyTerm:
         assert stats_night["active_cells"] == 1
         assert is_motion_night
 
+    def test_ambient_drift_diffuse_sunlight_suppressed(self):
+        """验证白天大面积均匀漫射光影（日落/朝阳）被准确识别为 ambient_drift 并软抑制。"""
+        grid_filter = SpatialGridMotionFilter(
+            grid_rows=8, grid_cols=8, base_noise_thresh=1.5,
+            ambient_drift_suppress=True, ambient_drift_active_ratio=0.35, ambient_drift_max_energy=5.0,
+        )
+        # 构造全屏均匀慢速漫射光影 (8x8 中约 32 个网格均发生微弱均匀变化 3.2 能量，无局部焦点)
+        frame_saliency = np.zeros((160, 160), dtype=np.float32)
+        frame_saliency[:80, :] = 3.2  # 上半屏 32 个格子全是 3.2 能量 (50% 面积)
+
+        eff_e, is_motion, stats = grid_filter.process_frame(frame_saliency, dt=0.2, is_night_mode=False)
+        assert stats["is_ambient_drift"] is True
+        assert not is_motion
+        assert stats["active_cells"] == 0
+
+    def test_genuine_person_movement_not_suppressed_by_ambient_drift(self):
+        """验证即使背景存在大面积漫射光影，前景真实人体动作（高能量/高局部对比）绝对不被误抑制。"""
+        grid_filter = SpatialGridMotionFilter(
+            grid_rows=8, grid_cols=8, base_noise_thresh=1.5,
+            ambient_drift_suppress=True, ambient_drift_active_ratio=0.35, ambient_drift_max_energy=5.0,
+        )
+        # 漫射光影 (3.0 能量) + 显著人物走动 (20, 20) 处能量达 15.0
+        frame_saliency = np.zeros((160, 160), dtype=np.float32)
+        frame_saliency[:80, :] = 3.0
+        frame_saliency[20:40, 20:40] = 15.0  # 人物焦点
+
+        eff_e, is_motion, stats = grid_filter.process_frame(frame_saliency, dt=0.2, is_night_mode=False)
+        assert stats["is_ambient_drift"] is False
+        assert is_motion
+        assert stats["active_cells"] > 0
+        assert stats["max_cell_energy"] >= 15.0
+
 
 
 

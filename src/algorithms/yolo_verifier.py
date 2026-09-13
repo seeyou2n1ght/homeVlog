@@ -224,8 +224,21 @@ class YoloVerifier:
         }
         from src.algorithms.segment import resolve_presence_segments
         cfg = getattr(self, "config", None) or {}
-        presence_gap = float(cfg.get("presence", {}).get("max_presence_gap_s", 180.0))
-        presence_conf = float(cfg.get("presence", {}).get("person_conf_threshold", 0.20))
+        pres_cfg = cfg.get("presence", {})
+        presence_gap = float(pres_cfg.get("max_presence_gap_s", 180.0))
+        presence_conf = float(pres_cfg.get("person_conf_threshold", 0.20))
+        night_enabled = bool(pres_cfg.get("night_stationary_enabled", True))
+        night_hours = tuple(pres_cfg.get("night_hours", [23, 7]))
+        stationary_energy_max = float(pres_cfg.get("stationary_energy_max", 2.5))
+        min_stationary_duration_s = float(pres_cfg.get("min_stationary_duration_s", 180.0))
         merged = _merge_same_state(segments, gap_tolerance=1.5)
-        return resolve_presence_segments(merged, max_presence_gap_s=presence_gap, person_conf_threshold=presence_conf)
+        return resolve_presence_segments(
+            merged,
+            max_presence_gap_s=presence_gap,
+            person_conf_threshold=presence_conf,
+            night_stationary_enabled=night_enabled,
+            night_hours=night_hours,
+            stationary_energy_max=stationary_energy_max,
+            min_stationary_duration_s=min_stationary_duration_s,
+        )
 

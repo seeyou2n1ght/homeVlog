@@ -389,7 +389,7 @@ class VlogDatabase:
                     et = getattr(seg, "end_in_file", 0.0)
                     state = getattr(seg, "state", "")
                     fp = getattr(seg, "filepath", "")
-                    if state in ("PRESENCE", "DYNAMIC", "DYNAMIC_AUDIO", "MICRO_MOTION"):
+                    if state in ("PRESENCE", "NIGHT_STATIONARY", "DYNAMIC", "DYNAMIC_AUDIO", "MICRO_MOTION"):
                         self.conn.execute(
                             """UPDATE segments
                                SET state = ?
@@ -481,7 +481,7 @@ class VlogDatabase:
                 elif category == "fp_suspect":
                     where_clauses.append("(state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)")
                 elif category == "fn_suspect":
-                    where_clauses.append("(state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0)")
+                    where_clauses.append("(state = 'STATIC' AND max_energy >= 1.5)")
                 elif category == "jitter":
                     where_clauses.append("(duration < 3.0 AND state = 'DYNAMIC')")
                 elif category == "reviewed":
@@ -490,7 +490,7 @@ class VlogDatabase:
                     where_clauses.append(
                         "((needs_review = 1) "
                         "OR (state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0) "
-                        "OR (state = 'STATIC' AND max_energy >= 1.5 AND max_energy <= 3.0) "
+                        "OR (state = 'STATIC' AND max_energy >= 1.5) "
                         "OR (duration < 3.0 AND state = 'DYNAMIC'))"
                     )
 

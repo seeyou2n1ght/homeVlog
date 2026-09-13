@@ -2,11 +2,14 @@ import json
 from dataclasses import dataclass
 
 
+ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
+
+
 @dataclass
 class Segment:
     start_time: float
     end_time: float
-    state: str  # "DYNAMIC" | "PRESENCE" | "MICRO_MOTION" | "STATIC" | "DYNAMIC_AUDIO"
+    state: str  # "DYNAMIC" | "PRESENCE" | "NIGHT_STATIONARY" | "MICRO_MOTION" | "STATIC" | "DYNAMIC_AUDIO"
     source_file: str
     file_start_offset: float = 0.0
     max_energy: float = 0.0
@@ -21,9 +24,8 @@ class Segment:
 
     @property
     def is_dynamic(self) -> bool:
-
-        """Returns True if segment represents active dynamic motion, presence, micro-motion or audio event."""
-        return self.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+        """Returns True if segment represents active dynamic motion, presence, micro-motion, night sleep or audio event."""
+        return self.state in ACTIVE_STATES
 
     @property
     def is_active_motion(self) -> bool:
@@ -157,9 +159,13 @@ def build_segments(
     )
 
     for s in res_segs:
-        if s.state == "STATIC" and 2.2 <= s.max_energy <= 3.5 and not s.needs_review:
-            s.needs_review = True
-            s.review_reason = f"BORDERLINE_MICRO_MOTION: 疑似微动作临界(energy={s.max_energy:.2f})"
+        if s.state == "STATIC" and not s.needs_review:
+            if s.max_energy >= 6.0:
+                s.needs_review = True
+                s.review_reason = f"ABSORBED_HIGH_ENERGY_MOTION: 吸收显著短运动(energy={s.max_energy:.2f})"
+            elif s.max_energy >= 2.2:
+                s.needs_review = True
+                s.review_reason = f"BORDERLINE_MICRO_MOTION: 疑似微动作临界(energy={s.max_energy:.2f})"
 
     return res_segs
 
@@ -596,18 +602,23 @@ def resolve_presence_segments(
     segments: list[Segment],
     max_presence_gap_s: float = 180.0,
     person_conf_threshold: float = 0.20,
+    night_stationary_enabled: bool = True,
+    night_hours: tuple[int, int] | list[int] = (23, 7),
+    stationary_energy_max: float = 2.5,
+    min_stationary_duration_s: float = 180.0,
 ) -> list[Segment]:
     """
-    基于时序因果链，识别并升级“有人驻留/静止陪伴 (PRESENCE)”切片。
-    当画面在活动事件（DYNAMIC / DYNAMIC_AUDIO / PRESENCE / MICRO_MOTION）之间存在 <= max_presence_gap_s 的静态停顿，
-    且因果链中存在有效主体活动证据时，说明人物并未离开房间，仅处于静坐、看书、看手机或微停顿、睡眠状态。
-    将其从 STATIC 提升为 PRESENCE，渲染端将以温和快进 (4x) 保留，避免人物在 Vlog 中被误当抽帧丢弃。
-    采用多轮因果链传递算法，支持复杂场景下复合事件链（如 动态->短音频->静坐->微动）的全量覆盖。
+    基于时序因果链，识别并升级“有人驻留/静止陪伴 (PRESENCE)”及“夜间熟睡静止 (NIGHT_STATIONARY)”切片。
+    当画面在活动事件（DYNAMIC / DYNAMIC_AUDIO / PRESENCE / NIGHT_STATIONARY / MICRO_MOTION）之间存在 <= max_presence_gap_s 的静态停顿，
+    且因果链中存在有效主体活动证据时，说明人物并未离开房间，处于静坐陪伴、睡眠或微停顿状态。
+    - 若命中夜间时间段（默认 23:00~07:00）或全天低能量长时静止，自适应升级为 NIGHT_STATIONARY（高倍缩时 16x~32x，杜绝成片严重虚胖）；
+    - 否则升级为 PRESENCE（温和快进 4x 保留）。
+    采用多轮因果链传递算法，支持复杂场景下复合事件链的全量覆盖。
     """
     if len(segments) < 3:
         return segments
 
-    active_states = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"}
+    active_states = set(ACTIVE_STATES)
 
     changed = True
     passes = 0
@@ -631,28 +642,46 @@ def resolve_presence_segments(
             right_active = next_seg.state in active_states
 
             # 强化的因果链主体证据：
-            # 1. 邻近置信度达标 (>= person_conf_threshold) 或已判定驻留 (PRESENCE)
+            # 1. 邻近置信度达标 (>= person_conf_threshold) 或已判定驻留 (PRESENCE / NIGHT_STATIONARY)
             # 2. 两端均为真实动态 (DYNAMIC <-> DYNAMIC)，证明人处于同一连续活动周期的短暂停顿
-            # 3. 动态/驻留与微动交替 (DYNAMIC/PRESENCE <-> MICRO_MOTION) 且停顿期残余能量 >= 2.0
+            # 3. 动态/驻留与微动交替且停顿期残余能量 >= 2.0
             # 4. 停顿期自身存在显著残余运动能量 (max_energy >= 2.5) 且两侧处于活动态
             has_person_evidence = (
                 prev_seg.avg_confidence >= person_conf_threshold
                 or next_seg.avg_confidence >= person_conf_threshold
-                or prev_seg.state == "PRESENCE"
-                or next_seg.state == "PRESENCE"
+                or prev_seg.state in ("PRESENCE", "NIGHT_STATIONARY")
+                or next_seg.state in ("PRESENCE", "NIGHT_STATIONARY")
                 or (prev_seg.state == "DYNAMIC" and next_seg.state == "DYNAMIC")
                 or (cur.max_energy >= 2.5 and (left_active or right_active))
                 or (prev_seg.state == "DYNAMIC_AUDIO" and next_seg.state in ("DYNAMIC", "MICRO_MOTION"))
                 or (next_seg.state == "DYNAMIC_AUDIO" and prev_seg.state in ("DYNAMIC", "MICRO_MOTION"))
-                or (prev_seg.state in ("DYNAMIC", "PRESENCE") and next_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
-                or (next_seg.state in ("DYNAMIC", "PRESENCE") and prev_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
+                or (prev_seg.state in ("DYNAMIC", "PRESENCE", "NIGHT_STATIONARY") and next_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
+                or (next_seg.state in ("DYNAMIC", "PRESENCE", "NIGHT_STATIONARY") and prev_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
             )
 
             if left_active and right_active and has_person_evidence:
-                cur.state = "PRESENCE"
                 conf_candidates = [s.avg_confidence for s in (prev_seg, next_seg) if s.avg_confidence > 0]
                 cur.avg_confidence = round(sum(conf_candidates) / len(conf_candidates), 4) if conf_candidates else 0.35
-                cur.review_reason = f"TARGET_PERSISTENCE: 驻留静坐陪伴(持续{dur:.1f}s)"
+
+                # 判定是否属于夜间睡眠或长时静止驻留：
+                # 1. 若两侧均为高置信度显性动态活动（如日常走动/陪护），说明人处于真实互动停顿，维持 PRESENCE；
+                # 2. 若落入夜间窗口（默认 23:00~07:00）或全天低能量长时静止（>= min_stationary_duration_s），判定为熟睡静止 NIGHT_STATIONARY。
+                hr = int((cur.start_time % 86400) // 3600)
+                is_night = (hr >= night_hours[0] or hr < night_hours[1])
+                is_active_flank = (
+                    prev_seg.state == "DYNAMIC" and next_seg.state == "DYNAMIC"
+                    and prev_seg.avg_confidence >= 0.5 and next_seg.avg_confidence >= 0.5
+                )
+                is_stationary = (
+                    cur.max_energy <= stationary_energy_max
+                    and (dur >= min_stationary_duration_s or (is_night and not is_active_flank))
+                )
+                if night_stationary_enabled and is_stationary:
+                    cur.state = "NIGHT_STATIONARY"
+                    cur.review_reason = f"TARGET_PERSISTENCE: 睡眠静止驻留(持续{dur:.1f}s)"
+                else:
+                    cur.state = "PRESENCE"
+                    cur.review_reason = f"TARGET_PERSISTENCE: 驻留静坐陪伴(持续{dur:.1f}s)"
                 changed = True
 
     return coalesce_micro_motion_segments(segments, gap_tolerance=5.0)

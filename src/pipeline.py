@@ -1633,7 +1633,23 @@ def _save_vlog_companion_assets(
         # 提取动态高光片段（用于下游相册/Web 秒级定位）
         highlights = []
         cur_vlog_pos = 0.0
-        plans = compute_display_plans(full_timeline)
+        seg_cfg = config.get("segment", {})
+        render_cfg = config.get("render", {})
+        presence_cfg = config.get("presence", {})
+        micro_cfg = config.get("micro_motion", {})
+        plans = compute_display_plans(
+            full_timeline,
+            static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
+            keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
+            min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
+            max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
+            speed_ramping=render_cfg.get("speed_ramping_enabled", True),
+            ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
+            presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+            night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
+            micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
+            micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        )
         for seg, (disp_dur, _) in zip(full_timeline, plans):
             start_vlog = cur_vlog_pos
             end_vlog = cur_vlog_pos + disp_dur

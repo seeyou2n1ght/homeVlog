@@ -90,6 +90,9 @@ class MotionDetector:
         self.cell_noise_alpha = det.get("cell_noise_alpha", 0.02)
         self.base_noise_thresh = det.get("base_noise_thresh", 1.5)
         self.cluster_boost = det.get("cluster_boost", 1.2)
+        self.ambient_drift_suppress = bool(det.get("ambient_drift_suppress", True))
+        self.ambient_drift_active_ratio = float(det.get("ambient_drift_active_ratio", 0.35))
+        self.ambient_drift_max_energy = float(det.get("ambient_drift_max_energy", 5.0))
 
         # R3: 音频 VAD 多模态事件唤醒 (Audio-Assisted Activity Detection)
         audio_cfg = config.get("audio_vad", {})
@@ -162,6 +165,9 @@ class MotionDetector:
             sens_multiplier=max(1.0, self.sensitivity * 0.5),
             base_noise_thresh=self.base_noise_thresh,
             cluster_boost=self.cluster_boost,
+            ambient_drift_suppress=self.ambient_drift_suppress,
+            ambient_drift_active_ratio=self.ambient_drift_active_ratio,
+            ambient_drift_max_energy=self.ambient_drift_max_energy,
         )
 
     def analyze_frames(

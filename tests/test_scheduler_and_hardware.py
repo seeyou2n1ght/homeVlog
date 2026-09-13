@@ -182,12 +182,16 @@ class TestHardwareSemaphoresAndProtection:
 
     def test_hardware_semaphores_isolation(self):
         reset_semaphores()
+        from src.hardware.scheduler import get_qsv_render_semaphore
         sem_nv = get_nv_semaphore()
         sem_qsv = get_qsv_semaphore()
+        sem_qsv_render = get_qsv_render_semaphore()
         sem_io = get_disk_semaphore()
 
         assert sem_nv is not sem_qsv
         assert sem_qsv is not sem_io
+        assert sem_qsv_render is not sem_qsv
+        assert sem_qsv_render is not sem_nv
 
     def test_check_disk_space(self, tmp_path):
         # 足够空间
