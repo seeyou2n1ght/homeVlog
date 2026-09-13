@@ -4,7 +4,7 @@ import logging
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
-from src.config import DB_PATH
+from src.core.config import DB_PATH
 
 logger = logging.getLogger("homevlog")
 
@@ -376,6 +376,34 @@ class VlogDatabase:
                 logger.error("DB error in get_all_segments_for_date: %s", e)
                 return []
 
+    def sync_timeline_segments(self, date: str, cam_index: int, timeline: list) -> None:
+        """Synchronize the resolved global timeline states back to the segments table.
+
+        Ensures that segments upgraded via causal chains (e.g. STATIC -> PRESENCE)
+        are accurately reflected in the database for auditing and reporting.
+        """
+        with self._lock:
+            try:
+                for seg in timeline:
+                    st = getattr(seg, "start_in_file", 0.0)
+                    et = getattr(seg, "end_in_file", 0.0)
+                    state = getattr(seg, "state", "")
+                    fp = getattr(seg, "filepath", "")
+                    if state in ("PRESENCE", "DYNAMIC", "DYNAMIC_AUDIO", "MICRO_MOTION"):
+                        self.conn.execute(
+                            """UPDATE segments
+                               SET state = ?
+                               WHERE filepath = ?
+                                 AND (start_time - file_start_offset) >= ? - 0.15
+                                 AND (end_time - file_start_offset) <= ? + 0.15""",
+                            (state, fp, st, et),
+                        )
+                self.conn.commit()
+            except Exception as e:
+                logger.warning("Failed to sync timeline segments to DB: %s", e)
+                self.conn.rollback()
+
+
     def update_segment_review(self, segment_id: int, manual_label: str, notes: str = "", archived_frame_path: str | None = None) -> bool:
         with self._lock:
             try:
@@ -582,6 +610,20 @@ class VlogDatabase:
                 return dict(row) if row else None
             except Exception as e:
                 logger.error("DB error in get_file_task_summary: %s", e)
+                return None
+
+    def get_file_task(self, filepath: str) -> dict | None:
+        with self._lock:
+            if self._conn is None:
+                return None
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM file_tasks WHERE filepath=?",
+                    (str(filepath),)
+                ).fetchone()
+                return dict(row) if row else None
+            except Exception as e:
+                logger.error("DB error in get_file_task for %s: %s", filepath, e)
                 return None
 
     def get_all_file_tasks_for_date(self, date: str, cam_index: int) -> list[dict]:

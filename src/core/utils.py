@@ -3,8 +3,8 @@ import threading
 import time
 from pathlib import Path
 
-import src.config as _config
-from src.config import (
+import src.core.config as _config
+from src.core.config import (
     PROJECT_ROOT,
     OUTPUT_DIR,
     TEMP_DIR,
@@ -33,18 +33,22 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
         _self.SETTINGS = _config.SETTINGS
 
 
-# 显式 re-export 供流水线与测试套件通过 src.utils 统一访问硬件调度核心接口
-from src.scheduler import (
-    reset_semaphores,
-    get_disk_semaphore,
-    get_nv_semaphore,
-    get_nvenc_semaphore,
-    get_nvdec_semaphore,
-    get_qsv_semaphore,
-    WorkStealingManager,
-    RenderBatchItem,
-    DualEndedBatchQueue,
-)
+def __getattr__(name):
+    if name in (
+        "reset_semaphores",
+        "get_disk_semaphore",
+        "get_nv_semaphore",
+        "get_nvenc_semaphore",
+        "get_nvdec_semaphore",
+        "get_qsv_semaphore",
+        "WorkStealingManager",
+        "RenderBatchItem",
+        "DualEndedBatchQueue",
+    ):
+        import src.hardware.scheduler as _sched
+        return getattr(_sched, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 
 _active_dashboard = None

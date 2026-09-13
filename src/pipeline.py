@@ -51,9 +51,12 @@ class PipelineTask:
     file_duration: float = 0.0
     has_audio: int = 0
     prescreen_status: str = "PENDING"
+    prescreen_result: str = ""
     analysis_status: str = "PENDING"
     analysis_segments: str = ""
     id: int | None = None
+    is_audio_gated_static: bool = False
+    audio_events: list = field(default_factory=list)
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -79,9 +82,12 @@ class PipelineTask:
             file_duration=float(data.get("file_duration") or 0.0),
             has_audio=int(data.get("has_audio") or 0),
             prescreen_status=str(data.get("prescreen_status", "PENDING")),
+            prescreen_result=str(data.get("prescreen_result") or ""),
             analysis_status=str(data.get("analysis_status", "PENDING")),
             analysis_segments=str(data.get("analysis_segments", "")),
             id=data.get("id"),
+            is_audio_gated_static=bool(data.get("is_audio_gated_static", False)),
+            audio_events=list(data.get("audio_events") or []),
         )
 
 
@@ -342,9 +348,18 @@ class StreamingOrchestrator:
                 )
 
                 if res["status"] == "SUSPICIOUS":
+                    res_json = res.get("result_json") or ""
+                    task["prescreen_result"] = res_json
+                    if "keyframes_audio_gate" in res_json:
+                        task["is_audio_gated_static"] = True
+                        try:
+                            gate_data = json.loads(res_json)
+                            task["audio_events"] = gate_data.get("audio_events", [])
+                        except Exception:
+                            task["audio_events"] = []
                     self.analysis_queue.put(task)
                     if not self._analysis_warmup_event.is_set():
-                        if self.analysis_queue.qsize() >= 6 or self.prescreen_queue.empty():
+                        if self.analysis_queue.qsize() >= 2 or self.prescreen_queue.empty():
                             self._analysis_warmup_event.set()
                     if self.dashboard is not None:
                         self.dashboard.update_analysis(
@@ -420,6 +435,81 @@ class StreamingOrchestrator:
                 latest_file=Path(filepath).name,
                 speed_str=f"正在分析 {dur_label}".strip(),
             )
+
+        # Check for visually static files with audio events (Fast Path)
+        is_audio_gated = bool(task.get("is_audio_gated_static", False))
+        audio_events = task.get("audio_events")
+        if not is_audio_gated or not audio_events:
+            prescreen_raw = task.get("prescreen_result")
+            if not prescreen_raw:
+                row = self.db.get_file_task(filepath)
+                prescreen_raw = row.get("prescreen_result") if row else None
+            if prescreen_raw and "keyframes_audio_gate" in prescreen_raw:
+                try:
+                    data = json.loads(prescreen_raw)
+                    audio_events = data.get("audio_events", [])
+                    if audio_events:
+                        is_audio_gated = True
+                except Exception:
+                    pass
+
+        if is_audio_gated and audio_events:
+            from src.algorithms.segment import build_audio_gated_segments
+            seg_cfg = self.config.get("segment", {})
+            file_dur = float(task.get("file_duration") or 300.0)
+            segments = build_audio_gated_segments(
+                filepath=filepath,
+                file_duration=file_dur,
+                file_start_offset=file_start_offset,
+                audio_events=audio_events,
+                pre_roll=seg_cfg.get("pre_roll", 1.0),
+                post_roll=seg_cfg.get("post_roll", 1.5),
+                gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+            )
+            js = segments_to_json(segments)
+            self.db.set_analysis_result(filepath, "ANALYZED", js)
+            from src.render_cache import processing_fingerprint
+            self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
+            t_ana_done = time.monotonic()
+            perf.add(
+                PerfRecord(
+                    stage="analysis",
+                    file=Path(filepath).name,
+                    gpu=gpu,
+                    duration=round(t_ana_done - t0, 3),
+                    extra={
+                        "status": "ANALYZED",
+                        "mode": "audio_gate_fast_path",
+                        "audio_events": len(audio_events),
+                        "decode_time_s": 0.0,
+                        "analysis_time_s": 0.0,
+                        "yolo_time_s": 0.0,
+                    },
+                    start_time=round(t0, 3),
+                    end_time=round(t_ana_done, 3),
+                    worker=worker_id or "ana",
+                )
+            )
+            dynamic_duration = sum(
+                (s.end_time - s.start_time)
+                for s in segments
+                if s.state == "DYNAMIC_AUDIO"
+            )
+            self.render_batch_queue.put(
+                {
+                    "filepath": filepath,
+                    "status": "ANALYZED",
+                    "is_heavy": False,
+                    "dynamic_duration": dynamic_duration,
+                }
+            )
+            if self.dashboard is not None:
+                self.dashboard.update_analysis(
+                    completed=self.dashboard.analysis_done + 1,
+                    latest_file=Path(filepath).name,
+                )
+                self._sync_queue_levels()
+            return
 
         labels, yolo_buffer = detector.analyze(
             filepath,
@@ -605,7 +695,7 @@ class StreamingOrchestrator:
 
         # 冷启动预热保护：等待预筛先形成候选积压，确保 SJF 短作业优先正常排序出清
         if not self._analysis_warmup_event.is_set():
-            self._analysis_warmup_event.wait(timeout=8.0)
+            self._analysis_warmup_event.wait(timeout=2.0)
 
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
             try:
@@ -797,19 +887,20 @@ class StreamingOrchestrator:
                                         active_nv = self._active_nv_renders
                                     q_len = heavy_queue.qsize()
                                     # 收尾硬屏障 (Tail Guard):
-                                    # 当所有素材派发完毕，且队列剩余批次 <= 1 并且 NVENC 正在处理任务时退出，避免抢占最后单卡任务反噬
-                                    if all_dispatched_event.is_set() and q_len <= 1 and active_nv >= 1:
+                                    # 当所有素材派发完毕：若队列已空，或剩余批次 <= 1 且 NVENC 正在处理任务，QSV 立即退出
+                                    if all_dispatched_event.is_set() and (heavy_queue.empty() or (q_len <= 1 and active_nv >= 1)):
                                         break
 
-                                    # 实时 Makespan 竞价模型 (Cost-Based ETA Bidding) + 队列收尾平滑衰减:
+                                    # 实时 Makespan 竞价模型 (Cost-Based ETA Bidding):
                                     # 双路 NVENC 平均耗时 ~42s/批次，预估 NVENC 编队清空当前所有排队批次所需的剩余完工时间 (T_nv_eta)：
-                                    # T_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * 42.0)
-                                    # 结合队列深度与完工期：队列充裕时放宽至 max_qsv_dynamic_s (180s) 高效分流；
-                                    # 随队列收敛，门限平滑向 60s 靠拢，确保末端长动态大批次 (如 200s+) 始终由独显 NVENC 以 5x 倍率快速收口
+                                    # 当 NVENC 积压明显 (t_nv_eta >= 35s) 时，QSV 编码能力 (100+ fps, ~5x 实时) 完全能并发出清 300~360s 标准切片，
+                                    # 平滑放宽窃取门限至 max_qsv_dynamic_s，彻底根除 QSV 500+ 次被拒空转与长尾失衡。
                                     t_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * 42.0)
-                                    allowed_dyn_s = min(max_qsv_dynamic_s, max(60.0, min(t_nv_eta * 1.8, q_len * 35.0)))
+                                    allowed_dyn_s = max_qsv_dynamic_s if t_nv_eta >= 35.0 else min(max_qsv_dynamic_s, max(60.0, t_nv_eta * 2.5))
                                     item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
                                     if item is None:
+                                        if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                                            break
                                         if not heavy_queue.empty():
                                             qsv_steal_rejected += 1
                                         time.sleep(0.5)
@@ -1189,7 +1280,7 @@ class StreamingOrchestrator:
                     self.analysis_queue.put(task)
                 else:
                     self.render_batch_queue.put({"filepath": task["filepath"], "status": task["analysis_status"]})
-            else:
+            elif task["prescreen_status"] != "PENDING":
                 self.render_batch_queue.put({"filepath": task["filepath"], "status": "FAILED"})
 
         # 若无需执行预筛（例如断点续跑），或预热队列已积压足量任务，即刻解除预热门控
@@ -1288,7 +1379,11 @@ class StreamingOrchestrator:
         return final_paths
 
 
-def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: bool = False, dashboard_enabled: bool = True) -> bool:
+def process_date_cam(
+    db: VlogDatabase, date: str, cam_index: int,
+    skip_render: bool = False, dashboard_enabled: bool = True,
+    force_render: bool = False,
+) -> bool:
     config = load_config()
     monitor = get_monitor()
     t_start = time.monotonic()
@@ -1331,7 +1426,7 @@ def process_date_cam(db: VlogDatabase, date: str, cam_index: int, skip_render: b
         decisions = [{k: r.get(k) for k in ("filepath", "file_duration", "prescreen_status", "analysis_segments", "human_reviews")} for r in rows]
         return render_fingerprint([r["filepath"] for r in rows], json.dumps(decisions, sort_keys=True),
                                   "final", out_cfg.get("fps", 20), out_cfg, out_cfg.get("audio", {}), config)
-    if (not skip_render and db.is_render_completed(date, cam_index) and
+    if (not force_render and not skip_render and db.is_render_completed(date, cam_index) and
             db.get_pending_file_count_for_date(date, cam_index) == 0 and
             reusable(output_path, final_fingerprint())):
         logger.info("Verified completed output: %s", output_path)

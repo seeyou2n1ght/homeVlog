@@ -642,6 +642,29 @@ $$\text{local\_t} = \max\left(0.0, \min\left(\text{start\_time} - \text{file\_of
 
 ---
 
+## 10.6 Four-Tier Adaptive Rate Contract (四级自适应阶梯浓缩模型)
+
+为了根除将“有人静止陪伴”或“夜间睡眠微动作”粗暴当作纯静态抽帧丢弃导致的 P0 级严重漏检，同时避免成片时长失控膨胀，系统确立了四级自适应浓缩契约：
+
+| 状态标识 (`state`) | 播放倍速与呈现模式 | 触发与识别条件 | 适用场景与业务目标 |
+| :--- | :--- | :--- | :--- |
+| **`DYNAMIC`** / **`DYNAMIC_AUDIO`** | **1.0x 常速原画** (无损保全) | YOLO 置信度达标目标或音频能量触发 | 行走、抱起、走动互动、有声事件（核心高光） |
+| **`PRESENCE`** | **4.0x 温和快进** (实体解码保留) | 两次活动事件间 $\le 180\text{s}$ 静止停顿，且具主体因果证据 | 家长看护坐定、静止陪伴、看书、看手机（防丢弃） |
+| **`MICRO_MOTION`** | **16.0x 巡航 + 3.0s 锚点** | 差分能量 $\ge 2.5$，YOLO 虽未框选但具有物理运动 | 夜间睡眠翻身、微弱手足活动、遮挡动作（事件保全） |
+| **`STATIC`** | **55.0s 抽 1 帧** (幻灯片快进) | 差分能量 $< 2.5$，无人无声，深度睡眠静止 | 纯静态空房间背景、深夜平稳深度睡眠期（极限浓缩） |
+
+### 跨文件时序因果链传递 (Cross-File Presence Propagation)
+监控录像通常每 5~10 分钟切分为独立物理文件。若仅在单文件内检测，处于文件首尾的切片（如视频结束前坐定、下一段视频开头站立）会因边界截断被判定为静态丢弃。
+因此，时间线构建必须在跨文件全局序列上执行 `resolve_presence_segments`，并在完成因果链状态传递后再通过 `split_segments_at_file_boundaries` 投影回各物理文件边界，确保 Virtual Concat 寻道绝对安全。
+
+### 渲染端活动实体集集合契约
+```text
+ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"}
+```
+所有属于 `ACTIVE_STATES` 的切片均进入实体音视频解码流，严禁将其作为静态抽帧忽略。
+
+---
+
 # 11. Rendering Architecture
 
 Rendering Pipeline 使用流式异构 Worker，而不是等待全天分析完全结束后再统一启动。

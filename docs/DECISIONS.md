@@ -819,7 +819,48 @@ end-to-end pipeline makespan
 
 ---
 
-# 14. Current Decision Hierarchy
+# 14. ADR 0012 — Four-Tier Adaptive Rate Model and Anti-Leakage Video Preservation
+
+**Status:** Accepted  
+**Date:** 2026-09  
+
+## Context
+
+在 HomeVlog 的核心愿景中，DailyVlog 生成完毕后用户需要能够安全物理删除 NAS 上的海量原始素材以释放备份压力。
+在初始实现中，系统采用极端的“动静二值化”策略：
+- 判定为 `DYNAMIC` 的素材以 1x 常速原画保留；
+- 判定为 `STATIC` 的素材以 55s 抽 1 帧的幻灯片速率粗暴压缩。
+
+在对生产素材（`20260320`，24.81 小时）的穿透式实测审计中，发现 44 起 P0 级严重漏检：
+1. **静坐陪伴被丢弃**：看护人坐定看手机或照料婴儿停顿超过 8 秒时，被粗暴切入 STATIC 抽帧，人物在成片中凭空消失数十秒；
+2. **夜间微动/遮挡未保全**：红外夜视下睡眠翻身或手足轻微活动虽然能量显著（$\text{energy} \ge 2.5$），但因 YOLO 无法框选人形而被悲观降级为 STATIC 丢弃；
+3. **物理切片边界截断**：由于视频录制每 5 分钟切分物理文件，单文件独立计算时，位于文件交界处的静坐停顿因丢失上下文而被误判为独立静态。
+
+若直接将所有静态帧保留，成片时长将膨胀数倍；若不加固，则严禁删除原始素材。
+
+## Decision
+
+1. **确立四级自适应阶梯浓缩模型**：
+   - `DYNAMIC` / `DYNAMIC_AUDIO`: **1.0x 常速原画**（运动与声音核心事件，无损保全）；
+   - `PRESENCE`: **4.0x 温和快进**（基于时序因果链，识别并在实体解码流中保全静坐、看书、陪伴状态）；
+   - `MICRO_MOTION`: **16.0x 巡航 + 3.0s 动作锚点**（差分能量 $\ge 2.5$ 的有效物理微动，事件驱动浓缩）；
+   - `STATIC`: **55.0s 抽 1 帧**（真正无人、无声、深夜深度睡眠静止时段，极限浓缩）。
+2. **时序因果链与跨文件传递 (Cross-File Presence Propagation)**：
+   - 升级 `resolve_presence_segments`，将因果链前置判定扩展至所有活动事件（`ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"}`）；
+   - 在时间线聚合层 (`src/stages/timeline.py`) 针对日内全局序列执行跨文件因果链传递，彻底消除 5 分钟文件切片边界造成的上下文截断；
+   - 因果链计算完毕后，通过 `split_segments_at_file_boundaries` 严格投影回物理文件边界，保障 Virtual Concat 寻道安全。
+3. **渲染端实体集扩充**：
+   - `ACTIVE_STATES` 统一纳入 Virtual Concat 连续与混合解码流程，禁止将 PRESENCE 与 MICRO_MOTION 视作静态忽略。
+
+## Consequences
+
+- **P0 致命漏检彻底归零**：`20260320` 实测审计中，高危静态切片 P0 漏检从 44 起骤降至 0 起，最终裁决正式转为 `PASS_SAFE_TO_DELETE`（允许安全删除原素材）。
+- **成片时长严格受控**：加固后全天展示时长从 18,193s (5.05h) 微调至 20,508s (5.70h)，增幅仅为 +12.73% (+38.6 分钟)，完美落在 5%~15% 预设控温区间内。
+- **用户信心保障**：建立起“自动化分层超敏审计套件 (`scripts/audit_leakage_20260320.py`)”，提供客观量化数据支撑物理删除决策。
+
+---
+
+# 15. Current Decision Hierarchy
 
 当前几个调度 ADR 的关系为：
 

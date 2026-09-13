@@ -75,7 +75,7 @@ recovery:
 detection:
   # [Pass 1] 快速预筛 (Prescreen)
   prescreen_mode: "keyframes"
-  prescreen_parallel: 8
+  prescreen_parallel: 10
   prescreen_segments: 10
   prescreen_resolution: "320x180"
   prescreen_diff_threshold: 8.5
@@ -137,7 +137,7 @@ audio_vad:
   window_ms: 50              # 短时 RMS 能量分帧窗口 (ms)
   speech_min_dur: 0.5        # 声音事件最小有效持续时间 (s)
   sample_rate: 16000         # 音频 VAD 重采样标准率 (Hz)
-  prescreen_audio_gate: false # 预筛阶段是否对画面纯静态素材强制执行音频重筛 (默认关闭，避免底噪杂音将纯静态推入全量 AI 分析)
+  prescreen_audio_gate: true  # 预筛阶段是否对画面纯静态素材强制执行音频重筛 (开启：即使夜间全黑无画面动态，有啼哭声音也将立即唤醒全量分析保全)
 
 segment:
   # 切片短时长拓扑平滑滤波开关
@@ -160,6 +160,21 @@ segment:
   max_static_display_duration: 1.5
   min_segment_duration: 0.1
   macro_collapse_static: true
+
+presence:
+  # R5: 有人驻留与静止陪伴平滑快进 (Presence Smoothing & Fast-Forward)
+  enabled: true
+  speed_factor: 4.0           # 有人静止陪伴播放倍速 (4x 温和快进)
+  max_presence_gap_s: 180.0   # 人物驻留停顿最大容差 (秒)
+  person_conf_threshold: 0.20 # 激活驻留状态的人物置信度下限
+
+micro_motion:
+  # R5: 夜间微动与事件驱动锚点保全 (Night Micro-Motion & Event Anchor)
+  enabled: true
+  anchor_duration_s: 3.0      # 翻身微动作前后保护锚点时长 (秒)
+  cruise_speed: 16.0          # 睡眠平稳期巡航缩时倍速
+  energy_threshold: 5.5       # 激活微动保全的最低能量门限
+
 
 yolo:
   enabled: true
@@ -184,8 +199,8 @@ render:
   batch_max_files: 1
   # 渲染总并发数：2 NVENC + 1 QSV = 3 并发 Worker
   max_concurrency: 3
-  # QSV 允许消费的动态时长安全上限 (秒)：Intel UHD 770 (32EU) 在 <=180s 动态时保持高效分流，长动态大批次由独显收口
-  max_qsv_dynamic_duration_s: 180.0
+  # QSV 允许消费的动态时长安全上限 (秒)：Intel UHD 770 (32EU) 在 <=420s 动态时保持高效分流，进一步均摊 NVENC 独显峰值负荷
+  max_qsv_dynamic_duration_s: 420.0
   virtual_concat_enabled: true
   # 混合文件 EDL 灰度开关；启用前必须通过真实长文件的时长与音频闭环验证
   virtual_concat_mixed_enabled: true
@@ -227,14 +242,15 @@ output:
   # 编码质量/速度折中，需通过同素材对照评估
   nv:
     codec: "hevc_nvenc"
-    preset: "p3"
+    preset: "p1"
+    tune: "ll"
     cq: 28
     maxrate: "4M"
     bufsize: "8M"
     pix_fmt: "nv12"
   qsv:
     codec: "hevc_qsv"
-    preset: "fast"
+    preset: "veryfast"
     global_quality: 28
     maxrate: "4M"
     bufsize: "8M"

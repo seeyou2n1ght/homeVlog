@@ -151,12 +151,17 @@ def compute_display_plans(
     max_static_display_duration: float | None = None,
     speed_ramping: bool = True,
     ramp_duration_s: float = 1.0,
+    presence_speed_factor: float = 4.0,
+    micro_motion_anchor_s: float = 3.0,
+    micro_motion_cruise_speed: float = 16.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
     """计算每个 TimelineSegment 的成片展示时长，与 build_concat_filter 严格同源。
 
     返回 [(display_dur, ramp_info_or_None), ...]：
-    - DYNAMIC/DYNAMIC_AUDIO: 展示时长 == 源时长，ramp_info 为 None；
-    - STATIC: 按全局抽帧倍率压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
+    - DYNAMIC/DYNAMIC_AUDIO: 1x 常速，展示时长 == 源时长，ramp_info 为 None；
+    - PRESENCE: 有人驻留静止陪伴，以 4x (presence_speed_factor) 平滑快进；
+    - MICRO_MOTION: 夜间微动或未确认目标，事件驱动锚点提取（动作保留 3s，其余 16x 巡航）；
+    - STATIC: 纯静态抽帧压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
     """
     kf_interval = max(static_keyframe_interval, 1.0)
     display_dur = max(keyframe_display_duration, 0.1)
@@ -169,14 +174,51 @@ def compute_display_plans(
         if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
             plans.append((dur, None))
             continue
+        elif seg.state == "PRESENCE":
+            target = max(0.25, dur / max(1.0, presence_speed_factor))
+            target = min(target, dur)
+            v_fast = dur / target if target > 0 else 1.0
+            has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            if speed_ramping and (has_in or has_out):
+                info = calculate_speed_ramping_curve(
+                    dur=dur, v_fast=v_fast,
+                    has_ramp_in=has_in, has_ramp_out=has_out,
+                    ramp_duration_s=ramp_duration_s,
+                    target_display_dur=target,
+                )
+                plans.append((info.target_display_dur, info))
+            else:
+                plans.append((target, None))
+            continue
+        elif seg.state == "MICRO_MOTION":
+            anchor = min(dur, max(1.0, micro_motion_anchor_s))
+            cruise_dur = max(0.0, dur - anchor)
+            target = anchor + (cruise_dur / max(1.0, micro_motion_cruise_speed))
+            target = min(max(target, 0.25), dur)
+            v_fast = dur / target if target > 0 else 1.0
+            has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+            if speed_ramping and (has_in or has_out):
+                info = calculate_speed_ramping_curve(
+                    dur=dur, v_fast=v_fast,
+                    has_ramp_in=has_in, has_ramp_out=has_out,
+                    ramp_duration_s=ramp_duration_s,
+                    target_display_dur=target,
+                )
+                plans.append((info.target_display_dur, info))
+            else:
+                plans.append((target, None))
+            continue
+
         target = max(dur / global_speed_factor, min_static_display_duration)
         target = min(target, dur)
         if max_static_display_duration is not None and max_static_display_duration > 0:
             target = min(target, max_static_display_duration)
 
         v_fast = dur / target if target > 0 else 1.0
-        has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
-        has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        has_in = i > 0 and timeline[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+        has_out = i < n - 1 and timeline[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
         if speed_ramping and (has_in or has_out):
             info = calculate_speed_ramping_curve(
                 dur=dur, v_fast=v_fast,
@@ -188,6 +230,7 @@ def compute_display_plans(
         else:
             plans.append((target, None))
     return plans
+
 
 
 def src_offset_at_display(
@@ -541,6 +584,11 @@ def build_timeline_from_rows(
         motion_absorb_energy_threshold=motion_absorb_threshold,
     )
 
+    from src.segment import resolve_presence_segments
+    presence_gap = float(config.get("presence", {}).get("max_presence_gap_s", 180.0))
+    presence_conf = float(config.get("presence", {}).get("person_conf_threshold", 0.25))
+    filtered = resolve_presence_segments(filtered, max_presence_gap_s=presence_gap, person_conf_threshold=presence_conf)
+
     # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
     reviews = [r for row in rows for r in row.get("human_reviews", [])]
     macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True) and not reviews
@@ -615,6 +663,11 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
         logger.debug(f"Could not load relational segments: {e}")
 
     timeline = build_timeline_from_rows(rows, date, config=config)
+    try:
+        if hasattr(db, "sync_timeline_segments"):
+            db.sync_timeline_segments(date, cam_index, timeline)
+    except Exception as e:
+        logger.debug("Could not sync timeline segments to DB: %s", e)
     logger.debug(
         "timeline for %s cam%d: %d segments",
         date, cam_index, len(timeline),
@@ -750,15 +803,15 @@ def build_concat_filter(
     for idx in sorted(segs_per_file):
         n_segs = segs_per_file[idx]
         file_segs = segs_by_file.get(idx, [])
-        all_static = all(s.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
+        all_static = all(s.state == "STATIC" for s in file_segs)
         min_src_dur = min((s.end_in_file - s.start_in_file) for s in file_segs) if file_segs else 0.0
         use_kf_fastpath = (
             not preselected_static
             and all_static
             and min_src_dur >= 2.0 * kf_interval
         )
-        has_dynamic = any(s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
-        has_static = any(s.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for s in file_segs)
+        has_dynamic = any(s.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION") for s in file_segs)
+        has_static = any(s.state == "STATIC" for s in file_segs)
         use_sparse_mixed = sparse_mixed and has_dynamic and has_static
 
         input_v = f"[{idx}:v]"
@@ -767,11 +820,12 @@ def build_concat_filter(
             sample_half = max(0.04, float(static_sample_window_s) * 0.5)
             raw_intervals: list[tuple[float, float]] = []
             for file_seg in file_segs:
-                if file_seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+                if file_seg.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"):
                     s = max(0.0, file_seg.start_in_file - 0.05)
                     e = file_seg.end_in_file + 0.05
                 else:
                     midpoint = (file_seg.start_in_file + file_seg.end_in_file) * 0.5
+
                     s = max(file_seg.start_in_file, midpoint - sample_half)
                     e = min(file_seg.end_in_file, midpoint + sample_half)
                 if e > s:
@@ -836,6 +890,8 @@ def build_concat_filter(
     source_timeline = source_timeline or timeline
     if len(source_timeline) != len(timeline):
         raise ValueError("source_timeline must align one-to-one with render timeline")
+    presence_cfg = tmp_cfg.get("presence", {})
+    micro_cfg = tmp_cfg.get("micro_motion", {})
     display_plans = compute_display_plans(
         source_timeline,
         static_keyframe_interval=static_keyframe_interval,
@@ -844,7 +900,11 @@ def build_concat_filter(
         max_static_display_duration=max_static_display_duration,
         speed_ramping=bool(speed_ramping),
         ramp_duration_s=ramp_duration_s,
+        presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
+        micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     )
+
 
     parts_v: list[str] = []
     parts_a: list[str] = []
@@ -908,7 +968,8 @@ def build_concat_filter(
         else:
             # Static segment speed scaling and speed ramping (与字幕映射同源)
             actual_display_dur, ramp_info = display_plans[i]
-            if preselected_static:
+            is_pure_static = seg.state == "STATIC"
+            if preselected_static and is_pure_static:
                 # Sparse representatives no longer span the source duration;
                 # normalize their compact PTS and let tpad own the exact
                 # display duration from the source timeline plan.
@@ -919,7 +980,7 @@ def build_concat_filter(
                 v_fast = dur / actual_display_dur if actual_display_dur > 0 else 1.0
                 pts_filter = f"(PTS-STARTPTS)/{v_fast:.4f}"
 
-            if preselected_static or use_sparse_mixed:
+            if (preselected_static or use_sparse_mixed) and is_pure_static:
                 # A sparse EDL may contain only one picture for a static
                 # interval.  Clone its final frame to the exact display-plan
                 # duration before the segment enters concat; otherwise FFmpeg

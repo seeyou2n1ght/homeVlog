@@ -12,8 +12,8 @@ import logging
 import threading
 import time
 
-from src.config import load_config
-from src.ffmpeg import FFmpegProcessRegistry
+from src.core.config import load_config
+from src.hardware.ffmpeg import FFmpegProcessRegistry
 
 logger = logging.getLogger("homevlog")
 

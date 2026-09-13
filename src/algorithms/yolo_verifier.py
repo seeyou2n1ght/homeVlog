@@ -17,6 +17,7 @@ class YoloVerifier:
     _inference_lock = threading.Lock()
 
     def __init__(self, config: dict, device: str | None = None):
+        self.config = config
         self.last_telemetry: dict[str, Any] = {}
         yolo_cfg = config.get("yolo", {})
         self.enabled = yolo_cfg.get("enabled", False)
@@ -197,10 +198,19 @@ class YoloVerifier:
                 seg.needs_review = True
                 seg.review_reason = "MULTIMODAL_AUDIO_NO_TARGET"
             else:
-                seg.state = "STATIC"
-                seg.needs_review = True
-                seg.review_reason = "YOLO_NEGATIVE_REQUIRES_AUDIT"
-                rejected_count += 1
+                cfg = getattr(self, "config", None) or {}
+                micro_thresh = float(cfg.get("micro_motion", {}).get("energy_threshold", 6.0))
+                # 若差分能量显著 (>= micro_thresh)，表明存在真实的物理运动 (如夜间睡眠翻身、遮挡动作)，
+                # 严禁将其作为纯静态抽帧丢弃！保全为 MICRO_MOTION 事件状态，防漏检
+                if seg.max_energy >= micro_thresh:
+                    seg.state = "MICRO_MOTION"
+                    seg.needs_review = True
+                    seg.review_reason = f"YOLO_NEGATIVE_ENERGY_HIGH: 显著运动未识别目标(energy={seg.max_energy:.1f})"
+                else:
+                    seg.state = "STATIC"
+                    seg.needs_review = True
+                    seg.review_reason = "YOLO_NEGATIVE_REQUIRES_AUDIT"
+                    rejected_count += 1
 
         self.last_telemetry = {
             "yolo_duration": round(time.monotonic() - t_yolo_start, 3),
@@ -212,4 +222,10 @@ class YoloVerifier:
             "yolo_rejected_segments": rejected_count,
             "yolo_status": "OK",
         }
-        return _merge_same_state(segments, gap_tolerance=1.5)
+        from src.algorithms.segment import resolve_presence_segments
+        cfg = getattr(self, "config", None) or {}
+        presence_gap = float(cfg.get("presence", {}).get("max_presence_gap_s", 180.0))
+        presence_conf = float(cfg.get("presence", {}).get("person_conf_threshold", 0.20))
+        merged = _merge_same_state(segments, gap_tolerance=1.5)
+        return resolve_presence_segments(merged, max_presence_gap_s=presence_gap, person_conf_threshold=presence_conf)
+

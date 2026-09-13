@@ -6,7 +6,7 @@ from dataclasses import dataclass
 class Segment:
     start_time: float
     end_time: float
-    state: str  # "DYNAMIC" | "STATIC" | "DYNAMIC_AUDIO"
+    state: str  # "DYNAMIC" | "PRESENCE" | "MICRO_MOTION" | "STATIC" | "DYNAMIC_AUDIO"
     source_file: str
     file_start_offset: float = 0.0
     max_energy: float = 0.0
@@ -15,8 +15,19 @@ class Segment:
     review_reason: str = ""
 
     @property
+    def duration(self) -> float:
+        """Returns the segment duration in seconds."""
+        return max(0.0, self.end_time - self.start_time)
+
+    @property
     def is_dynamic(self) -> bool:
-        """Returns True if segment represents active dynamic motion or audio event."""
+
+        """Returns True if segment represents active dynamic motion, presence, micro-motion or audio event."""
+        return self.state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+
+    @property
+    def is_active_motion(self) -> bool:
+        """Returns True if segment represents high-speed/1x active dynamic motion or audio."""
         return self.state in ("DYNAMIC", "DYNAMIC_AUDIO")
 
 
@@ -325,6 +336,197 @@ def segments_from_json(json_str: str) -> list[Segment]:
         return []
 
 
+def build_audio_gated_segments(
+    filepath: str,
+    file_duration: float,
+    file_start_offset: float = 0.0,
+    audio_events: list = None,
+    pre_roll: float = 1.0,
+    post_roll: float = 1.5,
+    gap_tolerance: float = 1.5,
+) -> list[Segment]:
+    """Build timeline segments for a visually static file with sparse audio events.
+
+    Events within gap_tolerance are merged. Audio intervals are expanded with pre_roll
+    and post_roll. The remaining spans are marked STATIC, producing a contiguous timeline
+    covering [file_start_offset, file_start_offset + file_duration].
+    """
+    if not audio_events or file_duration <= 0:
+        return [
+            Segment(
+                start_time=file_start_offset,
+                end_time=file_start_offset + max(0.0, file_duration),
+                state="STATIC",
+                source_file=filepath,
+                file_start_offset=file_start_offset,
+                max_energy=0.0,
+                avg_confidence=0.0,
+                needs_review=False,
+                review_reason="",
+            )
+        ]
+
+    # Normalize intervals with pre_roll / post_roll, clamped to [0, file_duration]
+    intervals = []
+    for ev in audio_events:
+        ev_s = float(ev[0])
+        ev_e = float(ev[1])
+        s = max(0.0, ev_s - pre_roll)
+        e = min(file_duration, ev_e + post_roll)
+        if e > s:
+            intervals.append((s, e))
+
+    if not intervals:
+        return [
+            Segment(
+                start_time=file_start_offset,
+                end_time=file_start_offset + file_duration,
+                state="STATIC",
+                source_file=filepath,
+                file_start_offset=file_start_offset,
+                max_energy=0.0,
+                avg_confidence=0.0,
+                needs_review=False,
+                review_reason="",
+            )
+        ]
+
+    intervals.sort(key=lambda x: x[0])
+    # Merge overlapping or close intervals
+    merged_intervals = []
+    cur_s, cur_e = intervals[0]
+    for nxt_s, nxt_e in intervals[1:]:
+        if nxt_s <= cur_e + gap_tolerance:
+            cur_e = max(cur_e, nxt_e)
+        else:
+            merged_intervals.append((cur_s, cur_e))
+            cur_s, cur_e = nxt_s, nxt_e
+    merged_intervals.append((cur_s, cur_e))
+
+    # Construct alternating STATIC and DYNAMIC_AUDIO segments
+    segments: list[Segment] = []
+    last_end = 0.0
+    for a_s, a_e in merged_intervals:
+        if a_s > last_end:
+            segments.append(
+                Segment(
+                    start_time=file_start_offset + last_end,
+                    end_time=file_start_offset + a_s,
+                    state="STATIC",
+                    source_file=filepath,
+                    file_start_offset=file_start_offset,
+                    max_energy=0.0,
+                    avg_confidence=0.0,
+                    needs_review=False,
+                    review_reason="",
+                )
+            )
+        segments.append(
+            Segment(
+                start_time=file_start_offset + a_s,
+                end_time=file_start_offset + a_e,
+                state="DYNAMIC_AUDIO",
+                source_file=filepath,
+                file_start_offset=file_start_offset,
+                max_energy=0.0,
+                avg_confidence=0.0,
+                needs_review=False,
+                review_reason="AUDIO_ACTIVITY_ONLY",
+            )
+        )
+        last_end = a_e
+
+    if last_end < file_duration:
+        segments.append(
+            Segment(
+                start_time=file_start_offset + last_end,
+                end_time=file_start_offset + file_duration,
+                state="STATIC",
+                source_file=filepath,
+                file_start_offset=file_start_offset,
+                max_energy=0.0,
+                avg_confidence=0.0,
+                needs_review=False,
+                review_reason="",
+            )
+        )
+
+    return segments
+
+
+def coalesce_micro_motion_segments(
+    segments: list[Segment],
+    gap_tolerance: float = 5.0,
+) -> list[Segment]:
+    """Coalesce adjacent MICRO_MOTION segments across short STATIC pauses.
+
+    During sleep or continuous subtle activity, micro-motions are often punctuated by
+    short 1-5s pauses. Leaving them fragmented creates dozens of jumpy 3s anchors and
+    inflates vlog length. Coalescing them into a single continuous MICRO_MOTION span
+    produces a clean 16x timelapse with a single anchor, preserving full event coverage.
+    """
+    if len(segments) < 3:
+        return segments
+
+    result: list[Segment] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        cur = segments[i]
+        if cur.state != "MICRO_MOTION":
+            result.append(cur)
+            i += 1
+            continue
+
+        # Try to bridge subsequent STATIC segments and MICRO_MOTION
+        j = i + 1
+        merged_end = cur.end_time
+        max_e = cur.max_energy
+        max_conf = cur.avg_confidence
+        needs_rev = cur.needs_review
+        rev_reasons = [cur.review_reason] if cur.review_reason else []
+
+        while j < n:
+            if segments[j].state == "MICRO_MOTION":
+                merged_end = segments[j].end_time
+                max_e = max(max_e, segments[j].max_energy)
+                max_conf = max(max_conf, segments[j].avg_confidence)
+                if segments[j].needs_review:
+                    needs_rev = True
+                    if segments[j].review_reason:
+                        rev_reasons.append(segments[j].review_reason)
+                j += 1
+            elif (
+                segments[j].state == "STATIC"
+                and (segments[j].end_time - segments[j].start_time) <= gap_tolerance
+                and j + 1 < n
+                and segments[j + 1].state == "MICRO_MOTION"
+            ):
+                # Bridge across the short static gap
+                merged_end = segments[j + 1].end_time
+                max_e = max(max_e, segments[j + 1].max_energy)
+                max_conf = max(max_conf, segments[j + 1].avg_confidence)
+                if segments[j + 1].needs_review:
+                    needs_rev = True
+                    if segments[j + 1].review_reason:
+                        rev_reasons.append(segments[j + 1].review_reason)
+                j += 2
+            else:
+                break
+
+        cur.end_time = merged_end
+        cur.max_energy = max_e
+        cur.avg_confidence = max_conf
+        cur.needs_review = needs_rev
+        if rev_reasons:
+            cur.review_reason = rev_reasons[0]
+        result.append(cur)
+        i = j
+
+    return result
+
+
+
 def split_segments_at_file_boundaries(
     segments: list[Segment],
     files_info: list[dict] | dict[str, tuple[float, float]] | None,
@@ -388,4 +590,72 @@ def split_segments_at_file_boundaries(
                 ))
 
     return split_result
+
+
+def resolve_presence_segments(
+    segments: list[Segment],
+    max_presence_gap_s: float = 180.0,
+    person_conf_threshold: float = 0.20,
+) -> list[Segment]:
+    """
+    基于时序因果链，识别并升级“有人驻留/静止陪伴 (PRESENCE)”切片。
+    当画面在活动事件（DYNAMIC / DYNAMIC_AUDIO / PRESENCE / MICRO_MOTION）之间存在 <= max_presence_gap_s 的静态停顿，
+    且因果链中存在有效主体活动证据时，说明人物并未离开房间，仅处于静坐、看书、看手机或微停顿、睡眠状态。
+    将其从 STATIC 提升为 PRESENCE，渲染端将以温和快进 (4x) 保留，避免人物在 Vlog 中被误当抽帧丢弃。
+    采用多轮因果链传递算法，支持复杂场景下复合事件链（如 动态->短音频->静坐->微动）的全量覆盖。
+    """
+    if len(segments) < 3:
+        return segments
+
+    active_states = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION"}
+
+    changed = True
+    passes = 0
+    while changed and passes < 10:
+        changed = False
+        passes += 1
+        n = len(segments)
+        for i in range(1, n - 1):
+            cur = segments[i]
+            if cur.state != "STATIC":
+                continue
+
+            dur = cur.end_time - cur.start_time
+            if dur > max_presence_gap_s:
+                continue
+
+            prev_seg = segments[i - 1]
+            next_seg = segments[i + 1]
+
+            left_active = prev_seg.state in active_states
+            right_active = next_seg.state in active_states
+
+            # 强化的因果链主体证据：
+            # 1. 邻近置信度达标 (>= person_conf_threshold) 或已判定驻留 (PRESENCE)
+            # 2. 两端均为真实动态 (DYNAMIC <-> DYNAMIC)，证明人处于同一连续活动周期的短暂停顿
+            # 3. 动态/驻留与微动交替 (DYNAMIC/PRESENCE <-> MICRO_MOTION) 且停顿期残余能量 >= 2.0
+            # 4. 停顿期自身存在显著残余运动能量 (max_energy >= 2.5) 且两侧处于活动态
+            has_person_evidence = (
+                prev_seg.avg_confidence >= person_conf_threshold
+                or next_seg.avg_confidence >= person_conf_threshold
+                or prev_seg.state == "PRESENCE"
+                or next_seg.state == "PRESENCE"
+                or (prev_seg.state == "DYNAMIC" and next_seg.state == "DYNAMIC")
+                or (cur.max_energy >= 2.5 and (left_active or right_active))
+                or (prev_seg.state == "DYNAMIC_AUDIO" and next_seg.state in ("DYNAMIC", "MICRO_MOTION"))
+                or (next_seg.state == "DYNAMIC_AUDIO" and prev_seg.state in ("DYNAMIC", "MICRO_MOTION"))
+                or (prev_seg.state in ("DYNAMIC", "PRESENCE") and next_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
+                or (next_seg.state in ("DYNAMIC", "PRESENCE") and prev_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
+            )
+
+            if left_active and right_active and has_person_evidence:
+                cur.state = "PRESENCE"
+                conf_candidates = [s.avg_confidence for s in (prev_seg, next_seg) if s.avg_confidence > 0]
+                cur.avg_confidence = round(sum(conf_candidates) / len(conf_candidates), 4) if conf_candidates else 0.35
+                cur.review_reason = f"TARGET_PERSISTENCE: 驻留静坐陪伴(持续{dur:.1f}s)"
+                changed = True
+
+    return coalesce_micro_motion_segments(segments, gap_tolerance=5.0)
+
+
 

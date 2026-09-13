@@ -409,3 +409,27 @@ def test_prescreen_audio_gate_disabled_by_default(tmp_path):
             row = db.conn.execute("SELECT prescreen_status FROM file_tasks WHERE filepath = ?", (filepath,)).fetchone()
             assert row[0] == "STATIC"
     db.close()
+
+
+def test_prescreen_audio_gate_enabled_wakes_up_suspicious(tmp_path):
+    """验证当启用 prescreen_audio_gate 时，画面静态但有声音事件的文件被成功唤醒为 SUSPICIOUS。"""
+    db = VlogDatabase(db_path=tmp_path / "audio_gate_enabled.db")
+    filepath = "cam0_crying_baby_dark.mp4"
+    db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901001000", 600.0)
+
+    cfg = {
+        "pipeline": {"render_start_delay": 0},
+        "audio_vad": {"prescreen_audio_gate": True},
+        "detection": {"prescreen_parallel": 1, "analysis_max_workers": 1},
+    }
+    orch = StreamingOrchestrator(db=db, date="20260901", cam_index=0, config=cfg, render_enabled=False, dashboard_enabled=False)
+    orch.prescreen_queue.put({"filepath": filepath, "file_duration": 600.0})
+    orch.stop_event.set()
+
+    with patch("src.pipeline.prescreen_file", return_value={"status": "STATIC", "has_audio": True, "result_json": "{}"}), \
+         patch("src.pipeline.detect_audio_activity", return_value=([(10.0, 15.0, -28.0)], {"active_ratio": 0.05})) as mock_vad:
+            orch._prescreen_worker("cpu")
+            mock_vad.assert_called_once()
+            row = db.conn.execute("SELECT prescreen_status FROM file_tasks WHERE filepath = ?", (filepath,)).fetchone()
+            assert row[0] == "SUSPICIOUS"
+    db.close()

@@ -4,7 +4,7 @@ import time as _time
 import threading
 from dataclasses import dataclass
 
-from src.config import load_config
+from src.core.config import load_config
 
 logger = logging.getLogger("homevlog")
 

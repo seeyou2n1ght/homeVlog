@@ -11,12 +11,15 @@ from pathlib import Path
 from src.utils import TEMP_DIR
 from src.scheduler import acquire_with_retry, VideoLease
 from src.ffmpeg import run_ffmpeg
-from src.timeline import build_concat_filter
+from src.stages.timeline import build_concat_filter, compute_display_plans
 from src.monitor import get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
 
+ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "MICRO_MOTION")
+
 _FFMPEG_PROGRESS_RE = re.compile(
+
     r"frame=\s*(\d+)\s+fps=\s*([\d.]+).*?speed=\s*([\d.]+)x"
 )
 
@@ -175,8 +178,9 @@ def build_virtual_concat_plan(
     dynamic_ranges = [
         [float(seg.start_in_file), float(seg.end_in_file)]
         for seg in timeline
-        if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        if seg.state in ACTIVE_STATES
     ]
+
     windows: list[list[float]] = []
     gap_limit = max(0.0, float(dynamic_coalesce_gap_s))
     window_limit = max(1.0, float(dynamic_window_max_s))
@@ -255,8 +259,9 @@ def build_compact_virtual_concat_plan(
     dynamic_ranges = [
         [float(seg.start_in_file), float(seg.end_in_file)]
         for seg in timeline
-        if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        if seg.state in ACTIVE_STATES
     ]
+
     windows: list[list[float]] = []
     gap_limit = max(0.0, float(dynamic_coalesce_gap_s))
     window_limit = max(1.0, float(dynamic_window_max_s))
@@ -463,8 +468,9 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     else:
         scale_mode = "cpu"
 
-    has_dynamic = any(s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in batch_copy)
-    all_dynamic = bool(batch_copy) and all(s.state in ("DYNAMIC", "DYNAMIC_AUDIO") for s in batch_copy)
+    has_dynamic = any(s.state in ACTIVE_STATES for s in batch_copy)
+    all_dynamic = bool(batch_copy) and all(s.state in ACTIVE_STATES for s in batch_copy)
+
     # Mixed EDL stays behind its own rollout switch.  The continuous sparse
     # filter remains the conservative fallback when a platform cannot preserve
     # concat-demuxer timestamps accurately.
@@ -497,11 +503,12 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             virtual_mixed = False
             prebuilt_plan = None
     if virtual_mixed:
-        # Repeated inpoints on the same HEVC source produce overlapping CUDA
-        # decoder DTS on this FFmpeg/driver combination.  Compact EDLs decode
-        # only a small fraction of the source, so software decode is both
-        # deterministic and still cheaper than a full-file NVDEC pass.
-        scale_mode = "cpu"
+        if enc_for_batch == "nv":
+            scale_mode = "cuda_passthrough"
+        elif enc_for_batch == "qsv":
+            scale_mode = "qsv"
+        else:
+            scale_mode = "cpu"
     descriptor_path = None
     staged_source = None
     input_args = None
@@ -538,9 +545,9 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             "-segment_time_metadata", "1",
             "-f", "concat", "-safe", "0",
         ]
-        if enc_for_batch == "nv" and not virtual_mixed:
+        if enc_for_batch == "nv":
             input_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        elif enc_for_batch == "qsv" and not virtual_mixed:
+        elif enc_for_batch == "qsv":
             input_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
         input_args += ["-i", str(descriptor_path)]
         if has_dynamic:
@@ -580,10 +587,11 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
 
     # 识别批次内纯静态文件（没有任何动态段），在解复用阶段跳过所有非关键帧解码
-    files_with_dynamic = {s.filepath for s in batch_copy if s.state in ("DYNAMIC", "DYNAMIC_AUDIO")}
+    files_with_dynamic = {s.filepath for s in batch_copy if s.state in ACTIVE_STATES}
     pure_static_files = {f for f in files if f not in files_with_dynamic}
+    presence_cfg = cfg.get("presence", {})
+    micro_cfg = cfg.get("micro_motion", {})
 
-    from src.timeline import compute_display_plans
     expected_duration = sum(d for d, _ in compute_display_plans(
         batch_copy,
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
@@ -592,6 +600,9 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
         speed_ramping=render_cfg.get("speed_ramping_enabled", True),
         ramp_duration_s=render_cfg.get("ramp_duration_s", 1.0),
+        presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
+        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
+        micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     ))
     # Match decoder skipping to the same long-static predicate used by the filter graph.
     interval = seg_cfg.get("static_keyframe_interval", 30.0)
@@ -941,7 +952,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     return None
 
 
-def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -> bool:
+def concat_output_files(files: list[Path], output: Path, timeout: float = 300, faststart: bool = False) -> bool:
     from src.render_cache import valid_video
     if not files:
         return False
@@ -951,8 +962,11 @@ def concat_output_files(files: list[Path], output: Path, timeout: float = 300) -
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
     try:
         concat_list.write_text("\n".join(f"file '{_concat_path(f)}'" for f in files)+"\n", encoding="utf-8")
-        result = run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy",
-                             "-movflags", "+faststart", str(temporary)], timeout=timeout)
+        cmd = ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy"]
+        if faststart:
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(temporary))
+        result = run_ffmpeg(cmd, timeout=timeout)
         if result.returncode != 0 or not valid_video(temporary):
             return False
         temporary.replace(output)
@@ -977,7 +991,7 @@ def _build_enc_args(encoder, out_cfg):
         ]
     else:
         nv = out_cfg.get("nv", {})
-        return [
+        args = [
             "-c:v", nv.get("codec", "hevc_nvenc"),
             "-preset", nv.get("preset", "p3"),
             "-cq", str(nv.get("cq", 28)),
@@ -988,3 +1002,6 @@ def _build_enc_args(encoder, out_cfg):
             "-pix_fmt", nv.get("pix_fmt", "nv12"),
             "-bsf:v", "dump_extra",
         ]
+        if nv.get("tune"):
+            args.extend(["-tune", str(nv["tune"])])
+        return args

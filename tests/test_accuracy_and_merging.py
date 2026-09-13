@@ -492,4 +492,105 @@ def test_config_settings_consumption_closed_loop():
     assert cfg.get("segment", {}).get("max_static_display_duration") == 1.5
 
 
+def test_build_audio_gated_segments():
+    """验证视觉静态音频闸门快速切片构建算法：正确生成 DYNAMIC_AUDIO 与 STATIC，并保持时间轴闭环。"""
+    from src.segment import build_audio_gated_segments
+
+    # 场景 1: 单一音频事件 (10.0 ~ 15.0s, pre_roll=1.0, post_roll=1.5)
+    segs = build_audio_gated_segments(
+        filepath="dummy.mp4",
+        file_duration=60.0,
+        file_start_offset=100.0,
+        audio_events=[(10.0, 15.0, "ACTIVE")],
+        pre_roll=1.0,
+        post_roll=1.5,
+        gap_tolerance=1.5,
+    )
+    assert len(segs) == 3
+    # 静态前置段 [100.0, 109.0]
+    assert segs[0].state == "STATIC"
+    assert segs[0].start_time == 100.0
+    assert segs[0].end_time == 109.0
+    # 音频动态段 [109.0, 116.5]
+    assert segs[1].state == "DYNAMIC_AUDIO"
+    assert segs[1].start_time == 109.0
+    assert segs[1].end_time == 116.5
+    # 静态后置段 [116.5, 160.0]
+    assert segs[2].state == "STATIC"
+    assert segs[2].start_time == 116.5
+    assert segs[2].end_time == 160.0
+
+    # 场景 2: 空音频事件，全片保全为单个静态段
+    empty_segs = build_audio_gated_segments(
+        filepath="dummy.mp4",
+        file_duration=60.0,
+        file_start_offset=100.0,
+        audio_events=[],
+    )
+    assert len(empty_segs) == 1
+    assert empty_segs[0].state == "STATIC"
+    assert empty_segs[0].start_time == 100.0
+    assert empty_segs[0].end_time == 160.0
+
+
+def test_coalesce_micro_motion_segments():
+    """验证相邻微动切片粘合算法：当两个 MICRO_MOTION 之间静态间隙 <= gap_tolerance 时平滑吸收合并。"""
+    from src.segment import coalesce_micro_motion_segments
+
+    # 准备 3 个切片：MICRO (0~10s) -> STATIC (10~13.4s, 3.4s间隙) -> MICRO (13.4~25s)
+    segs = [
+        Segment(start_time=0.0, end_time=10.0, state="MICRO_MOTION", source_file="test.mp4", max_energy=5.0),
+        Segment(start_time=10.0, end_time=13.4, state="STATIC", source_file="test.mp4", max_energy=0.0),
+        Segment(start_time=13.4, end_time=25.0, state="MICRO_MOTION", source_file="test.mp4", max_energy=6.2),
+    ]
+
+    coalesced = coalesce_micro_motion_segments(segs, gap_tolerance=5.0)
+    assert len(coalesced) == 1
+    assert coalesced[0].state == "MICRO_MOTION"
+    assert coalesced[0].start_time == 0.0
+    assert coalesced[0].end_time == 25.0
+    assert coalesced[0].max_energy == 6.2
+
+    # 若静态间隙为 8.0s (> gap_tolerance=5.0)，则不应吸收
+    segs_wide_gap = [
+        Segment(start_time=0.0, end_time=10.0, state="MICRO_MOTION", source_file="test.mp4"),
+        Segment(start_time=10.0, end_time=18.0, state="STATIC", source_file="test.mp4"),
+        Segment(start_time=18.0, end_time=25.0, state="MICRO_MOTION", source_file="test.mp4"),
+    ]
+    kept = coalesce_micro_motion_segments(segs_wide_gap, gap_tolerance=5.0)
+    assert len(kept) == 3
+    assert kept[1].state == "STATIC"
+
+
+def test_sync_timeline_segments_to_db(tmp_path):
+    """验证全局时间线向数据库 segments 表的状态同步回写机制。"""
+    from src.database import VlogDatabase
+    from src.stages.timeline import TimelineSegment
+
+    db = VlogDatabase(db_path=tmp_path / "sync_test.db")
+    fp = "cam0_test.mp4"
+    db.add_file_task(fp, 0, "20260320", "20260320000000", "20260320001000", 600.0)
+    row = db.conn.execute("SELECT id FROM file_tasks WHERE filepath=?", (fp,)).fetchone()
+    file_id = row[0]
+
+    # 初始化数据库中的切片（原始判定为 STATIC）
+    db.conn.execute("""
+        INSERT INTO segments (file_id, filepath, cam_index, date, start_time, end_time, duration, state, file_start_offset)
+        VALUES (?, ?, 0, '20260320', 10.0, 50.0, 40.0, 'STATIC', 0.0)
+    """, (file_id, fp))
+    db.conn.commit()
+
+    # 模拟时间线因果链升级为 PRESENCE
+    timeline = [
+        TimelineSegment(filepath=fp, input_index=0, start_in_file=10.0, end_in_file=50.0, state="PRESENCE", duration=40.0)
+    ]
+
+    db.sync_timeline_segments("20260320", 0, timeline)
+
+    updated_row = db.conn.execute("SELECT state FROM segments WHERE filepath=?", (fp,)).fetchone()
+    assert updated_row[0] == "PRESENCE"
+    db.close()
+
+
+
 

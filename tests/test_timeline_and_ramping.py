@@ -233,3 +233,70 @@ class TestDisplayPlanAndRampingInverse:
         # 300s 源片按 60x 压缩为 ~5s 展示，末条字幕墙钟应显著晚于起始
         assert "2026-09-01 10:0" in subs
 
+
+class TestPresenceAndMicroMotionPlans:
+    def test_presence_display_duration_and_ramping(self):
+        """PRESENCE 状态按 4x 播放，且相邻 DYNAMIC 时平滑缓入缓出。"""
+        timeline = [
+            TimelineSegment("f1.mp4", 0, 0.0, 10.0, "DYNAMIC", 10.0),
+            TimelineSegment("f1.mp4", 0, 10.0, 50.0, "PRESENCE", 40.0),
+            TimelineSegment("f1.mp4", 0, 50.0, 60.0, "DYNAMIC", 10.0),
+        ]
+        plans = compute_display_plans(
+            timeline,
+            presence_speed_factor=4.0,
+            speed_ramping=True,
+            ramp_duration_s=1.0,
+        )
+        assert len(plans) == 3
+        # DYNAMIC: 10s 源时长对应 10s 展示
+        assert plans[0][0] == pytest.approx(10.0)
+        assert plans[0][1] is None
+
+        # PRESENCE: 40s 源时长在 4x 下对应 10s 展示
+        disp_dur, ramp = plans[1]
+        assert disp_dur == pytest.approx(10.0, abs=0.1)
+        assert ramp is not None
+        assert ramp.has_ramp_in is True
+        assert ramp.has_ramp_out is True
+
+    def test_micro_motion_anchor_duration(self):
+        """MICRO_MOTION 状态保留锚点，其余部分以 16x 巡航。"""
+        timeline = [
+            TimelineSegment("f1.mp4", 0, 0.0, 35.0, "MICRO_MOTION", 35.0),
+        ]
+        plans = compute_display_plans(
+            timeline,
+            micro_motion_anchor_s=3.0,
+            micro_motion_cruise_speed=16.0,
+            speed_ramping=False,
+        )
+        # 35s 源时长: 3s 锚点 + 32s/16 = 3 + 2 = 5s 展示时长
+        disp_dur, ramp = plans[0]
+        assert disp_dur == pytest.approx(5.0, abs=0.1)
+
+    def test_resolve_presence_segments_logic(self):
+        """两段确认有人动态之间的静态停顿应升级为 PRESENCE。"""
+        from src.segment import Segment, resolve_presence_segments
+        segs = [
+            Segment(0.0, 10.0, "DYNAMIC", "f1.mp4", avg_confidence=0.85),
+            Segment(10.0, 46.0, "STATIC", "f1.mp4"),  # 36s 停顿 (<=120s)
+            Segment(46.0, 50.0, "DYNAMIC", "f1.mp4", avg_confidence=0.90),
+        ]
+        resolved = resolve_presence_segments(segs, max_presence_gap_s=120.0, person_conf_threshold=0.30)
+        assert resolved[1].state == "PRESENCE"
+        assert resolved[1].avg_confidence == pytest.approx(0.875)
+        assert "TARGET_PERSISTENCE" in resolved[1].review_reason
+
+    def test_resolve_presence_segments_skip_large_gap(self):
+        """停顿超过 120s 时不自动升级为 PRESENCE。"""
+        from src.segment import Segment, resolve_presence_segments
+        segs = [
+            Segment(0.0, 10.0, "DYNAMIC", "f1.mp4", avg_confidence=0.85),
+            Segment(10.0, 200.0, "STATIC", "f1.mp4"),  # 190s 停顿 (>120s)
+            Segment(200.0, 210.0, "DYNAMIC", "f1.mp4", avg_confidence=0.90),
+        ]
+        resolved = resolve_presence_segments(segs, max_presence_gap_s=120.0, person_conf_threshold=0.30)
+        assert resolved[1].state == "STATIC"
+
+

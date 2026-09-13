@@ -111,13 +111,13 @@ def main():
                 for d in target_dates:
                     if args.cam is not None:
                         db.conn.execute(
-                            "UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING', analysis_segments=NULL WHERE date=? AND cam_index=?",
+                            "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL WHERE date=? AND cam_index=?",
                             (d, args.cam),
                         )
                         db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, args.cam))
                     else:
                         db.conn.execute(
-                            "UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING', analysis_segments=NULL WHERE date=?",
+                            "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL WHERE date=?",
                             (d,),
                         )
                         db.conn.execute("DELETE FROM segments WHERE date=?", (d,))
@@ -126,7 +126,7 @@ def main():
                 console.print(f"[bold cyan]ℹ 已重置日期 [{dates_str}] ({cam_str}) 的分析缓存，将重新精析并渲染。[/bold cyan]")
             else:
                 db.conn.execute(
-                    "UPDATE file_tasks SET prescreen_status='PENDING', analysis_status='PENDING', analysis_segments=NULL"
+                    "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL"
                 )
                 db.conn.execute("DELETE FROM segments")
                 console.print("[bold cyan]ℹ 已重置数据库中所有任务的分析缓存，将全局重新精析并渲染。[/bold cyan]")
@@ -236,7 +236,12 @@ def main():
 
                 for d, cam in active_groups:
                     t0 = time.monotonic()
-                    ok = process_date_cam(db, d, cam, skip_render=skip_render, dashboard_enabled=dashboard_enabled)
+                    ok = process_date_cam(
+                        db, d, cam,
+                        skip_render=skip_render,
+                        dashboard_enabled=dashboard_enabled,
+                        force_render=getattr(args, "force_render", False),
+                    )
                     wall_s = time.monotonic() - t0
                     if ok:
                         ok_count += 1
