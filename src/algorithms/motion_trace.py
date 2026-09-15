@@ -6,9 +6,10 @@ import numpy as np
 
 
 class MotionTrace:
-    def __init__(self, detector, fps):
+    def __init__(self, detector, fps, is_night_mode=False):
         self.detector = detector
         self.dt = 1.0 / fps
+        self.is_night_mode = bool(is_night_mode)
         self.ema = detector.create_ema_model()
         self.grid = detector.create_grid_filter()
         self.previous = None
@@ -39,6 +40,8 @@ class MotionTrace:
                         if self.previous is not None else np.zeros_like(roi, dtype=np.float32))
             # Decoder buffers may be reused after append returns.
             self.previous = roi.copy()
-        energy, _, stats = self.grid.process_frame(saliency, self.dt)
+        energy, _, stats = self.grid.process_frame(
+            saliency, self.dt, is_night_mode=self.is_night_mode
+        )
         self.energies.append(energy)
         self.confidences.append(float(stats.get("max_confidence", 0.0)))

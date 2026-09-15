@@ -949,8 +949,14 @@ class StreamingOrchestrator:
                                 break
                             logger.warning("DB query failed for batch %d: %s", b_idx, e)
                         from src.timeline import build_timeline_from_rows
+                        # Streaming batches must use a stable per-file timeline;
+                        # cross-file presence depends on analysis results that may
+                        # arrive after this batch.
+                        stream_config = dict(self.config)
+                        stream_config["presence"] = dict(self.config.get("presence", {}))
+                        stream_config["presence"]["enabled"] = False
                         batch_segs = build_timeline_from_rows(
-                            all_rows, self.date, target_files=files_to_batch, config=self.config
+                            all_rows, self.date, target_files=files_to_batch, config=stream_config
                         )
 
                         if not batch_segs:
@@ -1463,6 +1469,25 @@ def process_date_cam(
         logger.error(
             "render %s cam%d has %d batch failures, aborting concat to preserve valid batches for resume: %s",
             date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
+        )
+        db.set_render_status(date, cam_index, "FAILED")
+        elapsed_wall = time.monotonic() - t_start
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+        return False
+
+    # A render batch can succeed while an upstream file task failed. Never
+    # publish a day that silently omits failed or unfinished source material.
+    task_rows = db.get_all_file_tasks_for_date(date, cam_index)
+    incomplete = [
+        row for row in task_rows
+        if row.get("prescreen_status") in ("PENDING", "FAILED")
+        or (row.get("prescreen_status") == "SUSPICIOUS"
+            and row.get("analysis_status") != "ANALYZED")
+    ]
+    if incomplete:
+        logger.error(
+            "render %s cam%d blocked: %d source tasks incomplete (first=%s)",
+            date, cam_index, len(incomplete), incomplete[0].get("filepath"),
         )
         db.set_render_status(date, cam_index, "FAILED")
         elapsed_wall = time.monotonic() - t_start

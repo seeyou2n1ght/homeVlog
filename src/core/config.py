@@ -45,7 +45,7 @@ def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a mapping")
     positive = {
-        "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_io_concurrency"),
+        "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_qsv_analysis_concurrency", "max_qsv_render_concurrency", "max_io_concurrency"),
         "detection": ("prescreen_parallel", "analysis_max_workers", "analysis_buffer_mb", "prescreen_segments", "analysis_fps", "prescreen_diff_threshold"),
         "render": (
             "batch_max_files", "max_concurrency", "inactivity_timeout_s",
@@ -81,6 +81,11 @@ def validate_config(config):
     if render_policy == "heterogeneous" and render_conc is not None:
         if int(render_conc) < 2:
             raise ValueError("pipeline.render_gpu_policy 'heterogeneous' requires render.max_concurrency >= 2")
+    hw = config.get("hardware", {})
+    qsv_total = hw.get("max_qsv_concurrency")
+    qsv_analysis = hw.get("max_qsv_analysis_concurrency")
+    if qsv_total is not None and qsv_analysis is not None and float(qsv_analysis) > float(qsv_total):
+        raise ValueError("hardware.max_qsv_analysis_concurrency cannot exceed max_qsv_concurrency")
     seg_cfg = config.get("segment", {})
     min_disp = seg_cfg.get("min_static_display_duration")
     max_disp = seg_cfg.get("max_static_display_duration")

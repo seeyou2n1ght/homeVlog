@@ -206,7 +206,9 @@ class MotionDetector:
                 audio_data, start_offset=start_offset
             )
 
-        trace = frames if isinstance(frames, MotionTrace) else MotionTrace(self, effective_fps)
+        trace = frames if isinstance(frames, MotionTrace) else MotionTrace(
+            self, effective_fps, is_night_mode=self._is_night_time(start_offset)
+        )
         if trace is not frames:
             for frame in frames:
                 trace.append(frame)
@@ -273,6 +275,29 @@ class MotionDetector:
                 "is_audio_active": is_audio_active,
             })
 
+        # Sparse analysis samples must not erase short audio events.
+        if audio_events and results:
+            for ev_start, ev_end, _ in audio_events:
+                start = max(start_offset, float(ev_start))
+                end = min(start_offset + file_duration, float(ev_end)) if file_duration > 0 else float(ev_end)
+                if end <= start:
+                    continue
+                results.extend((
+                    {"time": start, "is_motion": True, "state": "DYNAMIC_AUDIO",
+                     "energy": 0.0, "raw_energy": 0.0, "confidence": 0.0, "is_audio_active": True},
+                    {"time": end, "is_motion": False, "state": "STATIC",
+                     "energy": 0.0, "raw_energy": 0.0, "confidence": 0.0, "is_audio_active": False},
+                ))
+            results.sort(key=lambda item: item["time"])
+            deduped = []
+            for label in results:
+                if deduped and abs(deduped[-1]["time"] - label["time"]) < 1e-6:
+                    if label.get("is_audio_active") or label.get("is_motion"):
+                        deduped[-1] = label
+                else:
+                    deduped.append(label)
+            results = deduped
+
         # 时间轴闭环 (AGENTS.md 铁律): 末帧时间戳严格等于 start_offset + file_duration，
         # 杜绝渲染出的 Vlog 出现时间轴空洞或跳秒
         if file_duration > 0 and results:
@@ -310,6 +335,14 @@ class MotionDetector:
                 # Explicit ultra-long tier; duration alone does not establish static content.
                 return self.fps_tiers.get("ultra_long", self.fps_tiers["long"])
         return self.fps
+
+    def _is_night_time(self, timestamp: float) -> bool:
+        presence = self.config.get("presence", {})
+        if not presence.get("enabled", False):
+            return False
+        start, end = presence.get("night_hours", [23, 7])
+        hour = (float(timestamp) % 86400.0) / 3600.0
+        return (start <= hour < end) if start < end else (hour >= start or hour < end)
 
     def _decode_file(
         self, filepath: str, file_duration: float = 0.0
@@ -368,7 +401,7 @@ class MotionDetector:
         """
         from src.frame_pool import FramePool
         from src.motion_trace import MotionTrace
-        decoded_frames = (MotionTrace(self, effective_fps) if getattr(self, "_stream_motion", False)
+        decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0))) if getattr(self, "_stream_motion", False)
                           else FramePool(self.buffer_limit // 2))
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
@@ -645,7 +678,7 @@ class MotionDetector:
                 effective_fps = video_fps / frame_step
                 if getattr(self, "_stream_motion", False):
                     from src.motion_trace import MotionTrace
-                    decoded_frames = MotionTrace(self, effective_fps)
+                    decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)))
 
                 # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
                 # 保证 yolo_buffer 帧键与分析阶段时间轴严格对齐
@@ -789,28 +822,25 @@ class MotionDetector:
         - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
         - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
-        if file_duration > 0 and has_audio is not None:
-            self.file_duration_detected = file_duration
-            self.has_audio_detected = int(has_audio)
-        else:
-            # Lazy container metadata belongs to Analysis, never the directory scanner.
-            from src.scheduler import get_disk_semaphore
-            disk = get_disk_semaphore()
-            if not acquire_with_retry(disk):
-                raise TimeoutError("Metadata I/O admission timed out")
-            try:
-                with av.open(str(filepath), timeout=30.0) as container:
-                    if file_duration <= 0:
-                        stream = container.streams.video[0]
-                        duration = (float(stream.duration * stream.time_base) if stream.duration
-                                    else float(container.duration or 0) / av.time_base)
-                        if duration <= 0:
-                            raise ValueError("Missing video duration")
-                        file_duration = duration
-                    self.file_duration_detected = file_duration
-                    self.has_audio_detected = int(bool(container.streams.audio))
-            finally:
-                disk.release()
+        self._analysis_start_offset = start_offset
+        # Filename spans are day-relative placement metadata, not media duration.
+        # Analysis is the lazy metadata boundary, so always trust the container.
+        from src.scheduler import get_disk_semaphore
+        disk = get_disk_semaphore()
+        if not acquire_with_retry(disk):
+            raise TimeoutError("Metadata I/O admission timed out")
+        try:
+            with av.open(str(filepath), timeout=30.0) as container:
+                stream = container.streams.video[0]
+                actual_duration = (float(stream.duration * stream.time_base) if stream.duration
+                                   else float(container.duration or 0) / av.time_base)
+                if actual_duration <= 0:
+                    raise ValueError("Missing video duration")
+                file_duration = actual_duration
+                self.file_duration_detected = actual_duration
+                self.has_audio_detected = int(bool(container.streams.audio))
+        finally:
+            disk.release()
         # Phase 1: 解码
         from contextlib import nullcontext
         lease = self.device_lease() if hasattr(self, "device_lease") else nullcontext(self.decode_gpu)

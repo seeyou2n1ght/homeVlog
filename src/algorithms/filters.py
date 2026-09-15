@@ -257,7 +257,7 @@ class SpatialGridMotionFilter:
 
         # 4. Spatial-temporal confidence decay grid C_{r,c}(t)
         decay_factor = (
-            float(np.exp(-dt / max(0.1, self.cooldown_half_life)))
+            float(np.exp(-np.log(2.0) * dt / max(0.1, self.cooldown_half_life)))
             if self.cooldown_half_life > 0
             else 0.0
         )

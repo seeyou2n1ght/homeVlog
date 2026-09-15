@@ -48,23 +48,23 @@ uv run python -m pytest tests/
 ### 2.3 单模块聚焦验证
 按功能域独立验证特定子系统：
 ```powershell
-# 验证数据库与持久化契约
-uv run python -m pytest tests/test_database.py
+# 验证数据库与扫描持久化契约
+uv run python -m pytest tests/test_database_and_scanner.py
 
 # 验证时间轴构建与映射
-uv run python -m pytest tests/test_timeline.py
+uv run python -m pytest tests/test_timeline_and_ramping.py
 
 # 验证异构硬件调度与工作窃取
-uv run python -m pytest tests/test_hardware_scheduler.py
+uv run python -m pytest tests/test_scheduler_and_hardware.py
 
 # 验证多模态算法 (EMA / VAD / YOLO)
-uv run python -m pytest tests/test_algorithms.py
+uv run python -m pytest tests/test_motion_and_vad.py tests/test_accuracy_and_merging.py
 
 # 验证流式流水线编排与断点续传
-uv run python -m pytest tests/test_streaming_pipeline.py
+uv run python -m pytest tests/test_pipeline_streaming.py tests/test_resumption_and_shutdown.py
 
 # 验证 Web 审核平台与数据接口
-uv run python -m pytest tests/test_audit_workbench.py
+uv run python -m pytest tests/test_audit_service.py
 ```
 
 ### 2.4 本机真实硬件加速冒烟验收
@@ -93,8 +93,8 @@ HomeVlog 基于多模态融合（空间集中度预筛选 + EMA 运动差分 + A
 
 ## 4. 自动化测试套件执行基线 (Test Baseline)
 
-- **测试用例总数**: ~212 项（覆盖全流程）
-- **常规软测试耗时**: ~12.0 ~ 15.0 秒（基于 Intel 12 代 i5 / SSD 环境）
+- **测试用例总数**: 231 项通过，6 项硬件/环境条件跳过（最近一次验证）
+- **常规软测试耗时**: 约 24 秒（基于当前 Windows 开发环境）
 - **测试通过率要求**: **100% Passed**（除特定依赖物理硬件而显式跳过的 Case 外，不得有任何 Error 或 Failure）
 - **核心覆盖领域**:
   - `core/`: 数据库 WAL 并发、单行索引、状态机转换、配置隔离与参数校验

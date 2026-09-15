@@ -225,6 +225,8 @@ class YoloVerifier:
         from src.algorithms.segment import resolve_presence_segments
         cfg = getattr(self, "config", None) or {}
         pres_cfg = cfg.get("presence", {})
+        if not pres_cfg.get("enabled", True):
+            return _merge_same_state(segments, gap_tolerance=1.5)
         presence_gap = float(pres_cfg.get("max_presence_gap_s", 180.0))
         presence_conf = float(pres_cfg.get("person_conf_threshold", 0.20))
         night_enabled = bool(pres_cfg.get("night_stationary_enabled", True))

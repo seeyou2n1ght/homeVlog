@@ -188,7 +188,9 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
         return segments
     seg_cfg = config.get("segment", {})
     presence = config.get("presence", {})
-    high_threshold = float(config.get("micro_motion", {}).get("energy_threshold", 5.5))
+    micro_cfg = config.get("micro_motion", {})
+    high_threshold = (float(micro_cfg.get("energy_threshold", 5.5))
+                      if micro_cfg.get("enabled", True) else float("inf"))
     night_start, night_end = presence.get("night_hours", [23, 7])
 
     def is_night(t):

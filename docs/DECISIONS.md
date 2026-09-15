@@ -73,6 +73,7 @@ Superseded by: ADR xxxx
 | ADR 0013 | 五级自适应睡眠浓缩与滤镜图硬截断不变量 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0012 |
 | ADR 0014 | 异构分析与渲染 QSV 硬件信号量池隔离 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0010 |
 | ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
+| ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
 
 ---
 
@@ -1016,6 +1017,27 @@ docs/ARCHITECTURE.md
 - 单个配置项新增；
 - Benchmark 数值变化；
 - 不改变外部行为的性能优化。
+
+---
+
+# 17. ADR 0016 — Stable Streaming Timeline and Source Completion Gate
+
+**Status:** Accepted
+**Date:** 2026-09
+
+## Context
+
+流式渲染可能早于所有文件分析完成。此时跨文件 presence 推断会随着邻居任务完成顺序改变，导致同一批次在不同运行时得到不同时间轴；同时，单个渲染批次成功不能证明所有源文件都已成功分析。
+
+## Decision
+
+- 流式渲染批次只使用已持久化的单文件分析结果，暂不执行跨文件 presence 重判。
+- 日期/机位在合并成片前必须通过源任务完成门禁；`PENDING`、`FAILED` 或未完成的可疑分析会阻止发布。
+- 全量时间轴构建路径仍可在分析结果稳定后执行跨文件 presence 传播。
+
+## Consequences
+
+流式阶段牺牲部分 presence 跨文件优化，以换取批次时间轴确定性和失败可恢复性。源任务失败会保留已成功批次，等待修复后续跑。
 
 ---
 

@@ -593,6 +593,7 @@ def build_timeline_from_rows(
     date: str,
     target_files: set[str] | list[str] | None = None,
     config: dict | None = None,
+    resolve_presence: bool = True,
 ) -> list[TimelineSegment]:
     """
     基于给定的数据库任务行集合构建时间轴片段，支持按 target_files 精准局部过滤。
@@ -662,15 +663,16 @@ def build_timeline_from_rows(
     night_hours = tuple(presence_cfg.get("night_hours", [23, 7]))
     stationary_energy_max = float(presence_cfg.get("stationary_energy_max", 2.5))
     min_stationary_duration_s = float(presence_cfg.get("min_stationary_duration_s", 180.0))
-    filtered = resolve_presence_segments(
-        filtered,
-        max_presence_gap_s=presence_gap,
-        person_conf_threshold=presence_conf,
-        night_stationary_enabled=night_enabled,
-        night_hours=night_hours,
-        stationary_energy_max=stationary_energy_max,
-        min_stationary_duration_s=min_stationary_duration_s,
-    )
+    if resolve_presence and presence_cfg.get("enabled", True):
+        filtered = resolve_presence_segments(
+            filtered,
+            max_presence_gap_s=presence_gap,
+            person_conf_threshold=presence_conf,
+            night_stationary_enabled=night_enabled,
+            night_hours=night_hours,
+            stationary_energy_max=stationary_energy_max,
+            min_stationary_duration_s=min_stationary_duration_s,
+        )
 
     # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
     reviews = [r for row in rows for r in row.get("human_reviews", [])]
