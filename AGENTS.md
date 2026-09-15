@@ -1,188 +1,132 @@
 # AGENTS.md
 
-This repository contains the HomeVlog video analysis and rendering pipeline.
+This file defines repository-level execution rules and routes coding agents to the authoritative project documentation.
 
-This file defines repository-level constraints and routes coding agents to the project state, architecture, testing, and decision documentation. Do not treat it as a complete description of the implementation.
+It is not a complete description of the implementation.
 
 ---
 
 ## 1. Project Goals
 
-HomeVlog processes long-duration surveillance / home video into condensed Vlogs.
+HomeVlog processes long-duration surveillance and home video into condensed daily Vlogs.
 
-The system is optimized for:
+When making engineering trade-offs, prioritize:
 
-- long-running batch processing;
-- NAS and imperfect source media;
-- hardware-accelerated decoding / analysis / rendering;
-- resumable execution;
-- deterministic timeline generation;
-- graceful degradation instead of whole-pipeline failure.
-
-When making architectural trade-offs, prioritize:
-
-1. correctness of the final timeline;
+1. final timeline correctness;
 2. recoverability and resumability;
-3. bounded hardware resource usage;
-4. throughput;
+3. bounded hardware and I/O usage;
+4. end-to-end pipeline makespan;
 5. implementation simplicity.
+
+The system is expected to tolerate NAS instability, damaged media, seek failures, interrupted execution, and heterogeneous hardware.
 
 ---
 
 ## 2. Core Architecture Invariants
 
-These constraints apply across the repository unless an explicit architecture decision replaces them.
+These constraints apply across the repository unless explicitly replaced by a recorded architecture decision.
 
-### Single Decode
+### Single-Pass Analysis
 
-Decode source media once whenever practical and allow multiple consumers to reuse the decoded data.
-
-Do not introduce independent full decode pipelines for YOLO, motion analysis, or other consumers without an explicit architectural justification.
+Avoid independent full decode pipelines for consumers that can reuse existing decoded data.
 
 ### In-Memory Intermediate Frames
 
-Candidate frames should remain in memory using the existing compressed-frame pipeline.
+Intermediate candidate frames should remain in memory whenever practical.
 
-Avoid introducing large numbers of temporary image files or unnecessary disk I/O in intermediate processing stages.
+Do not introduce large numbers of temporary image files as stage-to-stage transport.
 
 ### Fault-Tolerant Processing
 
-NAS instability, damaged media, seek failures, and partial processing failures are expected operating conditions.
-
-Prefer:
+Isolated media or processing failures should normally:
 
 ```text
-failure
-→ record diagnostics
-→ safely skip or degrade
-→ continue pipeline
+diagnose → record → safely degrade/skip → continue
 ```
 
-over terminating an entire Vlog job when the failed unit can be isolated.
-
-Do not silently ignore failures that can affect timeline correctness or final-output integrity.
+Do not silently continue when timeline correctness, batch integrity, or final output integrity may be affected.
 
 ### Deterministic Timeline
 
-Rendering, subtitles, detection results, and wall-clock mapping must derive from a consistent timeline model.
+Rendering, subtitles, source-time mapping, and display duration must derive from the shared timeline model.
 
-`timeline.compute_display_plans()` is the authoritative source for display-duration planning.
-
-Changes affecting timestamps, duration calculation, segment transformation, or subtitle mapping require review against the timeline contract documented in `docs/ARCHITECTURE.md`.
+`timeline.compute_display_plans()` is the authoritative display-plan entry point.
 
 ### Controlled Hardware Concurrency
 
-GPU / QSV / FFmpeg concurrency must use the existing scheduler abstractions.
+Hardware resources must be managed through the existing scheduler abstractions.
 
-Do not bypass:
-
-- `src.scheduler.get_nv_semaphore()`
-- `src.scheduler.get_qsv_semaphore()`
-- `WorkStealingManager`
-
-or introduce independent hardware-concurrency control without updating the architecture decision.
+Do not introduce independent concurrency control that bypasses the scheduler.
 
 ### Managed FFmpeg Lifecycle
 
-Long-running FFmpeg subprocesses must participate in the repository's process lifecycle management.
-
-Processes created through `subprocess.Popen` must not become unmanaged orphan processes.
-
-Use the existing `FFmpegProcessRegistry` and guarantee cleanup during exceptions and Ctrl+C shutdown.
+Long-running FFmpeg subprocesses must participate in the repository process lifecycle and be cleanly terminable.
 
 ### Resumable Rendering
 
-Rendered batches are transactional units.
+Rendered batches are transactional work units.
 
-Incomplete output must not be indistinguishable from valid output.
-
-Preserve the existing pattern:
-
-```text
-temporary batch
-→ process completion
-→ validate exit status / output
-→ atomic promotion
-→ final batch
-```
-
-Do not remove valid completed batches during normal cleanup unless explicitly performing a full reset.
+Incomplete output must never be indistinguishable from valid completed output.
 
 ---
 
 ## 3. Repository-Specific Constraints
 
-### Metadata Loading
+### Metadata
 
 `src/scanner.py` must remain lightweight.
 
-Do not introduce blocking media probing such as per-file `ffprobe` calls during scanning.
+Do not introduce blocking per-file media probing during directory scanning.
 
-Media metadata should be lazily resolved during analysis and persisted through the existing metadata/database pipeline.
+Media metadata should be resolved lazily through the existing analysis pipeline and persisted.
 
-### Configuration Integrity
+### Configuration
 
-Every user-facing key in `config/settings.yaml` must correspond to real runtime behavior.
+Every user-facing key in `config/settings.yaml` must have real runtime semantics.
 
-When changing configuration:
+Do not add configuration without wiring its behavior.
 
-- new keys require implementation wiring;
-- removed behavior requires removal of obsolete keys;
-- preset / enum values require matching runtime branches.
+Do not leave obsolete or unused configuration keys behind.
 
-Avoid configuration that exists only in YAML without executable semantics.
+### Human Feedback
 
-### Human Feedback Priority
+Explicit human review must take precedence over algorithmic classification when rebuilding the final timeline.
 
-For timeline reconstruction, explicit human labels override algorithmic status.
+### Performance
 
-In particular, logic involving `human_label` and `algo_status` must preserve the repository's human-feedback precedence rules.
+Optimize for end-to-end pipeline makespan rather than maximizing utilization of an individual worker or device.
 
-### Performance Metrics
-
-Do not mix aggregate worker CPU/GPU time with elapsed wall-clock time.
-
-Performance tooling and reports must distinguish at least:
-
-- Worker Time
-- Wall-clock Time
-
-Performance baselines belong in `docs/PROGRESS.md` and `docs/ARCHITECTURE.md`.
+Distinguish wall-clock time from aggregate worker time when evaluating performance.
 
 ---
 
 ## 4. Module-Level Invariants
 
-Detailed implementation invariants are documented outside this file.
-
-Before modifying the corresponding subsystem, read its relevant architecture section.
-
-Important examples include:
-
-- semaphore ownership and exactly-once release;
-- FFmpeg process registration and deregistration;
-- grayscale analysis pipe format;
-- render-worker sentinel semantics;
-- render completion / batch reconciliation;
-- static-segment fast paths;
-- timeline endpoint semantics;
-- effective-FPS-based YOLO sampling;
-- frame archival fallback behavior;
-- active-learning dataset composition.
-
-Primary reference:
+Detailed subsystem contracts are documented in:
 
 ```text
 docs/ARCHITECTURE.md
 ```
 
-Do not duplicate detailed implementation rules in this file unless they apply broadly across multiple subsystems.
+Examples include:
+
+- semaphore ownership and exactly-once release;
+- NVENC / NVDEC / QSV scheduling semantics;
+- FFmpeg registration and cleanup;
+- grayscale analysis-frame contract;
+- render-worker termination semantics;
+- atomic render batches and completion reconciliation;
+- timeline closure and source/display-time mapping;
+- adaptive analysis FPS;
+- active-learning and frame-archival behavior.
+
+Do not duplicate detailed implementation rules here unless they apply broadly across multiple subsystems.
 
 ---
 
 ## 5. Project Documentation
 
-The repository documentation is authoritative for persistent project knowledge.
+Repository documentation is authoritative for persistent project knowledge.
 
 ### Architecture
 
@@ -190,17 +134,17 @@ The repository documentation is authoritative for persistent project knowledge.
 docs/ARCHITECTURE.md
 ```
 
-Contains:
+Contains the current:
 
 - system architecture;
 - module boundaries;
 - pipeline and data flow;
+- data contracts;
 - concurrency model;
 - timeline contract;
-- critical implementation invariants;
-- architecture decisions.
+- subsystem invariants.
 
-Read the relevant section before making structural changes.
+Read the relevant section before structural or cross-module changes.
 
 ### Project State
 
@@ -208,15 +152,16 @@ Read the relevant section before making structural changes.
 docs/PROGRESS.md
 ```
 
-Contains the current project state:
+Contains:
 
-- current focus;
+- current goal;
 - work in progress;
 - known issues;
+- blockers;
 - recently completed work;
-- next high-priority tasks.
+- next high-priority actions.
 
-For non-trivial work, read this file at task start.
+Read it at the start of non-trivial work.
 
 ### Decisions
 
@@ -224,19 +169,20 @@ For non-trivial work, read this file at task start.
 docs/DECISIONS.md
 ```
 
-Contains architectural or engineering decisions whose rationale should survive across sessions.
+Contains durable architectural and engineering decisions and their rationale.
 
-Record a decision when a change introduces or materially modifies:
+Create or update an ADR when changing:
 
 - architectural boundaries;
-- data contracts;
-- concurrency semantics;
+- cross-stage data contracts;
+- concurrency or resource semantics;
 - persistence semantics;
 - pipeline behavior;
-- hardware scheduling strategy;
-- recovery behavior.
+- timeline semantics;
+- hardware scheduling model;
+- recovery or resumability semantics.
 
-Do not record routine implementation details as decisions.
+Do not use ADRs for routine implementation details or parameter tuning.
 
 ### Testing
 
@@ -246,14 +192,27 @@ docs/TESTING.md
 
 Contains:
 
-- test strategy;
+- verification strategy;
 - test organization;
 - environment requirements;
 - verification commands;
-- quality and accuracy acceptance baselines;
-- known testing limitations.
+- known test limitations.
 
-Hardware baselines and production telemetry belong in `docs/ARCHITECTURE.md` and `docs/PROGRESS.md`.
+### Benchmarks
+
+```text
+docs/BENCHMARK.md
+```
+
+Contains reproducible:
+
+- performance baselines;
+- workload definitions;
+- hardware measurements;
+- optimization comparisons;
+- benchmark results.
+
+Do not create dated one-off benchmark documents unless explicitly required.
 
 ---
 
@@ -263,15 +222,15 @@ For non-trivial repository work:
 
 1. Read this `AGENTS.md`.
 2. Read `docs/PROGRESS.md`.
-3. Identify the affected subsystem.
+3. Identify the affected subsystem and task boundary.
 4. Read the relevant section of `docs/ARCHITECTURE.md`.
-5. Read relevant entries in `docs/DECISIONS.md` when the task touches an existing architectural decision.
+5. Read relevant ADRs when the task touches an existing architectural decision.
 6. Inspect the smallest necessary code surface.
-7. Identify the appropriate verification path before making changes.
+7. Identify the verification path before changing code.
 
-Do not start by reading the entire repository.
+Do not begin by reading the entire repository.
 
-Expand context only when dependencies or observed behavior require it.
+Expand context only when dependencies, failures, or observed behavior require it.
 
 ---
 
@@ -284,58 +243,56 @@ Avoid:
 - unrelated refactors during feature or bug-fix work;
 - opportunistic cleanup outside the affected subsystem;
 - duplicating existing abstractions;
-- bypassing scheduler, timeline, configuration, or lifecycle abstractions for local convenience.
+- bypassing scheduler, timeline, configuration, persistence, or lifecycle abstractions for local convenience.
 
-Before changing repository structure or introducing a new abstraction, verify that the same responsibility is not already implemented elsewhere.
+Before introducing a new abstraction or repository structure, verify that the same responsibility is not already implemented elsewhere.
 
-Preserve unrelated user modifications in the working tree.
+Preserve unrelated user modifications.
 
 ---
 
 ## 8. Testing and Verification
 
-The repository uses `uv` for Python environment and dependency management.
+Use `uv` for the project environment and dependency execution.
 
-Do not replace the configured CUDA-enabled PyTorch dependency with a CPU-only build unless explicitly required.
+Do not replace the configured CUDA-enabled PyTorch environment with a CPU-only build unless explicitly required.
 
-### Standard test suite
+Run the smallest relevant verification first.
 
-```powershell
+Repository-level verification:
+
+```bash
 uv run python -m pytest tests/
 ```
 
-### Syntax / import compilation check
+Compilation check:
 
-```powershell
+```bash
 uv run python -m compileall main.py src scripts
 ```
 
-Run the smallest relevant verification first during development.
+Compilation success is not sufficient evidence of behavioral correctness.
 
-Before considering a substantial change complete, run all relevant repository-level verification required by `docs/TESTING.md`.
-
-A change is not considered correct merely because the code compiles.
-
-For changes affecting concurrency, FFmpeg lifecycle, timeline behavior, resume behavior, or hardware scheduling, include targeted behavioral verification.
+Changes involving concurrency, FFmpeg, timeline semantics, resumability, persistence, or hardware scheduling require targeted behavioral verification defined in `docs/TESTING.md`.
 
 ---
 
 ## 9. Test Organization
 
-Keep tests organized around stable business or subsystem boundaries rather than individual bugs.
+Organize tests around stable subsystems or business behavior rather than individual bugs.
 
-Prefer extending an existing suite for:
+Prefer extending existing suites for areas such as:
 
-- database / scanning;
-- rendering / FFmpeg;
-- hardware scheduling;
-- review / feedback services;
+- scanning and persistence;
+- analysis and detection;
 - timeline behavior;
-- multimodal / detection logic.
+- rendering and FFmpeg;
+- hardware scheduling;
+- review and human feedback.
 
-Shared video-generation helpers, fixtures, and mock factories belong in `tests/conftest.py` or an established shared testing utility.
+Reusable fixtures, mock factories, and synthetic media helpers belong in shared test utilities such as `tests/conftest.py`.
 
-Do not create a new test file solely for one small regression if an appropriate existing suite exists.
+Do not create a dedicated test file for a single small regression when an appropriate subsystem suite already exists.
 
 ---
 
@@ -345,27 +302,28 @@ Before modifying or reverting a file with existing changes, inspect the current 
 
 Do not discard, overwrite, reset, stash, or revert unrelated user work.
 
-If repository state is ambiguous, preserve the current state and diagnose before performing destructive Git operations.
+If repository state is ambiguous, preserve the current state and diagnose before destructive Git operations.
 
-Local agent transcripts or tool history may be used as recovery evidence, but they are not a substitute for normal Git-tracked project state.
+Agent transcripts or tool history may be used as recovery evidence, but they are not a substitute for Git-tracked project state.
 
 ---
 
 ## 11. Task Completion Protocol
 
-Before declaring a non-trivial task complete:
+Before declaring non-trivial work complete:
 
-1. Run relevant verification.
+1. Run the relevant verification.
 2. Confirm no known regression or incomplete intermediate state remains.
-3. Review whether `docs/PROGRESS.md` must be updated.
-4. Review whether the change modified architecture or an important invariant.
-5. If so, update `docs/ARCHITECTURE.md` and/or `docs/DECISIONS.md`.
-6. Review whether the task exposed a reusable project-level rule or failure pattern.
-7. Update project guidance only when that knowledge is expected to matter in future tasks.
+3. Review whether `docs/PROGRESS.md` requires an update.
+4. Review whether current architecture or subsystem invariants changed.
+5. If so, update `docs/ARCHITECTURE.md`.
+6. If an important engineering decision was introduced or replaced, update `docs/DECISIONS.md`.
+7. If meaningful performance evidence changed, update `docs/BENCHMARK.md`.
+8. Evaluate whether the task exposed a reusable project-level rule or recurring failure pattern.
 
-Do not update documentation merely to record that a routine task occurred.
+Do not update documentation merely to record that routine work occurred.
 
-Persist information that future agents would otherwise need to rediscover.
+Persist information that a future agent would otherwise have to rediscover.
 
 ---
 
@@ -375,48 +333,31 @@ Documentation should be concise, factual, and maintained as persistent engineeri
 
 Avoid:
 
-- duplicate descriptions of the same architecture;
+- duplicate architecture descriptions;
 - temporary investigation reports in `docs/`;
 - narrative development diaries;
 - stale configuration documentation;
-- implementation details duplicated across multiple documents.
+- implementation details duplicated across multiple files;
+- benchmark numbers copied into architecture documentation.
 
-Use:
+Document responsibilities:
 
 ```text
 AGENTS.md
-```
+    Repository-wide execution rules and documentation routing
 
-for repository-wide execution rules and documentation routing.
-
-Use:
-
-```text
 docs/ARCHITECTURE.md
-```
+    Current architecture and subsystem invariants
 
-for architecture and subsystem invariants.
-
-Use:
-
-```text
 docs/PROGRESS.md
-```
+    Current project state
 
-for current project state.
-
-Use:
-
-```text
 docs/DECISIONS.md
-```
+    Durable engineering decisions and rationale
 
-for durable engineering decisions.
-
-Use:
-
-```text
 docs/TESTING.md
-```
+    Verification strategy
 
-for verification strategy and quality baselines.
+docs/BENCHMARK.md
+    Reproducible performance evidence
+```

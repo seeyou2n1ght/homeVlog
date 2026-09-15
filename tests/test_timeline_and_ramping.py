@@ -260,20 +260,18 @@ class TestPresenceAndMicroMotionPlans:
         assert ramp.has_ramp_in is True
         assert ramp.has_ramp_out is True
 
-    def test_micro_motion_anchor_duration(self):
-        """MICRO_MOTION 状态保留锚点，其余部分以 16x 巡航。"""
+    def test_micro_motion_cruises_between_explicit_activity_events(self):
+        """常速动作已分段；微动展示不再附加未定位的锚点。"""
         timeline = [
             TimelineSegment("f1.mp4", 0, 0.0, 35.0, "MICRO_MOTION", 35.0),
         ]
         plans = compute_display_plans(
             timeline,
-            micro_motion_anchor_s=3.0,
             micro_motion_cruise_speed=16.0,
             speed_ramping=False,
         )
-        # 35s 源时长: 3s 锚点 + 32s/16 = 3 + 2 = 5s 展示时长
         disp_dur, ramp = plans[0]
-        assert disp_dur == pytest.approx(5.0, abs=0.1)
+        assert disp_dur == pytest.approx(35.0 / 16, abs=0.001)
 
     def test_resolve_presence_segments_logic(self):
         """两段确认有人动态之间的静态停顿应升级为 PRESENCE。"""

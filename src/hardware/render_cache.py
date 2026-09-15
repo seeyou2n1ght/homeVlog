@@ -24,8 +24,8 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
 
 
 def processing_fingerprint(filepath, config):
-    selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment")}
-    return render_fingerprint([filepath], "analysis-v2", "analysis", 0, {}, {}, selected)
+    selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")}
+    return render_fingerprint([filepath], "analysis-v3-temporal-activity", "analysis", 0, {}, {}, selected)
 
 
 def valid_video(path, expected_duration=None):

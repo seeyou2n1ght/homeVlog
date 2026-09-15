@@ -476,6 +476,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     # concat-demuxer timestamps accurately.
     virtual_enabled = (
         bool(render_cfg.get("virtual_concat_enabled", True))
+        and render_cfg.get("static_mode") != "continuous"
         and len(files) == 1
         and not all_dynamic
         and (not has_dynamic or bool(render_cfg.get("virtual_concat_mixed_enabled", False)))
@@ -550,7 +551,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         elif enc_for_batch == "qsv":
             input_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
         input_args += ["-i", str(descriptor_path)]
-        if has_dynamic:
+        if any(r.get("has_audio") for r in rows if r.get("filepath") in files):
             # Keep audio on the original continuous timeline. Repeated concat
             # inpoints can drop AAC priming packets and shorten short motion
             # islands even when video packet metadata is exact.
@@ -578,9 +579,9 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         concat_demuxer=virtual_enabled,
         simple_dynamic=(not virtual_enabled and len(batch_copy) == 1 and
                         batch_copy[0].state in ("DYNAMIC", "DYNAMIC_AUDIO")),
-        sparse_mixed=(not virtual_enabled and bool(render_cfg.get("mixed_sparse_enabled", True))),
+        sparse_mixed=(not virtual_enabled and render_cfg.get("static_mode") != "continuous" and bool(render_cfg.get("mixed_sparse_enabled", True))),
         static_sample_window_s=render_cfg.get("static_sample_window_s", 0.25),
-        audio_input_offset=1 if virtual_enabled and has_dynamic else 0,
+        audio_input_offset=1 if virtual_enabled and any(r.get("has_audio") for r in rows if r.get("filepath") in files) else 0,
         source_timeline=source_timeline,
     )
 
@@ -602,7 +603,6 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         ramp_duration_s=render_cfg.get("ramp_duration_s", 1.0),
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     ))
     # Match decoder skipping to the same long-static predicate used by the filter graph.
@@ -615,6 +615,8 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             "virtual concat batch %d: %d EDL ranges (%d static samples), one decoder context",
             bi, plan.entries, plan.static_entries,
         )
+    if render_cfg.get("static_mode") == "continuous":
+        pure_static_files = set()
     try:
         result = _run_batch_render(
             files, fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,

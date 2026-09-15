@@ -62,6 +62,8 @@ def validate_config(config):
     for section, keys in positive.items():
         for key in keys:
             if key in config.get(section, {}):
+                if key == "max_static_display_duration" and config[section][key] is None:
+                    continue
                 value = float(config[section][key])
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"{section}.{key} must be positive and finite")

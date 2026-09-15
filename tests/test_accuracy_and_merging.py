@@ -19,6 +19,30 @@ from src.filters import SpatialGridMotionFilter, AudioEnergyVAD
 from scripts.verify_accuracy import fix_database_fragmentation, audit_database
 
 
+def test_temporal_events_survive_smoothing_yolo_rejection_and_audio_overlap():
+    from src.segment import refine_activity_segments
+
+    labels = [{"time": float(t), "energy": 0.2, "raw_energy": 0.2,
+               "is_audio_active": False} for t in range(101)]
+    labels[30]["raw_energy"] = 15  # A brief turn removed by median smoothing.
+    labels[70]["is_audio_active"] = True  # Audio overlapped a rejected visual candidate.
+    cfg = {"segment": {"pre_roll": 1, "post_roll": 1.5, "min_static_duration": 8}}
+    parent = Segment(0, 100, "DYNAMIC", "night.mp4", avg_confidence=0.8)
+    refined = refine_activity_segments([parent], labels, cfg)
+    assert refined[0].state == "NIGHT_STATIONARY"
+    assert any(s.state == "DYNAMIC" and s.start_time <= 28 and s.end_time >= 32.5 for s in refined)
+    assert any(s.state == "DYNAMIC_AUDIO" and s.start_time <= 69 and s.end_time >= 71 for s in refined)
+    assert sum(s.duration for s in refined) == 100
+    assert all(a.end_time == b.start_time for a, b in zip(refined, refined[1:]))
+    rejected = Segment(0, 100, "STATIC", "night.mp4", review_reason="YOLO_NEGATIVE_REQUIRES_AUDIT")
+    refined = refine_activity_segments([rejected], labels, cfg)
+    assert any(s.is_active_motion and s.start_time <= 30 < s.end_time for s in refined)
+    assert any(s.state == "DYNAMIC_AUDIO" and s.start_time <= 70 < s.end_time for s in refined)
+    uncertain = Segment(0, 100, "DYNAMIC", "night.mp4", avg_confidence=0.8, review_reason="YOLO_FAILED")
+    assert all(s.is_active_motion for s in refine_activity_segments([uncertain], labels, cfg))
+    assert refine_activity_segments([parent], labels[:50], cfg) == [parent]
+
+
 def test_yolo_confidence_backfill_and_merge():
     """验证 YOLO 验证阶段真实置信度回填与后置切片原子合并。"""
     config = {

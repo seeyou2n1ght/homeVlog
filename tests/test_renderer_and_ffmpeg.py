@@ -29,6 +29,59 @@ from src.timeline import (
 from tests.helpers import verify_filtergraph_labels_closure
 
 
+def test_fast_forward_keeps_pitch_and_audio_event_timing():
+    import shutil
+    import numpy as np
+    from src.timeline import build_retimed_audio
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg is required for the audio integration check")
+    graph = build_retimed_audio("0:a", "a", 0, 16, 4)
+    result = subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        r"aevalsrc=if(between(t\,8\,12)\,0.5*sin(2*PI*440*t)\,0):s=48000:d=16",
+        "-filter_complex", graph, "-map", "[a]", "-f", "f32le", "pipe:1",
+    ], capture_output=True, timeout=30, check=True)
+    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    assert len(audio) == 4 * 48000
+    assert np.max(np.abs(audio[12000:36000])) < 0.001
+    event = audio[108000:132000]  # Source 9..11 seconds appears at display 2.25..2.75.
+    assert np.sqrt(np.mean(event ** 2)) > 0.1
+    frequency = np.argmax(np.abs(np.fft.rfft(event))) * 48000 / len(event)
+    assert abs(frequency - 440) <= 2
+
+
+def test_continuous_static_video_and_audio_share_display_duration(tmp_path, monkeypatch):
+    import shutil
+    import av
+    import numpy as np
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg is required for the media integration check")
+    monkeypatch.setattr("src.stages.timeline.load_config", lambda: {"render": {"static_mode": "continuous"}})
+    segments = [TimelineSegment("source", 0, 0, 4, "DYNAMIC", 4),
+                TimelineSegment("source", 0, 4, 20, "STATIC", 16)]
+    graph = build_concat_filter(segments, [{"filepath": "source", "has_audio": 1}],
+                               output_fps=10, output_width=160, output_height=90,
+                               static_keyframe_interval=1, keyframe_display_duration=0.25,
+                               speed_ramping=False, audio_input_offset=1)
+    target = tmp_path / "mixed.mkv"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=20:duration=20",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+        "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+        "-c:v", "ffv1", "-c:a", "pcm_s16le", str(target),
+    ], capture_output=True, timeout=30, check=True)
+    with av.open(str(target)) as container:
+        frames = [f.to_ndarray(format="gray") for f in container.decode(video=0)]
+    with av.open(str(target)) as container:
+        samples = np.concatenate([f.to_ndarray().ravel() for f in container.decode(audio=0)])
+    assert len(frames) == 80  # 4 seconds at 1x, then 16 seconds at 4x.
+    assert len(samples) == 8 * 48000
+    assert np.mean(np.abs(frames[45].astype(float) - frames[65])) > 5
+    assert np.max(np.abs(samples[5*48000:7*48000])) > 100
+
+
 class TestRenderWatchdog:
     def test_multi_input_startup_gets_longer_grace(self):
         assert _startup_watchdog_timeout(8, 120.0, 600.0, 4800.0) == 600.0
@@ -106,8 +159,9 @@ class TestFiltergraphGenerationAndClosure:
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 
-    def test_keyframe_fastpath_pure_static_file(self):
+    def test_keyframe_fastpath_pure_static_file(self, monkeypatch):
         """纯静态长文件走 select 抽帧快路径，滤镜图标签保持闭包。"""
+        monkeypatch.setattr("src.stages.timeline.load_config", lambda: {"render": {"static_mode": "hybrid_keyframe"}})
         t1 = TimelineSegment(
             filepath="night.mp4",
             input_index=0,

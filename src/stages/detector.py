@@ -268,6 +268,7 @@ class MotionDetector:
                 "is_motion": is_motion,
                 "state": state,
                 "energy": float(energies[i]) if i < len(energies) else 0.0,
+                "raw_energy": float(trace.energies[i]),
                 "confidence": float(confidences[i]) if i < len(confidences) else 0.0,
                 "is_audio_active": is_audio_active,
             })

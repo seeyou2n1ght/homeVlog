@@ -155,7 +155,6 @@ def compute_display_plans(
     ramp_duration_s: float = 1.0,
     presence_speed_factor: float = 4.0,
     night_stationary_speed_factor: float = 16.0,
-    micro_motion_anchor_s: float = 3.0,
     micro_motion_cruise_speed: float = 16.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
     """计算每个 TimelineSegment 的成片展示时长，与 build_concat_filter 严格同源。
@@ -164,7 +163,7 @@ def compute_display_plans(
     - DYNAMIC/DYNAMIC_AUDIO: 1x 常速，展示时长 == 源时长，ramp_info 为 None；
     - PRESENCE: 有人驻留静止陪伴，以 4x (presence_speed_factor) 平滑快进；
     - NIGHT_STATIONARY: 夜间熟睡或长时低能量静止，以 16x (night_stationary_speed_factor) 高倍平滑快进；
-    - MICRO_MOTION: 夜间微动或未确认目标，事件驱动锚点提取（动作保留 3s，其余 16x 巡航）；
+    - MICRO_MOTION: 微动巡航；显著动作已在分析阶段拆为独立常速片段；
     - STATIC: 纯静态抽帧压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
     """
     kf_interval = max(static_keyframe_interval, 1.0)
@@ -213,9 +212,7 @@ def compute_display_plans(
                 plans.append((target, None))
             continue
         elif seg.state == "MICRO_MOTION":
-            anchor = min(dur, max(1.0, micro_motion_anchor_s))
-            cruise_dur = max(0.0, dur - anchor)
-            target = anchor + (cruise_dur / max(1.0, micro_motion_cruise_speed))
+            target = dur / max(1.0, micro_motion_cruise_speed)
             target = min(max(target, 0.25), dur)
             v_fast = dur / target if target > 0 else 1.0
             has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
@@ -289,6 +286,53 @@ def src_offset_at_display(
     else:
         u = dp * v_fast
     return s_mid + u
+
+
+def build_retimed_audio(input_label, output_label, source_start, source_duration,
+                        display_duration, ramp_info=None, sample_rate=48000):
+    """Retain source audio on the shared display clock, with pitch-preserving tempo.
+
+    Ramps use eight linear pieces per source ramp (at most ~2 ms mapping error
+    for the default one-second ramp); the cruise is one continuous audio span.
+    """
+    if min(source_duration, display_duration) <= 0:
+        raise ValueError("Audio source and display durations must be positive")
+    cuts = [0.0, display_duration]
+    if ramp_info is not None:
+        inv_v = 1.0 / ramp_info.v_fast
+        s_in, s_out = ramp_info.ramp_in_src_dur, ramp_info.ramp_out_src_dur
+        p_in = s_in * (1 + inv_v) / 2
+        p_mid = p_in + ramp_info.cruise_src_dur * inv_v
+        # ponytail: bounded piecewise tempo; continuous DSP only if ramp listening tests require it.
+        cuts = sorted(set([0.0, display_duration] +
+                          [s_in * (j / 8 - (1-inv_v) * (j/8)**2 / 2) for j in range(1, 9)] +
+                          [p_mid + s_out * (inv_v * j/8 + (1-inv_v) * (j/8)**2 / 2) for j in range(9)]))
+    parts, outputs = [], []
+    for j, (d0, d1) in enumerate(zip(cuts, cuts[1:])):
+        if d1 - d0 < 1e-6:
+            continue
+        s0 = src_offset_at_display(d0, source_duration, display_duration, ramp_info)
+        s1 = src_offset_at_display(d1, source_duration, display_duration, ramp_info)
+        speed = (s1 - s0) / (d1 - d0)
+        tempo = []
+        # Each atempo stays <= 2 so FFmpeg blends rather than skips samples.
+        while speed > 2.0:
+            tempo.append("atempo=2")
+            speed /= 2.0
+        while speed < 0.5:
+            tempo.append("atempo=0.5")
+            speed /= 0.5
+        tempo.append(f"atempo={speed:.9f}")
+        label = f"{output_label}_tempo{j}"
+        parts.append(
+            f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s1:.6f},"
+            f"asetpts=PTS-STARTPTS,{','.join(tempo)},"
+            f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
+            f"asetpts=N/SR/TB[{label}]"
+        )
+        outputs.append(f"[{label}]")
+    parts.append(f"{''.join(outputs)}concat=n={len(outputs)}:v=0:a=1[{output_label}]")
+    return ";".join(parts)
 
 
 def build_timecode_drawtext_filter(
@@ -376,7 +420,6 @@ def generate_timecode_subtitles(
         ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     )
 
@@ -596,20 +639,9 @@ def build_timeline_from_rows(
     all_segments.sort(key=lambda s: s.start_time)
     seg_cfg = config.get("segment", {})
     gap_tolerance = seg_cfg.get("gap_tolerance", 1.5)
-    min_motion_dur = seg_cfg.get("min_motion_duration", 2.0)
-    min_static_dur = seg_cfg.get("min_static_duration", 8.0)
-    motion_absorb_threshold = float(seg_cfg.get("motion_absorb_energy_threshold", 12.0))
-
-    # 全局跨文件平滑与合并，解决边界截断问题
-    merged = merge_cross_file(all_segments, gap_tolerance)
-    from src.segment import _filter_short
-    filtered = _filter_short(
-        merged,
-        min_motion_dur,
-        min_static_dur,
-        gap_tolerance,
-        motion_absorb_energy_threshold=motion_absorb_threshold,
-    )
+    # Analysis owns event boundaries. A second duration filter here can erase
+    # protected short actions/audio at file edges after temporal refinement.
+    filtered = merge_cross_file(all_segments, gap_tolerance)
 
     from src.segment import resolve_presence_segments
     presence_cfg = config.get("presence", {})
@@ -847,6 +879,7 @@ def build_concat_filter(
         min_src_dur = min((s.end_in_file - s.start_in_file) for s in file_segs) if file_segs else 0.0
         use_kf_fastpath = (
             not preselected_static
+            and render_cfg.get("static_mode") != "continuous"
             and all_static
             and min_src_dur >= 2.0 * kf_interval
         )
@@ -942,7 +975,6 @@ def build_concat_filter(
         ramp_duration_s=ramp_duration_s,
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-        micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
     )
 
@@ -1048,7 +1080,13 @@ def build_concat_filter(
                 f"setpts={pts_filter}"
                 f"{fps_filter}[v{seg_count}]"
             )
-            parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={actual_display_dur:.3f}[a{seg_count}]")
+            if input_has_audio.get(idx, False):
+                parts_a.append(build_retimed_audio(
+                    f"{audio_idx}:a", f"a{seg_count}", source_s, dur,
+                    actual_display_dur, ramp_info, audio_sample_rate,
+                ))
+            else:
+                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={actual_display_dur:.3f}[a{seg_count}]")
 
         seg_count += 1
 

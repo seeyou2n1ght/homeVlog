@@ -566,6 +566,8 @@ class StreamingOrchestrator:
                     if seg.is_dynamic:
                         seg.needs_review = True
                         seg.review_reason = "YOLO_UNAVAILABLE"
+            from src.segment import refine_activity_segments
+            segments = refine_activity_segments(segments, labels, self.config)
             yolo_after = len(segments)
 
             from src.archiver import FrameArchiver
@@ -1647,7 +1649,6 @@ def _save_vlog_companion_assets(
             ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
             presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
             night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-            micro_motion_anchor_s=float(micro_cfg.get("anchor_duration_s", 3.0)),
             micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
         )
         for seg, (disp_dur, _) in zip(full_timeline, plans):
@@ -1795,5 +1796,3 @@ __all__ = [
     "process_date_cam",
     "run_pipeline",
 ]
-
-

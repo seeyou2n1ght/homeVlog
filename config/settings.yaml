@@ -164,7 +164,7 @@ segment:
   min_static_display_duration: 0.3
   max_static_display_duration: 1.5
   min_segment_duration: 0.1
-  macro_collapse_static: true
+  macro_collapse_static: false  # 保留所有源区间，静止区间通过倍速缩短
 
 presence:
   # R5: 有人驻留与静止陪伴平滑快进 (Presence Smoothing & Fast-Forward)
@@ -182,9 +182,8 @@ presence:
 micro_motion:
   # R5: 夜间微动与事件驱动锚点保全 (Night Micro-Motion & Event Anchor)
   enabled: true
-  anchor_duration_s: 3.0      # 翻身微动作前后保护锚点时长 (秒)
   cruise_speed: 16.0          # 睡眠平稳期巡航缩时倍速
-  energy_threshold: 5.5       # 激活微动保全的最低能量门限
+  energy_threshold: 5.5       # 原始逐帧能量达到此值时恢复常速，使用 segment.pre_roll/post_roll 保护前后动作
 
 
 yolo:
@@ -230,7 +229,7 @@ render:
   startup_inactivity_timeout_s: 600.0 # 多输入 NAS 文件初始化阶段无进展阈值；首帧后立即切回严格阈值
   inactivity_timeout_s: 120.0 # 批次压制无进度停滞看门狗 (秒)，杜绝卡死挂起
   # R4: 动态变速过渡 (Speed Ramping)
-  speed_ramping_enabled: true
+  speed_ramping_enabled: false  # 按事件区间切换倍速，保持快进原声与画面使用同一线性时钟
   ramp_duration_s: 1.0
   # R4: 音频线性淡入淡出 (Linear Audio Cross-Fade)
   audio_fade_duration_s: 0.25

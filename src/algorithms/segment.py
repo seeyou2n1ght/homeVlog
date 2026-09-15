@@ -170,6 +170,81 @@ def build_segments(
     return res_segs
 
 
+def refine_activity_segments(segments: list[Segment], labels: list[dict], config: dict) -> list[Segment]:
+    """Locate 1x events before discarding per-frame evidence; never gate audio on YOLO.
+
+    Target presence determines the cruising state, while temporal energy determines
+    activity. Unverified dynamic segments retain their conservative 1x behavior.
+    """
+    from bisect import bisect_left
+    from dataclasses import replace
+
+    if not segments or len(labels) < 2:
+        return segments
+    times = [float(label["time"]) for label in labels]
+    if any(b <= a for a, b in zip(times, times[1:])):
+        return segments
+    if times[0] > segments[0].start_time or times[-1] < segments[-1].end_time:
+        return segments
+    seg_cfg = config.get("segment", {})
+    presence = config.get("presence", {})
+    high_threshold = float(config.get("micro_motion", {}).get("energy_threshold", 5.5))
+    night_start, night_end = presence.get("night_hours", [23, 7])
+
+    def is_night(t):
+        hour = (t % 86400) / 3600
+        return (night_start <= hour < night_end if night_start < night_end
+                else hour >= night_start or hour < night_end)
+
+    def confirmed(seg):
+        return (seg.state in ("DYNAMIC", "PRESENCE", "NIGHT_STATIONARY")
+                and seg.avg_confidence >= float(presence.get("person_conf_threshold", 0.2))
+                and not any(reason in seg.review_reason for reason in
+                            ("FAILED", "INSUFFICIENT", "UNAVAILABLE", "YOLO_NEGATIVE")))
+
+    energies = [float(label.get("raw_energy", label.get("energy", 0))) for label in labels]
+    events = []
+    pre, post = float(seg_cfg.get("pre_roll", 1)), float(seg_cfg.get("post_roll", 1.5))
+    for i, label in enumerate(labels[:-1]):
+        audio = bool(label.get("is_audio_active"))
+        if audio or energies[i] >= high_threshold:
+            # A frame difference describes the preceding sample interval too.
+            start = max(times[0], times[max(0, i - 1)] - pre)
+            end = min(times[-1], times[i + 1] + post)
+            state = "DYNAMIC_AUDIO" if audio else "DYNAMIC"
+            if events and start <= events[-1][1] + float(seg_cfg.get("min_static_duration", 8)):
+                old_start, old_end, old_state = events[-1]
+                events[-1] = (old_start, max(old_end, end),
+                              "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
+            else:
+                events.append((start, end, state))
+
+    result = []
+    event_index = 0
+    for parent in segments:
+        cuts = {parent.start_time, parent.end_time}
+        relevant = []
+        while event_index < len(events) and events[event_index][1] <= parent.start_time:
+            event_index += 1
+        for event in events[event_index:]:
+            if event[0] >= parent.end_time:
+                break
+            relevant.append(event)
+            cuts.update((max(parent.start_time, event[0]), min(parent.end_time, event[1])))
+        ordered = sorted(cuts)
+        for start, end in zip(ordered, ordered[1:]):
+            state = next((e[2] for e in relevant if e[0] < end and e[1] > start), None)
+            if state is None:
+                if confirmed(parent) and presence.get("enabled", True):
+                    state = "NIGHT_STATIONARY" if presence.get("night_stationary_enabled", True) and is_night(start) else "PRESENCE"
+                else:
+                    state = parent.state
+            lo, hi = bisect_left(times, start), bisect_left(times, end)
+            result.append(replace(parent, start_time=start, end_time=end, state=state,
+                                  max_energy=max(energies[lo:hi], default=parent.max_energy)))
+    return _merge_same_state(result, gap_tolerance=0)
+
+
 def _can_merge(a: Segment, b: Segment, gap_tolerance: float = 0.5) -> bool:
     gap = b.start_time - a.end_time
     return a.state == b.state and gap <= gap_tolerance
