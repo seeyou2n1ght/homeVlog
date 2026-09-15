@@ -155,6 +155,8 @@ segment:
   motion_absorb_energy_threshold: 12.0
   # 允许的静止间隙容差 (秒): 两个相邻运动片段间隔小于此值时直接连接
   gap_tolerance: 1.5
+  # 动作事件合并间隙 (秒): 动作间静止大于此值即刻断开并转入有人驻留(PRESENCE 4x)，彻底杜绝连环吞噬
+  action_coalesce_gap: 2.0
   # 动态片段前后缓冲 (秒): 确保人物入画和动作余波完整无生硬截断
   pre_roll: 1.0
   post_roll: 1.5

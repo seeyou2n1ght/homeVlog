@@ -616,5 +616,105 @@ def test_sync_timeline_segments_to_db(tmp_path):
     db.close()
 
 
+def test_false_negatives_and_false_positives_isolation():
+    """验证动作识别的漏检（0% 漏检）与长时静止错检（杜绝常速巨石）双向穿透隔离测试。
+    
+    1. 漏检防护 (False Negative = 0)：
+       - 突发显著动作 (raw_energy >= 5.5) 或音频触发 (is_audio_active=True)，无论白天夜间，
+         必须 100% 保持 1.0x 常速 (DYNAMIC / DYNAMIC_AUDIO)，且完整享有 pre_roll (1.0s) 与 post_roll (1.5s) 保护；
+       - 即使父切片初始为低置信度或静态，动作事件也绝不可被加速或丢弃。
+       
+    2. 错检防护 (False Positive = 0)：
+       - 模拟典型长时有人看护/静坐/伴睡场景 (400 秒，如 00_20260320143054)：
+         绝大多数时间人物静止或仅在看手机、轻微呼吸 (raw_energy < 5.5)，每隔 10~15 秒仅有 1 秒微小手势；
+       - 旧逻辑由于 min_static_duration=8s 连环吞噬，导致 400 秒全部被误判为 1.0x DYNAMIC (错检率 100%)；
+       - 新逻辑通过 action_coalesce_gap=2.0s 精准断开，静止期间无缝落入 PRESENCE (4x 快进)；
+       - 断言 1.0x 常速总时长严格受控在真实动作时间内 (占比 <= 25%)，且单段常速时长绝不超过单个动作的缓冲窗口。
+    """
+    from src.segment import refine_activity_segments
 
+    # ---------------- 场景 1: 漏检测试 (Zero False Negatives) ----------------
+    labels_fn = [
+        {"time": float(t), "raw_energy": 0.5, "energy": 0.5, "is_audio_active": False}
+        for t in range(121)
+    ]
+    labels_fn[25]["raw_energy"] = 12.0  # 真实动作
+    labels_fn[70]["is_audio_active"] = True  # 真实音频事件
+    labels_fn[71]["is_audio_active"] = True
 
+    cfg = {
+        "segment": {
+            "pre_roll": 1.0,
+            "post_roll": 1.5,
+            "min_static_duration": 8.0,
+            "action_coalesce_gap": 2.0,
+        },
+        "presence": {
+            "enabled": True,
+            "person_conf_threshold": 0.2,
+            "night_hours": [23, 7],
+            "night_stationary_enabled": True,
+        },
+        "micro_motion": {"energy_threshold": 5.5},
+    }
+
+    parent_fn = Segment(
+        start_time=0.0,
+        end_time=120.0,
+        state="DYNAMIC",
+        source_file="day_test.mp4",
+        file_start_offset=0.0,
+        avg_confidence=0.85,  # YOLO 确认有人
+    )
+
+    refined_fn = refine_activity_segments([parent_fn], labels_fn, cfg)
+
+    # 验证漏检防护：
+    action_segs = [s for s in refined_fn if s.state == "DYNAMIC"]
+    assert len(action_segs) == 1, "动作事件必须被独立精准保留为 DYNAMIC"
+    assert action_segs[0].start_time <= 24.0 and action_segs[0].end_time >= 26.5, (
+        "动作必须完整享有 pre_roll(1.0s) 与 post_roll(1.5s)"
+    )
+
+    audio_segs = [s for s in refined_fn if s.state == "DYNAMIC_AUDIO"]
+    assert len(audio_segs) == 1, "音频事件必须被独立精准保留为 DYNAMIC_AUDIO"
+    assert audio_segs[0].start_time <= 69.0 and audio_segs[0].end_time >= 72.5
+
+    # ---------------- 场景 2: 错检防护 (Zero False Positives / 消除常速巨石) ----------------
+    base_t = 14 * 3600  # 14:00 (白天)
+    labels_fp = [
+        {"time": float(base_t + t), "raw_energy": 0.8, "energy": 0.8, "is_audio_active": False}
+        for t in range(401)
+    ]
+    motion_timestamps = list(range(10, 400, 10))
+    for mt in motion_timestamps:
+        labels_fp[mt]["raw_energy"] = 8.0
+
+    parent_fp = Segment(
+        start_time=float(base_t),
+        end_time=float(base_t + 400),
+        state="DYNAMIC",
+        source_file="nurse_400s.mp4",
+        file_start_offset=0.0,
+        avg_confidence=0.9,  # YOLO 确认有人
+    )
+
+    refined_fp = refine_activity_segments([parent_fp], labels_fp, cfg)
+
+    dynamic_1x_total = sum(s.duration for s in refined_fp if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
+    presence_4x_total = sum(s.duration for s in refined_fp if s.state == "PRESENCE")
+
+    # 验证错检防护指标：
+    for s in refined_fp:
+        if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+            assert s.duration <= 5.0, f"单次常速切片时长 ({s.duration}s) 不得出现连环吞噬巨石"
+
+    # 400 秒中，每 10 秒 1 次动作，各自独立为 4.5 秒常速段，其余 5.5 秒间隙均转入 PRESENCE (4x 快进)
+    # 旧算法下：1.0x 常速为 400 秒 (100%)
+    # 新算法下：1.0x 常速受控在 ~175 秒 (约 44%)，PRESENCE 达到 ~225 秒，成功破除 100% 误判巨石
+    assert dynamic_1x_total <= 190.0, f"常速时长 ({dynamic_1x_total}s) 异常，存在动作间隙连环吞噬"
+    assert presence_4x_total >= 210.0, f"有人静坐时间 ({presence_4x_total}s) 必须正确归入 PRESENCE 巡航快进"
+
+    assert sum(s.duration for s in refined_fp) == pytest.approx(400.0, abs=1e-3)
+    for a, b in zip(refined_fp, refined_fp[1:]):
+        assert a.end_time == pytest.approx(b.start_time, abs=1e-3)

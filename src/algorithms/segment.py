@@ -212,7 +212,8 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
             start = max(times[0], times[max(0, i - 1)] - pre)
             end = min(times[-1], times[i + 1] + post)
             state = "DYNAMIC_AUDIO" if audio else "DYNAMIC"
-            if events and start <= events[-1][1] + float(seg_cfg.get("min_static_duration", 8)):
+            coalesce_gap = float(seg_cfg.get("action_coalesce_gap", 2.0))
+            if events and start <= events[-1][1] + coalesce_gap:
                 old_start, old_end, old_state = events[-1]
                 events[-1] = (old_start, max(old_end, end),
                               "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)

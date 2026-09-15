@@ -314,22 +314,33 @@ def build_retimed_audio(input_label, output_label, source_start, source_duration
         s0 = src_offset_at_display(d0, source_duration, display_duration, ramp_info)
         s1 = src_offset_at_display(d1, source_duration, display_duration, ramp_info)
         speed = (s1 - s0) / (d1 - d0)
-        tempo = []
-        # Each atempo stays <= 2 so FFmpeg blends rather than skips samples.
-        while speed > 2.0:
-            tempo.append("atempo=2")
-            speed /= 2.0
-        while speed < 0.5:
-            tempo.append("atempo=0.5")
-            speed /= 0.5
-        tempo.append(f"atempo={speed:.9f}")
         label = f"{output_label}_tempo{j}"
-        parts.append(
-            f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s1:.6f},"
-            f"asetpts=PTS-STARTPTS,{','.join(tempo)},"
-            f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
-            f"asetpts=N/SR/TB[{label}]"
-        )
+        if speed > 16.0:
+            # Audible tempo envelope: beyond 16x audio is unintelligible noise/screech.
+            # Mute cleanly and bound decode duration while preserving exact display sync.
+            src_dur = min(d1 - d0, s1 - s0)
+            parts.append(
+                f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s0+src_dur:.6f},"
+                f"asetpts=PTS-STARTPTS,volume=0,"
+                f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
+                f"asetpts=N/SR/TB[{label}]"
+            )
+        else:
+            tempo = []
+            # Each atempo stays <= 2 so FFmpeg blends rather than skips samples.
+            while speed > 2.0:
+                tempo.append("atempo=2")
+                speed /= 2.0
+            while speed < 0.5:
+                tempo.append("atempo=0.5")
+                speed /= 0.5
+            tempo.append(f"atempo={speed:.9f}")
+            parts.append(
+                f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s1:.6f},"
+                f"asetpts=PTS-STARTPTS,{','.join(tempo)},"
+                f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
+                f"asetpts=N/SR/TB[{label}]"
+            )
         outputs.append(f"[{label}]")
     parts.append(f"{''.join(outputs)}concat=n={len(outputs)}:v=0:a=1[{output_label}]")
     return ";".join(parts)
