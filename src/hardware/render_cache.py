@@ -18,7 +18,7 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
     model = Path(config.get("yolo", {}).get("model_path", "models/yolo11m.pt"))
     if not model.is_absolute():
         model = PROJECT_ROOT / model
-    payload = [2, [file_identity(p) for p in inputs], filtergraph, encoder, fps,
+    payload = [2 if encoder == "analysis" else 3, [file_identity(p) for p in inputs], filtergraph, encoder, fps,
                output, audio, config, file_identity(model)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -28,7 +28,7 @@ def processing_fingerprint(filepath, config):
     return render_fingerprint([filepath], "analysis-v3-temporal-activity", "analysis", 0, {}, {}, selected)
 
 
-def valid_video(path, expected_duration=None):
+def valid_video(path, expected_duration=None, checkpoints=()):
     """Reject empty/corrupt output, not legitimate small videos."""
     import av
     import logging
@@ -67,6 +67,23 @@ def valid_video(path, expected_duration=None):
                         "valid_video: file %s duration mismatch: actual=%.3fs, expected=%.3fs (diff=%.3fs > tol=%.3fs)",
                         path, duration, expected_duration, diff, tol,
                     )
+                    return False
+            for boundary in checkpoints:
+                # Decode across each join, not just an independently seekable IDR.
+                start = max(0.0, boundary - 0.5)
+                stop = min(duration, boundary + 0.5)
+                container.seek(int(start / stream.time_base), stream=stream, backward=True)
+                seen = []
+                for frame in container.decode(stream):
+                    if frame.is_corrupt or frame.pts is None:
+                        return False
+                    timestamp = float(frame.pts * frame.time_base)
+                    if timestamp >= start:
+                        seen.append(timestamp)
+                    if timestamp >= stop:
+                        break
+                frame_step = 1 / float(stream.average_rate or 20)
+                if not seen or seen[0] > start + 2 * frame_step or seen[-1] < stop - 2 * frame_step:
                     return False
             return True
     except Exception as e:

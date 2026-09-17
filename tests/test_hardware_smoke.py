@@ -62,3 +62,38 @@ def test_real_yolo_microbatch():
     result = verifier.verify("synthetic", segments, frames_buffer={
         i: np.zeros((234,416,3),np.uint8) for i in range(8)}, analysis_fps=2)
     assert result[0].state == "STATIC" and result[0].needs_review
+
+
+def test_real_mixed_encoder_concat_preserves_every_frame(tmp_path, monkeypatch):
+    import hashlib
+    from src.renderer import concat_output_files
+    from src.utils import load_config
+    source = tmp_path / "source.mp4"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("libx264", rate=20)
+        stream.width, stream.height, stream.pix_fmt = 640, 360, "yuv420p"
+        for i in range(40):
+            pixels = np.zeros((360, 640, 3), dtype=np.uint8)
+            pixels[30:200, i*4:i*4+100] = (180, 90, 60)
+            for packet in stream.encode(av.VideoFrame.from_ndarray(pixels, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    out_cfg = load_config()["output"]
+    clips = []
+    for i, gpu in enumerate(["nv", "qsv"]):
+        path = build_batch_render([TimelineSegment(str(source), 0, 0, 2, "DYNAMIC", 2)],
+                                  i, gpu, 20, 640, 360, {}, out_cfg, {}, "20260901", 0,
+                                  [{"filepath": str(source), "has_audio": 0}])
+        assert path
+        clips.append(Path(path))
+    def frames(path):
+        with av.open(str(path)) as container:
+            return [hashlib.sha256(f.to_ndarray(format="rgb24").tobytes()).hexdigest()
+                    for f in container.decode(video=0)]
+    expected = frames(clips[0]) + frames(clips[1])
+    output = tmp_path / "joined.mp4"
+    assert concat_output_files(clips, output)
+    assert len(expected) == 80
+    assert frames(output) == expected

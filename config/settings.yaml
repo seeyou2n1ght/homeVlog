@@ -186,6 +186,9 @@ micro_motion:
   enabled: true
   cruise_speed: 16.0          # 睡眠平稳期巡航缩时倍速
   energy_threshold: 5.5       # 原始逐帧能量达到此值时恢复常速，使用 segment.pre_roll/post_roll 保护前后动作
+  hysteresis_low_threshold: 3.5  # 迟滞维持低门限: 动作余波内能量>=此值平滑维持1x常速，杜绝眨眼式跳跃
+  cell_energy_threshold: 7.0     # 空间网格单格能量门限: 局部剧烈活动唤醒
+  min_active_cells: 2            # 最小连通活跃网格数: 配合局部单格能量识别小目标动作
 
 
 yolo:
@@ -250,22 +253,26 @@ output:
   resolution: "1920x1080"
   fps: 20
 
-  # 极限性能编码参数
-  # 编码质量/速度折中，需通过同素材对照评估
+  # 离线高质量压制编码参数 (P4 + GOP120 + AQ + Lookahead，兼顾高压缩率与画质稳定)
+  gop: 120
   nv:
     codec: "hevc_nvenc"
-    preset: "p1"
-    tune: "ll"
+    preset: "p4"
     cq: 28
     maxrate: "4M"
     bufsize: "8M"
+    gop: 120
+    rc_lookahead: 32
+    spatial_aq: 1
+    temporal_aq: 1
+    aq_strength: 8
     pix_fmt: "nv12"
   qsv:
     codec: "hevc_qsv"
     preset: "veryfast"
     global_quality: 28
-    maxrate: "4M"
-    bufsize: "8M"
+    # ICQ质量控制；与maxrate/bufsize混用在本机驱动上会回退为固定CQP。
+    gop: 120
     pix_fmt: "nv12"
   audio:
     codec: "aac"

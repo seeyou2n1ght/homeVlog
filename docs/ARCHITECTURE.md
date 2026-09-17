@@ -568,6 +568,8 @@ Wall-clock mapping
 
 不得分别实现自己的展示时长计算。
 
+流式批次与伴随资产均使用 `build_timeline_from_rows(..., resolve_presence=False)`：按文件独立构造，保留人工纠正，不重新进行跨文件 presence 分类/合并。伴随资产生成只读数据库。重叠区间归一化由 timeline 共用实现按文件独立处理；变速过渡不跨源文件边界，避免批次大小影响展示计划。
+
 ---
 
 ## 10.2 Human Override
@@ -874,7 +876,9 @@ consistent pixel format
 in-band parameter-set injection
 ```
 
-保证批次切换时解码器能够重新配置。
+批次使用 `hev1` 保留带内参数集，避免 `hvc1` 封装剥离异构编码器重配置所需信息。最终原子提交前解码各拼接边界；失败不覆盖既有成片。边界检查不能替代全片解码与目标播放器验收。
+
+QSV 以 `global_quality` 使用 ICQ，不混用 `maxrate/bufsize`。渲染接管素材时消费预取所有权；预取在已有源文件锁内复核，防止清理后迟到复制。
 
 修改：
 

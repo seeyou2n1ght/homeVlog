@@ -273,6 +273,8 @@ class MotionDetector:
                 "raw_energy": float(trace.energies[i]),
                 "confidence": float(confidences[i]) if i < len(confidences) else 0.0,
                 "is_audio_active": is_audio_active,
+                "active_cells": int(trace.active_cells[i]) if hasattr(trace, "active_cells") and i < len(trace.active_cells) else 0,
+                "max_cell_energy": float(trace.max_cell_energies[i]) if hasattr(trace, "max_cell_energies") and i < len(trace.max_cell_energies) else 0.0,
             })
 
         # Sparse analysis samples must not erase short audio events.

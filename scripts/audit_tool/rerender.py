@@ -189,7 +189,7 @@ class ReRenderManager:
             audio_cfg = out_cfg.get("audio", {})
             render_cfg = config.get("render", {})
 
-            batch_max_files = render_cfg.get("batch_max_files", 8)
+            batch_max_files = render_cfg.get("batch_max_files", 1)
             batches = partition_timeline_by_batches(timeline, batch_max_files=batch_max_files)
             total_batches = len(batches)
             update_state(total_batches=total_batches, current_batch=0, progress=15)
@@ -270,7 +270,33 @@ class ReRenderManager:
                 update_state(status="FAILED", error="Final concat failed")
                 return
 
-            # 8. 成功终态
+            # 8. 同步更新标准化成片伴随资产包 (.srt + .meta.json)
+            try:
+                from src.pipeline import _save_vlog_companion_assets
+                from src.scanner import resolve_camera_identity
+                cam_disp = None
+                try:
+                    s_dir = str(Path(sample_path).parent) if sample_path else ""
+                    cam_disp, _ = resolve_camera_identity(s_dir, cam_index=cam_index, config=config)
+                except Exception:
+                    pass
+                tot_files = len(healthy_rows)
+                tot_dur = sum(float(r.get("file_duration") or 0.0) for r in healthy_rows)
+                _save_vlog_companion_assets(
+                    output_path=final_output_path,
+                    date=date,
+                    cam_index=cam_index,
+                    cam_display=cam_disp,
+                    total_files=tot_files,
+                    total_input_dur=tot_dur,
+                    elapsed_wall=time.time() - t0,
+                    db=db,
+                    config=config,
+                )
+            except Exception as exc:
+                logger.warning("Failed to refresh companion assets after rerender: %s", exc)
+
+            # 9. 成功终态
             file_size_mb = round(final_output_path.stat().st_size / (1024 * 1024), 2)
             logger.info("Re-render finished: %s (%.1f MB) in %.1fs", final_output_path.name, file_size_mb, time.time() - t0)
             update_state(

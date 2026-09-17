@@ -112,8 +112,9 @@ def test_render_batch_error_preserves_batches_and_aborts_concat(tmp_path):
             mock_orch.run.return_value = [b0]
             mock_orch.error_lock = threading.Lock()
             mock_orch.errors = ['render batch 1 failed on nv']
+            mock_orch.render_worker_stats = {}
 
-            with patch('src.pipeline.concat_output_files') as mock_concat:
+            with patch('src.pipeline._dump_perf'), patch('src.pipeline.concat_output_files') as mock_concat:
                 ok = process_date_cam(db, '20260901', 0, dashboard_enabled=False)
                 assert not ok
                 # 严禁执行 concat，严禁删除已成功产出的 batch 0

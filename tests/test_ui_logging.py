@@ -18,7 +18,16 @@ from src.utils import (
     register_dashboard,
     unregister_dashboard,
     LOGS_DIR,
+    size_metrics,
 )
+
+
+def test_size_metrics_keeps_decimal_and_binary_units_explicit():
+    metrics = size_metrics(8_003_885_496)
+    assert metrics["output_size_bytes"] == 8_003_885_496
+    assert metrics["output_size_mb"] == pytest.approx(8003.89)
+    assert metrics["output_size_mib"] == pytest.approx(7633.10)
+    assert metrics["output_size_gb"] == pytest.approx(8.004)
 
 
 def test_subsystem_adapter_and_contextual_formatter(tmp_path):
@@ -293,4 +302,3 @@ def test_plain_progress_tracker():
         render_total=5,
         force=True,
     )
-

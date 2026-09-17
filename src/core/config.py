@@ -44,6 +44,9 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a mapping")
+    qsv = config.get("output", {}).get("qsv", {})
+    if qsv.get("maxrate") or qsv.get("bufsize"):
+        raise ValueError("QSV ICQ uses global_quality; remove maxrate/bufsize to avoid CQP fallback")
     positive = {
         "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_qsv_analysis_concurrency", "max_qsv_render_concurrency", "max_io_concurrency"),
         "detection": ("prescreen_parallel", "analysis_max_workers", "analysis_buffer_mb", "prescreen_segments", "analysis_fps", "prescreen_diff_threshold"),

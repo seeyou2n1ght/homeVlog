@@ -207,20 +207,45 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
     energies = [float(label.get("raw_energy", label.get("energy", 0))) for label in labels]
     events = []
     pre, post = float(seg_cfg.get("pre_roll", 1)), float(seg_cfg.get("post_roll", 1.5))
+    coalesce_gap = float(seg_cfg.get("action_coalesce_gap", 2.0))
+    low_threshold = float(micro_cfg.get("hysteresis_low_threshold", max(1.5, high_threshold * 0.6)))
+    cell_threshold = float(micro_cfg.get("cell_energy_threshold", 7.0))
+    min_active_cells = int(micro_cfg.get("min_active_cells", 2))
+
+    in_activity = False
     for i, label in enumerate(labels[:-1]):
         audio = bool(label.get("is_audio_active"))
-        if audio or energies[i] >= high_threshold:
-            # A frame difference describes the preceding sample interval too.
+        e = energies[i]
+        max_cell_e = float(label.get("max_cell_energy", 0.0))
+        act_cells = int(label.get("active_cells", 0))
+
+        is_high_trigger = (
+            audio
+            or e >= high_threshold
+            or (act_cells >= min_active_cells and max_cell_e >= cell_threshold)
+        )
+
+        is_maintain = (
+            in_activity
+            and (
+                e >= low_threshold
+                or (act_cells >= 1 and max_cell_e >= max(3.0, cell_threshold * 0.6))
+            )
+        )
+
+        if is_high_trigger or is_maintain:
+            in_activity = True
             start = max(times[0], times[max(0, i - 1)] - pre)
             end = min(times[-1], times[i + 1] + post)
             state = "DYNAMIC_AUDIO" if audio else "DYNAMIC"
-            coalesce_gap = float(seg_cfg.get("action_coalesce_gap", 2.0))
             if events and start <= events[-1][1] + coalesce_gap:
                 old_start, old_end, old_state = events[-1]
                 events[-1] = (old_start, max(old_end, end),
                               "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
             else:
                 events.append((start, end, state))
+        else:
+            in_activity = False
 
     result = []
     event_index = 0

@@ -10,6 +10,7 @@
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -280,6 +281,10 @@ class TestFiltergraphGenerationAndClosure:
         assert [(s.start_in_file, s.end_in_file) for s in normalized] == [
             (0.0, 375.0), (375.0, 378.5)
         ]
+        next_file = TimelineSegment("next.mp4", 1, 0.0, 10.0, "DYNAMIC", 10.0)
+        combined = _normalize_file_timeline(normalized + [next_file])
+        assert combined[-1] == next_file
+        assert sum(s.duration for s in combined) == pytest.approx(388.5)
 
     def test_virtual_concat_filter_selects_demuxer_ranges_before_scale(self):
         segs = [
@@ -358,6 +363,36 @@ class TestConcatOutputFiles:
         assert not concat_output_files([], out)
         assert not out.exists()
 
+    def test_invalid_join_preserves_previous_output_and_batches(self, tmp_path):
+        from types import SimpleNamespace
+        out, batch = tmp_path / "out.mp4", tmp_path / "batch.mp4"
+        out.write_bytes(b"previous")
+        batch.write_bytes(b"batch")
+        def encode(args, **kwargs):
+            Path(args[-1]).write_bytes(b"invalid join")
+            return SimpleNamespace(returncode=0)
+        with patch("src.renderer.get_duration", return_value=2), patch("src.renderer.run_ffmpeg", side_effect=encode), patch("src.render_cache.valid_video", return_value=False):
+            assert not concat_output_files([batch, batch], out)
+        assert out.read_bytes() == b"previous"
+        assert batch.read_bytes() == b"batch"
+        assert not out.with_name("out.tmp.mp4").exists()
+
+    def test_consumed_prefetch_does_not_recopy_source(self, tmp_path, monkeypatch):
+        from src.renderer import _stage_source_for_render
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"source")
+        monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path / "cache")
+        first = _stage_source_for_render(source)
+        assert first and first.read_bytes() == b"source"
+        first.unlink()
+        with patch("src.renderer.shutil.copyfile", side_effect=AssertionError("late prefetch copied")):
+            assert _stage_source_for_render(source, needed=lambda: False) is None
+
+    def test_qsv_rejects_silent_rate_control_fallback(self):
+        from src.renderer import _build_enc_args
+        with pytest.raises(ValueError, match="ICQ"):
+            _build_enc_args("qsv", {"qsv": {"global_quality": 28, "maxrate": "4M"}})
+
     def test_batch_render_reuse_existing_file(self, tmp_path):
         from src.renderer import _run_batch_render
         fake_batch = tmp_path / "_batch0_20260901_cam0.mp4"
@@ -385,7 +420,7 @@ class TestBuildEncArgs:
         from src.renderer import _build_enc_args
         out_cfg = {
             "nv": {"preset": "p1", "cq": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
-            "qsv": {"preset": "fast", "global_quality": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+            "qsv": {"preset": "fast", "global_quality": 28, "pix_fmt": "nv12"},
         }
         nv_args = _build_enc_args("nv", out_cfg)
         assert "-c:v" in nv_args
@@ -405,7 +440,7 @@ class TestBuildEncArgs:
         from src.renderer import _build_enc_args
         out_cfg = {
             "nv": {"preset": "p1", "cq": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
-            "qsv": {"preset": "fast", "global_quality": 28, "maxrate": "4M", "bufsize": "8M", "pix_fmt": "nv12"},
+            "qsv": {"preset": "fast", "global_quality": 28, "pix_fmt": "nv12"},
         }
         qsv_args = _build_enc_args("qsv", out_cfg)
         assert "-c:v" in qsv_args
@@ -420,3 +455,34 @@ class TestBuildEncArgs:
         assert qsv_args[qsv_args.index("-forced_idr") + 1] == "1"
         assert "-g" in qsv_args
         assert qsv_args[qsv_args.index("-g") + 1] == "60"
+
+    def test_advanced_enc_args_support(self):
+        from src.renderer import _build_enc_args
+        out_cfg = {
+            "gop": 120,
+            "nv": {
+                "preset": "p4",
+                "cq": 28,
+                "rc_lookahead": 32,
+                "spatial_aq": 1,
+                "temporal_aq": 1,
+                "aq_strength": 8,
+                "b_ref_mode": "middle",
+            },
+            "qsv": {
+                "gop": 120,
+                "look_ahead_depth": 32,
+            },
+        }
+        nv_args = _build_enc_args("nv", out_cfg)
+        assert nv_args[nv_args.index("-g") + 1] == "120"
+        assert nv_args[nv_args.index("-preset") + 1] == "p4"
+        assert nv_args[nv_args.index("-rc-lookahead") + 1] == "32"
+        assert nv_args[nv_args.index("-spatial-aq") + 1] == "1"
+        assert nv_args[nv_args.index("-temporal-aq") + 1] == "1"
+        assert nv_args[nv_args.index("-aq-strength") + 1] == "8"
+        assert nv_args[nv_args.index("-b_ref_mode") + 1] == "middle"
+
+        qsv_args = _build_enc_args("qsv", out_cfg)
+        assert qsv_args[qsv_args.index("-g") + 1] == "120"
+        assert qsv_args[qsv_args.index("-look_ahead_depth") + 1] == "32"

@@ -245,10 +245,14 @@ def test_analysis_json_matches_relational_segments(tmp_path):
     db.close()
 
 
-def test_invalid_config_does_not_poison_cache(tmp_path, monkeypatch):
+@pytest.mark.parametrize("settings", [
+    'hardware:\n  max_nv_concurrency: 0\n',
+    'output:\n  qsv:\n    global_quality: 28\n    maxrate: 4M\n',
+])
+def test_invalid_config_does_not_poison_cache(tmp_path, monkeypatch, settings):
     import src.utils as utils
     config = tmp_path / 'invalid.yaml'
-    config.write_text('hardware:\n  max_nv_concurrency: 0\n')
+    config.write_text(settings)
     previous = {'hardware': {'max_nv_concurrency': 2}}
     monkeypatch.setattr(utils, 'SETTINGS', previous)
     monkeypatch.setattr(utils, 'CONFIG_PATH', config)

@@ -219,6 +219,19 @@ class TestSystemMonitoring:
         assert summary["prescreen"]["count"] == 1
         assert summary["analysis"]["count"] == 1
 
+        perf.add(PerfRecord(
+            stage="analysis", file="queued.mp4", gpu="qsv", duration=0.2,
+            extra={"analysis_queue_wait_s": 1.25, "sem_wait": 0.4},
+        ))
+        perf.add(PerfRecord(
+            stage="render", file="batch_0.mp4", gpu="nv", duration=0.3,
+            extra={"render_queue_wait_s": 2.5},
+        ))
+        waits = perf.wait_summary()
+        assert waits["analysis_queue_wait_s"] == {"count": 1, "total": 1.25, "max": 1.25}
+        assert waits["sem_wait"] == {"count": 1, "total": 0.4, "max": 0.4}
+        assert waits["render_queue_wait_s"] == {"count": 1, "total": 2.5, "max": 2.5}
+
         dump_path = tmp_path / "perf.json"
         perf.dump(dump_path)
         assert dump_path.exists()

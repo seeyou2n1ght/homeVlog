@@ -174,6 +174,11 @@ def compute_display_plans(
     n = len(timeline)
     for i, seg in enumerate(timeline):
         dur = seg.end_in_file - seg.start_in_file
+        # File boundaries must behave identically in individual batches and companions.
+        has_in = (i > 0 and timeline[i - 1].filepath == seg.filepath
+                  and timeline[i - 1].state in ACTIVE_STATES)
+        has_out = (i < n - 1 and timeline[i + 1].filepath == seg.filepath
+                   and timeline[i + 1].state in ACTIVE_STATES)
         if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
             plans.append((dur, None))
             continue
@@ -181,8 +186,6 @@ def compute_display_plans(
             target = max(0.25, dur / max(1.0, presence_speed_factor))
             target = min(target, dur)
             v_fast = dur / target if target > 0 else 1.0
-            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
-            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
             if speed_ramping and (has_in or has_out):
                 info = calculate_speed_ramping_curve(
                     dur=dur, v_fast=v_fast,
@@ -198,8 +201,6 @@ def compute_display_plans(
             target = max(0.25, dur / max(1.0, night_stationary_speed_factor))
             target = min(target, dur)
             v_fast = dur / target if target > 0 else 1.0
-            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
-            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
             if speed_ramping and (has_in or has_out):
                 info = calculate_speed_ramping_curve(
                     dur=dur, v_fast=v_fast,
@@ -215,8 +216,6 @@ def compute_display_plans(
             target = dur / max(1.0, micro_motion_cruise_speed)
             target = min(max(target, 0.25), dur)
             v_fast = dur / target if target > 0 else 1.0
-            has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
-            has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
             if speed_ramping and (has_in or has_out):
                 info = calculate_speed_ramping_curve(
                     dur=dur, v_fast=v_fast,
@@ -235,8 +234,6 @@ def compute_display_plans(
             target = min(target, max_static_display_duration)
 
         v_fast = dur / target if target > 0 else 1.0
-        has_in = i > 0 and timeline[i - 1].state in ACTIVE_STATES
-        has_out = i < n - 1 and timeline[i + 1].state in ACTIVE_STATES
         if speed_ramping and (has_in or has_out):
             info = calculate_speed_ramping_curve(
                 dur=dur, v_fast=v_fast,
@@ -588,6 +585,35 @@ def _parse_row_segments(row: dict, default_offset: float) -> tuple[list[Segment]
     return [], False
 
 
+def normalize_file_timeline(timeline):
+    """Clip overlapping DB intervals before constructing the virtual EDL."""
+    normalized = []
+    cursor = 0.0
+    file_order = {fp: i for i, fp in enumerate(dict.fromkeys(s.filepath for s in timeline))}
+    for seg in sorted(timeline, key=lambda item: (file_order[item.filepath], item.start_in_file, item.end_in_file)):
+        if normalized and normalized[-1].filepath != seg.filepath:
+            cursor = 0.0
+        start = max(cursor, float(seg.start_in_file))
+        end = float(seg.end_in_file)
+        if end <= start + 1e-4:
+            continue
+        seg.start_in_file = start
+        seg.end_in_file = end
+        seg.duration = end - start
+        if (
+            normalized
+            and normalized[-1].filepath == seg.filepath
+            and normalized[-1].state == seg.state
+            and abs(normalized[-1].end_in_file - start) <= 1e-3
+        ):
+            normalized[-1].end_in_file = end
+            normalized[-1].duration = normalized[-1].end_in_file - normalized[-1].start_in_file
+        else:
+            normalized.append(seg)
+        cursor = end
+    return normalized
+
+
 def build_timeline_from_rows(
     rows: list[dict],
     date: str,
@@ -601,6 +627,17 @@ def build_timeline_from_rows(
     if config is None:
         config = load_config()
 
+    if not resolve_presence and target_files is not None:
+        targets = set(target_files)
+        rows = [row for row in rows if row["filepath"] in targets]
+    if not resolve_presence and len(rows) > 1:
+        timeline = []
+        for row in sorted(rows, key=lambda r: r["file_start_time"]):
+            timeline.extend(build_timeline_from_rows([row], date, config=config, resolve_presence=False))
+        indices = {fp: i for i, fp in enumerate(dict.fromkeys(s.filepath for s in timeline))}
+        for segment in timeline:
+            segment.input_index = indices[segment.filepath]
+        return timeline
     day_start = ts_to_unix(date + "000000")
 
     all_segments: list[Segment] = []
@@ -653,7 +690,7 @@ def build_timeline_from_rows(
     gap_tolerance = seg_cfg.get("gap_tolerance", 1.5)
     # Analysis owns event boundaries. A second duration filter here can erase
     # protected short actions/audio at file edges after temporal refinement.
-    filtered = merge_cross_file(all_segments, gap_tolerance)
+    filtered = merge_cross_file(all_segments, gap_tolerance) if resolve_presence else all_segments
 
     from src.segment import resolve_presence_segments
     presence_cfg = config.get("presence", {})
@@ -730,7 +767,7 @@ def build_timeline_from_rows(
             duration=end_in_file - start_in_file,
         ))
 
-    return timeline
+    return normalize_file_timeline(timeline) if not resolve_presence else timeline
 
 
 def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[TimelineSegment]:

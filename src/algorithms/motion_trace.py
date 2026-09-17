@@ -15,6 +15,8 @@ class MotionTrace:
         self.previous = None
         self.energies = array("d")
         self.confidences = array("d")
+        self.active_cells = array("I")
+        self.max_cell_energies = array("d")
 
     def __len__(self):
         return len(self.energies)
@@ -45,3 +47,5 @@ class MotionTrace:
         )
         self.energies.append(energy)
         self.confidences.append(float(stats.get("max_confidence", 0.0)))
+        self.active_cells.append(int(stats.get("active_cells", 0)))
+        self.max_cell_energies.append(float(stats.get("max_cell_energy", 0.0)))

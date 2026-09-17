@@ -10,8 +10,8 @@ from pathlib import Path
 
 from src.utils import TEMP_DIR
 from src.scheduler import acquire_with_retry, VideoLease
-from src.ffmpeg import run_ffmpeg
-from src.stages.timeline import build_concat_filter, compute_display_plans
+from src.ffmpeg import run_ffmpeg, get_duration
+from src.stages.timeline import build_concat_filter, compute_display_plans, normalize_file_timeline as _normalize_file_timeline
 from src.monitor import get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
@@ -85,32 +85,6 @@ def _reindex_timeline(timeline, files):
     mapping = {f: i for i, f in enumerate(files)}
     for t in timeline:
         t.input_index = mapping[t.filepath]
-
-
-def _normalize_file_timeline(timeline):
-    """Clip overlapping DB intervals before constructing the virtual EDL."""
-    normalized = []
-    cursor = 0.0
-    for seg in sorted(timeline, key=lambda item: (item.start_in_file, item.end_in_file)):
-        start = max(cursor, float(seg.start_in_file))
-        end = float(seg.end_in_file)
-        if end <= start + 1e-4:
-            continue
-        seg.start_in_file = start
-        seg.end_in_file = end
-        seg.duration = end - start
-        if (
-            normalized
-            and normalized[-1].filepath == seg.filepath
-            and normalized[-1].state == seg.state
-            and abs(normalized[-1].end_in_file - start) <= 1e-3
-        ):
-            normalized[-1].end_in_file = end
-            normalized[-1].duration = normalized[-1].end_in_file - normalized[-1].start_in_file
-        else:
-            normalized.append(seg)
-        cursor = end
-    return normalized
 
 
 @dataclass(frozen=True)
@@ -379,7 +353,7 @@ def _get_stage_lock(digest: str) -> threading.Lock:
         return _staging_locks[digest]
 
 
-def _stage_source_for_render(source: str | Path) -> Path | None:
+def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
     """Sequentially stage one NAS clip for low-latency local EDL seeks."""
     source_path = Path(source)
     try:
@@ -408,6 +382,8 @@ def _stage_source_for_render(source: str | Path) -> Path | None:
     partial = staged.with_suffix(staged.suffix + ".part")
 
     with _get_stage_lock(digest):
+        if needed is not None and not needed():
+            return None
         if staged.exists() and staged.stat().st_size == source_stat.st_size:
             return staged
 
@@ -732,7 +708,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp.mp4")
     tmp_output_path.unlink(missing_ok=True)
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
-    cmd += ["-tag:v", "hvc1", "-movflags", "+faststart"]
+    cmd += ["-tag:v", "hev1", "-movflags", "+faststart"]
     cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
@@ -964,13 +940,18 @@ def concat_output_files(files: list[Path], output: Path, timeout: float = 300, f
     def _concat_path(path):
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
     try:
+        durations = [get_duration(str(path)) for path in files]
+        if any(duration is None or duration <= 0 for duration in durations):
+            return False
+        from itertools import accumulate
+        checkpoints = list(accumulate(durations))[:-1]
         concat_list.write_text("\n".join(f"file '{_concat_path(f)}'" for f in files)+"\n", encoding="utf-8")
         cmd = ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy"]
         if faststart:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(temporary))
         result = run_ffmpeg(cmd, timeout=timeout)
-        if result.returncode != 0 or not valid_video(temporary):
+        if result.returncode != 0 or not valid_video(temporary, sum(durations), checkpoints=checkpoints):
             return False
         temporary.replace(output)
         return True
@@ -981,30 +962,47 @@ def concat_output_files(files: list[Path], output: Path, timeout: float = 300, f
 def _build_enc_args(encoder, out_cfg):
     if encoder == "qsv":
         qsv = out_cfg.get("qsv", {})
-        return [
+        if qsv.get("maxrate") or qsv.get("bufsize"):
+            raise ValueError("QSV ICQ uses global_quality; remove maxrate/bufsize to avoid CQP fallback")
+        gop = str(qsv.get("gop", out_cfg.get("gop", 60)))
+        args = [
             "-c:v", qsv.get("codec", "hevc_qsv"),
             "-preset", qsv.get("preset", "fast"),
             "-global_quality", str(qsv.get("global_quality", 28)),
-            "-maxrate", qsv.get("maxrate", "4M"),
-            "-bufsize", qsv.get("bufsize", "8M"),
-            "-g", "60",
+            "-g", gop,
             "-forced_idr", "1",
             "-pix_fmt", qsv.get("pix_fmt", "nv12"),
             "-bsf:v", "dump_extra",
         ]
+        if "look_ahead_depth" in qsv:
+            args.extend(["-look_ahead_depth", str(qsv["look_ahead_depth"])])
+        return args
     else:
         nv = out_cfg.get("nv", {})
+        gop = str(nv.get("gop", out_cfg.get("gop", 60)))
         args = [
             "-c:v", nv.get("codec", "hevc_nvenc"),
             "-preset", nv.get("preset", "p3"),
             "-cq", str(nv.get("cq", 28)),
             "-maxrate", nv.get("maxrate", "4M"),
             "-bufsize", nv.get("bufsize", "8M"),
-            "-g", "60",
+            "-g", gop,
             "-forced-idr", "1",
+            "-strict_gop", "1",
+            "-no-scenecut", "1",
             "-pix_fmt", nv.get("pix_fmt", "nv12"),
             "-bsf:v", "dump_extra",
         ]
         if nv.get("tune"):
             args.extend(["-tune", str(nv["tune"])])
+        if nv.get("rc_lookahead") is not None:
+            args.extend(["-rc-lookahead", str(nv["rc_lookahead"])])
+        if nv.get("spatial_aq") is not None:
+            args.extend(["-spatial-aq", str(nv["spatial_aq"])])
+        if nv.get("temporal_aq") is not None:
+            args.extend(["-temporal-aq", str(nv["temporal_aq"])])
+        if nv.get("aq_strength") is not None:
+            args.extend(["-aq-strength", str(nv["aq_strength"])])
+        if nv.get("b_ref_mode") is not None:
+            args.extend(["-b_ref_mode", str(nv["b_ref_mode"])])
         return args

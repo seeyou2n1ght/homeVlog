@@ -119,3 +119,4 @@ CI 在 Windows 执行 locked 依赖同步、Ruff、语法检查和回归。Ruff 
 - [重大架构决策记录 (ADR)](docs/DECISIONS.md)
 - [项目进度与实测遥测](docs/PROGRESS.md)
 - [测试策略与质量验收规范](docs/TESTING.md)
+- [性能与质量基准](docs/BENCHMARK.md)

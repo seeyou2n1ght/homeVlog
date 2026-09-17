@@ -342,13 +342,18 @@ class PerfCollector:
             self._records.append(asdict(record))
 
     def dump(self, path: Path, metadata: dict | None = None):
-        """Write all records + optional metadata to JSON."""
+        """Write all records + optional metadata to JSON via atomic file replacement."""
         data = metadata or {}
         with self._lock:
             data["records"] = list(self._records)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+            tmp_path.replace(path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         logger.info("perf data written: %s (%d records)", path, len(data["records"]))
 
     def summary_by_stage(self) -> dict[str, dict]:
@@ -399,6 +404,22 @@ class PerfCollector:
             "rejected_segments": rejected_segs,
             "suppression_rate_pct": round(rejected_segs / max(1, candidate_segs) * 100, 1),
         }
+
+    def wait_summary(self) -> dict:
+        """Aggregate queue and hardware wait fields without mixing them into work time."""
+        with self._lock:
+            records = list(self._records)
+        fields = ("analysis_queue_wait_s", "render_queue_wait_s", "sem_wait")
+        result = {}
+        for field in fields:
+            values = [float(r.get("extra", {}).get(field, 0.0) or 0.0) for r in records]
+            if values:
+                result[field] = {
+                    "count": sum(v > 0 for v in values),
+                    "total": round(sum(values), 3),
+                    "max": round(max(values), 3),
+                }
+        return result
 
     def reset(self):
         with self._lock:

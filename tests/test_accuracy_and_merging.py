@@ -718,3 +718,68 @@ def test_false_negatives_and_false_positives_isolation():
     assert sum(s.duration for s in refined_fp) == pytest.approx(400.0, abs=1e-3)
     for a, b in zip(refined_fp, refined_fp[1:]):
         assert a.end_time == pytest.approx(b.start_time, abs=1e-3)
+
+
+def test_multi_feature_hysteresis_activity_decision():
+    """验证多特征空间网格聚类触发与迟滞状态机维持逻辑。"""
+    from src.segment import Segment, refine_activity_segments
+
+    # 100 秒序列：
+    # 0~19s: 平稳静止 (raw_energy 0.5) -> PRESENCE
+    # 20s: 局部高能动作 (raw_energy 4.2 < 5.5，但 active_cells=3, max_cell_energy=9.0) -> 触发 DYNAMIC 1x
+    # 21~22s: 动作余波微动 (raw_energy 4.0 >= low_threshold 3.5) -> 迟滞维持 DYNAMIC 1x
+    # 23~30s: 恢复平静 (raw_energy 0.5) -> 回归 PRESENCE
+    # 50s: 孤立单格微弱扰动 (raw_energy 2.8, active_cells=1, max_cell_energy=3.5) -> 不触发 1x，保持 PRESENCE
+    labels = [
+        {"time": float(t), "raw_energy": 0.5, "energy": 0.5, "active_cells": 0, "max_cell_energy": 0.0, "is_audio_active": False}
+        for t in range(60)
+    ]
+    # 局部高能
+    labels[20]["raw_energy"] = 4.2
+    labels[20]["active_cells"] = 3
+    labels[20]["max_cell_energy"] = 9.0
+
+    # 迟滞维持区间
+    labels[21]["raw_energy"] = 4.0
+    labels[21]["active_cells"] = 2
+    labels[21]["max_cell_energy"] = 5.0
+    labels[22]["raw_energy"] = 3.8
+    labels[22]["active_cells"] = 2
+    labels[22]["max_cell_energy"] = 4.8
+
+    # 孤立弱扰动
+    labels[50]["raw_energy"] = 2.8
+    labels[50]["active_cells"] = 1
+    labels[50]["max_cell_energy"] = 3.5
+
+    cfg = {
+        "segment": {
+            "pre_roll": 1.0,
+            "post_roll": 1.5,
+            "action_coalesce_gap": 2.0,
+        },
+        "presence": {
+            "enabled": True,
+            "person_conf_threshold": 0.2,
+            "night_hours": [23, 7],
+            "night_stationary_enabled": False,
+        },
+        "micro_motion": {
+            "energy_threshold": 5.5,
+            "hysteresis_low_threshold": 3.5,
+            "cell_energy_threshold": 7.0,
+            "min_active_cells": 2,
+        },
+    }
+
+    parent = Segment(0.0, 59.0, "DYNAMIC", "test.mp4", avg_confidence=0.85)
+    refined = refine_activity_segments([parent], labels, cfg)
+
+    # 验证 20~22s 的局部动作成功触发并平滑维持 1x
+    dynamic_segs = [s for s in refined if s.state == "DYNAMIC"]
+    assert len(dynamic_segs) == 1, "局部高能及维持区间应合并为单个平滑的 DYNAMIC 片段"
+    d = dynamic_segs[0]
+    assert d.start_time <= 19.0 and d.end_time >= 23.5, "动作应享有 pre_roll 与 post_roll"
+
+    # 验证 50s 的单格微弱扰动未被误判为 1x
+    assert not any(s.state == "DYNAMIC" and s.start_time <= 50 <= s.end_time for s in refined)

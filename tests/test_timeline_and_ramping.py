@@ -33,6 +33,24 @@ from src.timeline import (
 class TestSegmentClusteringAndSmoothing:
     """测试片段聚类与跨文件平滑吸收。"""
 
+    @pytest.mark.parametrize("ramping", [False, True])
+    def test_streaming_plan_is_independent_of_neighbors_and_batch_size(self, ramping):
+        from src.timeline import build_timeline_from_rows
+        rows = []
+        for i, state in enumerate(["DYNAMIC", "STATIC", "DYNAMIC"]):
+            rows.append({"filepath": f"{i}.mp4", "file_start_time": f"202609010000{i}0",
+                         "file_end_time": f"202609010000{i+1}0", "file_duration": 10,
+                         "prescreen_status": "SUSPICIOUS", "analysis_segments": segments_to_json([
+                             Segment(i*10, (i+1)*10, state, f"{i}.mp4", i*10, avg_confidence=.9)])})
+        cfg = {"presence": {"enabled": True}, "segment": {"macro_collapse_static": False}}
+        whole = build_timeline_from_rows(rows, "20260901", config=cfg, resolve_presence=False)
+        parts = [s for row in rows for s in build_timeline_from_rows([row], "20260901", config=cfg, resolve_presence=False)]
+        key = lambda s: (s.filepath, s.start_in_file, s.end_in_file, s.state)
+        assert list(map(key, whole)) == list(map(key, parts))
+        assert whole[1].state == "STATIC"
+        assert compute_display_plans(whole, speed_ramping=ramping) == [
+            plan for segment in parts for plan in compute_display_plans([segment], speed_ramping=ramping)]
+
     def test_build_segments_basic_and_padding(self):
         # 0~9s STATIC, 10~15s DYNAMIC, 16~29s STATIC
         labels = [{"time": float(t), "state": "DYNAMIC" if 10.0 <= t <= 15.0 else "STATIC"} for t in range(30)]

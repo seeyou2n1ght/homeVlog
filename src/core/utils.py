@@ -19,6 +19,17 @@ CONFIG_PATH = _config.CONFIG_PATH
 SETTINGS = _config.SETTINGS
 
 
+def size_metrics(size_bytes: int | float) -> dict[str, float | int]:
+    """Return explicitly labelled decimal and binary file-size units."""
+    size = max(0, int(size_bytes))
+    return {
+        "output_size_bytes": size,
+        "output_size_mb": round(size / 1_000_000, 2),
+        "output_size_mib": round(size / (1024 * 1024), 2),
+        "output_size_gb": round(size / 1_000_000_000, 3),
+    }
+
+
 def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:
     import src.utils as _self
     if getattr(_self, "CONFIG_PATH", None) != _config.CONFIG_PATH:

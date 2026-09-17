@@ -20,6 +20,27 @@ from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
 
 
+@pytest.mark.parametrize("with_labels", [False, True])
+def test_analysis_result_survives_queue_metrics(tmp_path, with_labels):
+    from types import SimpleNamespace
+    from src.monitor import PerfCollector
+    db = VlogDatabase(tmp_path / "analysis.db")
+    try:
+        db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000010", 10)
+        orch = StreamingOrchestrator(db, "20260901", 0, {}, render_enabled=False, dashboard_enabled=False)
+        labels = [{"time": float(t), "state": "DYNAMIC", "energy": 8, "raw_energy": 8} for t in range(11)] if with_labels else []
+        detector = SimpleNamespace(analyze=lambda *a, **k: (labels, {}), decode_gpu="cpu", last_perf={}, fps=1)
+        perf = PerfCollector()
+        now = time.monotonic()
+        orch._execute_analysis_task({"file_duration": 10, "_analysis_queued_at": now - 3}, "clip.mp4", 0,
+                                    detector, None, "cpu", perf, now)
+        msg = orch.render_batch_queue.get_nowait()
+        assert msg["status"] == ("ANALYZED" if with_labels else "FAILED")
+        assert perf._records[-1]["extra"]["analysis_queue_wait_s"] == pytest.approx(3)
+    finally:
+        db.close()
+
+
 def test_analysis_queue_prioritizes_short_files_when_enabled():
     q = AnalysisQueue()
     q.cost_priority = True
@@ -29,6 +50,31 @@ def test_analysis_queue_prioritizes_short_files_when_enabled():
     q.task_done()
     assert q.get()["filepath"] == "long.mp4"
     q.task_done()
+
+
+def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
+    import json
+    from src.segment import Segment
+    from src.pipeline import _save_vlog_companion_assets
+    db = VlogDatabase(tmp_path / "companion.db")
+    try:
+        db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000020", 20)
+        db.set_prescreen_result("clip.mp4", "SUSPICIOUS")
+        db.set_analysis_result("clip.mp4", [Segment(0, .5, "STATIC", "clip.mp4"),
+                                            Segment(0, 10, "STATIC", "clip.mp4"),
+                                            Segment(10, 20, "DYNAMIC", "clip.mp4")])
+        before = db.get_all_file_tasks_for_date("20260901", 0)
+        out = tmp_path / "day.mp4"
+        out.write_bytes(b"placeholder")
+        with patch.object(db, "sync_timeline_segments") as sync, patch("src.ffmpeg.get_duration", return_value=11.5):
+            _save_vlog_companion_assets(out, "20260901", 0, "camera", 1, 20, 1, db,
+                                        {"render": {"generate_subtitles": False, "speed_ramping_enabled": False}})
+            sync.assert_not_called()
+        meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        assert meta["timeline_highlights"][0]["vlog_start_s"] == 1.5
+        assert db.get_all_file_tasks_for_date("20260901", 0) == before
+    finally:
+        db.close()
 
 
 class TestStreamingOrchestratorLifecycle:
@@ -191,10 +237,11 @@ class TestProcessDateCamPipeline:
         from src.timeline import build_timeline_from_rows as _real_build
         dispatched_targets: list[list[str]] = []
 
-        def _spy_build(rows, date, target_files=None, config=None):
+        def _spy_build(rows, date, target_files=None, config=None, **kwargs):
             files = list(target_files or [])
-            dispatched_targets.append(files)
-            return _real_build(rows, date, target_files=files, config=config)
+            if target_files is not None:
+                dispatched_targets.append(files)
+            return _real_build(rows, date, target_files=target_files, config=config, **kwargs)
 
         try:
             with patch("src.timeline.build_timeline_from_rows", side_effect=_spy_build):
@@ -225,6 +272,7 @@ class TestProcessDateCamPipeline:
             orch.batch_paths.sort(key=lambda x: x[0])
             assert [b[0] for b in orch.batch_paths] == [0, 1]
             assert all("mock_batch_" in p.name for _, p in orch.batch_paths)
+            assert not orch._prefetched_files
         finally:
             db.close()
 

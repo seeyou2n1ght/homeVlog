@@ -74,6 +74,7 @@ Superseded by: ADR xxxx
 | ADR 0014 | 异构分析与渲染 QSV 硬件信号量池隔离 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0010 |
 | ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
 | ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
+| ADR 0017 | 离线高质量编码重构与多特征迟滞动作判定 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0012, ADR 0013 |
 
 ---
 
@@ -1119,3 +1120,59 @@ docs/PROGRESS.md
 ```
 
 而不是在多个 ADR 中复制同一组生产数字。
+
+---
+
+# 19. ADR 0017 — Offline High-Efficiency Encoding and Multi-Feature Hysteresis Action Model
+
+**Status:** Accepted  
+**Date:** 2026-09  
+**Evolves:** ADR 0008, ADR 0012, ADR 0013
+
+## Context
+
+在五级浓缩模型和驻留优化落地后，系统运行遥测暴露两项深层矛盾：
+1. **静态压缩收益见顶与编码模式错配**：`20260320` 生产数据显示静态段在最终成片中展示时长仅约 1%，继续挤压静态段无法带来显著体积缩减；此前尝试单纯将 CQ 调高至 31/32 换取体积，导致抽样出现严重的“绿色解码损坏”。后续在 P4 下仍复现损坏：异构 HEVC 参数集被 hvc1 封装剥离是已验证原因，不能将损坏归因于提高 QP 或 P1。
+2. **动作判定单变量硬阈值与空间信息浪费**：`refine_activity_segments` 仅凭 `raw_energy >= 5.5` 做出 1x/4x 二值决策，单帧噪点极易被前后扩展缓冲 (`pre_roll 1.0s` + `post_roll 1.5s`) 放大为数秒常速巨石；与此同时，`SpatialGridMotionFilter` 已经计算出丰富的 8×8 连通单元数 (`active_cells`) 与局部单格能量峰值 (`max_cell_energy`)，但 `MotionTrace` 将其完全丢弃。
+
+## Decision
+
+### 1. 离线高质量编码参数重构
+- 将 NVENC 从超低延迟推流模式切为离线高质量压制预设：启用 `preset: p4`，彻底移除 `tune: ll`；
+- 将批次硬编码的 GOP=60 提升为可配置的 GOP=120（20fps 下 6.0s，契合独立切片 concat 规范）；
+- 开启硬件高级压缩特性：`-rc-lookahead 32`、`-spatial-aq 1`、`-temporal-aq 1`、`-aq-strength 8`；
+- 保留 `-strict_gop 1` 与 `-no-scenecut 1`；这些选项不能替代跨编码器参数集保留与拼接完整性验证；
+- QSV 同步开放配置并对齐 GOP=120。
+
+### 2. 空间网格特征管道持久化与多特征迟滞状态机
+- 在 `MotionTrace` 内存流中打通 `active_cells` 与 `max_cell_energies` 存储通道，经由 `detector.py` 传递给时序分段层；
+- 在 `refine_activity_segments` 中引入高低双门限 ($T_{high}=5.5, T_{low}=3.5$) 迟滞状态机与局部聚类触发：
+  - 音频事件 100% 强制直通 `DYNAMIC_AUDIO` 1x 保全；
+  - 触发门限：全局突变能量 $\ge 5.5$ 或局部聚类连通高能量 (`active_cells >= 2` 且 `max_cell_energy >= 7.0`) 触发 1x；
+  - 维持门限：在动作余波内，只要能量 $\ge 3.5$ 或局部 $\ge 4.2$ 即平滑维持，杜绝单帧抖动引起的眨眼式变速与常速膨胀。
+
+### 3. 调度器滑动平均动态竞价
+- 将异构工作窃取中写死的 42s 批次耗时经验常数升级为基于已完成批次真实耗时的在线滑动平均模型，自适应匹配当前素材负载。
+
+## Consequences
+
+- P4 和迟滞状态机保留为当前实现；其净体积、耗时与识别收益尚无有效同条件 A/B 证明。
+- 旧 6.832GB 产物的异构边界存在解码错误，不能作为质量验收结果；基准口径见 `docs/BENCHMARK.md`。
+
+# ADR 0018 — Preserve heterogeneous HEVC parameters and render timeline identity
+
+**Status:** Accepted  
+**Date:** 2026-09-16
+
+## Decision
+
+- HEVC 批次使用 hev1 并保留 in-band 参数集。最终合成在原子替换前检查各批次边界；失败时保留原成片与可恢复批次。渲染缓存版本升级，分析缓存不受该编码变更影响。
+- 流式渲染及伴随资产统一消费 `build_timeline_from_rows(..., resolve_presence=False)` 的逐文件分析结果与人工纠正；不跨文件重新分类或合并。展示时间继续来自 `compute_display_plans()`；区间归一化共用 timeline 实现，并对各文件独立维护游标，变速过渡不跨文件边界。
+- 渲染接管文件时消费预取所有权；预取在源文件锁内复核所有权，避免批次清理后重新复制。
+- QSV 使用明确的 ICQ 配置，拒绝同时传入会改变当前本机码控语义的 maxrate/bufsize。
+
+## Consequences
+
+- hev1 需要目标播放器兼容性验收；边界检查增加解码成本，不等价于逐帧全片验证。
+- 时间轴不再因伴随资产生成而写回或变动；历史跨文件 presence 重分类产物不能充当相同时间轴基线。
+- QSV ICQ28 的体积与画质需要重新测量；不从质量参数数值推导实际收益。
