@@ -1,8 +1,25 @@
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 
 
-ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
+class SegmentState(StrEnum):
+    """Canonical domain states for video timeline segments."""
+    DYNAMIC = "DYNAMIC"
+    DYNAMIC_AUDIO = "DYNAMIC_AUDIO"
+    PRESENCE = "PRESENCE"
+    NIGHT_STATIONARY = "NIGHT_STATIONARY"
+    MICRO_MOTION = "MICRO_MOTION"
+    STATIC = "STATIC"
+
+
+ACTIVE_STATES = (
+    SegmentState.DYNAMIC,
+    SegmentState.DYNAMIC_AUDIO,
+    SegmentState.PRESENCE,
+    SegmentState.NIGHT_STATIONARY,
+    SegmentState.MICRO_MOTION,
+)
 
 
 @dataclass
@@ -189,8 +206,6 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
     seg_cfg = config.get("segment", {})
     presence = config.get("presence", {})
     micro_cfg = config.get("micro_motion", {})
-    high_threshold = (float(micro_cfg.get("energy_threshold", 5.5))
-                      if micro_cfg.get("enabled", True) else float("inf"))
     night_start, night_end = presence.get("night_hours", [23, 7])
 
     def is_night(t):
@@ -207,41 +222,76 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
     energies = [float(label.get("raw_energy", label.get("energy", 0))) for label in labels]
     events = []
     pre, post = float(seg_cfg.get("pre_roll", 1)), float(seg_cfg.get("post_roll", 1.5))
-    coalesce_gap = float(seg_cfg.get("action_coalesce_gap", 2.0))
-    low_threshold = float(micro_cfg.get("hysteresis_low_threshold", max(1.5, high_threshold * 0.6)))
-    cell_threshold = float(micro_cfg.get("cell_energy_threshold", 7.0))
+    coalesce_gap = float(seg_cfg.get("action_coalesce_gap", 1.2))
+    max_maintain_dur = float(micro_cfg.get("max_maintain_duration", 2.5))
+    max_coalesce_dur = float(micro_cfg.get("max_coalesce_duration", 8.0))
     min_active_cells = int(micro_cfg.get("min_active_cells", 2))
+    low_ratio = float(micro_cfg.get("hysteresis_low_ratio", 0.65))
 
     in_activity = False
+    activity_start_time = 0.0
+
     for i, label in enumerate(labels[:-1]):
+        t_curr = times[i]
+        night = is_night(t_curr)
         audio = bool(label.get("is_audio_active"))
         e = energies[i]
         max_cell_e = float(label.get("max_cell_energy", 0.0))
         act_cells = int(label.get("active_cells", 0))
 
-        is_high_trigger = (
-            audio
-            or e >= high_threshold
-            or (act_cells >= min_active_cells and max_cell_e >= cell_threshold)
-        )
+        is_night_mode = night and presence.get("night_stationary_enabled", True)
+        high_threshold = float(micro_cfg.get("night_energy_threshold", micro_cfg.get("energy_threshold", 12.0)) if is_night_mode 
+                               else micro_cfg.get("day_energy_threshold", micro_cfg.get("energy_threshold", 10.0)))
+        cell_threshold = float(micro_cfg.get("night_cell_threshold", micro_cfg.get("cell_energy_threshold", 35.0)) if is_night_mode 
+                               else micro_cfg.get("day_cell_threshold", micro_cfg.get("cell_energy_threshold", 28.0)))
 
-        is_maintain = (
-            in_activity
-            and (
-                e >= low_threshold
-                or (act_cells >= 1 and max_cell_e >= max(3.0, cell_threshold * 0.6))
+        has_grid_info = ("active_cells" in label or "max_cell_energy" in label)
+
+        min_cells_req = max(min_active_cells, 3) if is_night_mode else min_active_cells
+        if has_grid_info:
+            is_high_trigger = (
+                audio
+                or (e >= high_threshold and act_cells >= min_cells_req)
+                or (act_cells >= min_cells_req and max_cell_e >= cell_threshold)
             )
-        )
+            low_e = high_threshold * low_ratio
+            low_cell = cell_threshold * low_ratio
+            is_maintain = (
+                in_activity
+                and (t_curr - activity_start_time <= max_maintain_dur)
+                and (
+                    (e >= low_e and act_cells >= min_cells_req)
+                    or (act_cells >= 2 and max_cell_e >= low_cell)
+                )
+            )
+        else:
+            is_high_trigger = (audio or e >= high_threshold)
+            low_e = float(micro_cfg.get("hysteresis_low_threshold", high_threshold * 0.6))
+            is_maintain = (
+                in_activity
+                and (t_curr - activity_start_time <= max_maintain_dur)
+                and (e >= low_e)
+            )
 
         if is_high_trigger or is_maintain:
+            if is_high_trigger:
+                activity_start_time = t_curr
             in_activity = True
             start = max(times[0], times[max(0, i - 1)] - pre)
             end = min(times[-1], times[i + 1] + post)
             state = "DYNAMIC_AUDIO" if audio else "DYNAMIC"
             if events and start <= events[-1][1] + coalesce_gap:
                 old_start, old_end, old_state = events[-1]
-                events[-1] = (old_start, max(old_end, end),
-                              "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
+                duration_so_far = end - old_start
+                can_coalesce = (
+                    duration_so_far <= max_coalesce_dur
+                    or (duration_so_far <= max_coalesce_dur * 1.5 and (audio or e >= high_threshold * 1.8))
+                )
+                if can_coalesce:
+                    events[-1] = (old_start, max(old_end, end),
+                                  "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
+                else:
+                    events.append((start, end, state))
             else:
                 events.append((start, end, state))
         else:
@@ -263,10 +313,14 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
         for start, end in zip(ordered, ordered[1:]):
             state = next((e[2] for e in relevant if e[0] < end and e[1] > start), None)
             if state is None:
-                if confirmed(parent) and presence.get("enabled", True):
-                    state = "NIGHT_STATIONARY" if presence.get("night_stationary_enabled", True) and is_night(start) else "PRESENCE"
-                else:
+                if "YOLO_FAILED" in parent.review_reason:
                     state = parent.state
+                elif is_night(start) and presence.get("night_stationary_enabled", True):
+                    state = "NIGHT_STATIONARY"
+                elif confirmed(parent) and presence.get("enabled", True):
+                    state = "PRESENCE"
+                else:
+                    state = "STATIC" if parent.state in ("DYNAMIC", "DYNAMIC_AUDIO") else parent.state
             lo, hi = bisect_left(times, start), bisect_left(times, end)
             result.append(replace(parent, start_time=start, end_time=end, state=state,
                                   max_energy=max(energies[lo:hi], default=parent.max_energy)))
@@ -302,6 +356,7 @@ def _filter_short(
     min_static: float,
     gap_tolerance: float = 0.5,
     motion_absorb_energy_threshold: float = 12.0,
+    max_cumulative_absorb_s: float = float("inf"),
 ) -> list[Segment]:
     if not segments:
         return segments
@@ -310,6 +365,7 @@ def _filter_short(
     # Guard: max iterations = segment count (each iteration absorbs at least one)
     max_iters = len(segments) + 1
     changed = True
+    cumulative_absorbed: dict[int, float] = {}
     while changed and max_iters > 0:
         max_iters -= 1
         changed = False
@@ -324,40 +380,48 @@ def _filter_short(
 
             # If current is STATIC (< min_static)
             if not is_dynamic:
-                # 能量门控：静态段仅当相邻动态段能量充沛（max_energy >= 门限，或无能量标注的测试用例），或者停顿极短（<= gap_tolerance）时，才允许被动态吸收
+                left_absorbed = cumulative_absorbed.get(id(segments[i - 1]), 0.0) if i > 0 else 0.0
+                right_absorbed = cumulative_absorbed.get(id(segments[i + 1]), 0.0) if i + 1 < len(segments) else 0.0
+                # 能量门控与累计吸收上限：静态段仅当相邻动态段能量充沛（max_energy >= 门限，或无能量标注的测试用例），或者停顿极短（<= gap_tolerance）时，且累计吸收时长未超过上限才允许被动态吸收
                 can_absorb_left = (
                     i > 0 and segments[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+                    and (left_absorbed + dur <= max_cumulative_absorb_s)
                     and (segments[i - 1].max_energy == 0.0 or segments[i - 1].max_energy >= motion_absorb_energy_threshold or dur <= gap_tolerance)
                 )
                 can_absorb_right = (
                     i + 1 < len(segments) and segments[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+                    and (right_absorbed + dur <= max_cumulative_absorb_s)
                     and (segments[i + 1].max_energy == 0.0 or segments[i + 1].max_energy >= motion_absorb_energy_threshold or dur <= gap_tolerance)
                 )
 
                 if can_absorb_left:
-                    segments[i - 1].end_time = segments[i].end_time
-                    segments[i - 1].max_energy = max(segments[i - 1].max_energy, segments[i].max_energy)
-                    segments[i - 1].avg_confidence = max(segments[i - 1].avg_confidence, segments[i].avg_confidence)
+                    target = segments[i - 1]
+                    target.end_time = segments[i].end_time
+                    target.max_energy = max(target.max_energy, segments[i].max_energy)
+                    target.avg_confidence = max(target.avg_confidence, segments[i].avg_confidence)
+                    cumulative_absorbed[id(target)] = left_absorbed + dur
                     if segments[i].needs_review:
-                        segments[i - 1].needs_review = True
-                        if segments[i].review_reason and segments[i].review_reason not in segments[i - 1].review_reason:
-                            segments[i - 1].review_reason = f"{segments[i - 1].review_reason}; {segments[i].review_reason}".strip("; ")
+                        target.needs_review = True
+                        if segments[i].review_reason and segments[i].review_reason not in target.review_reason:
+                            target.review_reason = f"{target.review_reason}; {segments[i].review_reason}".strip("; ")
                     segments.pop(i)
                     changed = True
                     continue
                 elif can_absorb_right:
-                    segments[i + 1].start_time = segments[i].start_time
-                    segments[i + 1].max_energy = max(segments[i + 1].max_energy, segments[i].max_energy)
-                    segments[i + 1].avg_confidence = max(segments[i + 1].avg_confidence, segments[i].avg_confidence)
+                    target = segments[i + 1]
+                    target.start_time = segments[i].start_time
+                    target.max_energy = max(target.max_energy, segments[i].max_energy)
+                    target.avg_confidence = max(target.avg_confidence, segments[i].avg_confidence)
+                    cumulative_absorbed[id(target)] = right_absorbed + dur
                     if segments[i].needs_review:
-                        segments[i + 1].needs_review = True
-                        if segments[i].review_reason and segments[i].review_reason not in segments[i + 1].review_reason:
-                            segments[i + 1].review_reason = f"{segments[i + 1].review_reason}; {segments[i].review_reason}".strip("; ")
+                        target.needs_review = True
+                        if segments[i].review_reason and segments[i].review_reason not in target.review_reason:
+                            target.review_reason = f"{target.review_reason}; {segments[i].review_reason}".strip("; ")
                     segments.pop(i)
                     changed = True
                     continue
                 else:
-                    # 两侧动态段皆为微弱低能量（如睡觉微动/噪点），严禁吞噬中间的静态段！静态段必须保留以供抽帧
+                    # 两侧动态段皆为微弱低能量（如睡觉微动/噪点），或已达到最大吸收上限，严禁吞噬中间的静态段！静态段必须保留以供抽帧
                     i += 1
                     continue
 

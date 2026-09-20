@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from src.core.config import DB_PATH
+from src.core.identity import camera_key
 
 logger = logging.getLogger("homevlog")
 
@@ -144,7 +145,6 @@ class VlogDatabase:
                 FROM segments WHERE manual_label IS NOT NULL""")
             if "camera_id" not in columns:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN camera_id TEXT")
-            from src.scanner import camera_key
             for row in self.conn.execute("SELECT id,filepath,cam_index,date FROM file_tasks WHERE camera_id IS NULL ORDER BY id").fetchall():
                 identity = camera_key(row["filepath"], row["cam_index"])
                 index = self._camera_index(identity, row["cam_index"])
@@ -170,7 +170,7 @@ class VlogDatabase:
             self.conn.commit()
 
     def invalidate_stale_results(self, date, cam_index, config):
-        from src.render_cache import processing_fingerprint
+        from src.hardware.render_cache import processing_fingerprint
         rows = self.get_all_file_tasks_for_date(date, cam_index)
         stale = [r["filepath"] for r in rows if r["prescreen_status"] in ("STATIC", "SUSPICIOUS")
                  and r.get("processing_fingerprint") != processing_fingerprint(r["filepath"], config)]
@@ -216,7 +216,6 @@ class VlogDatabase:
     ) -> bool:
         with self._lock:
             try:
-                from src.scanner import camera_key
                 identity = camera_key(filepath, cam_index)
                 # Serialize identity allocation across independent SQLite connections.
                 if not self.conn.in_transaction:

@@ -14,7 +14,7 @@ def file_identity(path):
 
 
 def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config):
-    from src.utils import PROJECT_ROOT
+    from src.core.config import PROJECT_ROOT
     model = Path(config.get("yolo", {}).get("model_path", "models/yolo11m.pt"))
     if not model.is_absolute():
         model = PROJECT_ROOT / model
@@ -26,6 +26,40 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
 def processing_fingerprint(filepath, config):
     selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")}
     return render_fingerprint([filepath], "analysis-v3-temporal-activity", "analysis", 0, {}, {}, selected)
+
+
+def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: float) -> bool:
+    import av
+    import logging
+    _log = logging.getLogger("homevlog")
+    try:
+        with av.open(str(path), timeout=10.0) as container:
+            if not container.streams.video:
+                _log.warning("valid_video checkpoint chunk: file %s has no video stream", path)
+                return False
+            stream = container.streams.video[0]
+            frame_step = 1.0 / float(stream.average_rate or 20)
+            for boundary in chunk:
+                start = max(0.0, boundary - 0.5)
+                stop = min(duration, boundary + 0.5)
+                container.seek(int(start / stream.time_base), stream=stream, backward=True)
+                seen = []
+                for frame in container.decode(stream):
+                    if frame.is_corrupt or frame.pts is None:
+                        _log.warning("valid_video: corrupt frame at boundary %.2fs in %s", boundary, path)
+                        return False
+                    timestamp = float(frame.pts * frame.time_base)
+                    if timestamp >= start:
+                        seen.append(timestamp)
+                    if timestamp >= stop:
+                        break
+                if not seen or seen[0] > start + 2 * frame_step or seen[-1] < stop - 2 * frame_step:
+                    _log.warning("valid_video: boundary %.2fs gap or frame discontinuity in %s", boundary, path)
+                    return False
+        return True
+    except Exception as e:
+        _log.warning("valid_video checkpoint chunk exception for %s: %s", path, e)
+        return False
 
 
 def valid_video(path, expected_duration=None, checkpoints=()):
@@ -68,23 +102,34 @@ def valid_video(path, expected_duration=None, checkpoints=()):
                         path, duration, expected_duration, diff, tol,
                     )
                     return False
-            for boundary in checkpoints:
-                # Decode across each join, not just an independently seekable IDR.
-                start = max(0.0, boundary - 0.5)
-                stop = min(duration, boundary + 0.5)
-                container.seek(int(start / stream.time_base), stream=stream, backward=True)
-                seen = []
-                for frame in container.decode(stream):
-                    if frame.is_corrupt or frame.pts is None:
+            if checkpoints:
+                checkpoints_list = list(checkpoints)
+                if len(checkpoints_list) <= 4:
+                    frame_step = 1 / float(stream.average_rate or 20)
+                    for boundary in checkpoints_list:
+                        # Decode across each join, not just an independently seekable IDR.
+                        start = max(0.0, boundary - 0.5)
+                        stop = min(duration, boundary + 0.5)
+                        container.seek(int(start / stream.time_base), stream=stream, backward=True)
+                        seen = []
+                        for frame in container.decode(stream):
+                            if frame.is_corrupt or frame.pts is None:
+                                return False
+                            timestamp = float(frame.pts * frame.time_base)
+                            if timestamp >= start:
+                                seen.append(timestamp)
+                            if timestamp >= stop:
+                                break
+                        if not seen or seen[0] > start + 2 * frame_step or seen[-1] < stop - 2 * frame_step:
+                            return False
+                else:
+                    from concurrent.futures import ThreadPoolExecutor
+                    num_workers = min(8, len(checkpoints_list))
+                    chunks = [checkpoints_list[i::num_workers] for i in range(num_workers) if checkpoints_list[i::num_workers]]
+                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                        results = list(pool.map(lambda c: _validate_checkpoint_chunk(c, path, duration), chunks))
+                    if not all(results):
                         return False
-                    timestamp = float(frame.pts * frame.time_base)
-                    if timestamp >= start:
-                        seen.append(timestamp)
-                    if timestamp >= stop:
-                        break
-                frame_step = 1 / float(stream.average_rate or 20)
-                if not seen or seen[0] > start + 2 * frame_step or seen[-1] < stop - 2 * frame_step:
-                    return False
             return True
     except Exception as e:
         _log.warning("valid_video: file %s validation exception: %s", path, e, exc_info=True)

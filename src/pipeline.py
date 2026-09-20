@@ -12,30 +12,35 @@ from src.ui import (
     print_startup_banner,
     print_summary_card,
 )
-from src.database import VlogDatabase
-from src.scanner import scan_directory, get_date_cam_groups
-from src.prescreen import prescreen_file
-from src.detector import MotionDetector, detect_audio_activity
-from src.renderer import build_batch_render, concat_output_files
-from src.config import (
+from src.core.database import VlogDatabase
+from src.stages.scanner import scan_directory, get_date_cam_groups
+from src.stages.prescreen import prescreen_file
+from src.stages.detector import MotionDetector, detect_audio_activity
+from src.stages.renderer import build_batch_render, concat_output_files
+from src.stages.companion import (
+    dump_perf as _dump_perf,
+    build_headline as _build_headline,
+    save_vlog_companion_assets as _save_vlog_companion_assets,
+)
+from src.core.config import (
     load_config,
     OUTPUT_DIR,
     LOGS_DIR,
 )
-from src.scheduler import (
+from src.hardware.scheduler import (
     WorkStealingManager,
     RenderBatchItem,
     DualEndedBatchQueue,
 )
-from src.ffmpeg import FFmpegProcessRegistry
-from src.utils import (
+from src.hardware.ffmpeg import FFmpegProcessRegistry
+from src.core.utils import (
     cleanup_resources,
     check_disk_space,
     register_dashboard,
     unregister_dashboard,
 )
 from dataclasses import dataclass, field
-from src.monitor import get_monitor, get_perf, PerfRecord
+from src.hardware.monitor import get_monitor, get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
 
@@ -191,7 +196,7 @@ class StreamingOrchestrator:
         self.render_delay = pipe_cfg.get("render_start_delay", 5)
 
         # 状态控制
-        from src.renderer import FFmpegProcessRegistry
+        from src.hardware.ffmpeg import FFmpegProcessRegistry
         FFmpegProcessRegistry.reset_interrupted()
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
@@ -231,7 +236,7 @@ class StreamingOrchestrator:
             self.abort_event.set()
             self.stop_event.set()
             self.render_finished_event.set()
-            from src.renderer import FFmpegProcessRegistry
+            from src.hardware.ffmpeg import FFmpegProcessRegistry
             FFmpegProcessRegistry.kill_all()
 
     def _add_error(self, message: str):
@@ -265,7 +270,7 @@ class StreamingOrchestrator:
 
     def _lookahead_prefetch_worker(self):
         """后台异步 I/O Worker：超前拉取即将压制的源文件至本地 SSD，消除 GPU 串行 I/O 等待气泡。"""
-        from src.renderer import _stage_source_for_render
+        from src.stages.renderer import _stage_source_for_render
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self._prefetch_queue.empty()):
             try:
                 fp = self._prefetch_queue.get(timeout=0.5)
@@ -339,7 +344,7 @@ class StreamingOrchestrator:
                 if prescreen_has_audio is not None:
                     task["has_audio"] = int(prescreen_has_audio)
                 if res["status"] in ("STATIC", "SUSPICIOUS"):
-                    from src.render_cache import processing_fingerprint
+                    from src.hardware.render_cache import processing_fingerprint
                     self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
                 with self._prescreen_results_lock:
                     self._prescreen_results[filepath] = res["status"]
@@ -442,7 +447,7 @@ class StreamingOrchestrator:
         t0: float,
         worker_id: str = "",
     ):
-        from src.segment import build_segments, segments_to_json
+        from src.algorithms.segment import build_segments, segments_to_json
 
         analysis_queue_wait = max(0.0, t0 - float(task.get("_analysis_queued_at") or t0))
 
@@ -487,7 +492,7 @@ class StreamingOrchestrator:
             )
             js = segments_to_json(segments)
             self.db.set_analysis_result(filepath, "ANALYZED", js)
-            from src.render_cache import processing_fingerprint
+            from src.hardware.render_cache import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
             t_ana_done = time.monotonic()
             perf.add(
@@ -573,7 +578,7 @@ class StreamingOrchestrator:
                     filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
                 )
                 yolo_telemetry = getattr(yolo_verifier, "last_telemetry", {})
-                from src.segment import _merge_same_state, _filter_short
+                from src.algorithms.segment import _merge_same_state, _filter_short
                 segments = _merge_same_state(segments, gap_tolerance=seg_cfg.get("gap_tolerance", 1.5))
                 if seg_cfg.get("apply_smoothing", True):
                     segments = _filter_short(
@@ -588,11 +593,11 @@ class StreamingOrchestrator:
                     if seg.is_dynamic:
                         seg.needs_review = True
                         seg.review_reason = "YOLO_UNAVAILABLE"
-            from src.segment import refine_activity_segments
+            from src.algorithms.segment import refine_activity_segments
             segments = refine_activity_segments(segments, labels, self.config)
             yolo_after = len(segments)
 
-            from src.archiver import FrameArchiver
+            from src.stages.archiver import FrameArchiver
             rate = detector.last_perf.get("effective_fps", detector.fps)
             for seg in segments:
                 if not seg.needs_review or not yolo_buffer:
@@ -604,7 +609,7 @@ class StreamingOrchestrator:
                     FrameArchiver.remember(filepath, key / rate, payload)
             js = segments_to_json(segments)
             self.db.set_analysis_result(filepath, "ANALYZED", js)
-            from src.render_cache import processing_fingerprint
+            from src.hardware.render_cache import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
 
             t_ana_done = time.monotonic()
@@ -711,7 +716,7 @@ class StreamingOrchestrator:
         yolo_verifier = None
         yolo_cfg = self.config.get("yolo", {})
         if yolo_cfg.get("enabled", False) and yolo_cfg.get("streaming_verify", True):
-            from src.yolo_verifier import YoloVerifier
+            from src.algorithms.yolo_verifier import YoloVerifier
             try:
                 yolo_verifier = YoloVerifier(self.config)
             except Exception as exc:
@@ -738,7 +743,7 @@ class StreamingOrchestrator:
             )
 
             try:
-                from src.utils import ts_to_unix
+                from src.core.identity import ts_to_unix
 
                 file_start_ts = ts_to_unix(task["file_start_time"])
                 file_start_offset = max(
@@ -793,7 +798,7 @@ class StreamingOrchestrator:
         """渲染管理器：In-Order Sliding Window 保序消费完成消息，构建时间严格单调的批次并启动渲染 Worker。"""
         out_cfg = self.config.get("output", {})
         fps = out_cfg.get("fps", 20)
-        from src.utils import parse_res
+        from src.core.utils import parse_res
 
         width, height = parse_res(out_cfg.get("resolution", "1920x1080"))
         seg_cfg = self.config.get("segment", {})
@@ -819,7 +824,7 @@ class StreamingOrchestrator:
             raw_segs = r.get("analysis_segments")
             if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
                 try:
-                    from src.timeline import segments_from_json
+                    from src.algorithms.segment import segments_from_json
                     segs = segments_from_json(raw_segs)
                     dyn_dur = sum((s.end_time - s.start_time) for s in segs if getattr(s, "is_dynamic", False))
                     dynamic_duration_by_file[fp] = dyn_dur
@@ -926,21 +931,21 @@ class StreamingOrchestrator:
                                         active_nv = self._active_nv_renders
                                     q_len = heavy_queue.qsize()
                                     # 收尾硬屏障 (Tail Guard):
-                                    # 当所有素材派发完毕：若队列已空，或剩余批次 <= 1 且 NVENC 正在处理任务，QSV 立即退出
-                                    if all_dispatched_event.is_set() and (heavy_queue.empty() or (q_len <= 1 and active_nv >= 1)):
+                                    # 当所有素材派发完毕且队列已空，QSV 立即退出
+                                    if all_dispatched_event.is_set() and heavy_queue.empty():
                                         break
 
                                     # 实时 Makespan 竞价模型 (Cost-Based ETA Bidding):
                                     # 双路 NVENC 平均耗时 ~42s/批次，预估 NVENC 编队清空当前所有排队批次所需的剩余完工时间 (T_nv_eta)：
-                                    # 当 NVENC 积压明显 (t_nv_eta >= 35s) 时，QSV 编码能力 (100+ fps, ~5x 实时) 完全能并发出清 300~360s 标准切片，
-                                    # 平滑放宽窃取门限至 max_qsv_dynamic_s，彻底根除 QSV 500+ 次被拒空转与长尾失衡。
                                     with nv_duration_lock:
                                         avg_nv_time = (sum(nv_batch_durations[-8:]) / len(nv_batch_durations[-8:])) if nv_batch_durations else 42.0
                                     t_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * avg_nv_time)
-                                    allowed_dyn_s = max_qsv_dynamic_s if t_nv_eta >= 35.0 else min(max_qsv_dynamic_s, max(60.0, t_nv_eta * 2.5))
+                                    # 当处于尾部收尾阶段且 NVENC 正在满负荷渲染时，动态适度放宽窃取门限至 1.5x (有 fallback on nv 兜底)
+                                    effective_max_dyn = max_qsv_dynamic_s * 1.5 if (all_dispatched_event.is_set() and active_nv >= 1) else max_qsv_dynamic_s
+                                    allowed_dyn_s = effective_max_dyn if t_nv_eta >= 35.0 else min(effective_max_dyn, max(60.0, t_nv_eta * 2.5))
                                     item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
                                     if item is None:
-                                        if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                                        if all_dispatched_event.is_set() and (heavy_queue.empty() or q_len <= active_nv):
                                             break
                                         if not heavy_queue.empty():
                                             qsv_steal_rejected += 1
@@ -988,7 +993,7 @@ class StreamingOrchestrator:
                             if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                                 break
                             logger.warning("DB query failed for batch %d: %s", b_idx, e)
-                        from src.timeline import build_timeline_from_rows
+                        from src.stages.timeline import build_timeline_from_rows
                         # Streaming batches must use a stable per-file timeline;
                         # cross-file presence depends on analysis results that may
                         # arrive after this batch.
@@ -1001,7 +1006,7 @@ class StreamingOrchestrator:
                         )
 
                         if not batch_segs:
-                            from src.timeline import TimelineSegment
+                            from src.stages.timeline import TimelineSegment
                             rows_by_path = {r["filepath"]: r for r in all_rows}
 
                             # 检查批次文件是否已被宏观折叠（Macro-collapse）或分析确认无需画面输出
@@ -1129,6 +1134,29 @@ class StreamingOrchestrator:
                         else:
                             if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                                 break
+                            # Fallback retry on nv if QSV failed
+                            if gpu == "qsv" and render_hw_policy == "heterogeneous":
+                                logger.warning(
+                                    "render batch %d returned no output on qsv; retrying fallback on nv...",
+                                    b_idx,
+                                )
+                                t_retry0 = time.monotonic()
+                                res_path = build_batch_render(
+                                    batch_segs, b_idx, "nv", fps, width, height,
+                                    seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
+                                    all_rows
+                                )
+                                if res_path:
+                                    r_dur = round(time.monotonic() - t_retry0, 3)
+                                    busy_time += r_dur
+                                    batches_count += 1
+                                    logger.info("render batch %d succeeded on nv retry in %.3fs", b_idx, r_dur)
+                                    with self.batch_lock:
+                                        self.batch_paths.append((b_idx, Path(res_path)))
+                                    if self.dashboard is not None:
+                                        self.dashboard.render_batch_finished(len(files_to_batch))
+                                    continue
+
                             self._add_error(f"render batch {b_idx} returned no output")
                             with self.batch_lock:
                                 terminal_batch_ids.add(b_idx)
@@ -1410,7 +1438,7 @@ class StreamingOrchestrator:
             self.abort_event.set()
             self.stop_event.set()
             self.render_finished_event.set()
-            from src.renderer import FFmpegProcessRegistry
+            from src.hardware.ffmpeg import FFmpegProcessRegistry
             FFmpegProcessRegistry.mark_interrupted()
             FFmpegProcessRegistry.kill_all()
             if self.dashboard is not None:
@@ -1463,7 +1491,7 @@ def process_date_cam(
     out_cfg = config.get("output", {})
     naming_template = out_cfg.get("naming", "DailyVlog_{date}_{mac}.mp4")
     sample_filepath = all_tasks[0]["filepath"] if all_tasks else None
-    from src.scanner import resolve_output_filename, resolve_camera_identity
+    from src.stages.scanner import resolve_output_filename, resolve_camera_identity
     output_name = resolve_output_filename(naming_template, date, cam_index, sample_filepath=sample_filepath, config=config)
 
     cam_display = None
@@ -1484,7 +1512,7 @@ def process_date_cam(
     logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
     output_path = OUTPUT_DIR / output_name
 
-    from src.render_cache import render_fingerprint, reusable, save_manifest
+    from src.hardware.render_cache import render_fingerprint, reusable, save_manifest
     def final_fingerprint():
         rows = db.get_all_file_tasks_for_date(date, cam_index)
         decisions = [{k: r.get(k) for k in ("filepath", "file_duration", "prescreen_status", "analysis_segments", "human_reviews")} for r in rows]
@@ -1619,175 +1647,15 @@ def process_date_cam(
                worker_stats=getattr(orchestrator, "render_worker_stats", {}))
 
     # 自动回收本地预暂存文件，释放磁盘存储空间
-    from src.utils import cleanup_staging_files, cleanup_temp_artifacts
+    from src.core.utils import cleanup_staging_files, cleanup_temp_artifacts
     cleanup_staging_files()
     if config.get("render", {}).get("cleanup_batches_on_success", False):
         cleanup_temp_artifacts(clean_batches=True)
     return True
 
 
-def _dump_perf(perf, monitor, date: str, cam_index: int, pipeline_duration: float, headline: dict | None = None, worker_stats: dict | None = None):
-    try:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        perf_dir = LOGS_DIR / "perf"
-        perf_dir.mkdir(parents=True, exist_ok=True)
-        perf_path = perf_dir / f"perf_{date}_cam{cam_index}_{timestamp}.json"
-        yolo_sum = perf.yolo_summary() if hasattr(perf, "yolo_summary") else {}
-        wait_sum = perf.wait_summary() if hasattr(perf, "wait_summary") else {}
-        metadata = {
-            "date": date,
-            "cam": cam_index,
-            "pipeline_duration": round(pipeline_duration, 2),
-            "monitor_summary": monitor.stages_data(),
-            "perf_summary": perf.summary_by_stage(),
-        }
-        if worker_stats:
-            metadata["worker_stats"] = worker_stats
-        if yolo_sum:
-            metadata["yolo_summary"] = yolo_sum
-        if wait_sum:
-            metadata["wait_summary"] = wait_sum
-        if headline:
-            metadata["headline"] = headline
-        perf.dump(perf_path, metadata=metadata)
-        perf.reset()
-    except Exception:
-        pass
-
-
-def _build_headline(output_path: Path, total_input_dur: float, elapsed_wall: float) -> dict:
-    """汇总单日头条指标：处理倍速、浓缩率、产出体积（性能评估的顶层仪表盘）。"""
-    headline: dict = {
-        "input_dur_s": round(total_input_dur, 1),
-        "wall_s": round(elapsed_wall, 1),
-        "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
-    }
-    try:
-        from src.utils import size_metrics
-        headline.update(size_metrics(output_path.stat().st_size))
-    except OSError:
-        pass
-    try:
-        from src.ffmpeg import get_duration
-        out_dur = get_duration(str(output_path))
-        if out_dur and out_dur > 0:
-            headline["output_dur_s"] = round(out_dur, 1)
-            headline["condensation_x"] = round(total_input_dur / out_dur, 1)
-    except Exception:
-        pass
-    return headline
-
-
-def _save_vlog_companion_assets(
-    output_path: Path,
-    date: str,
-    cam_index: int,
-    cam_display: str,
-    total_files: int,
-    total_input_dur: float,
-    elapsed_wall: float,
-    db: VlogDatabase,
-    config: dict,
-) -> None:
-    """生成同名标准交付资产包：.srt 现实世界时间码字幕 + .meta.json 自描述结构化清单。"""
-    try:
-        from src.timeline import build_timeline_from_rows, save_timecode_subtitles, compute_display_plans
-        rows = db.get_all_file_tasks_for_date(date, cam_index)
-        full_timeline = build_timeline_from_rows(rows, date, config=config, resolve_presence=False)
-
-        # 1. 生成伴随 .srt 字幕（默认开启，可在配置中显式关闭）
-        srt_path = output_path.with_suffix(".srt")
-        if config.get("render", {}).get("generate_subtitles", True):
-            try:
-                save_timecode_subtitles(
-                    full_timeline,
-                    srt_path,
-                    rows=rows,
-                    base_date=date,
-                )
-            except Exception as e:
-                logger.warning("save_timecode_subtitles failed: %s", e)
-
-        # 2. 生成伴随 .meta.json 结构化清单
-        meta_path = output_path.with_suffix(".meta.json")
-        vlog_size = output_path.stat().st_size if output_path.exists() else 0
-        from src.ffmpeg import get_duration
-        vlog_dur = get_duration(str(output_path)) or 0.0
-
-        dyn_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"))
-        sta_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") == "STATIC")
-
-        # 提取动态高光片段（用于下游相册/Web 秒级定位）
-        highlights = []
-        cur_vlog_pos = 0.0
-        seg_cfg = config.get("segment", {})
-        render_cfg = config.get("render", {})
-        presence_cfg = config.get("presence", {})
-        micro_cfg = config.get("micro_motion", {})
-        plans = compute_display_plans(
-            full_timeline,
-            static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
-            keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
-            min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
-            max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
-            speed_ramping=render_cfg.get("speed_ramping_enabled", True),
-            ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
-            presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
-            night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-            micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
-        )
-        for seg, (disp_dur, _) in zip(full_timeline, plans):
-            start_vlog = cur_vlog_pos
-            end_vlog = cur_vlog_pos + disp_dur
-            cur_vlog_pos = end_vlog
-            if getattr(seg, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"):
-                highlights.append({
-                    "vlog_start_s": round(start_vlog, 2),
-                    "vlog_end_s": round(end_vlog, 2),
-                    "vlog_duration_s": round(disp_dur, 2),
-                    "state": seg.state,
-                    "source_file": Path(getattr(seg, "filepath", getattr(seg, "source_file", ""))).name,
-                    "max_energy": round(float(getattr(seg, "max_energy", 0.0) or 0.0), 1),
-                    "avg_confidence": round(float(getattr(seg, "avg_confidence", 0.0) or 0.0), 2),
-                })
-
-        from src.scanner import camera_key
-        first_fp = rows[0]["filepath"] if rows else ""
-        cam_id = rows[0].get("camera_id") if rows and rows[0].get("camera_id") else (camera_key(first_fp, cam_index) if first_fp else f"cam_{cam_index}")
-
-        from src.utils import size_metrics
-        manifest_data = {
-            "version": "1.0",
-            "date": date,
-            "camera": {
-                "id": cam_id,
-                "name": cam_display,
-                "cam_index": cam_index,
-            },
-            "metrics": {
-                "raw_duration_s": round(total_input_dur, 2),
-                "vlog_duration_s": round(vlog_dur, 2),
-                "condensation_ratio": round(total_input_dur / max(vlog_dur, 0.1), 2),
-                "dynamic_duration_s": round(dyn_dur, 2),
-                "static_duration_s": round(sta_dur, 2),
-                "total_source_files": total_files,
-                **size_metrics(vlog_size),
-            },
-            "timeline_highlights": highlights,
-            "performance": {
-                "wall_clock_s": round(elapsed_wall, 2),
-                "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
-                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        }
-        meta_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("Saved vlog companion assets: %s, %s", srt_path.name, meta_path.name)
-    except Exception as e:
-        logger.warning("Failed to save vlog companion assets for %s: %s", output_path.name, e)
-
-
 def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True) -> dict:
-    from src.utils import cleanup_temp_artifacts
+    from src.core.utils import cleanup_temp_artifacts
     cleanup_temp_artifacts()
     db = VlogDatabase()
     monitor = get_monitor()
@@ -1822,7 +1690,7 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 else:
                     failed += 1
             except KeyboardInterrupt:
-                from src.renderer import FFmpegProcessRegistry
+                from src.hardware.ffmpeg import FFmpegProcessRegistry
                 FFmpegProcessRegistry.mark_interrupted()
                 FFmpegProcessRegistry.kill_all()
                 logger.warning("run_pipeline interrupted by user (Ctrl+C). Halting batch pipeline.")
@@ -1834,7 +1702,7 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 wall_s = time.monotonic() - t0
                 tasks = db.get_all_file_tasks_for_date(date, cam_index)
                 sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else ""
-                from src.scanner import resolve_camera_identity, resolve_output_filename
+                from src.stages.scanner import resolve_camera_identity, resolve_output_filename
                 disp, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=load_config())
                 out_name = resolve_output_filename(
                     load_config().get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),

@@ -33,7 +33,7 @@ class YoloVerifier:
             return
             
         raw_path = yolo_cfg.get("model_path", "models/yolo11n.pt")
-        from src.utils import PROJECT_ROOT
+        from src.core.config import PROJECT_ROOT
         p = Path(raw_path)
         if not p.is_absolute():
             # 依次探测: 相对当前工作目录 -> 相对 PROJECT_ROOT -> 相对 PROJECT_ROOT/models
@@ -101,7 +101,7 @@ class YoloVerifier:
         import cv2
         import torch
         from bisect import bisect_left
-        from src.segment import _merge_same_state
+        from src.algorithms.segment import _merge_same_state
 
         frames_buffer = frames_buffer or {}
         keys = sorted(frames_buffer)
@@ -117,6 +117,7 @@ class YoloVerifier:
                 matched = [matched[j] for j in np.linspace(0, len(matched)-1, 8, dtype=int)]
             jobs.extend((i, k) for k in matched)
             counts[i], confirmed[i], confidences[i] = 0, False, 0.0
+        person_boxes_by_seg: dict[int, list[np.ndarray]] = {i: [] for i in counts}
 
         batch_size = max(1, int(getattr(self, "batch_size", 4)))
         yolo_lock_wait_total = 0.0
@@ -159,12 +160,44 @@ class YoloVerifier:
                     raise RuntimeError("YOLO returned an incomplete batch")
                 for i, threshold, result in zip(owners, thresholds, results):
                     counts[i] += 1
-                    if result.boxes is None:
+                    boxes = result.boxes
+                    if boxes is None:
                         continue
-                    for cls, conf in zip(result.boxes.cls.cpu().numpy(), result.boxes.conf.cpu().numpy()):
-                        if int(cls) in self.target_classes:
+                    if hasattr(boxes, "data") and (torch.is_tensor(boxes.data) or isinstance(boxes.data, np.ndarray)):
+                        data = boxes.data.cpu().numpy() if hasattr(boxes.data, "cpu") else np.asarray(boxes.data)
+                        if len(data) == 0:
+                            continue
+                        xyxy_arr = data[:, :4]
+                        conf_arr = data[:, 4]
+                        cls_arr = data[:, 5]
+                    else:
+                        cls_arr = boxes.cls.cpu().numpy() if hasattr(boxes.cls, "cpu") else np.array(boxes.cls)
+                        conf_arr = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.array(boxes.conf)
+                        has_xyxy = hasattr(boxes, "xyxy") and (torch.is_tensor(boxes.xyxy) or isinstance(boxes.xyxy, np.ndarray))
+                        xyxy_arr = (boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.asarray(boxes.xyxy)) if has_xyxy else None
+                    orig_shape = getattr(result, "orig_shape", None)
+                    h_orig, w_orig = (float(orig_shape[0]), float(orig_shape[1])) if orig_shape and len(orig_shape) >= 2 else (1.0, 1.0)
+
+                    best_person_conf = -1.0
+                    best_person_box = None
+
+                    for idx, (cls, conf) in enumerate(zip(cls_arr, conf_arr)):
+                        c_int = int(cls)
+                        if c_int in self.target_classes:
                             confidences[i] = max(confidences[i], float(conf))
                             confirmed[i] |= float(conf) >= threshold
+                        if c_int == 0 and float(conf) >= threshold and xyxy_arr is not None and idx < len(xyxy_arr):
+                            if float(conf) > best_person_conf:
+                                best_person_conf = float(conf)
+                                b = xyxy_arr[idx]
+                                best_person_box = np.array([
+                                    b[0] / max(1.0, w_orig),
+                                    b[1] / max(1.0, h_orig),
+                                    b[2] / max(1.0, w_orig),
+                                    b[3] / max(1.0, h_orig),
+                                ], dtype=np.float32)
+                    if best_person_box is not None:
+                        person_boxes_by_seg[i].append(best_person_box)
         except Exception as exc:
             logger.warning("YOLO verification failed for %s: %s; retaining motion", filepath, exc)
             for i in counts:
@@ -191,7 +224,42 @@ class YoloVerifier:
                 seg.needs_review = True
                 seg.review_reason = "INSUFFICIENT_YOLO_EVIDENCE"
             elif confirmed[i]:
-                if confidences[i] < 0.28:
+                # 人体空间位移门控 (Human-Centric Motion Gating):
+                # 若检测到人体，但采样帧间包围盒位移极小且能量低于剧烈爆发门限 (< 25.0)，且非音频事件，
+                # 判定为静坐/静卧陪伴 (PRESENCE 或 NIGHT_STATIONARY)，避免膨胀为 1x DYNAMIC
+                p_boxes = person_boxes_by_seg.get(i, [])
+                is_stationary_human = False
+                if len(p_boxes) >= 2 and seg.state != "DYNAMIC_AUDIO" and seg.max_energy < 25.0:
+                    disps = []
+                    ious = []
+                    for b1, b2 in zip(p_boxes[:-1], p_boxes[1:]):
+                        c1 = ((b1[0] + b1[2]) / 2, (b1[1] + b1[3]) / 2)
+                        c2 = ((b2[0] + b2[2]) / 2, (b2[1] + b2[3]) / 2)
+                        disps.append(float(np.hypot(c2[0] - c1[0], c2[1] - c1[1])))
+                        ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+                        ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+                        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+                        inter = iw * ih
+                        area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+                        area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+                        ious.append(inter / max(1e-6, area1 + area2 - inter))
+                    if max(disps) < 0.08 and min(ious) > 0.55:
+                        is_stationary_human = True
+
+                if is_stationary_human:
+                    cfg = getattr(self, "config", None) or {}
+                    pres_cfg = cfg.get("presence", {})
+                    night_hours = tuple(pres_cfg.get("night_hours", [23, 7]))
+                    hour = (seg.start_time % 86400) / 3600
+                    is_seg_night = (night_hours[0] <= hour < night_hours[1] if night_hours[0] < night_hours[1]
+                                    else hour >= night_hours[0] or hour < night_hours[1])
+                    if is_seg_night and pres_cfg.get("night_stationary_enabled", True):
+                        seg.state = "NIGHT_STATIONARY"
+                    else:
+                        seg.state = "PRESENCE"
+                    seg.needs_review = False
+                    seg.review_reason = "STATIONARY_PRESENCE: YOLO主体静止"
+                elif confidences[i] < 0.28:
                     seg.needs_review = True
                     seg.review_reason = "BORDERLINE_CONFIDENCE"
             elif seg.state == "DYNAMIC_AUDIO":

@@ -6,13 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.database import VlogDatabase
-from src.segment import Segment, segments_from_json, merge_cross_file, split_segments_at_file_boundaries
-from src.utils import load_config, ts_to_unix
+from src.core.database import VlogDatabase
+from src.algorithms.segment import (
+    ACTIVE_STATES,
+    Segment,
+    SegmentState,
+    merge_cross_file,
+    segments_from_json,
+    split_segments_at_file_boundaries,
+)
+from src.core.config import load_config
+from src.core.identity import ts_to_unix
 
 logger = logging.getLogger("homevlog")
-
-ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
 
 
 @dataclass
@@ -145,6 +151,29 @@ def calculate_speed_ramping_curve(
     )
 
 
+def _plan_speed_segment(
+    dur: float,
+    target: float,
+    has_in: bool,
+    has_out: bool,
+    speed_ramping: bool,
+    ramp_duration_s: float,
+) -> tuple[float, SpeedRampInfo | None]:
+    """Helper to calculate display duration and speed ramping curve for non-1x segments."""
+    v_fast = dur / target if target > 0 else 1.0
+    if speed_ramping and (has_in or has_out):
+        info = calculate_speed_ramping_curve(
+            dur=dur,
+            v_fast=v_fast,
+            has_ramp_in=has_in,
+            has_ramp_out=has_out,
+            ramp_duration_s=ramp_duration_s,
+            target_display_dur=target,
+        )
+        return (info.target_display_dur, info)
+    return (target, None)
+
+
 def compute_display_plans(
     timeline: list[TimelineSegment],
     static_keyframe_interval: float = 12.0,
@@ -179,71 +208,28 @@ def compute_display_plans(
                   and timeline[i - 1].state in ACTIVE_STATES)
         has_out = (i < n - 1 and timeline[i + 1].filepath == seg.filepath
                    and timeline[i + 1].state in ACTIVE_STATES)
-        if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO"):
+        if seg.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO):
             plans.append((dur, None))
             continue
-        elif seg.state == "PRESENCE":
-            target = max(0.25, dur / max(1.0, presence_speed_factor))
-            target = min(target, dur)
-            v_fast = dur / target if target > 0 else 1.0
-            if speed_ramping and (has_in or has_out):
-                info = calculate_speed_ramping_curve(
-                    dur=dur, v_fast=v_fast,
-                    has_ramp_in=has_in, has_ramp_out=has_out,
-                    ramp_duration_s=ramp_duration_s,
-                    target_display_dur=target,
-                )
-                plans.append((info.target_display_dur, info))
-            else:
-                plans.append((target, None))
-            continue
-        elif seg.state == "NIGHT_STATIONARY":
-            target = max(0.25, dur / max(1.0, night_stationary_speed_factor))
-            target = min(target, dur)
-            v_fast = dur / target if target > 0 else 1.0
-            if speed_ramping and (has_in or has_out):
-                info = calculate_speed_ramping_curve(
-                    dur=dur, v_fast=v_fast,
-                    has_ramp_in=has_in, has_ramp_out=has_out,
-                    ramp_duration_s=ramp_duration_s,
-                    target_display_dur=target,
-                )
-                plans.append((info.target_display_dur, info))
-            else:
-                plans.append((target, None))
-            continue
-        elif seg.state == "MICRO_MOTION":
-            target = dur / max(1.0, micro_motion_cruise_speed)
-            target = min(max(target, 0.25), dur)
-            v_fast = dur / target if target > 0 else 1.0
-            if speed_ramping and (has_in or has_out):
-                info = calculate_speed_ramping_curve(
-                    dur=dur, v_fast=v_fast,
-                    has_ramp_in=has_in, has_ramp_out=has_out,
-                    ramp_duration_s=ramp_duration_s,
-                    target_display_dur=target,
-                )
-                plans.append((info.target_display_dur, info))
-            else:
-                plans.append((target, None))
-            continue
-
-        target = max(dur / global_speed_factor, min_static_display_duration)
-        target = min(target, dur)
-        if max_static_display_duration is not None and max_static_display_duration > 0:
-            target = min(target, max_static_display_duration)
-
-        v_fast = dur / target if target > 0 else 1.0
-        if speed_ramping and (has_in or has_out):
-            info = calculate_speed_ramping_curve(
-                dur=dur, v_fast=v_fast,
-                has_ramp_in=has_in, has_ramp_out=has_out,
-                ramp_duration_s=ramp_duration_s,
-                target_display_dur=target,
-            )
-            plans.append((info.target_display_dur, info))
+        elif seg.state == SegmentState.PRESENCE:
+            target = min(max(0.25, dur / max(1.0, presence_speed_factor)), dur)
+        elif seg.state == SegmentState.NIGHT_STATIONARY:
+            target = min(max(0.25, dur / max(1.0, night_stationary_speed_factor)), dur)
+        elif seg.state == SegmentState.MICRO_MOTION:
+            target = min(max(0.25, dur / max(1.0, micro_motion_cruise_speed)), dur)
         else:
-            plans.append((target, None))
+            target = min(max(dur / global_speed_factor, min_static_display_duration), dur)
+            if max_static_display_duration is not None and max_static_display_duration > 0:
+                target = min(target, max_static_display_duration)
+
+        plans.append(_plan_speed_segment(
+            dur=dur,
+            target=target,
+            has_in=has_in,
+            has_out=has_out,
+            speed_ramping=speed_ramping,
+            ramp_duration_s=ramp_duration_s,
+        ))
     return plans
 
 
@@ -692,7 +678,7 @@ def build_timeline_from_rows(
     # protected short actions/audio at file edges after temporal refinement.
     filtered = merge_cross_file(all_segments, gap_tolerance) if resolve_presence else all_segments
 
-    from src.segment import resolve_presence_segments
+    from src.algorithms.segment import resolve_presence_segments
     presence_cfg = config.get("presence", {})
     presence_gap = float(presence_cfg.get("max_presence_gap_s", 180.0))
     presence_conf = float(presence_cfg.get("person_conf_threshold", 0.25))
@@ -740,7 +726,7 @@ def build_timeline_from_rows(
 
     # 严格按物理文件边界切分，防止跨文件批次渲染时超出物理文件时长
     split_segs = split_segments_at_file_boundaries(filtered, files_meta)
-    from src.feedback import overlay_reviews
+    from src.stages.feedback import overlay_reviews
     split_segs = overlay_reviews(split_segs, reviews)
 
     # 若指定 target_files，则快速局部过滤出目标文件的切片

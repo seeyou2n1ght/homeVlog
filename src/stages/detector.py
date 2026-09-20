@@ -9,13 +9,13 @@ import av
 import cv2
 import numpy as np
 
-from src.utils import parse_res
-from src.scheduler import acquire_with_retry, VideoLease
-from src.ffmpeg import run_ffmpeg, FFmpegProcessRegistry
+from src.core.utils import parse_res
+from src.hardware.scheduler import acquire_with_retry, VideoLease
+from src.hardware.ffmpeg import run_ffmpeg, FFmpegProcessRegistry
 
-# 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.filters 提供（单一实现，防漂移）。
+# 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.algorithms.filters 提供（单一实现，防漂移）。
 # 此处 re-export 以保持 `from src.detector import ...` 的历史导入路径兼容。
-from src.filters import (
+from src.algorithms.filters import (
     AudioEnergyVAD,
     EmaBackgroundModel,
     SpatialGridMotionFilter,
@@ -93,6 +93,10 @@ class MotionDetector:
         self.ambient_drift_suppress = bool(det.get("ambient_drift_suppress", True))
         self.ambient_drift_active_ratio = float(det.get("ambient_drift_active_ratio", 0.35))
         self.ambient_drift_max_energy = float(det.get("ambient_drift_max_energy", 5.0))
+        self.camera_motion_suppress = bool(det.get("camera_motion_suppress", True))
+        self.camera_motion_active_ratio = float(det.get("camera_motion_active_ratio", 0.65))
+        self.camera_motion_max_cov = float(det.get("camera_motion_max_cov", 0.60))
+        self.camera_motion_max_focal_ratio = float(det.get("camera_motion_max_focal_ratio", 3.5))
 
         # R3: 音频 VAD 多模态事件唤醒 (Audio-Assisted Activity Detection)
         audio_cfg = config.get("audio_vad", {})
@@ -168,6 +172,10 @@ class MotionDetector:
             ambient_drift_suppress=self.ambient_drift_suppress,
             ambient_drift_active_ratio=self.ambient_drift_active_ratio,
             ambient_drift_max_energy=self.ambient_drift_max_energy,
+            camera_motion_suppress=self.camera_motion_suppress,
+            camera_motion_active_ratio=self.camera_motion_active_ratio,
+            camera_motion_max_cov=self.camera_motion_max_cov,
+            camera_motion_max_focal_ratio=self.camera_motion_max_focal_ratio,
         )
 
     def analyze_frames(
@@ -187,7 +195,7 @@ class MotionDetector:
         dt = 1.0 / effective_fps if effective_fps > 0 else 0.2
         frame_interval = dt
 
-        from src.motion_trace import MotionTrace
+        from src.algorithms.motion_trace import MotionTrace
         early_terminated = False
 
         # R3: Audio VAD event extraction if audio buffer provided
@@ -401,8 +409,8 @@ class MotionDetector:
         本路径解码侧在 GPU 完成 fps 过滤与缩放，仅 ~660 个 416x234 小帧经管道回传，
         实测可将单文件解码耗时从 ~240s 降至 ~15-30s。
         """
-        from src.frame_pool import FramePool
-        from src.motion_trace import MotionTrace
+        from src.hardware.frame_pool import FramePool
+        from src.algorithms.motion_trace import MotionTrace
         decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0))) if getattr(self, "_stream_motion", False)
                           else FramePool(self.buffer_limit // 2))
         yolo_buffer: dict[int, np.ndarray] = {}
@@ -411,12 +419,12 @@ class MotionDetector:
         frame_size = w * h  # 单通道灰度直通，IPC 管道数据量降低 66.7%
 
         if self.decode_gpu == "qsv":
-            from src.utils import get_qsv_semaphore
+            from src.hardware.scheduler import get_qsv_semaphore
             io_sem = VideoLease(get_qsv_semaphore())
             hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
             vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12"
         else:
-            from src.utils import get_nvdec_semaphore
+            from src.hardware.scheduler import get_nvdec_semaphore
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12"
@@ -453,7 +461,7 @@ class MotionDetector:
         total_frames = 0
         proc: subprocess.Popen | None = None
         watchdog_timer: threading.Timer | None = None
-        from src.utils import TEMP_DIR
+        from src.core.utils import TEMP_DIR
         pipe_key = f"pipe_decode_{Path(filepath).name}_{time.monotonic()}"
         safe_stem = Path(filepath).stem.replace(" ", "_")
         err_log = TEMP_DIR / f".pipe_decode_{safe_stem}_{os.getpid()}_{threading.get_ident()}.log"
@@ -554,7 +562,7 @@ class MotionDetector:
         return decoded_frames, yolo_buffer, meta
 
     def _decode_audio_pipe(self, filepath: str, file_duration: float):
-        from src.audio_features import AudioFeatures
+        from src.algorithms.audio_features import AudioFeatures
         features = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
         if not self.audio_vad_enabled or getattr(self, "has_audio_detected", None) == 0:
             return features
@@ -580,17 +588,17 @@ class MotionDetector:
         Phase 1 (信号量保护): 硬件解码全部帧到内存缓冲区。
         返回 (grayscale_frames, yolo_buffer, audio_samples, metadata)。
         """
-        from src.frame_pool import FramePool
+        from src.hardware.frame_pool import FramePool
         decoded_frames = FramePool(self.buffer_limit // 2)
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
 
         if self.decode_gpu == "qsv":
-            from src.utils import get_qsv_semaphore
+            from src.hardware.scheduler import get_qsv_semaphore
             io_sem = VideoLease(get_qsv_semaphore())
             hw_name = "qsv"
         else:
-            from src.utils import get_nvdec_semaphore
+            from src.hardware.scheduler import get_nvdec_semaphore
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_name = "cuda"
 
@@ -611,7 +619,7 @@ class MotionDetector:
                 "sem_wait": sem_wait,
             }
 
-        from src.audio_features import AudioFeatures
+        from src.algorithms.audio_features import AudioFeatures
         audio_features = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
         audio_resampler = None
         has_audio = 0
@@ -679,7 +687,7 @@ class MotionDetector:
                 frame_step = max(1, int(round(video_fps / effective_fps)))
                 effective_fps = video_fps / frame_step
                 if getattr(self, "_stream_motion", False):
-                    from src.motion_trace import MotionTrace
+                    from src.algorithms.motion_trace import MotionTrace
                     decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)))
 
                 # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
@@ -698,7 +706,7 @@ class MotionDetector:
                 if self.audio_vad_enabled and audio_stream is not None:
                     streams_to_decode.append(audio_stream)
 
-                from src.renderer import FFmpegProcessRegistry
+                from src.hardware.ffmpeg import FFmpegProcessRegistry
                 for frame in container.decode(*streams_to_decode):
                     if FFmpegProcessRegistry.is_interrupted():
                         break
@@ -728,16 +736,23 @@ class MotionDetector:
 
                     if getattr(self, "yolo_enabled", False) and (total_frames - 1) % yolo_sample_interval == 0:
                         try:
-                            rgb_raw = frame.reformat(
-                                width=self.width, height=self.height, format="rgb24"
+                            bgr_tmp = frame.reformat(
+                                width=self.width, height=self.height, format="bgr24"
                             ).to_ndarray()
                         except Exception:
-                            rgb_raw = cv2.resize(
-                                frame.to_ndarray(format="rgb24"),
-                                (self.width, self.height),
-                                interpolation=cv2.INTER_LINEAR,
-                            )
-                        bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
+                            try:
+                                bgr_tmp = cv2.resize(
+                                    frame.to_ndarray(format="bgr24"),
+                                    (self.width, self.height),
+                                    interpolation=cv2.INTER_LINEAR,
+                                )
+                            except Exception:
+                                rgb_raw = cv2.resize(
+                                    frame.to_ndarray(format="rgb24"),
+                                    (self.width, self.height),
+                                    interpolation=cv2.INTER_LINEAR,
+                                )
+                                bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
                         ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
                         item = buf_jpg if ok_enc else bgr_tmp
                         jpeg_bytes += item.nbytes
@@ -746,7 +761,11 @@ class MotionDetector:
                         yolo_buffer[total_frames - 1] = item
 
                     try:
-                        if frame.planes:
+                        if frame.planes and hasattr(frame.planes[0], "line_size") and getattr(frame.planes[0], "line_size", 0) > 0:
+                            p0 = frame.planes[0]
+                            y_raw = np.frombuffer(p0, dtype=np.uint8).reshape((frame.height, p0.line_size))[:, :frame.width]
+                            gray = cv2.resize(y_raw, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+                        elif frame.planes:
                             y_raw = frame.to_ndarray(format="gray")
                             gray = cv2.resize(y_raw, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
                         else:
@@ -826,23 +845,27 @@ class MotionDetector:
         """
         self._analysis_start_offset = start_offset
         # Filename spans are day-relative placement metadata, not media duration.
-        # Analysis is the lazy metadata boundary, so always trust the container.
-        from src.scheduler import get_disk_semaphore
-        disk = get_disk_semaphore()
-        if not acquire_with_retry(disk):
-            raise TimeoutError("Metadata I/O admission timed out")
-        try:
-            with av.open(str(filepath), timeout=30.0) as container:
-                stream = container.streams.video[0]
-                actual_duration = (float(stream.duration * stream.time_base) if stream.duration
-                                   else float(container.duration or 0) / av.time_base)
-                if actual_duration <= 0:
-                    raise ValueError("Missing video duration")
-                file_duration = actual_duration
-                self.file_duration_detected = actual_duration
-                self.has_audio_detected = int(bool(container.streams.audio))
-        finally:
-            disk.release()
+        # Analysis is the lazy metadata boundary; probe only if metadata was not already resolved.
+        if file_duration <= 0 or has_audio is None:
+            from src.hardware.scheduler import get_disk_semaphore
+            disk = get_disk_semaphore()
+            if not acquire_with_retry(disk):
+                raise TimeoutError("Metadata I/O admission timed out")
+            try:
+                with av.open(str(filepath), timeout=30.0) as container:
+                    stream = container.streams.video[0]
+                    actual_duration = (float(stream.duration * stream.time_base) if stream.duration
+                                       else float(container.duration or 0) / av.time_base)
+                    if actual_duration <= 0:
+                        raise ValueError("Missing video duration")
+                    file_duration = actual_duration
+                    self.file_duration_detected = actual_duration
+                    self.has_audio_detected = int(bool(container.streams.audio))
+            finally:
+                disk.release()
+        else:
+            self.file_duration_detected = file_duration
+            self.has_audio_detected = has_audio
         # Phase 1: 解码
         from contextlib import nullcontext
         lease = self.device_lease() if hasattr(self, "device_lease") else nullcontext(self.decode_gpu)

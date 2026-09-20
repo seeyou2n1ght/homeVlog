@@ -7,9 +7,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args, FFmpegProcessRegistry
-from src.scheduler import acquire_with_retry, VideoLease
-from src.utils import parse_res
+from src.hardware.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args, FFmpegProcessRegistry
+from src.hardware.scheduler import acquire_with_retry, VideoLease
+from src.core.utils import parse_res
 
 logger = logging.getLogger("homevlog")
 
@@ -35,7 +35,7 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
         vframes=1,
         gpu=gpu,
     )
-    from src.scheduler import get_qsv_semaphore, get_nv_semaphore
+    from src.hardware.scheduler import get_qsv_semaphore, get_nv_semaphore
     hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
     expected = width * height * 3
     for attempt in range(2):
@@ -114,7 +114,7 @@ def _prescreen_keyframes(
     sample_ts: list[float] = []
     has_audio = 0
 
-    from src.utils import get_disk_semaphore
+    from src.hardware.scheduler import get_disk_semaphore
     io_sem = get_disk_semaphore()
 
     _t_sem = time.monotonic()
@@ -147,8 +147,15 @@ def _prescreen_keyframes(
                 k += 1
                 if k > 1 and (k - 1) % kf_step != 0:
                     continue
-                y_raw = frame.to_ndarray(format="gray")
-                curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_AREA)
+                try:
+                    if frame.planes and hasattr(frame.planes[0], "line_size") and getattr(frame.planes[0], "line_size", 0) > 0:
+                        p0 = frame.planes[0]
+                        y_raw = np.frombuffer(p0, dtype=np.uint8).reshape((frame.height, p0.line_size))[:, :frame.width]
+                    else:
+                        y_raw = frame.to_ndarray(format="gray")
+                except Exception:
+                    y_raw = frame.to_ndarray(format="gray")
+                curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_LINEAR)
                 if time.monotonic() - _t_sem > timeout:
                     return {"status": "SUSPICIOUS", "has_audio": has_audio, "error": "prescreen coverage timeout"}
 
@@ -438,10 +445,10 @@ def _prescreen_stream_fps(
     cmd = _build_stream_fps_args(filepath, sample_fps, max_frames, width, height, gpu)
 
     if gpu == "qsv":
-        from src.utils import get_qsv_semaphore
+        from src.hardware.scheduler import get_qsv_semaphore
         io_sem = VideoLease(get_qsv_semaphore())
     else:
-        from src.utils import get_nv_semaphore
+        from src.hardware.scheduler import get_nv_semaphore
         io_sem = VideoLease(get_nv_semaphore())
 
     stderr_lines: list[str] = []

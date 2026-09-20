@@ -65,7 +65,7 @@ class StageStats:
 class Monitor:
     def __init__(self, interval: float | None = None):
         if interval is None:
-            from src.utils import load_config
+            from src.core.config import load_config
             interval = load_config().get("logging", {}).get("monitor_interval", 2.0)
         self.interval = interval
         self._stages: list[StageStats] = []

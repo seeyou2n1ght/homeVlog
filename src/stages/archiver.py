@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from src.database import VlogDatabase
-from src.utils import PROJECT_ROOT
+from src.core.database import VlogDatabase
+from src.core.config import PROJECT_ROOT
 
 logger = logging.getLogger("homevlog.archiver")
 
@@ -127,7 +127,7 @@ def _extract_and_archive_frame(
             str(target_img),
         ]
         try:
-            from src.ffmpeg import run_ffmpeg
+            from src.hardware.ffmpeg import run_ffmpeg
             res = run_ffmpeg(cmd[1:], capture_output=True, timeout=12)
             if res.returncode == 0 and target_img.exists() and target_img.stat().st_size > 0:
                 extracted = True

@@ -1176,3 +1176,149 @@ docs/PROGRESS.md
 - hev1 需要目标播放器兼容性验收；边界检查增加解码成本，不等价于逐帧全片验证。
 - 时间轴不再因伴随资产生成而写回或变动；历史跨文件 presence 重分类产物不能充当相同时间轴基线。
 - QSV ICQ28 的体积与画质需要重新测量；不从质量参数数值推导实际收益。
+
+---
+
+# ADR 0019 — Human-Centric Spatial Gating, Adaptive Day/Night Thresholds, and PTZ Cruise Suppression
+
+**Status:** Accepted  
+**Date:** 2026-09-18  
+**Evolves:** ADR 0012, ADR 0013, ADR 0017
+
+## Context
+
+在 `20260320` 真实全天素材中，成片膨胀至 6.11 小时 / 6.81 GB（历史早期仅约 2.96 小时 / 2.41~2.85 GB）。诊断发现 93.6%（20,576 秒）的成片被锁定在 1.0x `DYNAMIC` 常速播放，大量应以 4x 快进（`PRESENCE`）或 16x 延时（`NIGHT_STATIONARY`）的片段失控膨胀：
+1. **迟滞底噪下限与人体呼吸微动失配**：ADR 0017 设定的空间网格门限 $7.0$ 与全局门限 $5.5$ 处于人体静坐呼吸底噪（单格能量 10~17，全局能量 6~8）之下，导致看护人静坐 6 分钟被 100% 误判为常速剧烈运动；
+2. **事件无界连环合并**：在 `action_coalesce_gap = 2.0s` 缺乏时长上限约束时，微弱呼吸噪点连锁吞噬整段静止；
+3. **夜间低照度低置信度回退错误**：静止间隙在未能高置信度检出人体时，错误回退至 `parent.state`（1x DYNAMIC），造成夜间大量睡眠被当作 1x 播放；
+4. **云台自适应巡航误报**：全景巡航平移导致 60/64 单元均匀激活，伪造假动态；
+5. **室外类别污染**：室内机位检测汽车/自行车/摩托车造成假目标干扰。
+
+## Decision
+
+1. **人体空间位移门控 (Human-Centric Motion Gating)**：
+   - 在 `YoloVerifier.verify` 中追踪人体采样包围盒序列；
+   - 当连续采样帧位移 $\text{max\_disp} < 0.08$、$\text{min\_iou} > 0.55$ 且能量 $< 25.0$（无音频事件）时，确认为静坐/静卧陪伴，精准升级为 `PRESENCE`（日间 4x）或 `NIGHT_STATIONARY`（夜间 16x），彻底剥离 1x 动态。
+2. **室内检测目标净化**：
+   - 室内机位剥离 COCO 1/2/3 类（汽车、自行车、摩托车），锁定目标类别为 `target_classes: [0, 15, 16]`（人、猫、狗）。
+3. **云台巡航与全画幅相机平移抑制 (PTZ Cruise Gating)**：
+   - 在 `SpatialGridMotionFilter` 中增加全画幅平移抑制：当激活单元比 $\ge 0.65$ 且方差变异系数 $\text{cov} < 0.60$、聚焦比 $\text{focal\_ratio} < 3.5$ 时，判定为全景平移而非主体活动，予以软抑制。
+4. **昼夜自适应多特征迟滞状态机与合并边界收敛**：
+   - 区分日间触发门限（全局 $e \ge 10.0$ 或局部 $\text{max\_cell\_e} \ge 28.0$ 且连通数 $\ge 2$）与夜间微动保护门限（全局 $e \ge 12.0$ 或局部 $\text{max\_cell\_e} \ge 35.0$）；
+   - 迟滞维持设最大窗口 `max_maintain_duration = 2.5s`；
+   - 动作合并设最大单体时长 `max_coalesce_duration = 8.0s`（非强动作/音频禁止无限连环合并）；
+   - 修复静止间隙回退优先级：优先保留 `YOLO_FAILED` 故障兜底，夜间强制回归 `NIGHT_STATIONARY` (16x)，日间有人回归 `PRESENCE` (4x)，无人回归 `STATIC`。
+
+## Consequences
+
+- 日间静坐测试素材（如 `140727`、`143054`）75% 以上时长精准进入 `PRESENCE` (4x)，展示时长减少 20%~26%；
+- 夜间睡眠素材（如 `000658` 50分钟视频）99.2% 时长精准落入 `NIGHT_STATIONARY` (16x)，展示时长减少 30.7%；
+- 全量 243 项自动化单元测试 100% 保持通过，零漏检（$P0 = 0$）防护机制持续成立。
+
+---
+
+# ADR 0020 — Virtual Concat Local Staging Dynamic Binding, QSV Heterogeneous Retry, and SMB Probing Bypass
+
+**Status:** Accepted  
+**Date:** 2026-09-19  
+**Evolves:** ADR 0004, ADR 0015, ADR 0016
+
+## Context
+
+在对全天 24.81 小时 `20260320` 素材执行全流程复现时，管线在 141/142 批次时遇到中断：
+1. **虚拟转码音频流远程阻塞**：`_prepare_virtual_input` 对源视频切片执行了本地 SSD 缓存（`staged_source`），但 filtergraph 伴生音频输入 `-i` 仍硬编码绑定至远程 SMB NAS 原始路径 `files[0]`。当多路分析并发冲击 NAS 磁盘吞吐时，FFmpeg 启动探针阻塞超过 120s 被看门狗终止；
+2. **纯静态虚拟批次硬失败**：纯静态虚拟批次重试条件仅检查 `virtual_mixed`，导致单文件纯静态批次在启动异常时无法降级至 continuous 稀疏路径；
+3. **异构单批次偶发失败阻断全局**：当 QSV 批次偶发超时或底层驱动卡顿时，缺少异构（NVENC）容错重试路径，直接导致全天合成被中止；
+4. **冗余 NAS 探测读锁放大**：`detector.analyze` 对每个已由数据库记录 `file_duration` 与 `has_audio` 的切片依然无差别发起 `av.open` 远端嗅探，造成全天 95 次重复远程网络 I/O；
+5. **硬件并发信号量不对齐**：`analysis_max_workers: 8` 争抢 `max_qsv_analysis_concurrency: 7` 导致信号量获取频繁超时抖动。
+
+## Decision
+
+1. **虚拟渲染本地暂存动态全流绑定**：
+   - 在 `_prepare_virtual_input` 中，当源文件已暂存至本地 SSD（`staged_source`）时，动态将 `input_args` 中的音频输入流 `-i` 替换为 `staged_source` 本地路径，确保音视频流解码全部消费本地 SSD。
+2. **虚拟批次自愈降级**：
+   - 将虚拟拼接异常重试条件放宽至 `not virtual_enabled`，所有虚拟批次（含纯静态批次）在遭遇启动超时或校验失败时均能平滑回退至 continuous 稀疏渲染模式。
+3. **异构渲染跨硬件自动重试**：
+   - 在 `StreamingOrchestrator` 批次收集流程中，若批次在 `qsv` 下未能产出有效输出，自动使用 `nv` 触发一次无感重试，保障单批次硬件偶发异常不影响整日交付。
+4. **数据库缓存感知并跳过冗余远端探测**：
+   - 在 `MotionDetector.analyze` 中判断若入参已具备 `file_duration > 0` 且 `has_audio is not None`，直接使用已知元数据，彻底绕过跨 SMB 网络的 `av.open`。
+5. **硬件并发信号量严格对齐**：
+   - 生产配置中 `analysis_max_workers` 与 `max_qsv_analysis_concurrency` 统一收敛为 7，避免过载争用。
+
+## Consequences
+
+- 20260320 全量 142 个批次 100% 成功交付并完成最终合成；
+- 成片 `DailyVlog_20260320_B888805AA3CD.mp4`（4.21 GB / 226分56秒 / 6.56x 浓缩 / 49.5x 实时）一次性生成，音画同步误差小于 0.021s；
+- 全量自动化单元测试 243 passed，7 skipped，零回归风险。
+
+---
+
+# ADR 0021 — Clean Code Architecture Layering, Zero Dependency Inversion, and Companion Decoupling
+
+**Status:** Accepted  
+**Date:** 2026-09-19  
+**Evolves:** ADR 0011, ADR 0014
+
+## Context
+
+随着多阶段流式管线演进，系统出现以下代码结构坏味道：
+1. **分层依赖反转**：底座核心 `src/core/database.py` 逆向导入顶层阶段 `src/stages/scanner.py`（用于机位别名解析），引发下层依赖上层的架构反转；
+2. **伴随资产与编排混杂**：`src/pipeline.py` 中充斥着大量的字幕（SRT）生成、元数据（meta.json）序列化及性能图表持久化逻辑，流水线编排核心职责膨胀；
+3. **状态常量发散**：切片状态与活动集合在各模块中以字面量元组形式硬编码定义，存在拼写错误与契约漂移风险；
+4. **内部垫片残留**：内部生产模块间依然存在通过根目录垫片（`from src.utils import ...`）引用的历史遗留，未彻底收敛至分层子包规范。
+
+## Decision
+
+1. **新建机位与文件名规则层 `src/core/identity.py`**：
+   - 将 `resolve_camera_identity`、`resolve_output_filename` 等纯规则算子下沉至 `src.core.identity`，`database.py` 与 `scanner.py` 均单向依赖核心层，彻底终结架构倒置。
+2. **伴随资产生成逻辑独立封装 `src/stages/companion.py`**：
+   - 提取 `save_companion_assets`、`build_srt_subtitles`、`build_vlog_metadata`，`pipeline.py` 仅关注阶段调度编排。
+3. **领域状态枚举与活动集合契约收敛**：
+   - 在 `src/algorithms/segment.py` 统一定义 `SegmentState(StrEnum)` 与 `ACTIVE_STATES`，全库统一引入。
+4. **内部生产导入卫生全面治理**：
+   - 全库生产代码全面迁移为 `src.core.*`, `src.hardware.*`, `src.algorithms.*`, `src.stages.*`, `src.ui.*`，生产代码对根层垫片引用清零；顶层透明 Facade 严格保留以保证外部脚本与单测 100% 兼容。
+
+## Consequences
+
+- 根除所有隐式循环依赖与架构反转；
+- 代码内聚性与模块边界显著清晰，流水线编排模块代码精简 ~160 行；
+- 243 项自动化单元测试 100% 保持绿色通过。
+
+---
+
+# ADR 0022 — QSV Tail Load Balancing, Parallel Checkpoint Validation, and Critical Path Operator Acceleration
+
+**Status:** Accepted  
+**Date:** 2026-09-20  
+**Evolves:** ADR 0015, ADR 0019, ADR 0020
+
+## Context
+
+对 `20260320` 真实 4K 全天素材（142 切片 / 24.81 小时）的性能分析暴露了三大瓶颈：
+1. **QSV 尾部饥饿与负载失衡**：刚性 420s 动态上限与过激的退出守卫导致尾部队列仅剩少量重任务时 QSV 提前退出，空转闲置 **168.16 秒**（近 3 分钟），全由 NVENC 孤军收尾；
+2. **最终拼接串行接缝校验延迟**：4.4GB 成片中 141 个接缝由单线程逐一 Seek 解码校验，耗时高达 **~39.5 秒**；
+3. **关键算子微观损耗**：
+   - 预筛选与精析逐帧将 YUV420p 转 Gray（FFmpeg `to_ndarray` 需 10.6ms/帧）；
+   - YOLO 推理每帧执行 3 次独立 `.cpu().numpy()` 导致冗余 CUDA 同步；
+   - 候选帧反复执行 `rgb24` $\rightarrow$ `cv2.cvtColor(BGR)` 内存拷贝。
+
+## Decision
+
+1. **QSV 尾部动态窃取与负载均衡**：
+   - 退出守卫调整为仅当队列为空或剩余任务 $\le$ 活跃 NV 工人数时退出；
+   - 当 NV 工人全忙时，动态放宽 QSV 窃取门限 1.5×（由 420s 放宽至 630s），实现毫秒级同步收尾。
+2. **拼接点全量多线程并行校验**：
+   - 坚持全量接缝校验原则（杜绝抽样风险）；
+   - 超过 4 个接缝时采用 `ThreadPoolExecutor(max_workers=min(8, N))` 分块并行校验，各线程独立持有解码容器且 Seek 单向递增。
+3. **关键路径零拷贝算子加速**：
+   - 预筛选与运动分析直接从 `frame.planes[0]` 读取 Y 分量零拷贝切片（0.16ms vs 11.2ms，71x 提速）；
+   - YOLO 单次搬移连续张量 `boxes.data.cpu().numpy()`；
+   - 候选帧直出 `bgr24`，消除中间内存与色彩转换。
+
+## Consequences
+
+- 20260320 端到端壁钟由 **30分03秒 (1803.14s)** 缩短至 **24分12秒 (1452.84s)**，**净提速 5分50秒 (-19.43%)**，吞吐达 **61.48× 实时**；
+- QSV 尾部空转由 168.16s 降至 **0.56s**（利用率 100%），三工人总空转损耗由 337s 降至 **2.61s**（消除 99.2%）；
+- 拼接接缝校验由 39.5s 压缩至 **10.66s (3.7x 提速)**；
+- 独显显存峰值降低 **-31.7%**（5,198MB $\rightarrow$ 3,551MB），全库 244 项单测 100% 通过。
+

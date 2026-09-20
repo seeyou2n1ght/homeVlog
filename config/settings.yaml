@@ -87,7 +87,7 @@ detection:
   # [Pass 1.5] 精细分析 (Detailed Analysis)
   analysis_fps: 5
   analysis_resolution: "416x234" # 灰度分析与候选尺寸；小目标召回需单独评估
-  analysis_max_workers: 8
+  analysis_max_workers: 7
   analysis_buffer_mb: 256  # 每任务候选、音频及诊断帧池预算；正式运动分析按帧消费
 
   
@@ -122,6 +122,10 @@ detection:
   ambient_drift_suppress: true       # 白天大面积慢速光影漫射/日出日落均匀偏转软抑制
   ambient_drift_active_ratio: 0.35   # 激活网格覆盖率门限 (>=35% 全画幅激活)
   ambient_drift_max_energy: 5.0      # 显著运动安全上限 (<5.0 低能量漫射方可抑制，严防漏检真实动作)
+  camera_motion_suppress: true       # 云台巡航/全画幅相机平移与光影漂移软抑制
+  camera_motion_active_ratio: 0.65   # 激活网格覆盖率门限 (>=65% 全画幅激活)
+  camera_motion_max_cov: 0.60        # 方差变异系数上限 (均匀无局部焦点)
+  camera_motion_max_focal_ratio: 3.5 # 局部峰值能量聚焦比上限
 
   # 检测算法调优
   motion_sensitivity: 1.0
@@ -138,7 +142,7 @@ audio_vad:
   # R3: 音频 VAD 多模态配置 (Voice Activity Detection & Multimodal Decision)
   enabled: true
   noise_margin_db: 14.0      # 相对底噪容限 (dB)
-  min_dbfs: -38.0            # 绝对最低激活能量 (dBFS)
+  min_dbfs: -32.0            # 绝对最低激活能量 (dBFS)
   window_ms: 50              # 短时 RMS 能量分帧窗口 (ms)
   speech_min_dur: 0.5        # 声音事件最小有效持续时间 (s)
   sample_rate: 16000         # 音频 VAD 重采样标准率 (Hz)
@@ -149,14 +153,14 @@ segment:
   apply_smoothing: true
   # 最小运动片段时长 (秒): 短于此值的动作片段将被平滑吸收
   min_motion_duration: 2.0
-  # 最小静止片段时长 (秒): 短于此值的微小停顿将自动保持常速，避免眨眼式跳跃
-  min_static_duration: 8.0
+  # 最小静止片段时长 (秒): 短于此值的微小停顿将自动保持常速，避免眨眼式跳跃 (收紧至 3.0s 杜绝连环吞噬)
+  min_static_duration: 3.0
   # 动态段吸收静止停顿的能量门槛：仅当动态段具备足够能量时才吞噬静止段，防止微弱噪点链式吞噬整段录像
   motion_absorb_energy_threshold: 12.0
   # 允许的静止间隙容差 (秒): 两个相邻运动片段间隔小于此值时直接连接
   gap_tolerance: 1.5
   # 动作事件合并间隙 (秒): 动作间静止大于此值即刻断开并转入有人驻留(PRESENCE 4x)，彻底杜绝连环吞噬
-  action_coalesce_gap: 2.0
+  action_coalesce_gap: 1.2
   # 动态片段前后缓冲 (秒): 确保人物入画和动作余波完整无生硬截断
   pre_roll: 1.0
   post_roll: 1.5
@@ -182,13 +186,19 @@ presence:
 
 
 micro_motion:
-  # R5: 夜间微动与事件驱动锚点保全 (Night Micro-Motion & Event Anchor)
+  # R5: 昼夜微动与事件驱动锚点保全 (Adaptive Day/Night Micro-Motion & Event Anchor)
   enabled: true
   cruise_speed: 16.0          # 睡眠平稳期巡航缩时倍速
-  energy_threshold: 5.5       # 原始逐帧能量达到此值时恢复常速，使用 segment.pre_roll/post_roll 保护前后动作
-  hysteresis_low_threshold: 3.5  # 迟滞维持低门限: 动作余波内能量>=此值平滑维持1x常速，杜绝眨眼式跳跃
-  cell_energy_threshold: 7.0     # 空间网格单格能量门限: 局部剧烈活动唤醒
-  min_active_cells: 2            # 最小连通活跃网格数: 配合局部单格能量识别小目标动作
+  # 日间显著运动门限 (防坐姿呼吸/微动被误判为 1x 常速):
+  day_energy_threshold: 16.0   # 全局能量触发门限 (日间显著躯体运动，高于静坐微动底噪)
+  day_cell_threshold: 35.0     # 空间网格单格能量门限 (日间肢体局部挥动/走动)
+  # 夜间微动保护门限 (红外噪点与翻身微动保持 16x 延时，仅剧烈活动唤醒 1x):
+  night_energy_threshold: 18.0 # 全局能量门限 (夜间红外抗噪保护)
+  night_cell_threshold: 45.0   # 空间网格单格能量门限 (夜间红外抗噪保护)
+  min_active_cells: 2          # 最小连通活跃网格数
+  hysteresis_low_ratio: 0.65   # 迟滞维持低门限比例
+  max_maintain_duration: 2.0   # 迟滞维持最大窗口 (秒)，杜绝常速无界顺延
+  max_coalesce_duration: 8.0   # 动作事件最大合并时长 (秒)，杜绝常速巨石
 
 
 yolo:
@@ -199,8 +209,8 @@ yolo:
   # 当前保留 m 权重，改型前用同一人工验证集比较
   model_path: "models/yolo11m.pt"
   device: "cuda:0"
-  # COCO 类别: 0:person, 1:bicycle, 2:car, 3:motorcycle, 15:cat, 16:dog
-  target_classes: [0, 1, 2, 3, 15, 16]
+  # COCO 类别: 0:person, 15:cat, 16:dog (室内场景剔除 1:bicycle, 2:car, 3:motorcycle 等室外交通工具干扰)
+  target_classes: [0, 15, 16]
   confidence: 0.3
   sample_fps: 2
   batch_size: 4  # 实际分批送入模型，限制显存峰值

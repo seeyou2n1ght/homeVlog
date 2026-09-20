@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from src.config import load_config, PROJECT_ROOT, OUTPUT_DIR, TEMP_DIR
+from src.core.config import load_config, PROJECT_ROOT, OUTPUT_DIR, TEMP_DIR
 
 
 def check_python_environment() -> Dict[str, Any]:
@@ -128,7 +128,7 @@ def check_gpu_and_cuda() -> Dict[str, Any]:
 def check_storage_and_paths() -> Dict[str, Any]:
     """检测素材输入目录、输出磁盘空间与临时目录状态。"""
     config = load_config()
-    from src.utils import get_input_dirs, check_disk_space
+    from src.core.utils import get_input_dirs, check_disk_space
 
     input_dirs = get_input_dirs(config)
     input_status = []

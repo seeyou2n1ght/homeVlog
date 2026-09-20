@@ -112,6 +112,10 @@ class SpatialGridMotionFilter:
         ambient_drift_suppress: bool = True,
         ambient_drift_active_ratio: float = 0.35,
         ambient_drift_max_energy: float = 5.0,
+        camera_motion_suppress: bool = True,
+        camera_motion_active_ratio: float = 0.65,
+        camera_motion_max_cov: float = 0.60,
+        camera_motion_max_focal_ratio: float = 3.5,
     ):
         self.grid_rows = int(grid_rows)
         self.grid_cols = int(grid_cols)
@@ -124,6 +128,10 @@ class SpatialGridMotionFilter:
         self.ambient_drift_suppress = bool(ambient_drift_suppress)
         self.ambient_drift_active_ratio = float(ambient_drift_active_ratio)
         self.ambient_drift_max_energy = float(ambient_drift_max_energy)
+        self.camera_motion_suppress = bool(camera_motion_suppress)
+        self.camera_motion_active_ratio = float(camera_motion_active_ratio)
+        self.camera_motion_max_cov = float(camera_motion_max_cov)
+        self.camera_motion_max_focal_ratio = float(camera_motion_max_focal_ratio)
 
         self.confidence_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=np.float32)
         self.noise_floor_grid = np.full((self.grid_rows, self.grid_cols), self.base_noise_thresh, dtype=np.float32)
@@ -202,12 +210,28 @@ class SpatialGridMotionFilter:
         mean_floor = float(np.mean(self.noise_floor_grid))
         is_global_flash = bool(raw_active_ratio >= 0.85 and (global_mean := float(np.mean(saliency_map)) if saliency_map.size > 0 else 0.0) > max(3.0, mean_floor * 2.5))
 
+        # 云台巡航/全画幅相机平移与光影漂移软抑制 (PTZ Cruise / Camera Motion Gating)
+        # 当激活单元占比大 (>= 65%)，且激活单元能量方差变异系数小、缺乏集中焦点时，判定为全景平移而非真实主体运动
+        is_camera_motion = False
+        if (
+            self.camera_motion_suppress
+            and raw_active_ratio >= self.camera_motion_active_ratio
+        ):
+            active_vals = energies[raw_active]
+            mean_act = float(np.mean(active_vals)) if active_vals.size > 0 else 0.0
+            std_act = float(np.std(active_vals)) if active_vals.size > 0 else 0.0
+            max_cell_e = float(np.max(energies))
+            focal_ratio = max_cell_e / (mean_act + 1e-4)
+            cov = std_act / (mean_act + 1e-4)
+            if cov < self.camera_motion_max_cov and focal_ratio < self.camera_motion_max_focal_ratio:
+                is_camera_motion = True
+
         filtered_active = np.zeros((self.grid_rows, self.grid_cols), dtype=bool)
 
         min_conn = 1 if is_night_mode else self.min_connected_cells
         isolated_multiplier = 1.6 if is_night_mode else 2.5
 
-        if not is_global_flash:
+        if not is_global_flash and not is_camera_motion:
             components = self.find_connected_components(raw_active)
             for comp in components:
                 if len(comp) >= min_conn:
@@ -282,6 +306,7 @@ class SpatialGridMotionFilter:
             "effective_energy": effective_energy,
             "is_global_flash": is_global_flash,
             "is_ambient_drift": is_ambient_drift,
+            "is_camera_motion": is_camera_motion,
         }
         return effective_energy, is_motion, stats
 

@@ -330,17 +330,17 @@ def cleanup_resources(db=None):
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("homevlog").debug("CUDA cache clear skipped: %s", e)
 
     if db is not None:
         try:
             db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.getLogger("homevlog").debug("WAL checkpoint skipped: %s", e)
 
     try:
-        from src.renderer import FFmpegProcessRegistry
+        from src.hardware.ffmpeg import FFmpegProcessRegistry
         FFmpegProcessRegistry.kill_all()
     except Exception as e:
         logging.getLogger("homevlog").warning("cleanup error: %s", e)

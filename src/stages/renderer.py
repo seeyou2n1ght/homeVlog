@@ -8,15 +8,15 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.utils import TEMP_DIR
-from src.scheduler import acquire_with_retry, VideoLease
-from src.ffmpeg import run_ffmpeg, get_duration
+from src.core.config import TEMP_DIR
+from src.hardware.scheduler import acquire_with_retry, VideoLease
+from src.hardware.ffmpeg import run_ffmpeg, get_duration, FFmpegProcessRegistry
 from src.stages.timeline import build_concat_filter, compute_display_plans, normalize_file_timeline as _normalize_file_timeline
-from src.monitor import get_perf, PerfRecord
+from src.hardware.monitor import get_perf, PerfRecord
+
+from src.algorithms.segment import ACTIVE_STATES, SegmentState
 
 logger = logging.getLogger("homevlog")
-
-ACTIVE_STATES = ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION")
 
 _FFMPEG_PROGRESS_RE = re.compile(
 
@@ -58,8 +58,8 @@ def _startup_watchdog_timeout(
     )
 
 
-# Re-export from src.ffmpeg for backwards compatibility across tests and modules
-from src.ffmpeg import FFmpegProcessRegistry
+# Re-export from src.hardware.ffmpeg for backwards compatibility across tests and modules
+from src.hardware.ffmpeg import FFmpegProcessRegistry
 
 
 def _clean_ffmpeg_error(err_tail: str) -> str:
@@ -216,7 +216,7 @@ def build_compact_virtual_concat_plan(
     trims and wall-clock mapping.
     """
     from copy import deepcopy
-    from src.timeline import TimelineSegment
+    from src.stages.timeline import TimelineSegment
 
     files = {str(seg.filepath) for seg in timeline}
     if len(files) != 1:
@@ -387,7 +387,7 @@ def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
         if staged.exists() and staged.stat().st_size == source_stat.st_size:
             return staged
 
-        from src.utils import get_disk_semaphore
+        from src.hardware.scheduler import get_disk_semaphore
         disk_sem = get_disk_semaphore()
         acquired = acquire_with_retry(disk_sem, timeout=30.0, retries=6)
         if not acquired:
@@ -420,7 +420,7 @@ def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
 
 def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows):
     from copy import deepcopy
-    from src.utils import load_config
+    from src.core.config import load_config
     cfg = {}
     try:
         cfg = load_config()
@@ -514,6 +514,10 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
                 dynamic_window_max_s=render_cfg.get("dynamic_window_max_s", 600.0),
             )
             descriptor_path.write_text(execution_plan.text, encoding="utf-8")
+            if any(r.get("has_audio") for r in rows if r.get("filepath") in files):
+                audio_src = str(staged_source) if staged_source is not None else files[0]
+                if len(input_args) >= 2 and input_args[-2] == "-i":
+                    input_args[-1] = audio_src
             return True
 
         prepare_input = _prepare_virtual_input
@@ -600,7 +604,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             expected_duration=expected_duration, input_args=input_args,
             fingerprint_salt=plan.text if plan else "", prepare_input=prepare_input,
         )
-        if result is not None or not virtual_mixed or FFmpegProcessRegistry.is_interrupted():
+        if result is not None or not virtual_enabled or FFmpegProcessRegistry.is_interrupted():
             return result
 
         logger.warning(
@@ -645,14 +649,14 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         logger.info("batch-render cam%d batch%d terminated by signal (Ctrl+C)", cam_index, batch_idx)
         return None
 
-    from src.utils import load_config
+    from src.core.config import load_config
     cfg = {}
     try:
         cfg = load_config()
     except Exception:
         pass
     render_cfg = cfg.get("render", {})
-    from src.render_cache import render_fingerprint, reusable, valid_video, save_manifest
+    from src.hardware.render_cache import render_fingerprint, reusable, valid_video, save_manifest
     fingerprint = render_fingerprint(
         input_files, filter_complex + fingerprint_salt,
         encoder, fps, out_cfg, audio_cfg, cfg,
@@ -712,10 +716,10 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
-        from src.utils import get_qsv_render_semaphore
+        from src.hardware.scheduler import get_qsv_render_semaphore
         io_sem = VideoLease(get_qsv_render_semaphore(), 1 if input_args is not None else len(input_files))
     else:
-        from src.utils import get_nvenc_semaphore
+        from src.hardware.scheduler import get_nvenc_semaphore
         io_sem = VideoLease(get_nvenc_semaphore(), 1 if input_args is not None else len(input_files))
     err_log = TEMP_DIR / f"_stderr_batch{batch_idx}_{date}_cam{cam_index}.log"
 
@@ -931,8 +935,14 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
     return None
 
 
-def concat_output_files(files: list[Path], output: Path, timeout: float = 300, faststart: bool = False) -> bool:
-    from src.render_cache import valid_video
+def concat_output_files(
+    files: list[Path],
+    output: Path,
+    timeout: float = 300,
+    faststart: bool = False,
+    durations: list[float] | None = None,
+) -> bool:
+    from src.hardware.render_cache import valid_video
     if not files:
         return False
     concat_list = output.with_name(f".concat_{output.stem}.txt")
@@ -940,7 +950,27 @@ def concat_output_files(files: list[Path], output: Path, timeout: float = 300, f
     def _concat_path(path):
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
     try:
-        durations = [get_duration(str(path)) for path in files]
+        if durations is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _probe_duration(p: Path) -> float | None:
+                try:
+                    import av
+                    with av.open(str(p), timeout=10.0) as container:
+                        if container.streams.video:
+                            v = container.streams.video[0]
+                            d = (float(v.duration * v.time_base) if v.duration
+                                 else float(container.duration or 0) / av.time_base)
+                            if d > 0:
+                                return d
+                except Exception:
+                    pass
+                return get_duration(str(p))
+
+            max_w = min(16, max(1, len(files)))
+            with ThreadPoolExecutor(max_workers=max_w) as pool:
+                durations = list(pool.map(_probe_duration, files))
+
         if any(duration is None or duration <= 0 for duration in durations):
             return False
         from itertools import accumulate

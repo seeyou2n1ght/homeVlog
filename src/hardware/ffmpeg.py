@@ -82,7 +82,7 @@ def run_ffmpeg(
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
         
-    from src.scheduler import acquire_with_retry, get_disk_semaphore
+    from src.hardware.scheduler import acquire_with_retry, get_disk_semaphore
     io_sem = get_disk_semaphore()
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     if not acquire_with_retry(io_sem):
@@ -192,7 +192,7 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
         str(filepath),
     ]
     
-    from src.scheduler import acquire_with_retry, get_disk_semaphore
+    from src.hardware.scheduler import acquire_with_retry, get_disk_semaphore
     io_sem = get_disk_semaphore()
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     if not acquire_with_retry(io_sem):

@@ -133,6 +133,20 @@ def test_valid_video_duration_tolerance(tmp_path):
     assert not valid_video(path, 20.0)
 
 
+def test_valid_video_checkpoints_sequential_and_parallel(tmp_path):
+    from src.render_cache import valid_video
+    path = make_video(tmp_path / "checkpoints.mp4", seconds=20, fps=5)
+    # 1. 无接缝校验
+    assert valid_video(path, 20.0, checkpoints=())
+    # 2. 顺序快速路径 (<= 4 个接缝)
+    assert valid_video(path, 20.0, checkpoints=[3.0, 7.0, 12.0])
+    # 3. 多线程并行校验路径 (> 4 个接缝)
+    assert valid_video(path, 20.0, checkpoints=[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0])
+    # 4. 超出时长的非法接缝正确拦截
+    assert not valid_video(path, 20.0, checkpoints=[2.0, 50.0])
+
+
+
 
 def test_camera_indices_persist_across_scan_order(tmp_path):
     dbpath = tmp_path / "db.sqlite"
