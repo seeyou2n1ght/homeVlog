@@ -250,12 +250,17 @@ class ReRenderManager:
 
             # 7. 合并最终成片
             update_state(status="CONCATING", progress=90)
+            cleanup_batches = config.get("render", {}).get("cleanup_batches_on_success", False)
             if len(batch_outputs) == 1:
-                batch_outputs[0].replace(final_output_path)
+                if cleanup_batches:
+                    batch_outputs[0].replace(final_output_path)
+                else:
+                    import shutil
+                    shutil.copy2(batch_outputs[0], final_output_path)
                 ok = True
             else:
                 ok = concat_output_files(batch_outputs, final_output_path)
-                if ok:
+                if ok and cleanup_batches:
                     for p in batch_outputs:
                         p.unlink(missing_ok=True)
 

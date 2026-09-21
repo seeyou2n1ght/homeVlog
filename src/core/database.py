@@ -434,6 +434,23 @@ class VlogDatabase:
                 self.conn.rollback()
                 return False
 
+    def clear_segment_review(self, segment_id: int) -> bool:
+        """撤销切片的人工审核标记与笔记。"""
+        with self._lock:
+            try:
+                self.conn.execute(
+                    """UPDATE segments
+                       SET manual_label=NULL, review_notes=NULL, reviewed_at=NULL
+                       WHERE id=?""",
+                    (segment_id,),
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error("DB error in clear_segment_review: %s", e)
+                self.conn.rollback()
+                return False
+
     def set_segment_archived_path(self, segment_id: int, archived_frame_path: str) -> bool:
         with self._lock:
             try:
@@ -466,14 +483,15 @@ class VlogDatabase:
         date: str | None = None,
         cam_index: int | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict]:
         """主动召回高争议与潜在误判/漏判的切片，支持按错检类型多维过滤 (Active Learning 模式)。
 
         Categories:
             - 'all': 召回所有争议疑难切片
             - 'needs_review': 算法自动打标的不确定/待审典型场景
-            - 'fp_suspect': 疑似误报 (算法判定 DYNAMIC，但 YOLO 无目标且能量偏低，疑似光影/微尘)
-            - 'fn_suspect': 疑似漏报 (算法判定 STATIC，但能量接近临界阈值，疑似微动漏检)
+            - 'fp_suspect': 疑似误报 (算法判定 DYNAMIC/PRESENCE/DYNAMIC_AUDIO，但 YOLO 无目标且能量偏低，疑似光影/微尘)
+            - 'fn_suspect': 疑似漏报 (算法判定 STATIC/NIGHT_STATIONARY，但能量接近临界阈值，疑似微动漏检)
             - 'jitter': 极短毛刺 (时长 < 3.0s 的动态突变碎片)
             - 'reviewed': 已完成人工复核的切片
         """
@@ -485,19 +503,19 @@ class VlogDatabase:
                 if category == "needs_review":
                     where_clauses.append("(needs_review = 1)")
                 elif category == "fp_suspect":
-                    where_clauses.append("(state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0)")
+                    where_clauses.append("(state IN ('DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE') AND avg_confidence = 0.0 AND max_energy < 8.0)")
                 elif category == "fn_suspect":
-                    where_clauses.append("(state = 'STATIC' AND max_energy >= 1.5)")
+                    where_clauses.append("(state IN ('STATIC', 'NIGHT_STATIONARY') AND max_energy >= 1.5)")
                 elif category == "jitter":
-                    where_clauses.append("(duration < 3.0 AND state = 'DYNAMIC')")
+                    where_clauses.append("(duration < 3.0 AND state IN ('DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE'))")
                 elif category == "reviewed":
                     where_clauses.append("manual_label IS NOT NULL")
                 else:  # 'all' 或默认
                     where_clauses.append(
                         "((needs_review = 1) "
-                        "OR (state = 'DYNAMIC' AND avg_confidence = 0.0 AND max_energy < 8.0) "
-                        "OR (state = 'STATIC' AND max_energy >= 1.5) "
-                        "OR (duration < 3.0 AND state = 'DYNAMIC'))"
+                        "OR (state IN ('DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE') AND avg_confidence = 0.0 AND max_energy < 8.0) "
+                        "OR (state IN ('STATIC', 'NIGHT_STATIONARY') AND max_energy >= 1.5) "
+                        "OR (duration < 3.0 AND state IN ('DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE')))"
                     )
 
                 if date:
@@ -512,15 +530,16 @@ class VlogDatabase:
                     SELECT * FROM segments
                     WHERE {where_str}
                     ORDER BY (manual_label IS NULL) DESC, needs_review DESC, max_energy DESC
-                    LIMIT ?
+                    LIMIT ? OFFSET ?
                 """
-                params.append(limit)
+                params.extend([limit, offset])
 
                 rows = self.conn.execute(query, params).fetchall()
                 results = []
                 for r in rows:
                     item = dict(r)
                     # 语义化标记错检原因与人工复核指引
+                    st = item.get("state")
                     if item.get("manual_label"):
                         item["anomaly_type"] = "reviewed"
                         item["reason_desc"] = f"已复核 ({item['manual_label']})"
@@ -539,13 +558,13 @@ class VlogDatabase:
                             item["anomaly_type"] = "jitter"
                         else:
                             item["anomaly_type"] = "needs_review"
-                    elif item.get("state") == "DYNAMIC" and float(item.get("avg_confidence", 0.0)) == 0.0 and float(item.get("max_energy", 0.0)) < 8.0:
+                    elif st in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE") and float(item.get("avg_confidence", 0.0)) == 0.0 and float(item.get("max_energy", 0.0)) < 8.0:
                         item["anomaly_type"] = "fp_suspect"
                         item["reason_desc"] = "疑似光影刚性 (无目标置信度)"
-                    elif item.get("state") == "STATIC" and float(item.get("max_energy", 0.0)) >= 1.5 and float(item.get("max_energy", 0.0)) <= 3.0:
+                    elif st in ("STATIC", "NIGHT_STATIONARY") and float(item.get("max_energy", 0.0)) >= 1.5:
                         item["anomaly_type"] = "fn_suspect"
                         item["reason_desc"] = "疑似微动作漏判 (能量临界)"
-                    elif float(item.get("duration", 0.0)) < 3.0 and item.get("state") == "DYNAMIC":
+                    elif float(item.get("duration", 0.0)) < 3.0 and st in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE"):
                         item["anomaly_type"] = "jitter"
                         item["reason_desc"] = f"极短突发碎片 ({float(item['duration']):.1f}s)"
                     else:
@@ -558,6 +577,7 @@ class VlogDatabase:
             except Exception as e:
                 logger.error("DB error in get_anomaly_segments: %s", e)
                 return []
+
 
     def reset_failed_tasks(self, date: str, cam_index: int, max_retries: int = 3) -> dict:
         """将 FAILED 预筛/分析任务重置为 PENDING，使重跑时自愈补齐丢失内容。

@@ -312,3 +312,264 @@ class TestReRenderWorkflow:
         suffix = Path(base).suffix
         final_name = f"{stem}_{output_version}{suffix}"
         assert final_name == "DailyVlog_20260402_B888805AA3CD_v2.mp4"
+
+
+def test_audit_scenario_and_clear_review(tmp_path):
+    """测试场景归因标签、备注打包解析与打标撤销"""
+    db_path = tmp_path / "test_scenario.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+
+    try:
+        fp = "test_scenario_cam0.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+        sample_segs = [
+            Segment(start_time=0.0, end_time=15.0, state="DYNAMIC", source_file=fp, max_energy=5.0),
+        ]
+        db.set_analysis_result(fp, "ANALYZED", sample_segs)
+
+        file_segs = service.get_file_segments(filepath=fp)["segments"]
+        seg_id = file_segs[0]["id"]
+
+        # 1. 提交带场景归因与用户备注的审核
+        ok = service.submit_review(seg_id, "FALSE_ALARM", notes="车灯反射白墙", scenario="HEADLIGHT")
+        assert ok is True
+
+        # 2. 检验 get_file_segments 与 get_anomalies 是否能正确解包 scenario 和 user_notes
+        segs_after = service.get_file_segments(filepath=fp)["segments"]
+        assert segs_after[0]["manual_label"] == "FALSE_ALARM"
+        assert segs_after[0]["scenario"] == "HEADLIGHT"
+        assert segs_after[0]["user_notes"] == "车灯反射白墙"
+
+        # 3. 撤销打标
+        assert service.clear_review(seg_id) is True
+
+        segs_cleared = service.get_file_segments(filepath=fp)["segments"]
+        assert segs_cleared[0]["manual_label"] is None
+        assert segs_cleared[0]["scenario"] == ""
+        assert segs_cleared[0]["user_notes"] == ""
+    finally:
+        db.close()
+
+
+def test_confusion_matrix_cross_tabulation(tmp_path):
+    """验证混淆矩阵基于 (predicted_state, manual_label) 交叉计算"""
+    db_path = tmp_path / "test_matrix.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+
+    try:
+        fp = "test_matrix_cam0.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+        sample_segs = [
+            # 1. DYNAMIC -> CONFIRMED_MOTION (TP)
+            Segment(start_time=0.0, end_time=10.0, state="DYNAMIC", source_file=fp, max_energy=10.0),
+            # 2. DYNAMIC -> FALSE_ALARM (FP)
+            Segment(start_time=10.0, end_time=20.0, state="DYNAMIC", source_file=fp, max_energy=3.0),
+            # 3. STATIC -> MISSED_MOTION (FN)
+            Segment(start_time=20.0, end_time=30.0, state="STATIC", source_file=fp, max_energy=2.0),
+            # 4. STATIC -> CONFIRMED_STATIC (TN)
+            Segment(start_time=30.0, end_time=40.0, state="STATIC", source_file=fp, max_energy=0.5),
+        ]
+        db.set_analysis_result(fp, "ANALYZED", sample_segs)
+
+        segs = service.get_file_segments(filepath=fp)["segments"]
+        service.submit_review(segs[0]["id"], "CONFIRMED_MOTION")
+        service.submit_review(segs[1]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
+        service.submit_review(segs[2]["id"], "MISSED_MOTION", scenario="INFANT_MOTION")
+        service.submit_review(segs[3]["id"], "CONFIRMED_STATIC")
+
+        ov = service.get_overview()
+        labels = ov["labels"]
+        assert labels["tp"] == 1
+        assert labels["fp"] == 1
+        assert labels["fn"] == 1
+        assert labels["tn"] == 1
+
+        metrics = ov["metrics"]
+        assert metrics["precision"] == 50.0  # 1 / (1 + 1)
+        assert metrics["recall"] == 50.0     # 1 / (1 + 1)
+        assert metrics["f1_score"] == 50.0
+    finally:
+        db.close()
+
+
+def test_save_bounding_box(tmp_path, monkeypatch):
+    """测试人工绘制 BBox 并保存为 YOLO 规范的 txt 文件"""
+    from pathlib import Path
+    db_path = tmp_path / "test_bbox.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+
+    # 隔离归档目录到临时目录
+    fake_archive = tmp_path / "feedback_archive"
+    fake_archive.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("scripts.audit_tool.service.ARCHIVE_DIR", fake_archive)
+
+    try:
+        boxes = [
+            {"class_id": 0, "x_center": 0.5, "y_center": 0.6, "width": 0.2, "height": 0.4},
+            {"class_id": 15, "x_center": 0.8, "y_center": 0.9, "width": 0.1, "height": 0.1},
+        ]
+        res = service.save_bounding_box(boxes=boxes, image_name="test_peak.jpg")
+        assert res["success"] is True
+        assert res["box_count"] == 2
+        assert len(res["saved_paths"]) >= 1
+
+        # 检查生成的文件内容
+        saved_txt = Path(res["saved_paths"][0])
+        assert saved_txt.exists()
+        lines = saved_txt.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+        assert lines[0] == "0 0.500000 0.600000 0.200000 0.400000"
+        assert lines[1] == "15 0.800000 0.900000 0.100000 0.100000"
+    finally:
+        db.close()
+
+
+def test_tuning_insights(tmp_path):
+    """测试根据人工审核记录量化生成 settings.yaml 调参建议"""
+    db_path = tmp_path / "test_tuning.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+
+    try:
+        fp = "test_tuning_cam0.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+        sample_segs = [
+            Segment(start_time=0.0, end_time=10.0, state="DYNAMIC", source_file=fp, max_energy=3.2),
+            Segment(start_time=10.0, end_time=20.0, state="DYNAMIC", source_file=fp, max_energy=3.8),
+            Segment(start_time=20.0, end_time=30.0, state="DYNAMIC", source_file=fp, max_energy=4.0),
+            Segment(start_time=30.0, end_time=40.0, state="STATIC", source_file=fp, max_energy=2.0),
+            Segment(start_time=40.0, end_time=50.0, state="STATIC", source_file=fp, max_energy=1.8),
+        ]
+        db.set_analysis_result(fp, "ANALYZED", sample_segs)
+
+        segs = service.get_file_segments(filepath=fp)["segments"]
+        # 3 处光影误报
+        service.submit_review(segs[0]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
+        service.submit_review(segs[1]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
+        service.submit_review(segs[2]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
+        # 2 处婴儿微动漏报
+        service.submit_review(segs[3]["id"], "MISSED_MOTION", scenario="INFANT_MOTION")
+        service.submit_review(segs[4]["id"], "MISSED_MOTION", scenario="INFANT_MOTION")
+
+        insights = service.get_tuning_insights()
+        assert insights["total_reviewed"] == 5
+        assert insights["scenario_counts"]["LIGHT_SHADOW"] == 3
+        assert insights["scenario_counts"]["INFANT_MOTION"] == 2
+
+        # 检查是否给出了 min_motion_threshold 与 yolo.confidence 的调参建议
+        recs = insights["recommendations"]
+        params = [r["param"] for r in recs]
+        assert "detection.min_motion_threshold" in params
+        assert "yolo.confidence" in params
+    finally:
+        db.close()
+
+
+def test_anomaly_offset_pagination(tmp_path):
+    """测试 get_anomalies 的 offset 分页功能"""
+    db_path = tmp_path / "test_page.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+
+    try:
+        fp = "test_page_cam0.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+        sample_segs = [
+            Segment(start_time=float(i * 10), end_time=float(i * 10 + 2), state="DYNAMIC", source_file=fp)
+            for i in range(10)
+        ]
+        db.set_analysis_result(fp, "ANALYZED", sample_segs)
+
+        page1 = service.get_anomalies(category="jitter", limit=3, offset=0)
+        assert len(page1) == 3
+
+        page2 = service.get_anomalies(category="jitter", limit=3, offset=3)
+        assert len(page2) == 3
+
+        # 两页的 id 应无交集
+        ids1 = {x["id"] for x in page1}
+        ids2 = {x["id"] for x in page2}
+        assert len(ids1.intersection(ids2)) == 0
+    finally:
+        db.close()
+
+
+def test_audit_http_new_endpoints(tmp_path, monkeypatch):
+    """测试新增加的 HTTP 端点: /api/tuning_insights, /api/clear_review, /api/save_bbox, /api/export_yolo_dataset"""
+    import http.cookiejar
+    import json
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+    from scripts.audit_tool.app import AuditHandler
+
+    fake_archive = tmp_path / "feedback_archive"
+    fake_archive.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("scripts.audit_tool.service.ARCHIVE_DIR", fake_archive)
+
+    server = HTTPServer(("127.0.0.1", 0), AuditHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    try:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.open(f"http://127.0.0.1:{port}/").read()
+
+        # GET /api/tuning_insights
+        with opener.open(f"http://127.0.0.1:{port}/api/tuning_insights") as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert "total_reviewed" in data
+            assert "recommendations" in data
+
+        # POST /api/save_bbox
+        bbox_payload = json.dumps({
+            "boxes": [{"class_id": 0, "x_center": 0.5, "y_center": 0.5, "width": 0.1, "height": 0.2}],
+            "image_name": "test_http_bbox.jpg"
+        }).encode("utf-8")
+        req_bbox = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/save_bbox",
+            data=bbox_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_bbox) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert data["box_count"] == 1
+
+        # POST /api/clear_review
+        clear_payload = json.dumps({"segment_id": 99999}).encode("utf-8")
+        req_clear = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/clear_review",
+            data=clear_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_clear) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert "success" in data
+
+        # POST /api/export_yolo_dataset
+        exp_payload = json.dumps({"val_ratio": 0.2, "output_dir": str(tmp_path / "yolo_out")}).encode("utf-8")
+        req_exp = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/export_yolo_dataset",
+            data=exp_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_exp) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert "success" in data
+
+    finally:
+        server.shutdown()
+        server.server_close()

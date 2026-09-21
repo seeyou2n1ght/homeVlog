@@ -129,14 +129,18 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/anomalies":
             limit = int(params.get("limit", [60])[0])
+            offset = int(params.get("offset", [0])[0])
             if not 1 <= limit <= 500:
                 self.send_error(400, "limit must be between 1 and 500")
+                return
+            if offset < 0:
+                self.send_error(400, "offset must be non-negative")
                 return
             dt = params.get("date", [None])[0]
             cat = params.get("category", ["all"])[0]
             cam = params.get("cam_index", [None])[0]
             cam_int = int(cam) if cam is not None else None
-            self._send_json(service.get_anomalies(category=cat, date=dt, cam_index=cam_int, limit=limit))
+            self._send_json(service.get_anomalies(category=cat, date=dt, cam_index=cam_int, limit=limit, offset=offset))
             return
         elif path == "/api/file_segments":
             fid = params.get("file_id", [None])[0]
@@ -186,7 +190,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/export":
             fmt = params.get("format", ["csv"])[0].lower()
-            content, ctype = service.export_report(fmt=fmt)
+            only_rev = params.get("only_reviewed", ["false"])[0].lower() in ("true", "1")
+            content, ctype = service.export_report(fmt=fmt, only_reviewed=only_rev)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             ts = time.strftime("%Y%m%d_%H%M%S")
@@ -201,6 +206,9 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        elif path == "/api/tuning_insights":
+            self._send_json(service.get_tuning_insights())
             return
         elif path == "/api/rerender_status":
             dt = params.get("date", [""])[0]
@@ -251,11 +259,48 @@ class AuditHandler(BaseHTTPRequestHandler):
             seg_id = payload.get("segment_id")
             label = payload.get("manual_label")
             notes = payload.get("notes", "")
+            scenario = payload.get("scenario", "")
             if not seg_id or not label:
                 self._send_json({"error": "Missing segment_id or manual_label"}, status=400)
                 return
-            ok = service.submit_review(int(seg_id), str(label), str(notes))
+            ok = service.submit_review(
+                int(seg_id),
+                str(label),
+                notes=str(notes),
+                scenario=str(scenario),
+            )
             self._send_json({"success": ok})
+            return
+
+        elif path == "/api/clear_review":
+            seg_id = payload.get("segment_id")
+            if not seg_id:
+                self._send_json({"error": "Missing segment_id"}, status=400)
+                return
+            ok = service.clear_review(int(seg_id))
+            self._send_json({"success": ok})
+            return
+
+        elif path == "/api/save_bbox":
+            boxes = payload.get("boxes", [])
+            image_name = payload.get("image_name")
+            segment_id = payload.get("segment_id")
+            if not boxes or not isinstance(boxes, list):
+                self._send_json({"error": "boxes must be a non-empty list"}, status=400)
+                return
+            res = service.save_bounding_box(
+                boxes=boxes,
+                image_name=str(image_name) if image_name else None,
+                segment_id=int(segment_id) if segment_id is not None else None,
+            )
+            self._send_json(res)
+            return
+
+        elif path == "/api/export_yolo_dataset":
+            val_ratio = float(payload.get("val_ratio", 0.2))
+            out_dir = payload.get("output_dir")
+            res = service.export_yolo_dataset(val_ratio=val_ratio, output_dir=out_dir)
+            self._send_json(res)
             return
 
         elif path == "/api/yolo_detect":

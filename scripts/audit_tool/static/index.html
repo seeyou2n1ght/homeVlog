@@ -79,6 +79,12 @@
         <button class="btn btn-accent" id="btn-open-rerender" title="应用当前人工审核打标并重新压制 Vlog">
           <span class="icon">🚀</span> 重新浓缩成片
         </button>
+        <button class="btn btn-glass" id="btn-open-yolo-modal" title="导出 YOLO 目标检测训练集 (带 BBox 标注)">
+          <span class="icon">🏷️</span> 导出 YOLO 数据集
+        </button>
+        <button class="btn btn-glass" id="btn-open-tuning-modal" title="查看基于人工标注的 settings.yaml 量化调优建议">
+          <span class="icon">💡</span> 调优建议
+        </button>
         <button class="btn btn-glass" id="btn-open-archive-modal" title="查看真实反馈帧归档与备份状态">
           <span class="icon">💾</span> 归档库 (<span id="archive-count-badge">0</span>)
         </button>
@@ -116,6 +122,16 @@
         <button class="cat-chip" data-category="fn_suspect" id="cat-fn">疑似漏报 <span class="cat-badge fn" id="badge-cat-fn">0</span></button>
         <button class="cat-chip" data-category="jitter" id="cat-jitter">短碎片 <span class="cat-badge jitter" id="badge-cat-jitter">0</span></button>
         <button class="cat-chip" data-category="reviewed" id="cat-reviewed">已复核 <span class="cat-badge reviewed" id="badge-cat-reviewed">0</span></button>
+      </div>
+
+      <!-- 日期与机位下拉过滤栏 -->
+      <div class="filter-dropdown-row">
+        <select id="filter-date-select" title="筛选素材日期">
+          <option value="">📅 所有日期</option>
+        </select>
+        <select id="filter-cam-select" title="筛选摄像头机位">
+          <option value="">📷 所有机位</option>
+        </select>
       </div>
 
       <!-- 搜索与排序工具行 -->
@@ -225,10 +241,10 @@
           </div>
           <div class="gallery-actions">
             <button class="btn btn-accent" id="btn-yolo-enhance">
-              <span class="btn-icon">⚡</span> 运行 YOLO 强化画框
+              <span class="btn-icon">⚡</span> 运行 YOLO 强化画框 (Y)
             </button>
             <button class="btn btn-cyan" id="btn-clip-preview">
-              <span class="btn-icon">🎬</span> 动图微视频预览
+              <span class="btn-icon">🎬</span> 动图微视频预览 (Space)
             </button>
           </div>
         </div>
@@ -243,7 +259,7 @@
               </div>
               <div class="card-header-right">
                 <span class="card-ts font-mono" id="ts-start">0.00s</span>
-                <button class="btn-card-zoom" id="btn-zoom-start" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+                <button class="btn-card-zoom" id="btn-zoom-start" title="点击全屏放大查看细节">🔍 放大</button>
               </div>
             </div>
             <div class="card-visual-wrapper" id="wrap-start" title="点击全屏放大查看高清细节">
@@ -266,11 +282,13 @@
               </div>
               <div class="card-header-right">
                 <span class="card-ts font-mono highlight" id="ts-mid">0.00s</span>
-                <button class="btn-card-zoom highlight" id="btn-zoom-mid" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+                <button class="btn-card-zoom highlight" id="btn-toggle-bbox" title="进入目标框选标注模式 (快捷键 B)">✏️ 标注 (B)</button>
+                <button class="btn-card-zoom highlight" id="btn-zoom-mid" title="点击全屏放大查看细节">🔍 放大</button>
               </div>
             </div>
-            <div class="card-visual-wrapper hero-frame" id="wrap-mid" title="点击全屏放大查看高清细节">
+            <div class="card-visual-wrapper hero-frame" id="wrap-mid" title="点击全屏放大或在标注模式下绘制目标框">
               <img id="img-mid" class="frame-img hidden" alt="Peak Frame" />
+              <canvas id="bbox-canvas" class="bbox-canvas hidden"></canvas>
               <div class="img-placeholder" id="placeholder-mid">
                 <span class="ph-icon">⚡</span>
                 <span class="ph-text">等待切片加载...</span>
@@ -278,6 +296,13 @@
               <div class="img-shimmer hidden" id="shimmer-mid"></div>
               <div class="hero-badge" id="hero-badge">CENTER PEAK</div>
               <div class="zoom-hover-hint"><span>🔍 点击放大细节</span></div>
+            </div>
+            <div class="bbox-toolbar hidden" id="bbox-toolbar">
+              <span class="bbox-tip font-mono">✏️ 框选模式: 拖动鼠标绘制漏检目标框</span>
+              <div class="bbox-actions">
+                <button class="btn btn-glass btn-sm" id="btn-bbox-undo">撤销框</button>
+                <button class="btn btn-cyan btn-sm" id="btn-bbox-save">💾 保存标注</button>
+              </div>
             </div>
           </div>
 
@@ -290,7 +315,7 @@
               </div>
               <div class="card-header-right">
                 <span class="card-ts font-mono" id="ts-end">0.00s</span>
-                <button class="btn-card-zoom" id="btn-zoom-end" title="点击全屏放大查看细节 (快捷键)">🔍 放大</button>
+                <button class="btn-card-zoom" id="btn-zoom-end" title="点击全屏放大查看细节">🔍 放大</button>
               </div>
             </div>
             <div class="card-visual-wrapper" id="wrap-end" title="点击全屏放大查看高清细节">
@@ -326,13 +351,35 @@
             <span class="kbd-hint"><kbd>2</kbd> 误报(FP)</span>
             <span class="kbd-hint"><kbd>3</kbd> 漏报(FN)</span>
             <span class="kbd-hint"><kbd>4</kbd> 纯静止(TN)</span>
-            <span class="kbd-hint"><kbd>J</kbd>/<kbd>K</kbd> 上下切片</span>
+            <span class="kbd-hint"><kbd>K</kbd>/<kbd>J</kbd> 上下切片</span>
+            <span class="kbd-hint"><kbd>B</kbd> 框选目标</span>
+            <span class="kbd-hint"><kbd>U</kbd> 撤销打标</span>
             <span class="kbd-hint"><kbd>Space</kbd> 动图预览</span>
             <span class="kbd-hint"><kbd>Y</kbd> YOLO画框</span>
           </div>
           <div class="nav-btn-group">
-            <button class="btn btn-glass btn-sm" id="btn-prev-seg" title="快捷键 J 或 ↑">▲ 上一个切片 (J)</button>
-            <button class="btn btn-glass btn-sm" id="btn-next-seg" title="快捷键 K 或 ↓">▼ 下一个切片 (K)</button>
+            <button class="btn btn-glass btn-sm" id="btn-prev-seg" title="快捷键 K 或 ↑">▲ 上一个切片 (K)</button>
+            <button class="btn btn-glass btn-sm" id="btn-next-seg" title="快捷键 J 或 ↓">▼ 下一个切片 (J)</button>
+          </div>
+        </div>
+
+        <!-- 场景归因标签与用户备注栏 (Scenario Attribution & Notes) -->
+        <div class="scenario-attribution-bar">
+          <div class="scenario-chips-row">
+            <span class="scenario-title">场景归因:</span>
+            <div class="scenario-chips" id="scenario-chips">
+              <button class="scenario-chip" data-scenario="LIGHT_SHADOW">☀️ 光影刚性</button>
+              <button class="scenario-chip" data-scenario="HEADLIGHT">🚗 车灯直射</button>
+              <button class="scenario-chip" data-scenario="CURTAIN">🪟 窗帘晃动</button>
+              <button class="scenario-chip" data-scenario="INFANT_MOTION">👶 婴儿微动</button>
+              <button class="scenario-chip" data-scenario="DARK_ROOM">🌙 弱光夜视</button>
+              <button class="scenario-chip" data-scenario="PET">🐾 宠物活动</button>
+              <button class="scenario-chip" data-scenario="OTHER">📝 其他场景</button>
+            </div>
+          </div>
+          <div class="scenario-notes-row">
+            <input type="text" id="review-notes-input" class="notes-input" placeholder="输入审核备注（例如：夜间翻身微动、车灯反射白墙）..." />
+            <button class="btn btn-glass btn-sm" id="btn-clear-review" title="撤销当前切片的人工打标 (快捷键 U)">↩️ 撤销打标 (U)</button>
           </div>
         </div>
 
@@ -487,6 +534,78 @@
           <button class="btn btn-glass" id="btn-archive-modal-close">关闭</button>
           <button class="btn btn-cyan" id="btn-archive-batch-run">⚡ 补齐全量历史归档</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- YOLO 数据集导出模态框 (YOLO Dataset Modal) -->
+  <div class="modal-scrim hidden" id="yolo-dataset-modal">
+    <div class="modal-box" style="width: 620px;">
+      <div class="modal-top">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">🏷️</span>
+          <h4>导出 YOLO 目标检测训练集 (Active Learning Dataset)</h4>
+        </div>
+        <button class="btn-close" id="btn-yolo-modal-close">✕</button>
+      </div>
+      <div class="modal-view" style="padding: 20px;">
+        <div class="modal-desc-box" style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 6px; padding: 12px; margin-bottom: 16px; font-size: 13px; line-height: 1.6;">
+          <strong style="color: var(--color-green);">🤖 主动学习数据流水线:</strong>
+          <div style="color: var(--text-secondary); margin-top: 4px;">
+            一键将所有人工复核样本 (包含确认动态、手动绘制 BBox 漏检正样本、光影/微尘困难负样本) 导出为标准 YOLO 数据集结构 (train/val 划分 + 归一化 txt 标注 + data.yaml 配置文件)，直接用于模型微调训练。
+          </div>
+        </div>
+        <div class="form-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-size: 13px; color: var(--text-muted);">验证集划分比例 (Val Ratio):</span>
+          <select id="yolo-val-ratio" style="padding: 6px 12px; background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 6px;">
+            <option value="0.1">10% 验证集 (0.1)</option>
+            <option value="0.2" selected>20% 验证集 (0.2 推荐)</option>
+            <option value="0.3">30% 验证集 (0.3)</option>
+          </select>
+        </div>
+        <div class="form-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-size: 13px; color: var(--text-muted);">导出输出目录:</span>
+          <span class="font-mono" style="color: var(--color-cyan); font-size: 13px;">data/yolo_dataset</span>
+        </div>
+        <div id="yolo-export-result" class="hidden" style="margin-top: 16px; padding: 14px; background: rgba(0,0,0,0.3); border-radius: 6px; border: 1px solid var(--border-subtle);">
+          <div style="color: var(--color-green); font-weight: 600; font-size: 13px; margin-bottom: 8px;">✅ 数据集构建成功！</div>
+          <div id="yolo-export-stats" style="font-size: 12px; color: var(--text-secondary); line-height: 1.8;"></div>
+          <div style="margin-top: 10px;">
+            <span style="font-size: 12px; color: var(--text-muted);">本地训练指令 (点击复制):</span>
+            <div id="yolo-train-cmd" class="font-mono" style="margin-top: 4px; padding: 8px; background: #000; border-radius: 4px; color: var(--color-cyan); font-size: 11px; cursor: pointer; word-break: break-all;"></div>
+          </div>
+        </div>
+        <div class="rerender-actions" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
+          <button class="btn btn-glass" id="btn-yolo-modal-cancel">关闭</button>
+          <button class="btn btn-accent" id="btn-yolo-do-export">⚡ 立即导出数据集</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 调优建议模态框 (Tuning Insights Modal) -->
+  <div class="modal-scrim hidden" id="tuning-insights-modal">
+    <div class="modal-box" style="width: 720px; max-height: 85vh; display: flex; flex-direction: column;">
+      <div class="modal-top">
+        <div class="modal-title-wrap">
+          <span class="modal-icon">💡</span>
+          <h4>算法参数与规则校准建议 (Settings.yaml Insights)</h4>
+        </div>
+        <button class="btn-close" id="btn-tuning-modal-close">✕</button>
+      </div>
+      <div class="modal-view" style="padding: 20px; overflow-y: auto; flex: 1;">
+        <div id="tuning-summary-box" style="display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;">
+          <!-- 统计指标卡 -->
+        </div>
+        <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 10px;">
+          🛠️ 基于人工复核反馈的推荐参数调优项:
+        </div>
+        <div id="tuning-recommendations-list" style="display: flex; flex-direction: column; gap: 10px;">
+          <!-- 调优建议卡 -->
+        </div>
+      </div>
+      <div class="rerender-actions" style="padding: 12px 20px; border-top: 1px solid var(--border-subtle); display: flex; justify-content: flex-end;">
+        <button class="btn btn-glass" id="btn-tuning-modal-cancel">关闭</button>
       </div>
     </div>
   </div>

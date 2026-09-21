@@ -6,6 +6,10 @@ const state = {
   currentCategory: 'all',  // 'all' | 'fp_suspect' | 'fn_suspect' | 'jitter' | 'reviewed'
   sortMode: 'energy',      // 'energy' | 'time_asc' | 'time_desc' | 'duration'
   searchQuery: '',
+  filterDate: '',
+  filterCam: '',
+  selectedScenario: '',
+  selectedAnomalyIndex: -1,
   anomalies: [],
   filteredAnomalies: [],
   categoryCounts: {
@@ -19,6 +23,12 @@ const state = {
   currentSegments: [],
   selectedSegIndex: -1,
   sidebarCollapsed: false,
+
+  // BBox 标注状态
+  bboxMode: false,
+  currentBBoxes: [], // [{class_id: 0, x_center, y_center, width, height}]
+  isDrawingBBox: false,
+  drawStart: { x: 0, y: 0 },
   
   // 双层时间轴状态
   timeline: {
@@ -39,6 +49,7 @@ const state = {
 // DOM 初始化入口
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
+  initBBoxCanvas();
   initLightbox();
   loadOverview();
   loadCategoryBadges();
@@ -79,6 +90,22 @@ function initEventListeners() {
     });
   });
 
+  // 日期与机位下拉过滤
+  const dateSel = document.getElementById('filter-date-select');
+  if (dateSel) {
+    dateSel.addEventListener('change', (e) => {
+      state.filterDate = e.target.value;
+      loadAnomalies();
+    });
+  }
+  const camSel = document.getElementById('filter-cam-select');
+  if (camSel) {
+    camSel.addEventListener('change', (e) => {
+      state.filterCam = e.target.value;
+      loadAnomalies();
+    });
+  }
+
   // 搜索过滤输入
   const filterInput = document.getElementById('filter-input');
   if (filterInput) {
@@ -99,51 +126,70 @@ function initEventListeners() {
 
   // 双层时间轴缩放控制按钮
   const btnZoomIn = document.getElementById('btn-zoom-in');
+  if (btnZoomIn) btnZoomIn.addEventListener('click', () => zoomTimeline(0.75));
   const btnZoomOut = document.getElementById('btn-zoom-out');
+  if (btnZoomOut) btnZoomOut.addEventListener('click', () => zoomTimeline(1.33));
   const btnZoomFocus = document.getElementById('btn-zoom-focus');
-  const btnZoomReset = document.getElementById('btn-zoom-reset');
-
-  if (btnZoomIn) btnZoomIn.addEventListener('click', () => zoomTimeline(0.6));
-  if (btnZoomOut) btnZoomOut.addEventListener('click', () => zoomTimeline(1.5));
   if (btnZoomFocus) btnZoomFocus.addEventListener('click', () => focusCurrentSegment());
+  const btnZoomReset = document.getElementById('btn-zoom-reset');
   if (btnZoomReset) btnZoomReset.addEventListener('click', () => resetTimelineZoom());
 
-  // 双层时间轴交互事件：Minimap 镜头拖拽与点击
-  initMinimapInteractions();
-  // Focus Track 滚轮缩放与鼠标拖拽平移
-  initFocusTrackInteractions();
-
-  // 报表导出
-  const btnExpCsv = document.getElementById('btn-export-csv');
-  if (btnExpCsv) {
-    btnExpCsv.addEventListener('click', () => triggerReportDownload('csv'));
-  }
-  const btnExpJson = document.getElementById('btn-export-json');
-  if (btnExpJson) {
-    btnExpJson.addEventListener('click', () => triggerReportDownload('json'));
-  }
-
-  // 工具按钮
-  const btnYolo = document.getElementById('btn-yolo-enhance');
-  if (btnYolo) btnYolo.addEventListener('click', runYoloEnhance);
-  const btnClip = document.getElementById('btn-clip-preview');
-  if (btnClip) btnClip.addEventListener('click', showClipPreview);
-
-  // 切片上下切换按钮
+  // 快捷切片导航按钮 (修复 K 为上一切片，J 为下一切片)
   const btnPrevSeg = document.getElementById('btn-prev-seg');
   if (btnPrevSeg) btnPrevSeg.addEventListener('click', () => selectNextSegment(-1));
   const btnNextSeg = document.getElementById('btn-next-seg');
   if (btnNextSeg) btnNextSeg.addEventListener('click', () => selectNextSegment(1));
 
-  // 打标按钮
-  document.querySelectorAll('.decision-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const label = btn.getAttribute('data-label');
-      submitCurrentReview(label);
+  // 场景归因标签点击切换
+  document.querySelectorAll('.scenario-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const sc = chip.getAttribute('data-scenario');
+      if (state.selectedScenario === sc) {
+        state.selectedScenario = '';
+        chip.classList.remove('active');
+      } else {
+        document.querySelectorAll('.scenario-chip').forEach(c => c.classList.remove('active'));
+        state.selectedScenario = sc;
+        chip.classList.add('active');
+      }
     });
   });
 
-  // 真实反馈帧归档库弹窗事件
+  // 撤销打标按钮
+  const btnClearReview = document.getElementById('btn-clear-review');
+  if (btnClearReview) btnClearReview.addEventListener('click', clearCurrentReview);
+
+  // 四路决策裁决按钮
+  const btnLabelTp = document.getElementById('btn-label-tp');
+  if (btnLabelTp) btnLabelTp.addEventListener('click', () => submitCurrentReview('CONFIRMED_MOTION'));
+  const btnLabelFp = document.getElementById('btn-label-fp');
+  if (btnLabelFp) btnLabelFp.addEventListener('click', () => submitCurrentReview('FALSE_ALARM'));
+  const btnLabelFn = document.getElementById('btn-label-fn');
+  if (btnLabelFn) btnLabelFn.addEventListener('click', () => submitCurrentReview('MISSED_MOTION'));
+  const btnLabelTn = document.getElementById('btn-label-tn');
+  if (btnLabelTn) btnLabelTn.addEventListener('click', () => submitCurrentReview('CONFIRMED_STATIC'));
+
+  // 视觉强化与预览按钮
+  const btnYolo = document.getElementById('btn-yolo-enhance');
+  if (btnYolo) btnYolo.addEventListener('click', runYoloEnhance);
+  const btnClip = document.getElementById('btn-clip-preview');
+  if (btnClip) btnClip.addEventListener('click', showClipPreview);
+
+  // BBox 标注工具栏按钮
+  const btnToggleBBox = document.getElementById('btn-toggle-bbox');
+  if (btnToggleBBox) btnToggleBBox.addEventListener('click', toggleBBoxMode);
+  const btnBBoxUndo = document.getElementById('btn-bbox-undo');
+  if (btnBBoxUndo) btnBBoxUndo.addEventListener('click', undoBBox);
+  const btnBBoxSave = document.getElementById('btn-bbox-save');
+  if (btnBBoxSave) btnBBoxSave.addEventListener('click', saveCurrentBBoxes);
+
+  // 全量导出报表下载
+  const btnExportCsv = document.getElementById('btn-export-csv');
+  if (btnExportCsv) btnExportCsv.addEventListener('click', () => triggerReportDownload('csv'));
+  const btnExportJson = document.getElementById('btn-export-json');
+  if (btnExportJson) btnExportJson.addEventListener('click', () => triggerReportDownload('json'));
+
+  // 真实反馈帧归档弹窗
   const btnOpenArchive = document.getElementById('btn-open-archive-modal');
   if (btnOpenArchive) btnOpenArchive.addEventListener('click', openArchiveModal);
   const btnArchiveClose = document.getElementById('btn-archive-close');
@@ -152,6 +198,24 @@ function initEventListeners() {
   if (btnArchiveModalClose) btnArchiveModalClose.addEventListener('click', closeArchiveModal);
   const btnArchiveBatchRun = document.getElementById('btn-archive-batch-run');
   if (btnArchiveBatchRun) btnArchiveBatchRun.addEventListener('click', triggerBatchArchive);
+
+  // YOLO 数据集导出模态框事件
+  const btnOpenYolo = document.getElementById('btn-open-yolo-modal');
+  if (btnOpenYolo) btnOpenYolo.addEventListener('click', openYoloModal);
+  const btnYoloClose = document.getElementById('btn-yolo-modal-close');
+  if (btnYoloClose) btnYoloClose.addEventListener('click', closeYoloModal);
+  const btnYoloCancel = document.getElementById('btn-yolo-modal-cancel');
+  if (btnYoloCancel) btnYoloCancel.addEventListener('click', closeYoloModal);
+  const btnYoloDoExport = document.getElementById('btn-yolo-do-export');
+  if (btnYoloDoExport) btnYoloDoExport.addEventListener('click', exportYoloDataset);
+
+  // 调参建议模态框事件
+  const btnOpenTuning = document.getElementById('btn-open-tuning-modal');
+  if (btnOpenTuning) btnOpenTuning.addEventListener('click', openTuningModal);
+  const btnTuningClose = document.getElementById('btn-tuning-modal-close');
+  if (btnTuningClose) btnTuningClose.addEventListener('click', closeTuningModal);
+  const btnTuningCancel = document.getElementById('btn-tuning-modal-cancel');
+  if (btnTuningCancel) btnTuningCancel.addEventListener('click', closeTuningModal);
 
   // 重渲染弹窗事件
   const btnOpenRerender = document.getElementById('btn-open-rerender');
@@ -222,7 +286,7 @@ function switchCategory(cat) {
 function handleKeydown(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
-  // 若高清细节放大视窗开启，优先响应视窗内缩放与关闭
+  // 高清视窗开启时优先响应放大与 Esc
   if (lightboxState && lightboxState.isOpen) {
     if (e.key === 'Escape') {
       closeLightbox();
@@ -250,10 +314,14 @@ function handleKeydown(e) {
     submitCurrentReview('MISSED_MOTION');
   } else if (e.key === '4') {
     submitCurrentReview('CONFIRMED_STATIC');
-  } else if (e.key === 'j' || e.key === 'ArrowDown') {
+  } else if (e.key === 'j' || e.key === 'J' || e.key === 'ArrowDown') {
     selectNextSegment(1);
-  } else if (e.key === 'k' || e.key === 'ArrowUp') {
+  } else if (e.key === 'k' || e.key === 'K' || e.key === 'ArrowUp') {
     selectNextSegment(-1);
+  } else if (e.key === 'b' || e.key === 'B') {
+    toggleBBoxMode();
+  } else if (e.key === 'u' || e.key === 'U') {
+    clearCurrentReview();
   } else if (e.key === 'y' || e.key === 'Y') {
     runYoloEnhance();
   } else if (e.key === ' ') {
@@ -266,7 +334,12 @@ function handleKeydown(e) {
     if (rModal && !rModal.classList.contains('hidden')) closeRerenderModal();
     const aModal = document.getElementById('archive-modal');
     if (aModal && !aModal.classList.contains('hidden')) closeArchiveModal();
+    const yModal = document.getElementById('yolo-dataset-modal');
+    if (yModal && !yModal.classList.contains('hidden')) closeYoloModal();
+    const tModal = document.getElementById('tuning-insights-modal');
+    if (tModal && !tModal.classList.contains('hidden')) closeTuningModal();
     if (lightboxState && lightboxState.isOpen) closeLightbox();
+    if (state.bboxMode) toggleBBoxMode();
   }
 }
 
@@ -286,7 +359,7 @@ function showToast(msg, type = 'success') {
   }, 2500);
 }
 
-// 触发报表下载 (不影响当前页面状态)
+// 触发报表下载
 function triggerReportDownload(fmt) {
   showToast(`正在导出并下载 ${fmt.toUpperCase()} 复核报表...`, 'info');
   const a = document.createElement('a');
@@ -295,6 +368,39 @@ function triggerReportDownload(fmt) {
   document.body.appendChild(a);
   a.click();
   setTimeout(() => a.remove(), 200);
+}
+
+// ================== 切片本地相对时间换算核心算法 ==================
+function getSegmentLocalRange(seg) {
+  const fileDur = state.timeline.fileDuration || 300;
+  const rawStart = Number(seg.start_time || 0);
+  const rawEnd = Number(seg.end_time || rawStart);
+  const dur = Number(seg.duration || (rawEnd - rawStart));
+  
+  // 1. 首选数据库显式存储的 file_start_offset
+  if (seg.file_start_offset != null && !isNaN(Number(seg.file_start_offset))) {
+    const off = Number(seg.file_start_offset);
+    if (rawStart >= off) {
+      const ls = rawStart - off;
+      return { start: Math.max(0, ls), dur: dur, end: Math.min(fileDur, ls + dur) };
+    }
+  }
+
+  // 2. 次选解析出的视频起始绝对秒数 fileOffsetSec
+  const fileOff = state.timeline.fileOffsetSec || 0;
+  if (fileOff > 0 && rawStart >= fileOff) {
+    const ls = rawStart - fileOff;
+    return { start: Math.max(0, ls), dur: dur, end: Math.min(fileDur, ls + dur) };
+  }
+
+  // 3. 若 rawStart 大于文件总时长，说明是日内绝对秒数，减去首切片起始秒数对齐
+  const firstStart = (state.currentSegments && state.currentSegments.length > 0) ? Number(state.currentSegments[0].start_time || 0) : 0;
+  if (rawStart > fileDur && firstStart > 0 && rawStart >= firstStart) {
+    const ls = rawStart - firstStart;
+    return { start: Math.max(0, ls), dur: dur, end: Math.min(fileDur, ls + dur) };
+  }
+
+  return { start: Math.max(0, rawStart), dur: dur, end: Math.min(fileDur, rawStart + dur) };
 }
 
 // ================== 全局看板与各分类数量徽标 ==================
@@ -317,7 +423,9 @@ async function loadOverview() {
     const fnEl = document.getElementById('metric-fn');
     if (fnEl) fnEl.innerText = data.labels.fn;
     const precRecEl = document.getElementById('metric-prec-rec');
-    if (precRecEl) precRecEl.innerText = `${data.metrics.precision == null ? "N/A" : data.metrics.precision + "%"} / ${data.metrics.recall == null ? "N/A" : data.metrics.recall + "%"}`;
+    if (precRecEl) {
+      precRecEl.innerText = `${data.metrics.precision == null ? "N/A" : data.metrics.precision + "%"} / ${data.metrics.recall == null ? "N/A" : data.metrics.recall + "%"}`;
+    }
 
     const pct = data.total_segments > 0 ? (data.reviewed_segments / data.total_segments) * 100 : 0;
     const barEl = document.getElementById('metric-progress-bar');
@@ -342,9 +450,9 @@ async function loadCategoryBadges() {
     allList.forEach(item => {
       if (item.manual_label) {
         reviewedCount++;
-      } else if (item.state === 'DYNAMIC' && (item.avg_confidence === 0 || item.max_energy < 1.0)) {
+      } else if (['DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE'].includes(item.state) && (item.avg_confidence === 0 || item.max_energy < 8.0)) {
         fpCount++;
-      } else if (item.state === 'STATIC' && item.max_energy >= 1.5) {
+      } else if (['STATIC', 'NIGHT_STATIONARY'].includes(item.state) && item.max_energy >= 1.5) {
         fnCount++;
       } else if (item.duration < 3.0) {
         jitterCount++;
@@ -382,7 +490,10 @@ async function loadAnomalies() {
   }
 
   try {
-    const url = `/api/anomalies?category=${state.currentCategory}&limit=100`;
+    let url = `/api/anomalies?category=${state.currentCategory}&limit=100`;
+    if (state.filterDate) url += `&date=${encodeURIComponent(state.filterDate)}`;
+    if (state.filterCam) url += `&cam_index=${encodeURIComponent(state.filterCam)}`;
+
     const res = await fetch(url);
     const list = await res.json();
     state.anomalies = list || [];
@@ -390,17 +501,54 @@ async function loadAnomalies() {
     const countEl = document.getElementById('anomaly-count');
     if (countEl) countEl.innerText = state.anomalies.length;
 
+    // 动态提取日期与机位填充下拉列表
+    populateFilterDropdowns();
+
     applyFilterAndSort();
 
     // 默认聚焦第一条
-    if (state.filteredAnomalies.length > 0 && container) {
-      const firstCard = container.querySelector('.anomaly-card');
-      if (firstCard) firstCard.click();
+    if (state.filteredAnomalies.length > 0) {
+      selectAnomalyItem(0);
     }
   } catch (err) {
     console.error('Failed to load anomalies:', err);
     if (container) container.innerHTML = '<div class="state-loader error">加载争议样本失败，请检查服务状态</div>';
   }
+}
+
+function populateFilterDropdowns() {
+  const dateSel = document.getElementById('filter-date-select');
+  const camSel = document.getElementById('filter-cam-select');
+  if (!dateSel || !camSel) return;
+
+  const dates = new Set();
+  const cams = new Set();
+
+  state.anomalies.forEach(item => {
+    if (item.date) dates.add(item.date);
+    if (item.cam_index != null) cams.add(item.cam_index);
+  });
+
+  const curDate = state.filterDate;
+  const curCam = state.filterCam;
+
+  dateSel.innerHTML = '<option value="">📅 所有日期</option>';
+  Array.from(dates).sort().reverse().forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d;
+    opt.innerText = `📅 ${d}`;
+    if (d === curDate) opt.selected = true;
+    dateSel.appendChild(opt);
+  });
+
+  camSel.innerHTML = '<option value="">📷 所有机位</option>';
+  Array.from(cams).sort().forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.innerText = `📷 机位 ${c}`;
+    if (c.toString() === curCam.toString()) opt.selected = true;
+    camSel.appendChild(opt);
+  });
 }
 
 function applyFilterAndSort() {
@@ -414,7 +562,8 @@ function applyFilterAndSort() {
       const eng = (item.max_energy || 0).toString();
       const st = (item.state || '').toLowerCase();
       const reason = (item.reason_desc || '').toLowerCase();
-      return fn.includes(q) || eng.includes(q) || st.includes(q) || reason.includes(q);
+      const sc = (item.scenario || '').toLowerCase();
+      return fn.includes(q) || eng.includes(q) || st.includes(q) || reason.includes(q) || sc.includes(q);
     });
   }
 
@@ -443,7 +592,7 @@ function renderAnomalyList() {
     return;
   }
 
-  state.filteredAnomalies.forEach(item => {
+  state.filteredAnomalies.forEach((item, index) => {
     const div = document.createElement('div');
     div.className = `anomaly-card state-${(item.state || 'STATIC').toLowerCase()}`;
     div.id = `anomaly-item-${item.id}`;
@@ -456,16 +605,16 @@ function renderAnomalyList() {
       reason = `已复核: ${item.manual_label}`;
       icon = '✓';
       badgeClass = 'chip-reviewed';
-    } else if (item.anomaly_type === 'FP_SUSPECT' || (item.state === 'DYNAMIC' && item.avg_confidence === 0)) {
+    } else if (item.anomaly_type === 'fp_suspect' || item.anomaly_type === 'FP_SUSPECT') {
       reason = '疑似光影假阳性 (无目标置信度)';
       icon = '⚠️';
       badgeClass = 'chip-fp';
-    } else if (item.anomaly_type === 'FN_SUSPECT' || (item.state === 'STATIC' && item.max_energy >= 1.5)) {
-      reason = '疑似微动作漏判 (高能量静止)';
+    } else if (item.anomaly_type === 'fn_suspect' || item.anomaly_type === 'FN_SUSPECT') {
+      reason = '疑似微动作漏判 (能量临界)';
       icon = '🎯';
       badgeClass = 'chip-fn';
     } else if (item.duration < 3.0) {
-      reason = '碎片跳变切片';
+      reason = '极短碎片跳变';
       icon = '⏱️';
       badgeClass = 'chip-jitter';
     }
@@ -473,6 +622,7 @@ function renderAnomalyList() {
     const fn = (item.filepath || '').split('\\').pop().split('/').pop();
     const durSec = (item.duration || 0).toFixed(1);
     const engVal = (item.max_energy || 0).toFixed(1);
+    const scTag = item.scenario ? `<span class="scenario-badge-mini">${item.scenario}</span>` : '';
 
     div.innerHTML = `
       <div class="anomaly-card-top">
@@ -482,6 +632,7 @@ function renderAnomalyList() {
       <div class="anomaly-reason-tag ${badgeClass}">
         <span>${icon}</span>
         <span>${reason}</span>
+        ${scTag}
       </div>
       <div class="anomaly-card-footer font-mono">
         <span>⚡ 峰值: ${engVal}</span>
@@ -490,13 +641,26 @@ function renderAnomalyList() {
     `;
 
     div.addEventListener('click', () => {
-      document.querySelectorAll('.anomaly-card').forEach(el => el.classList.remove('selected'));
-      div.classList.add('selected');
-      loadFileSegments(item.file_id, item.filepath, item.id);
+      selectAnomalyItem(index);
     });
 
     container.appendChild(div);
   });
+}
+
+function selectAnomalyItem(index) {
+  if (index < 0 || index >= state.filteredAnomalies.length) return;
+  state.selectedAnomalyIndex = index;
+  const item = state.filteredAnomalies[index];
+
+  document.querySelectorAll('.anomaly-card').forEach(el => el.classList.remove('selected'));
+  const card = document.getElementById(`anomaly-item-${item.id}`);
+  if (card) {
+    card.classList.add('selected');
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  loadFileSegments(item.file_id, item.filepath, item.id);
 }
 
 // ================== 全量素材目录树 ==================
@@ -594,7 +758,7 @@ async function loadFileSegments(fileId, filepath, targetSegId = null) {
   }
 }
 
-// 解析文件名中的真实墙钟时间 (例如 cam0_20260320180514.mp4 或 20260320_180514.mp4)
+// 解析文件名中的真实墙钟时间
 function parseFileClockContext(filename) {
   let baseHour = 0, baseMin = 0, baseSec = 0;
   const match = filename.match(/(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})/);
@@ -619,7 +783,6 @@ function parseFileClockContext(filename) {
   }
 }
 
-// 将日内绝对秒数转换为 hh:mm:ss 格式
 function formatClockTime(absSec) {
   const totalSec = Math.floor(absSec) % 86400;
   const hh = Math.floor(totalSec / 3600);
@@ -628,7 +791,6 @@ function formatClockTime(absSec) {
   return `${hh.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`;
 }
 
-// 格式化相对时间 mm:ss.s
 function formatRelativeTime(sec) {
   const sClamped = Math.max(0, sec);
   const m = Math.floor(sClamped / 60);
@@ -655,10 +817,6 @@ function renderMinimap() {
   const durTxt = document.getElementById('minimap-duration-txt');
   if (durTxt) durTxt.innerText = formatRelativeTime(totalDur);
 
-  const firstStart = segs[0].start_time;
-  const isDayOffset = (firstStart >= 3600);
-  const baseOffset = isDayOffset ? firstStart : 0;
-
   segs.forEach((s, idx) => {
     const block = document.createElement('div');
     block.className = 'minimap-seg';
@@ -673,11 +831,9 @@ function renderMinimap() {
       block.classList.add('state-static');
     }
 
-    const localStart = isDayOffset ? (s.start_time - baseOffset) : s.start_time;
-    const localDur = s.duration || (s.end_time - s.start_time);
-
-    const leftPct = (localStart / totalDur) * 100;
-    const widthPct = (localDur / totalDur) * 100;
+    const range = getSegmentLocalRange(s);
+    const leftPct = (range.start / totalDur) * 100;
+    const widthPct = (range.dur / totalDur) * 100;
 
     block.style.left = `${Math.max(0, Math.min(100, leftPct))}%`;
     block.style.width = `${Math.max(0.3, Math.min(100, widthPct))}%`;
@@ -751,14 +907,11 @@ function renderFocusTrack() {
   const segs = state.currentSegments;
   if (!segs || segs.length === 0) return;
 
-  const firstStart = segs[0].start_time;
-  const isDayOffset = (firstStart >= 3600);
-  const baseOffset = isDayOffset ? firstStart : 0;
-
   segs.forEach((s, idx) => {
-    const localStart = isDayOffset ? (s.start_time - baseOffset) : s.start_time;
-    const localDur = s.duration || (s.end_time - s.start_time);
-    const localEnd = localStart + localDur;
+    const range = getSegmentLocalRange(s);
+    const localStart = range.start;
+    const localDur = range.dur;
+    const localEnd = range.end;
 
     if (localEnd < vStart || localStart > vEnd) return;
 
@@ -814,16 +967,10 @@ function renderFocusTrack() {
 function focusCurrentSegment() {
   if (state.selectedSegIndex < 0 || state.selectedSegIndex >= state.currentSegments.length) return;
   const seg = state.currentSegments[state.selectedSegIndex];
+  const range = getSegmentLocalRange(seg);
+  const localMid = (range.start + range.end) / 2.0;
 
-  const firstStart = state.currentSegments[0].start_time;
-  const isDayOffset = (firstStart >= 3600);
-  const baseOffset = isDayOffset ? firstStart : 0;
-
-  const localStart = isDayOffset ? (seg.start_time - baseOffset) : seg.start_time;
-  const localDur = seg.duration || (seg.end_time - seg.start_time);
-  const localMid = localStart + localDur / 2.0;
-
-  const targetSpan = Math.min(state.timeline.fileDuration, Math.max(16.0, localDur * 4.5));
+  const targetSpan = Math.min(state.timeline.fileDuration, Math.max(16.0, range.dur * 4.5));
   
   let newStart = localMid - targetSpan / 2.0;
   let newEnd = localMid + targetSpan / 2.0;
@@ -848,18 +995,20 @@ function zoomTimeline(factor, anchorRatio = 0.5) {
   const curSpan = state.timeline.viewEnd - state.timeline.viewStart;
   let newSpan = curSpan * factor;
 
-  newSpan = Math.max(4.0, Math.min(totalDur, newSpan));
+  const minSpan = 4.0;
+  const maxSpan = totalDur;
+  newSpan = Math.max(minSpan, Math.min(maxSpan, newSpan));
 
-  const anchorSec = state.timeline.viewStart + curSpan * anchorRatio;
-  let newStart = anchorSec - newSpan * anchorRatio;
-  let newEnd = anchorSec + newSpan * (1.0 - anchorRatio);
+  const anchorSec = state.timeline.viewStart + (curSpan * anchorRatio);
+  let newStart = anchorSec - (newSpan * anchorRatio);
+  let newEnd = newStart + newSpan;
 
   if (newStart < 0) {
     newStart = 0;
-    newEnd = Math.min(totalDur, newSpan);
+    newEnd = newSpan;
   } else if (newEnd > totalDur) {
     newEnd = totalDur;
-    newStart = Math.max(0, newEnd - newSpan);
+    newStart = Math.max(0, totalDur - newSpan);
   }
 
   state.timeline.viewStart = newStart;
@@ -876,127 +1025,6 @@ function resetTimelineZoom() {
   renderFocusTrack();
 }
 
-function initMinimapInteractions() {
-  const wrap = document.getElementById('minimap-track-wrap');
-  const lens = document.getElementById('minimap-lens');
-  if (!wrap || !lens) return;
-
-  wrap.addEventListener('click', (e) => {
-    if (state.timeline.isDraggingLens) return;
-    const rect = wrap.getBoundingClientRect();
-    const clickRatio = (e.clientX - rect.left) / rect.width;
-    const clickSec = clickRatio * state.timeline.fileDuration;
-
-    const span = state.timeline.viewEnd - state.timeline.viewStart;
-    let newStart = clickSec - span / 2.0;
-    let newEnd = clickSec + span / 2.0;
-
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = Math.min(state.timeline.fileDuration, span);
-    } else if (newEnd > state.timeline.fileDuration) {
-      newEnd = state.timeline.fileDuration;
-      newStart = Math.max(0, newEnd - span);
-    }
-
-    state.timeline.viewStart = newStart;
-    state.timeline.viewEnd = newEnd;
-    updateMinimapLens();
-    renderFocusTrack();
-  });
-
-  lens.addEventListener('mousedown', (e) => {
-    e.stopPropagation();
-    state.timeline.isDraggingLens = true;
-    state.timeline.dragStartX = e.clientX;
-    state.timeline.lensDragStartViewStart = state.timeline.viewStart;
-    document.body.style.userSelect = 'none';
-  });
-
-  window.addEventListener('mousemove', (e) => {
-    if (!state.timeline.isDraggingLens) return;
-    const wrapRect = wrap.getBoundingClientRect();
-    const deltaX = e.clientX - state.timeline.dragStartX;
-    const deltaSec = (deltaX / wrapRect.width) * state.timeline.fileDuration;
-
-    const span = state.timeline.viewEnd - state.timeline.viewStart;
-    let newStart = state.timeline.lensDragStartViewStart + deltaSec;
-    let newEnd = newStart + span;
-
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = span;
-    } else if (newEnd > state.timeline.fileDuration) {
-      newEnd = state.timeline.fileDuration;
-      newStart = newEnd - span;
-    }
-
-    state.timeline.viewStart = newStart;
-    state.timeline.viewEnd = newEnd;
-    updateMinimapLens();
-    renderFocusTrack();
-  });
-
-  window.addEventListener('mouseup', () => {
-    if (state.timeline.isDraggingLens) {
-      state.timeline.isDraggingLens = false;
-      document.body.style.userSelect = '';
-    }
-  });
-}
-
-function initFocusTrackInteractions() {
-  const trackWrapper = document.getElementById('focus-track-wrapper');
-  if (!trackWrapper) return;
-
-  trackWrapper.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const rect = trackWrapper.getBoundingClientRect();
-    const mouseRatio = (e.clientX - rect.left) / rect.width;
-    const factor = e.deltaY > 0 ? 1.25 : 0.8;
-    zoomTimeline(factor, mouseRatio);
-  }, { passive: false });
-
-  trackWrapper.addEventListener('mousedown', (e) => {
-    if (e.target.closest('.focus-seg-block')) return;
-    state.timeline.isPanningFocus = true;
-    state.timeline.panStartX = e.clientX;
-    state.timeline.panStartViewStart = state.timeline.viewStart;
-    trackWrapper.style.cursor = 'grabbing';
-  });
-
-  window.addEventListener('mousemove', (e) => {
-    if (!state.timeline.isPanningFocus) return;
-    const rect = trackWrapper.getBoundingClientRect();
-    const deltaX = e.clientX - state.timeline.panStartX;
-    const span = state.timeline.viewEnd - state.timeline.viewStart;
-    const deltaSec = -(deltaX / rect.width) * span;
-
-    let newStart = state.timeline.panStartViewStart + deltaSec;
-    let newEnd = newStart + span;
-
-    if (newStart < 0) {
-      newStart = 0;
-      newEnd = span;
-    } else if (newEnd > state.timeline.fileDuration) {
-      newEnd = state.timeline.fileDuration;
-      newStart = newEnd - span;
-    }
-
-    state.timeline.viewStart = newStart;
-    state.timeline.viewEnd = newEnd;
-    updateMinimapLens();
-    renderFocusTrack();
-  });
-
-  window.addEventListener('mouseup', () => {
-    if (state.timeline.isPanningFocus) {
-      state.timeline.isPanningFocus = false;
-      if (trackWrapper) trackWrapper.style.cursor = '';
-    }
-  });
-}
-
 // ================== 切片选中与三联画廊安全防裂加载 ==================
 
 function selectSegment(index, autoFocus = false) {
@@ -1011,6 +1039,21 @@ function selectSegment(index, autoFocus = false) {
   if (autoFocus) {
     focusCurrentSegment();
   }
+
+  // 恢复切片的场景归因与用户备注
+  state.selectedScenario = seg.scenario || '';
+  document.querySelectorAll('.scenario-chip').forEach(chip => {
+    if (chip.getAttribute('data-scenario') === state.selectedScenario) {
+      chip.classList.add('active');
+    } else {
+      chip.classList.remove('active');
+    }
+  });
+  const notesInput = document.getElementById('review-notes-input');
+  if (notesInput) notesInput.value = seg.user_notes || '';
+
+  // 重置 BBox 标注状态
+  resetBBoxes();
 
   const tagsWrap = document.getElementById('current-segment-tags');
   if (tagsWrap) {
@@ -1037,6 +1080,12 @@ function selectSegment(index, autoFocus = false) {
       revChip.innerText = `✓ 已复核: ${seg.manual_label}`;
       tagsWrap.appendChild(revChip);
     }
+    if (seg.scenario) {
+      const scChip = document.createElement('span');
+      scChip.className = 'chip chip-scenario';
+      scChip.innerText = `🏷️ ${seg.scenario}`;
+      tagsWrap.appendChild(scChip);
+    }
   }
 
   const yoloTags = document.getElementById('yolo-tags');
@@ -1049,17 +1098,14 @@ function selectSegment(index, autoFocus = false) {
 
 function loadFramesForSegment(seg) {
   const fp = state.currentFile.filepath;
+  const range = getSegmentLocalRange(seg);
+  const relStart = range.start;
+  const relEnd = range.end;
+  const relMid = (relStart + relEnd) / 2.0;
+
   const tStart = seg.start_time;
   const tMid = (seg.start_time + seg.end_time) / 2.0;
   const tEnd = Math.max(seg.end_time - 0.1, seg.start_time);
-
-  const firstStart = state.currentSegments[0].start_time;
-  const isDayOffset = (firstStart >= 3600);
-  const baseOffset = isDayOffset ? firstStart : 0;
-
-  const relStart = isDayOffset ? (tStart - baseOffset) : tStart;
-  const relMid = isDayOffset ? (tMid - baseOffset) : tMid;
-  const relEnd = isDayOffset ? (tEnd - baseOffset) : tEnd;
 
   setElementText('ts-start', `${relStart.toFixed(2)}s`);
   setElementText('ts-mid', `${relMid.toFixed(2)}s`);
@@ -1074,7 +1120,10 @@ function loadFramesForSegment(seg) {
   setElementText('clock-end', clockEnd);
 
   setSafeFrameImage('start', fp, tStart);
-  setSafeFrameImage('mid', fp, tMid);
+  setSafeFrameImage('mid', fp, tMid, () => {
+    // 中继帧加载完成后，如在标注模式则重绘 Canvas
+    if (state.bboxMode) syncBBoxCanvasSize();
+  });
   setSafeFrameImage('end', fp, tEnd);
 }
 
@@ -1083,7 +1132,7 @@ function setElementText(id, text) {
   if (el) el.innerText = text;
 }
 
-function setSafeFrameImage(pos, filepath, timestamp) {
+function setSafeFrameImage(pos, filepath, timestamp, onLoadCallback) {
   const img = document.getElementById(`img-${pos}`);
   const shimmer = document.getElementById(`shimmer-${pos}`);
   const placeholder = document.getElementById(`placeholder-${pos}`);
@@ -1106,6 +1155,7 @@ function setSafeFrameImage(pos, filepath, timestamp) {
     img.classList.remove('hidden');
     placeholder.classList.add('hidden');
     if (shimmer) shimmer.classList.add('hidden');
+    if (onLoadCallback) onLoadCallback();
   };
   tempImg.onerror = () => {
     img.classList.add('hidden');
@@ -1118,6 +1168,194 @@ function setSafeFrameImage(pos, filepath, timestamp) {
     `;
   };
   tempImg.src = src;
+}
+
+// ================== BBox 交互式目标画框标注引擎 ==================
+
+function initBBoxCanvas() {
+  const canvas = document.getElementById('bbox-canvas');
+  if (!canvas) return;
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (!state.bboxMode) return;
+    const rect = canvas.getBoundingClientRect();
+    state.isDrawingBBox = true;
+    state.drawStart = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (!state.bboxMode || !state.isDrawingBBox) return;
+    const rect = canvas.getBoundingClientRect();
+    const curX = e.clientX - rect.left;
+    const curY = e.clientY - rect.top;
+
+    drawAllBBoxes(curX, curY);
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (!state.bboxMode || !state.isDrawingBBox) return;
+    state.isDrawingBBox = false;
+
+    const rect = canvas.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const curY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+
+    const x1 = Math.min(state.drawStart.x, curX);
+    const x2 = Math.max(state.drawStart.x, curX);
+    const y1 = Math.min(state.drawStart.y, curY);
+    const y2 = Math.max(state.drawStart.y, curY);
+
+    const w = x2 - x1;
+    const h = y2 - y1;
+
+    // 过滤无意义点击或超小噪点框
+    if (w > 10 && h > 10 && rect.width > 0 && rect.height > 0) {
+      const xc = (x1 + w / 2) / rect.width;
+      const yc = (y1 + h / 2) / rect.height;
+      const nw = w / rect.width;
+      const nh = h / rect.height;
+
+      state.currentBBoxes.push({
+        class_id: 0, // 0: person
+        x_center: xc,
+        y_center: yc,
+        width: nw,
+        height: nh
+      });
+      showToast(`已添加目标框 #${state.currentBBoxes.length} (person)`, 'info');
+    }
+
+    drawAllBBoxes();
+  });
+}
+
+function toggleBBoxMode() {
+  state.bboxMode = !state.bboxMode;
+  const canvas = document.getElementById('bbox-canvas');
+  const toolbar = document.getElementById('bbox-toolbar');
+  const btnToggle = document.getElementById('btn-toggle-bbox');
+
+  if (state.bboxMode) {
+    if (canvas) canvas.classList.remove('hidden');
+    if (toolbar) toolbar.classList.remove('hidden');
+    if (btnToggle) {
+      btnToggle.innerText = '✕ 退出标注 (B)';
+      btnToggle.classList.add('active');
+    }
+    syncBBoxCanvasSize();
+    drawAllBBoxes();
+    showToast('已进入目标框选标注模式：在峰值画面拖拽鼠标框选漏检人物', 'info');
+  } else {
+    if (canvas) canvas.classList.add('hidden');
+    if (toolbar) toolbar.classList.add('hidden');
+    if (btnToggle) {
+      btnToggle.innerText = '✏️ 标注 (B)';
+      btnToggle.classList.remove('active');
+    }
+  }
+}
+
+function syncBBoxCanvasSize() {
+  const canvas = document.getElementById('bbox-canvas');
+  const img = document.getElementById('img-mid');
+  if (!canvas || !img) return;
+
+  canvas.width = img.clientWidth || 480;
+  canvas.height = img.clientHeight || 270;
+}
+
+function drawAllBBoxes(dragX = null, dragY = null) {
+  const canvas = document.getElementById('bbox-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const cw = canvas.width;
+  const ch = canvas.height;
+
+  // 1. 绘制已固化的 BBox
+  state.currentBBoxes.forEach((b, idx) => {
+    const x = (b.x_center - b.width / 2) * cw;
+    const y = (b.y_center - b.height / 2) * ch;
+    const w = b.width * cw;
+    const h = b.height * ch;
+
+    ctx.strokeStyle = '#10b981';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+    ctx.fillRect(x, y, w, h);
+
+    ctx.fillStyle = '#10b981';
+    ctx.font = '11px monospace';
+    ctx.fillText(`person #${idx + 1}`, x + 4, Math.max(y - 4, 12));
+  });
+
+  // 2. 绘制当前拖拽中的临时虚线框
+  if (state.isDrawingBBox && dragX !== null && dragY !== null) {
+    const x1 = Math.min(state.drawStart.x, dragX);
+    const y1 = Math.min(state.drawStart.y, dragY);
+    const w = Math.abs(dragX - state.drawStart.x);
+    const h = Math.abs(dragY - state.drawStart.y);
+
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = '#06b6d4';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, w, h);
+    ctx.fillStyle = 'rgba(6, 182, 212, 0.15)';
+    ctx.fillRect(x1, y1, w, h);
+    ctx.setLineDash([]);
+  }
+}
+
+function undoBBox() {
+  if (state.currentBBoxes.length > 0) {
+    state.currentBBoxes.pop();
+    drawAllBBoxes();
+    showToast('已撤销上一个目标框', 'info');
+  }
+}
+
+function resetBBoxes() {
+  state.currentBBoxes = [];
+  const canvas = document.getElementById('bbox-canvas');
+  if (canvas) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+async function saveCurrentBBoxes() {
+  if (state.selectedSegIndex < 0 || state.currentBBoxes.length === 0) {
+    showToast('暂无绘制的目标边框', 'info');
+    return;
+  }
+  const seg = state.currentSegments[state.selectedSegIndex];
+
+  try {
+    const res = await fetch('/api/save_bbox', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        segment_id: seg.id,
+        boxes: state.currentBBoxes
+      })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(`已成功保存 ${data.box_count} 个目标标注至 YOLO 侧边文件`, 'success');
+      toggleBBoxMode();
+    } else {
+      showToast('保存标注失败', 'error');
+    }
+  } catch (err) {
+    console.error('Failed to save BBoxes:', err);
+    showToast('保存标注请求异常', 'error');
+  }
 }
 
 // ================== YOLO 强化检测与动图预览 ==================
@@ -1204,11 +1442,14 @@ function showClipPreview() {
   tempImg.src = clipUrl;
 }
 
-// ================== 裁决打标与自动步进 ==================
+// ================== 裁决打标、撤销与自动步进 ==================
 
 async function submitCurrentReview(manualLabel) {
   if (state.selectedSegIndex < 0) return;
   const seg = state.currentSegments[state.selectedSegIndex];
+  const notesInput = document.getElementById('review-notes-input');
+  const userNotes = notesInput ? notesInput.value.trim() : '';
+  const scenario = state.selectedScenario || '';
 
   try {
     const res = await fetch('/api/review', {
@@ -1217,12 +1458,21 @@ async function submitCurrentReview(manualLabel) {
       body: JSON.stringify({
         segment_id: seg.id,
         manual_label: manualLabel,
-        notes: ''
+        notes: userNotes,
+        scenario: scenario
       })
     });
     const data = await res.json();
     if (data.success) {
       seg.manual_label = manualLabel;
+      seg.scenario = scenario;
+      seg.user_notes = userNotes;
+
+      // 若在当前切片上手动绘制了 BBox，伴随一并自动保存为侧边标注
+      if (state.currentBBoxes.length > 0) {
+        saveCurrentBBoxes();
+      }
+
       renderDualTimeline();
       loadOverview();
       loadCategoryBadges();
@@ -1235,7 +1485,8 @@ async function submitCurrentReview(manualLabel) {
         'CONFIRMED_STATIC': '纯静确认 (TN)'
       };
       const labelName = labelMap[manualLabel] || manualLabel;
-      showToast(`已标记为 [${labelName}] 并自动归档真实代表帧`, 'success');
+      const extraSc = scenario ? ` • 归因: [${scenario}]` : '';
+      showToast(`已标记为 [${labelName}]${extraSc} 并同步归档代表帧`, 'success');
 
       selectNextSegment(1);
     }
@@ -1245,11 +1496,203 @@ async function submitCurrentReview(manualLabel) {
   }
 }
 
+async function clearCurrentReview() {
+  if (state.selectedSegIndex < 0) return;
+  const seg = state.currentSegments[state.selectedSegIndex];
+  if (!seg.manual_label) {
+    showToast('当前切片尚未打标，无需撤销', 'info');
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/clear_review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segment_id: seg.id })
+    });
+    const data = await res.json();
+    if (data.success) {
+      seg.manual_label = null;
+      seg.scenario = '';
+      seg.user_notes = '';
+      state.selectedScenario = '';
+      document.querySelectorAll('.scenario-chip').forEach(c => c.classList.remove('active'));
+      const notesInput = document.getElementById('review-notes-input');
+      if (notesInput) notesInput.value = '';
+
+      renderDualTimeline();
+      loadOverview();
+      loadCategoryBadges();
+      loadArchiveStats();
+      showToast(`已成功撤销切片 #${seg.id} 的复核标注`, 'success');
+    } else {
+      showToast('撤销打标失败', 'error');
+    }
+  } catch (err) {
+    console.error('Failed to clear review:', err);
+    showToast('撤销打标请求异常', 'error');
+  }
+}
+
 function selectNextSegment(step) {
+  // 若在疑难排查模式下，优先在争议队列中连续步进
+  if (state.currentTab === 'anomalies') {
+    const nextAno = (state.selectedAnomalyIndex >= 0 ? state.selectedAnomalyIndex : 0) + step;
+    if (nextAno >= 0 && nextAno < state.filteredAnomalies.length) {
+      selectAnomalyItem(nextAno);
+      return;
+    }
+  }
+  // 否则在当前文件切片列表中步进
   const nextIdx = state.selectedSegIndex + step;
   if (nextIdx >= 0 && nextIdx < state.currentSegments.length) {
     selectSegment(nextIdx, true);
   }
+}
+
+// ================== YOLO 数据集导出模态框 ==================
+
+function openYoloModal() {
+  const modal = document.getElementById('yolo-dataset-modal');
+  const resBox = document.getElementById('yolo-export-result');
+  if (resBox) resBox.classList.add('hidden');
+  if (modal) modal.classList.remove('hidden');
+}
+
+function closeYoloModal() {
+  const modal = document.getElementById('yolo-dataset-modal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function exportYoloDataset() {
+  const btn = document.getElementById('btn-yolo-do-export');
+  const valRatioSel = document.getElementById('yolo-val-ratio');
+  const valRatio = valRatioSel ? parseFloat(valRatioSel.value) : 0.2;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-ring" style="width: 14px; height: 14px; display: inline-block;"></span> 正在构建数据集...';
+  }
+
+  try {
+    const res = await fetch('/api/export_yolo_dataset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ val_ratio: valRatio })
+    });
+    const data = await res.json();
+    if (data.success) {
+      const resBox = document.getElementById('yolo-export-result');
+      const statsEl = document.getElementById('yolo-export-stats');
+      const cmdEl = document.getElementById('yolo-train-cmd');
+
+      if (statsEl && data.stats) {
+        statsEl.innerHTML = `
+          <div>📁 训练集: <strong>${data.stats.train_images}</strong> 张图片 | <strong>${data.stats.train_boxes}</strong> 个目标标注</div>
+          <div>📁 验证集: <strong>${data.stats.val_images}</strong> 张图片 | <strong>${data.stats.val_boxes}</strong> 个目标标注</div>
+          <div>🛡️ 困难负样本: <strong>${data.stats.negatives}</strong> 张 (空 txt 标注，抑制虚警)</div>
+          <div>📄 配置文件: <span class="font-mono" style="color: var(--color-cyan);">${data.yaml_path}</span></div>
+        `;
+      }
+      if (cmdEl && data.train_cmd) {
+        cmdEl.innerText = data.train_cmd;
+        cmdEl.onclick = () => {
+          navigator.clipboard.writeText(data.train_cmd);
+          showToast('已复制训练命令至剪贴板！', 'success');
+        };
+      }
+      if (resBox) resBox.classList.remove('hidden');
+      showToast('YOLO 数据集导出完成！', 'success');
+    } else {
+      showToast(data.message || '导出数据集失败', 'error');
+    }
+  } catch (err) {
+    console.error('YOLO dataset export error:', err);
+    showToast('导出数据集请求异常', 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '⚡ 立即导出数据集';
+    }
+  }
+}
+
+// ================== 调参建议模态框 ==================
+
+async function openTuningModal() {
+  const modal = document.getElementById('tuning-insights-modal');
+  const sumBox = document.getElementById('tuning-summary-box');
+  const listEl = document.getElementById('tuning-recommendations-list');
+
+  if (modal) modal.classList.remove('hidden');
+  if (sumBox) sumBox.innerHTML = '<div class="state-loader">正在全量计算误报/漏报归因与能量分位点...</div>';
+  if (listEl) listEl.innerHTML = '';
+
+  try {
+    const res = await fetch('/api/tuning_insights');
+    const data = await res.json();
+
+    if (sumBox) {
+      const dist = data.distribution || {};
+      const sc = data.scenario_counts || {};
+      const nrg = data.energy_stats || {};
+
+      let scHtml = Object.entries(sc).map(([k, v]) => `<span>🏷️ ${k}: <strong>${v}</strong></span>`).join(' • ') || '暂无场景标注';
+
+      sumBox.innerHTML = `
+        <div class="tuning-metric-pill">
+          <span class="tuning-metric-label">已复核切片</span>
+          <span class="tuning-metric-val font-mono">${data.total_reviewed} 处</span>
+        </div>
+        <div class="tuning-metric-pill">
+          <span class="tuning-metric-label">误报 (FP)</span>
+          <span class="tuning-metric-val font-mono" style="color: var(--color-red);">${dist.fp || 0} 处 (均能 ${nrg.fp_avg_energy || 0})</span>
+        </div>
+        <div class="tuning-metric-pill">
+          <span class="tuning-metric-label">漏报 (FN)</span>
+          <span class="tuning-metric-val font-mono" style="color: var(--color-blue);">${dist.fn || 0} 处 (均能 ${nrg.fn_avg_energy || 0})</span>
+        </div>
+        <div class="tuning-metric-pill" style="flex: 2;">
+          <span class="tuning-metric-label">场景归因分布</span>
+          <span class="tuning-metric-val" style="font-size: 12px; font-weight: normal; color: var(--text-secondary); margin-top: 4px;">${scHtml}</span>
+        </div>
+      `;
+    }
+
+    if (listEl) {
+      const recs = data.recommendations || [];
+      if (recs.length === 0) {
+        listEl.innerHTML = `
+          <div class="state-loader" style="text-align: left; padding: 16px;">
+            当前审核样本量尚不足或分类指标极佳，未触发规则阈值微调报警。<br>
+            建议继续复核 5~10 处疑难切片并打标「光影刚性」或「婴儿微动」场景。
+          </div>
+        `;
+      } else {
+        recs.forEach(r => {
+          const card = document.createElement('div');
+          card.className = 'tuning-rec-card';
+          card.innerHTML = `
+            <div class="tuning-rec-header">
+              <span class="tuning-rec-cat">${r.category}</span>
+              <span class="tuning-rec-param">${r.param}</span>
+              <span class="tuning-rec-change font-mono">${r.current_value} ➔ <strong style="color: var(--color-green);">${r.suggested_value}</strong></span>
+            </div>
+            <div class="tuning-rec-rationale">${r.rationale}</div>
+          `;
+          listEl.appendChild(card);
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load tuning insights:', err);
+    if (sumBox) sumBox.innerHTML = '<div class="state-loader error">加载调参建议失败</div>';
+  }
+}
+
+function closeTuningModal() {
+  const modal = document.getElementById('tuning-insights-modal');
+  if (modal) modal.classList.add('hidden');
 }
 
 // ================== 重渲染状态机与交互 ==================
@@ -1338,13 +1781,10 @@ function cancelOrCloseRerender() {
 async function checkCurrentRerenderStatus(date, cam) {
   try {
     const res = await fetch(`/api/rerender_status?date=${date}&cam_index=${cam}`);
-    const data = await res.json();
-    if (['CHECKING', 'RENDERING', 'CONCATING'].includes(data.status)) {
-      applyRerenderStatus(data);
-      startPollingRerender(date, cam);
-    }
+    const st = await res.json();
+    applyRerenderState(st);
   } catch (err) {
-    console.error('Check rerender status error:', err);
+    console.warn('Status poll failed:', err);
   }
 }
 
@@ -1352,170 +1792,179 @@ async function startRerender() {
   const { date, cam } = getActiveDateAndCam();
   const btnStart = document.getElementById('btn-rerender-start');
   if (btnStart) btnStart.disabled = true;
-  const btnCancel = document.getElementById('btn-rerender-cancel');
-  if (btnCancel) btnCancel.innerText = '中断任务';
 
   try {
     const res = await fetch('/api/rerender', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        date: date,
-        cam_index: cam,
-        version: 'reviewed'
-      })
+      body: JSON.stringify({ date, cam_index: cam, version: 'reviewed' })
     });
     const data = await res.json();
-    if (data.error && data.error !== 'Task already running') {
-      showToast(`启动失败: ${data.error}`, 'error');
+    if (data.error) {
+      showToast(data.error, 'error');
       if (btnStart) btnStart.disabled = false;
-      if (btnCancel) btnCancel.innerText = '关闭';
       return;
     }
-    showToast(`已提交 ${date} cam${cam} 重浓缩任务`, 'info');
-    startPollingRerender(date, cam);
+
+    showToast('重渲染任务已提交执行', 'info');
+    const btnCancel = document.getElementById('btn-rerender-cancel');
+    if (btnCancel) btnCancel.innerText = '中断任务';
+
+    if (rerenderPollTimer) clearInterval(rerenderPollTimer);
+    rerenderPollTimer = setInterval(() => checkCurrentRerenderStatus(date, cam), 1000);
   } catch (err) {
-    console.error('Start rerender failed:', err);
-    showToast('提交重浓缩请求异常', 'error');
+    console.error('Failed to start rerender:', err);
+    showToast('启动重渲染失败', 'error');
     if (btnStart) btnStart.disabled = false;
   }
 }
 
-function startPollingRerender(date, cam) {
-  if (rerenderPollTimer) clearInterval(rerenderPollTimer);
-  rerenderPollTimer = setInterval(async () => {
-    try {
-      const res = await fetch(`/api/rerender_status?date=${date}&cam_index=${cam}`);
-      const st = await res.json();
-      applyRerenderStatus(st);
+function applyRerenderState(st) {
+  if (!st || st.status === 'IDLE') return;
 
-      if (['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'].includes(st.status)) {
-        clearInterval(rerenderPollTimer);
-        rerenderPollTimer = null;
-        const btnCancel = document.getElementById('btn-rerender-cancel');
-        if (btnCancel) btnCancel.innerText = '关闭';
-        const btnStart = document.getElementById('btn-rerender-start');
-        if (btnStart) btnStart.disabled = false;
-      }
-    } catch (err) {
-      console.error('Poll rerender status failed:', err);
-    }
-  }, 900);
-}
-
-function applyRerenderStatus(st) {
-  const checkChip = document.getElementById('rerender-file-check-status');
-  const stageText = document.getElementById('rerender-stage-text');
-  const pctText = document.getElementById('rerender-pct-text');
-  const barFill = document.getElementById('rerender-progress-fill');
-  const batchText = document.getElementById('rerender-batch-text');
-  const timeText = document.getElementById('rerender-time-text');
-  const missingAlert = document.getElementById('rerender-missing-alert');
-  const missingList = document.getElementById('rerender-missing-list');
-  const btnStart = document.getElementById('btn-rerender-start');
-  const btnOpenDir = document.getElementById('btn-rerender-open-dir');
-
-  if (timeText) timeText.innerText = `已耗时: ${(st.elapsed_s || 0).toFixed(1)}s`;
-  if (pctText) pctText.innerText = `${st.progress || 0}%`;
-  if (barFill) barFill.style.width = `${st.progress || 0}%`;
+  const status = st.status;
+  const statusEl = document.getElementById('rerender-file-check-status');
+  const stageEl = document.getElementById('rerender-stage-text');
+  const pctEl = document.getElementById('rerender-pct-text');
+  const batchEl = document.getElementById('rerender-batch-text');
+  const timeEl = document.getElementById('rerender-time-text');
+  const fill = document.getElementById('rerender-progress-fill');
+  const btnCancel = document.getElementById('btn-rerender-cancel');
 
   if (st.missing_files && st.missing_files.length > 0) {
-    if (missingAlert) missingAlert.classList.remove('hidden');
-    if (missingList) {
-      missingList.innerHTML = st.missing_files.map(f => `<div>• ${f.split('\\').pop().split('/').pop()}</div>`).join('');
+    const alertEl = document.getElementById('rerender-missing-alert');
+    const listEl = document.getElementById('rerender-missing-list');
+    if (alertEl) alertEl.classList.remove('hidden');
+    if (listEl) {
+      listEl.innerHTML = st.missing_files.map(f => `<div>• ${f}</div>`).join('');
     }
-    if (checkChip) {
-      checkChip.className = 'status-chip';
-      checkChip.style.background = 'rgba(245, 158, 11, 0.2)';
-      checkChip.style.color = '#f59e0b';
-      checkChip.innerText = `⚠️ 缺失 ${st.missing_files.length} 个物理文件 (已自愈跳过)`;
-    }
-  } else if (st.status !== 'IDLE' && checkChip) {
-    checkChip.className = 'status-chip';
-    checkChip.style.background = 'rgba(16, 185, 129, 0.2)';
-    checkChip.style.color = '#34d399';
-    checkChip.innerText = '✅ 全部源文件物理校验通过';
   }
 
-  if (st.status === 'CHECKING' && stageText) {
-    stageText.innerText = '正在探测素材物理存在性与可读性...';
-  } else if (st.status === 'RENDERING') {
-    if (stageText) stageText.innerText = `正在执行硬件加速切片压制 (批次 ${st.current_batch}/${st.total_batches})...`;
-    if (batchText) batchText.innerText = `批次: ${st.current_batch} / ${st.total_batches}`;
-  } else if (st.status === 'CONCATING' && stageText) {
-    stageText.innerText = '正在合并最终成片并封装元数据...';
-  } else if (st.status === 'COMPLETED') {
-    if (stageText) stageText.innerText = `🎉 浓缩压制完成！成片体积: ${st.file_size_mb || 0} MB`;
-    if (barFill) barFill.style.background = '#10b981';
+  if (timeEl && st.elapsed_s != null) {
+    timeEl.innerText = `已耗时: ${st.elapsed_s}s`;
+  }
+
+  if (fill && st.progress != null) {
+    fill.style.width = `${st.progress}%`;
+  }
+  if (pctEl && st.progress != null) {
+    pctEl.innerText = `${st.progress}%`;
+  }
+
+  if (batchEl && st.total_batches != null) {
+    batchEl.innerText = `批次: ${st.current_batch || 0} / ${st.total_batches}`;
+  }
+
+  if (status === 'CHECKING') {
+    if (statusEl) {
+      statusEl.className = 'status-chip';
+      statusEl.innerText = '正在探测素材可达性...';
+    }
+    if (stageEl) stageEl.innerText = '前置存储物理探测';
+    if (btnCancel) btnCancel.innerText = '中断任务';
+  } else if (status === 'RENDERING') {
+    if (statusEl) {
+      statusEl.className = 'status-chip chip-reviewed';
+      statusEl.innerText = '物理校验通过';
+    }
+    if (stageEl) stageEl.innerText = `硬件批次渲染中 (${st.current_batch}/${st.total_batches})`;
+    if (btnCancel) btnCancel.innerText = '中断任务';
+  } else if (status === 'CONCATING') {
+    if (stageEl) stageEl.innerText = '合并最终 Vlog 成片并生成配套资产...';
+    if (btnCancel) btnCancel.innerText = '中断任务';
+  } else if (status === 'COMPLETED') {
+    if (stageEl) stageEl.innerText = `✅ 重渲染完成！体积: ${st.file_size_mb || 0} MB`;
+    if (fill) fill.style.background = 'var(--color-green)';
+    if (btnCancel) btnCancel.innerText = '关闭';
+    const btnStart = document.getElementById('btn-rerender-start');
     if (btnStart) btnStart.classList.add('hidden');
-    if (btnOpenDir) btnOpenDir.classList.remove('hidden');
-    currentRerenderOutputFile = st.output_file;
-    showToast('Vlog 成片重新浓缩成功！', 'success');
-  } else if (st.status === 'FAILED') {
-    if (stageText) stageText.innerText = `❌ 重渲染失败: ${st.error || '未知错误'}`;
-    if (barFill) barFill.style.background = '#f43f5e';
-    showToast(`重渲染失败: ${st.error}`, 'error');
-  } else if (st.status === 'CANCELLED' && stageText) {
-    stageText.innerText = '已中止任务';
+    
+    currentRerenderOutputFile = st.output_file || '';
+    const btnOpenDir = document.getElementById('btn-rerender-open-dir');
+    if (btnOpenDir && currentRerenderOutputFile) {
+      btnOpenDir.classList.remove('hidden');
+    }
+
+    if (rerenderPollTimer) {
+      clearInterval(rerenderPollTimer);
+      rerenderPollTimer = null;
+    }
+    showToast('🎉 Vlog 即时重新浓缩压制完成！', 'success');
+  } else if (status === 'FAILED') {
+    if (stageEl) stageEl.innerText = `❌ 渲染失败: ${st.error || '未知错误'}`;
+    if (fill) fill.style.background = 'var(--color-red)';
+    if (btnCancel) btnCancel.innerText = '关闭';
+    const btnStart = document.getElementById('btn-rerender-start');
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.classList.remove('hidden');
+    }
+    if (rerenderPollTimer) {
+      clearInterval(rerenderPollTimer);
+      rerenderPollTimer = null;
+    }
+  } else if (status === 'CANCELLED') {
+    if (stageEl) stageEl.innerText = '⚠️ 任务已被用户中断';
+    if (btnCancel) btnCancel.innerText = '关闭';
+    const btnStart = document.getElementById('btn-rerender-start');
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.classList.remove('hidden');
+    }
+    if (rerenderPollTimer) {
+      clearInterval(rerenderPollTimer);
+      rerenderPollTimer = null;
+    }
   }
 }
 
-function openRerenderOutputDir() {
+async function openRerenderOutputDir() {
   if (!currentRerenderOutputFile) return;
-  fetch(`/api/open_output_dir?filepath=${encodeURIComponent(currentRerenderOutputFile)}`)
-    .then(r => r.json())
-    .then(data => {
-      if (data.success) {
-        showToast('已在文件管理器中定位成片', 'info');
-      } else {
-        showToast('打开文件路径失败', 'error');
-      }
-    });
+  try {
+    const res = await fetch(`/api/open_output_dir?filepath=${encodeURIComponent(currentRerenderOutputFile)}`);
+    const data = await res.json();
+    if (data.success) {
+      showToast('已在资源管理器中定位成片文件', 'success');
+    } else {
+      showToast('定位文件失败', 'error');
+    }
+  } catch (err) {
+    console.error('Failed to open dir:', err);
+  }
 }
 
-// ================== 真实反馈帧归档管理 ==================
+// ================== 反馈帧归档状态管理 ==================
 
 async function loadArchiveStats() {
   try {
     const res = await fetch('/api/archive_stats');
     const data = await res.json();
+    
     const countBadge = document.getElementById('archive-count-badge');
     if (countBadge) countBadge.innerText = data.total_images || 0;
 
     const dirEl = document.getElementById('archive-dir-path');
     if (dirEl) dirEl.innerText = data.archive_dir || 'data/feedback_archive';
 
-    const totalImgEl = document.getElementById('archive-total-images');
-    if (totalImgEl) totalImgEl.innerText = `${data.total_images || 0} 张`;
+    const totImgEl = document.getElementById('archive-total-images');
+    if (totImgEl) totImgEl.innerText = `${data.total_images || 0} 张`;
 
-    const totalSizeEl = document.getElementById('archive-total-size');
-    if (totalSizeEl) totalSizeEl.innerText = `${data.total_size_mb || 0} MB`;
+    const totSizeEl = document.getElementById('archive-total-size');
+    if (totSizeEl) totSizeEl.innerText = `${data.total_size_mb || 0} MB`;
 
-    const breakdownEl = document.getElementById('archive-label-breakdown');
-    if (breakdownEl) {
-      breakdownEl.innerHTML = '';
-      const counts = data.label_counts || {};
-      if (Object.keys(counts).length === 0) {
-        breakdownEl.innerHTML = '<span style="color: var(--text-muted); font-size: 11px;">暂无打标归档数据</span>';
-      } else {
-        const labelStyles = {
-          'CONFIRMED_MOTION': { text: '动态确认', bg: 'rgba(16, 185, 129, 0.2)', color: '#34d399' },
-          'VERIFIED_MOTION': { text: '动态确认', bg: 'rgba(16, 185, 129, 0.2)', color: '#34d399' },
-          'FALSE_ALARM': { text: '光影误报', bg: 'rgba(244, 63, 94, 0.2)', color: '#f87171' },
-          'MISSED_MOTION': { text: '漏报补录', bg: 'rgba(59, 130, 246, 0.2)', color: '#60a5fa' },
-          'CONFIRMED_STATIC': { text: '纯静确认', bg: 'rgba(148, 163, 184, 0.2)', color: '#94a3b8' },
-        };
-        for (const [lbl, cnt] of Object.entries(counts)) {
-          const style = labelStyles[lbl] || { text: lbl, bg: 'rgba(255,255,255,0.1)', color: '#fff' };
-          const span = document.createElement('span');
-          span.style.cssText = `padding: 2px 8px; border-radius: 4px; font-size: 11px; background: ${style.bg}; color: ${style.color};`;
-          span.innerText = `${style.text}: ${cnt}`;
-          breakdownEl.appendChild(span);
-        }
-      }
+    const distWrap = document.getElementById('archive-label-breakdown');
+    if (distWrap && data.labels) {
+      distWrap.innerHTML = '';
+      Object.entries(data.labels).forEach(([lbl, cnt]) => {
+        const span = document.createElement('span');
+        span.className = 'chip font-mono';
+        span.style.fontSize = '11px';
+        span.innerText = `${lbl}: ${cnt}`;
+        distWrap.appendChild(span);
+      });
     }
   } catch (err) {
-    console.error('Failed to load archive stats:', err);
+    console.warn('Failed to load archive stats:', err);
   }
 }
 
@@ -1532,11 +1981,10 @@ function closeArchiveModal() {
 
 async function triggerBatchArchive() {
   const btn = document.getElementById('btn-archive-batch-run');
-  if (!btn) return;
-  const oldText = btn.innerHTML;
-  btn.innerHTML = '<span class="spin-ring" style="width: 14px; height: 14px; display: inline-block;"></span> 归档中...';
-  btn.disabled = true;
-
+  if (btn) {
+    btn.disabled = true;
+    btn.innerText = '正在全量归档...';
+  }
   try {
     const res = await fetch('/api/archive_all', {
       method: 'POST',
@@ -1544,18 +1992,20 @@ async function triggerBatchArchive() {
       body: JSON.stringify({ force: false })
     });
     const data = await res.json();
-    showToast(`补齐归档完成：新增 ${data.archived} 张，跳过/失败 ${data.failed} 张`, 'success');
+    showToast(`全量归档完成: 新增 ${data.success || 0} 张, 跳过 ${data.skipped || 0} 张`, 'success');
     loadArchiveStats();
   } catch (err) {
-    console.error('Batch archive failed:', err);
-    showToast('批量归档失败', 'error');
+    console.error('Batch archive error:', err);
+    showToast('批量归档执行异常', 'error');
   } finally {
-    btn.innerHTML = oldText;
-    btn.disabled = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.innerText = '⚡ 补齐全量历史归档';
+    }
   }
 }
 
-// ================== 🚀 高清关键帧细节放大查看器 (Lightbox Engine) ==================
+// ================== 高清关键帧微距放大视窗 (Lightbox) ==================
 
 const lightboxState = {
   isOpen: false,
@@ -1565,8 +2015,8 @@ const lightboxState = {
   translateX: 0,
   translateY: 0,
   isPanning: false,
-  panStartX: 0,
-  panStartY: 0,
+  startX: 0,
+  startY: 0,
   startTranslateX: 0,
   startTranslateY: 0,
   currentPos: '',
@@ -1574,69 +2024,44 @@ const lightboxState = {
 };
 
 function initLightbox() {
-  const modal = document.getElementById('lightbox-modal');
-  const btnClose = document.getElementById('btn-lightbox-close');
-  const btnZoomIn = document.getElementById('btn-lightbox-zoom-in');
-  const btnZoomOut = document.getElementById('btn-lightbox-zoom-out');
+  // 绑定三联画卡片放大按钮
+  const bStart = document.getElementById('btn-zoom-start');
+  if (bStart) bStart.addEventListener('click', () => openLightbox('start'));
+  const bMid = document.getElementById('btn-zoom-mid');
+  if (bMid) bMid.addEventListener('click', () => openLightbox('mid'));
+  const bEnd = document.getElementById('btn-zoom-end');
+  if (bEnd) bEnd.addEventListener('click', () => openLightbox('end'));
+
+  // 绑定控制条
+  const btnIn = document.getElementById('btn-lightbox-zoom-in');
+  if (btnIn) btnIn.addEventListener('click', () => zoomLightbox(1.25));
+  const btnOut = document.getElementById('btn-lightbox-zoom-out');
+  if (btnOut) btnOut.addEventListener('click', () => zoomLightbox(0.8));
   const btnReset = document.getElementById('btn-lightbox-reset');
+  if (btnReset) btnReset.addEventListener('click', resetLightboxZoom);
   const btnActual = document.getElementById('btn-lightbox-actual');
+  if (btnActual) btnActual.addEventListener('click', setLightboxActualSize);
+  const btnClose = document.getElementById('btn-lightbox-close');
+  if (btnClose) btnClose.addEventListener('click', closeLightbox);
+
+  // 鼠标滚轮缩放与按住平移
   const viewport = document.getElementById('lightbox-viewport');
   const canvas = document.getElementById('lightbox-canvas');
 
-  if (btnClose) btnClose.addEventListener('click', closeLightbox);
-  if (btnZoomIn) btnZoomIn.addEventListener('click', () => zoomLightbox(1.25));
-  if (btnZoomOut) btnZoomOut.addEventListener('click', () => zoomLightbox(0.8));
-  if (btnReset) btnReset.addEventListener('click', resetLightboxZoom);
-  if (btnActual) btnActual.addEventListener('click', setLightboxActualSize);
-
-  // 点击背景外侧关闭
-  if (modal) {
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) closeLightbox();
-    });
-  }
-
-  // 绑定三联卡片头部放大按钮与卡片容器点击
-  ['start', 'mid', 'end'].forEach(pos => {
-    const btnZoom = document.getElementById(`btn-zoom-${pos}`);
-    if (btnZoom) {
-      btnZoom.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openLightbox(pos);
-      });
-    }
-
-    const wrap = document.getElementById(`wrap-${pos}`);
-    if (wrap) {
-      wrap.addEventListener('click', (e) => {
-        const img = document.getElementById(`img-${pos}`);
-        if (img && !img.classList.contains('hidden') && img.src) {
-          openLightbox(pos);
-        }
-      });
-    }
-  });
-
-  // 滚轮缩放画布 (以视窗中心或指针为锚点)
-  if (viewport) {
+  if (viewport && canvas) {
     viewport.addEventListener('wheel', (e) => {
       e.preventDefault();
       const rect = viewport.getBoundingClientRect();
       const mouseX = e.clientX - rect.left - rect.width / 2;
       const mouseY = e.clientY - rect.top - rect.height / 2;
-
-      const factor = e.deltaY < 0 ? 1.2 : 0.833;
+      const factor = e.deltaY > 0 ? 0.85 : 1.18;
       zoomLightboxAt(factor, mouseX, mouseY);
     }, { passive: false });
-  }
 
-  // 鼠标拖拽平移
-  if (canvas) {
     canvas.addEventListener('mousedown', (e) => {
-      e.preventDefault();
       lightboxState.isPanning = true;
-      lightboxState.panStartX = e.clientX;
-      lightboxState.panStartY = e.clientY;
+      lightboxState.startX = e.clientX;
+      lightboxState.startY = e.clientY;
       lightboxState.startTranslateX = lightboxState.translateX;
       lightboxState.startTranslateY = lightboxState.translateY;
       canvas.classList.add('panning');
@@ -1644,8 +2069,8 @@ function initLightbox() {
 
     window.addEventListener('mousemove', (e) => {
       if (!lightboxState.isPanning) return;
-      const dx = e.clientX - lightboxState.panStartX;
-      const dy = e.clientY - lightboxState.panStartY;
+      const dx = e.clientX - lightboxState.startX;
+      const dy = e.clientY - lightboxState.startY;
       lightboxState.translateX = lightboxState.startTranslateX + dx;
       lightboxState.translateY = lightboxState.startTranslateY + dy;
       applyLightboxTransform();
@@ -1698,10 +2123,8 @@ function openLightbox(pos) {
   }
   lightboxState.currentTimestamp = timestamp;
 
-  const firstStart = state.currentSegments[0].start_time;
-  const isDayOffset = (firstStart >= 3600);
-  const baseOffset = isDayOffset ? firstStart : 0;
-  const relTime = isDayOffset ? (timestamp - baseOffset) : timestamp;
+  const range = getSegmentLocalRange(seg);
+  const relTime = pos === 'start' ? range.start : (pos === 'end' ? range.end : (range.start + range.end) / 2.0);
   const clockTime = formatClockTime(state.timeline.fileOffsetSec + relTime);
   const fn = (fp || '').split('\\').pop().split('/').pop();
 
@@ -1717,7 +2140,7 @@ function openLightbox(pos) {
   }
 
   // 若中继帧已具备 YOLO 增强画框结果，直接采用画框图供用户微距检阅
-  if (pos === 'mid' && cardImg && cardImg.src && (cardImg.src.includes('yolo') || cardImg.src.includes('data:image'))) {
+  if (pos === 'mid' && cardImg && cardImg.src && (cardImg.src.includes('yolo') || cardImg.src.includes('data:image') || cardImg.src.includes('annotated'))) {
     imgEl.src = cardImg.src;
     if (spinner) spinner.classList.add('hidden');
     return;
@@ -1786,4 +2209,3 @@ function applyLightboxTransform() {
     statusEl.innerText = `${Math.round(lightboxState.scale * 100)}%`;
   }
 }
-

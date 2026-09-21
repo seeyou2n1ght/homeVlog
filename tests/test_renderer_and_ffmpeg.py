@@ -106,7 +106,7 @@ def test_fractional_segments_keep_one_video_audio_clock(tmp_path, fps, state):
         # Real camera audio may contain overlapping timestamps. Sample counts,
         # rather than source PTS span, must determine the output segment clock.
         "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=22,asetpts=0.98*PTS",
-        "-filter_complex_script", str(graph_path), "-map", "[v]", "-map", "[a]",
+        "-/filter_complex", str(graph_path), "-map", "[v]", "-map", "[a]",
         "-c:v", "ffv1", "-c:a", "pcm_s16le", str(target),
     ], capture_output=True, timeout=30, check=True)
     with av.open(str(target)) as container:

@@ -1671,3 +1671,184 @@ body {
   color: var(--text-muted);
 }
 
+/* ================== 日期与机位下拉过滤 ================== */
+.filter-dropdown-row {
+  display: flex;
+  gap: 8px;
+  padding: 8px 14px 4px;
+}
+.filter-dropdown-row select {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+  cursor: pointer;
+}
+.filter-dropdown-row select:focus {
+  border-color: var(--color-cyan);
+}
+
+/* ================== BBox 目标边界框标注 ================== */
+.bbox-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 15;
+  cursor: crosshair;
+}
+.bbox-toolbar {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(14, 20, 36, 0.92);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 6px 14px;
+  backdrop-filter: blur(12px);
+  z-index: 25;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  white-space: nowrap;
+}
+.bbox-tip {
+  font-size: 11px;
+  color: var(--color-cyan);
+}
+.bbox-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ================== 场景归因与用户备注 ================== */
+.scenario-attribution-bar {
+  background: rgba(14, 20, 36, 0.7);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.scenario-chips-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.scenario-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.scenario-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.scenario-chip {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  border-radius: 14px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.scenario-chip:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+.scenario-chip.active {
+  background: rgba(6, 182, 212, 0.2);
+  border-color: var(--color-cyan);
+  color: var(--color-cyan);
+  font-weight: 600;
+}
+.scenario-notes-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.notes-input {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 6px 12px;
+  outline: none;
+}
+.notes-input:focus {
+  border-color: var(--color-cyan);
+}
+
+/* ================== 调参建议卡片 ================== */
+.tuning-metric-pill {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  flex: 1;
+  min-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tuning-metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.tuning-metric-val {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.tuning-rec-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tuning-rec-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.tuning-rec-cat {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-cyan);
+}
+.tuning-rec-param {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-amber);
+}
+.tuning-rec-change {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.tuning-rec-rationale {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}

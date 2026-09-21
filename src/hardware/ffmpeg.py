@@ -112,7 +112,10 @@ def run_ffmpeg(
                 expired = threading.Event()
                 def drain_errors():
                     while True:
-                        block = proc.stderr.read(4096)
+                        try:
+                            block = proc.stderr.read(4096)
+                        except (OSError, ValueError):
+                            break  # The stream may close after a consumer failure.
                         if not block:
                             break
                         errors.append(block)
