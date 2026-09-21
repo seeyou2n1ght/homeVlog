@@ -14,7 +14,7 @@ from src.hardware.ffmpeg import run_ffmpeg, get_duration, FFmpegProcessRegistry
 from src.stages.timeline import build_concat_filter, compute_display_plans, normalize_file_timeline as _normalize_file_timeline
 from src.hardware.monitor import get_perf, PerfRecord
 
-from src.algorithms.segment import ACTIVE_STATES, SegmentState
+from src.algorithms.segment import ACTIVE_STATES
 
 logger = logging.getLogger("homevlog")
 
@@ -584,6 +584,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        output_fps=float(out_cfg.get("fps", 20)),
     ))
     # Match decoder skipping to the same long-static predicate used by the filter graph.
     interval = seg_cfg.get("static_keyframe_interval", 30.0)
@@ -661,7 +662,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         input_files, filter_complex + fingerprint_salt,
         encoder, fps, out_cfg, audio_cfg, cfg,
     )
-    if reusable(output_path, fingerprint, expected_duration):
+    if reusable(output_path, fingerprint, expected_duration, require_audio=True):
         logger.info("Reusing verified batch %s", output_path.name)
         return str(output_path)
 
@@ -769,7 +770,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             try:
                 while True:
                     try:
-                        ret = proc.wait(timeout=2.0)
+                        proc.wait(timeout=2.0)
                         break
                     except subprocess.TimeoutExpired:
                         pass
@@ -865,7 +866,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
 
     if proc is not None and proc.returncode == 0 and tmp_output_path.exists():
         try:
-            if valid_video(tmp_output_path, expected_duration):
+            if valid_video(tmp_output_path, expected_duration, require_audio=True):
                 # 原子重命名为正式批次成片，保证断点续传绝不复用半成品
                 tmp_output_path.replace(output_path)
                 save_manifest(output_path, fingerprint)
@@ -956,13 +957,17 @@ def concat_output_files(
             def _probe_duration(p: Path) -> float | None:
                 try:
                     import av
-                    with av.open(str(p), timeout=10.0) as container:
+                    with av.open(str(p), timeout=30.0) as container:
+                        # Video owns the frame clock. AAC padding must not move
+                        # the next video's start and create a visible gap.
+                        c_dur = float(container.duration or 0) / av.time_base if container.duration else 0.0
+                        v_dur = 0.0
                         if container.streams.video:
                             v = container.streams.video[0]
-                            d = (float(v.duration * v.time_base) if v.duration
-                                 else float(container.duration or 0) / av.time_base)
-                            if d > 0:
-                                return d
+                            v_dur = float(v.duration * v.time_base) if v.duration else 0.0
+                        d = v_dur or c_dur
+                        if d > 0:
+                            return d
                 except Exception:
                     pass
                 return get_duration(str(p))
@@ -971,17 +976,28 @@ def concat_output_files(
             with ThreadPoolExecutor(max_workers=max_w) as pool:
                 durations = list(pool.map(_probe_duration, files))
 
-        if any(duration is None or duration <= 0 for duration in durations):
+        if len(durations) != len(files) or any(duration is None or duration <= 0 for duration in durations):
             return False
         from itertools import accumulate
         checkpoints = list(accumulate(durations))[:-1]
-        concat_list.write_text("\n".join(f"file '{_concat_path(f)}'" for f in files)+"\n", encoding="utf-8")
-        cmd = ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy"]
+        concat_list.write_text("\n".join(
+            f"file '{_concat_path(f)}'\nduration {duration:.9f}"
+            for f, duration in zip(files, durations)
+        )+"\n", encoding="utf-8")
+        from src.core.config import load_config
+        audio = load_config().get("output", {}).get("audio", {})
+        cmd = ["-f", "concat", "-safe", "0", "-i", str(concat_list),
+               "-c:v", "copy", "-c:a", audio.get("codec", "aac"),
+               "-b:a", audio.get("bitrate", "96k"),
+               "-af", "aresample=48000:async=1:min_hard_comp=0:first_pts=0,"
+               f"atrim=duration={sum(durations):.9f}"]
         if faststart:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(temporary))
         result = run_ffmpeg(cmd, timeout=timeout)
-        if result.returncode != 0 or not valid_video(temporary, sum(durations), checkpoints=checkpoints):
+        if result.returncode != 0 or not valid_video(
+            temporary, sum(durations), checkpoints=checkpoints, require_audio=True
+        ):
             return False
         temporary.replace(output)
         return True

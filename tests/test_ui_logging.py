@@ -107,7 +107,7 @@ def test_dashboard_alert_bridge():
         unregister_dashboard()
 
 
-def test_ui_components_render(tmp_path):
+def test_ui_components_render(tmp_path, capsys):
     """验证 Startup Banner, Summary Card, Error Summary 与 Scan Results 表格渲染无崩溃。"""
     # 1. 批量启动 Banner 与 单日启动 Banner
     from src.ui import print_batch_startup_banner
@@ -146,6 +146,9 @@ def test_ui_components_render(tmp_path):
 
     # 4. 扫描列表展示
     print_scan_results([("20260901", 0), ("20260902", 1)])
+    output = capsys.readouterr().out
+    assert "20260903" in output and "20260902" in output
+    assert "Corrupt slice detected" in output and "QSV session timeout" in output
 
 
 def test_pipeline_dashboard_lifecycle():
@@ -235,9 +238,11 @@ def test_system_doctor_and_report():
     assert isinstance(ok, bool)
 
 
-def test_batch_summary_table_and_status_table(tmp_path):
+def test_batch_summary_table_and_status_table(tmp_path, capsys, monkeypatch):
     """验证多日批处理全景大表与数据库任务状态大表正常渲染。"""
     from src.ui import print_batch_summary_table, print_status_table
+    from src.ui import console
+    monkeypatch.setattr(console, "width", 220)
     from src.database import VlogDatabase
 
     # 1. 批量全景表
@@ -285,11 +290,14 @@ def test_batch_summary_table_and_status_table(tmp_path):
             file_duration=600.0,
         )
         print_status_table(db, camera_display_names={0: "baby_room (B888805AA3CD)"})
+        output = capsys.readouterr().out
+        assert "20260320" in output and "20260321" in output
+        assert "baby_room" in output
     finally:
         db.close()
 
 
-def test_plain_progress_tracker():
+def test_plain_progress_tracker(capsys):
     """验证无头模式流式进度心跳器触发无异常。"""
     from src.ui import PlainProgressTracker
     tracker = PlainProgressTracker(date="20260320", cam_index=0, total_files=100, interval_s=0.01)
@@ -302,3 +310,32 @@ def test_plain_progress_tracker():
         render_total=5,
         force=True,
     )
+    output = capsys.readouterr().out
+    assert "20260320" in output and "50/100" in output and "2/5" in output
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
+    from unittest.mock import MagicMock
+    import main as cli
+    from src.database import VlogDatabase
+
+    db = VlogDatabase(tmp_path / "cli.db")
+    db.add_file_task("clip.mp4", 0, "20260320", "20260320000000", "20260320000100", 60)
+    monkeypatch.setattr("sys.argv", ["main.py", "--date", "20260320", "--no-tui"])
+    monkeypatch.setattr(cli, "VlogDatabase", lambda: db)
+    monkeypatch.setattr(cli, "scan_directory", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "process_date_cam", lambda *a, **k: success)
+    monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
+    monkeypatch.setattr("src.monitor.get_monitor", lambda: MagicMock())
+    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
+    if success:
+        cli.main()
+    else:
+        with pytest.raises(SystemExit) as caught:
+            cli.main()
+        assert caught.value.code == 1
+    output = capsys.readouterr().out
+    assert ("处理完成" in output) is success
+    assert ("处理失败" in output) is not success

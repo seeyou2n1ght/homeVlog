@@ -120,7 +120,10 @@ class TestFilenameParsingAndScanner:
 
 
 
-    def test_scan_directory_incremental_and_groups(self, tmp_path):
+    def test_scan_directory_incremental_and_groups(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.stages.scanner.load_config", lambda: {
+            "recovery": {"skip_today": False, "scanner_freeze_minutes": 0}
+        })
         db_path = tmp_path / "test_vlog.db"
         db = VlogDatabase(db_path=db_path)
         try:
@@ -153,7 +156,10 @@ class TestFilenameParsingAndScanner:
         finally:
             db.close()
 
-    def test_scan_multiple_directories(self, tmp_path):
+    def test_scan_multiple_directories(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.stages.scanner.load_config", lambda: {
+            "recovery": {"skip_today": False, "scanner_freeze_minutes": 0}
+        })
         db_path = tmp_path / "test_multi.db"
         db = VlogDatabase(db_path=db_path)
         try:
@@ -214,6 +220,11 @@ class TestVlogDatabaseLifecycle:
             db.set_file_metadata(filepath, has_audio=1)
             all_tasks = db.get_all_file_tasks_for_date("20260901", 0)
             assert all_tasks[0]["has_audio"] == 1
+            assert all_tasks[0]["duration_verified"] == 0
+            db.set_file_metadata(filepath, has_audio=1, duration=299.5)
+            all_tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert all_tasks[0]["file_duration"] == 299.5
+            assert all_tasks[0]["duration_verified"] == 1
 
         finally:
             db.close()
@@ -322,3 +333,25 @@ class TestSegmentsTableLifecycle:
         finally:
             db.close()
 
+    def test_empty_analysis_replaces_old_segments_and_bad_json_fails(self, tmp_path):
+        from src.segment import Segment
+
+        db = VlogDatabase(tmp_path / "replace.sqlite")
+        fp = "clip.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_analysis_result(fp, [Segment(0, 60, "DYNAMIC", fp)])
+        assert len(db.get_segments_for_file(fp)) == 1
+        db.set_analysis_result(fp, "ANALYZED", [])
+        assert db.get_segments_for_file(fp) == []
+        with pytest.raises(ValueError):
+            db.set_analysis_result(fp, "ANALYZED", "{broken")
+        db.close()
+
+    def test_file_task_query_can_be_scoped_to_render_batch(self, tmp_path):
+        db = VlogDatabase(tmp_path / "scoped.sqlite")
+        for index in range(3):
+            fp = f"clip_{index}.mp4"
+            db.add_file_task(fp, 0, "20260901", f"20260901000{index}00", f"20260901000{index}59", 59)
+        rows = db.get_all_file_tasks_for_date("20260901", 0, filepaths=["clip_1.mp4"])
+        assert [row["filepath"] for row in rows] == ["clip_1.mp4"]
+        db.close()

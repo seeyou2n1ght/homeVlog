@@ -19,6 +19,19 @@ from src.stages.timeline import (
 logger = logging.getLogger("homevlog")
 
 
+def companion_assets_complete(output_path: Path, config: dict) -> bool:
+    try:
+        meta = json.loads(output_path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        metrics = meta.get("metrics", {})
+        if (metrics.get("vlog_duration_s", 0) <= 0
+                or metrics.get("output_size_bytes") != output_path.stat().st_size):
+            return False
+        return (not config.get("render", {}).get("generate_subtitles", True)
+                or output_path.with_suffix(".srt").exists())
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def dump_perf(
     perf: Any,
     monitor: Any,
@@ -27,6 +40,7 @@ def dump_perf(
     pipeline_duration: float,
     headline: dict | None = None,
     worker_stats: dict | None = None,
+    run_context: dict | None = None,
 ) -> None:
     """Dump structured performance metrics JSON to logs/perf."""
     try:
@@ -43,6 +57,8 @@ def dump_perf(
             "monitor_summary": monitor.stages_data(),
             "perf_summary": perf.summary_by_stage(),
         }
+        if run_context:
+            metadata["run_context"] = run_context
         if worker_stats:
             metadata["worker_stats"] = worker_stats
         if yolo_sum:
@@ -65,7 +81,9 @@ def build_headline(output_path: Path, total_input_dur: float, elapsed_wall: floa
         "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
     }
     try:
+        from src.hardware.render_cache import file_identity
         headline.update(size_metrics(output_path.stat().st_size))
+        headline["output_identity"] = file_identity(output_path)
     except OSError:
         pass
     try:
@@ -88,29 +106,38 @@ def save_vlog_companion_assets(
     elapsed_wall: float,
     db: VlogDatabase,
     config: dict,
-) -> None:
+    rows: list[dict] | None = None,
+) -> bool:
     """生成同名标准交付资产包：.srt 现实世界时间码字幕 + .meta.json 自描述结构化清单。"""
     try:
-        rows = db.get_all_file_tasks_for_date(date, cam_index)
+        rows = rows if rows is not None else db.get_all_file_tasks_for_date(date, cam_index)
         full_timeline = build_timeline_from_rows(rows, date, config=config, resolve_presence=False)
 
         # 1. 生成伴随 .srt 字幕（默认开启，可在配置中显式关闭）
         srt_path = output_path.with_suffix(".srt")
         if config.get("render", {}).get("generate_subtitles", True):
             try:
+                srt_tmp = srt_path.with_name(srt_path.name + ".tmp")
                 save_timecode_subtitles(
                     full_timeline,
-                    srt_path,
+                    srt_tmp,
                     rows=rows,
                     base_date=date,
                 )
+                srt_tmp.replace(srt_path)
             except Exception as e:
                 logger.warning("save_timecode_subtitles failed: %s", e)
+                return False
+        else:
+            srt_path.unlink(missing_ok=True)
 
         # 2. 生成伴随 .meta.json 结构化清单
         meta_path = output_path.with_suffix(".meta.json")
         vlog_size = output_path.stat().st_size if output_path.exists() else 0
         vlog_dur = get_duration(str(output_path)) or 0.0
+        if vlog_size <= 0 or vlog_dur <= 0:
+            logger.warning("companion assets require a valid media artifact: %s", output_path)
+            return False
 
         dyn_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"))
         sta_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") == "STATIC")
@@ -133,6 +160,7 @@ def save_vlog_companion_assets(
             presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
             night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
             micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+            output_fps=float(config.get("output", {}).get("fps", 20)),
         )
         for seg, (disp_dur, _) in zip(full_timeline, plans):
             start_vlog = cur_vlog_pos
@@ -176,7 +204,13 @@ def save_vlog_companion_assets(
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         }
-        meta_path.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("Saved vlog companion assets: %s, %s", srt_path.name, meta_path.name)
+        meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+        meta_tmp.write_text(json.dumps(manifest_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        meta_tmp.replace(meta_path)
+        logger.info("Saved vlog companion assets: %s", ", ".join(
+            p.name for p in (srt_path, meta_path) if p.exists()
+        ))
+        return True
     except Exception as e:
         logger.warning("Failed to save vlog companion assets for %s: %s", output_path.name, e)
+        return False

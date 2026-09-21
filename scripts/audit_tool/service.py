@@ -27,6 +27,15 @@ class AuditService:
         self.config = load_config()
         self._shared_yolo = None
 
+    def is_registered_filepath(self, filepath: str) -> bool:
+        if not filepath:
+            return False
+        with self.db._lock:
+            row = self.db.conn.execute(
+                "SELECT 1 FROM file_tasks WHERE filepath=?", (str(Path(filepath)),)
+            ).fetchone()
+        return row is not None
+
     def get_overview(self) -> dict[str, Any]:
         """获取全局质量与审核统计大屏数据。"""
         with self.db._lock:

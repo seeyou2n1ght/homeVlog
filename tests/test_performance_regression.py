@@ -9,6 +9,24 @@ from src.filters import SpatialGridMotionFilter
 from src.detector import MotionDetector
 
 
+def test_perf_log_json_schema_validity(tmp_path):
+    import json
+    from src.monitor import PerfCollector, PerfRecord
+    from tests.helpers import validate_perf_json_schema
+
+    perf = PerfCollector()
+    for stage, device, duration in [("prescreen", "qsv", .04), ("analysis", "cuda", .12), ("render", "nv", 1.5)]:
+        perf.add(PerfRecord(stage=stage, file="clip.mp4", gpu=device, duration=duration))
+    path = tmp_path / "perf.json"
+    perf.dump(path, metadata={
+        "date": "20260901", "cam": 0, "pipeline_duration": 1.66,
+        "monitor_summary": [{"name": "pipeline", "duration": 1.66, "avg_cpu": 25.0, "avg_ram": 8.0}],
+        "perf_summary": perf.summary_by_stage(),
+    })
+    valid, message = validate_perf_json_schema(json.loads(path.read_text(encoding="utf-8")))
+    assert valid, message
+
+
 class ReferenceGrid(SpatialGridMotionFilter):
     def extract_grid_energies(self, image):
         h, w = image.shape

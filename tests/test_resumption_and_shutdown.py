@@ -11,6 +11,17 @@ from src.timeline import TimelineSegment
 from src.utils import cleanup_temp_artifacts, TEMP_DIR
 
 
+def test_cleanup_continues_after_cuda_failure_and_checkpoints_database():
+    from src.utils import cleanup_resources
+    db = MagicMock()
+    with patch("torch.cuda.is_available", return_value=True), \
+         patch("torch.cuda.empty_cache", side_effect=RuntimeError("device unavailable")), \
+         patch("src.hardware.ffmpeg.FFmpegProcessRegistry.kill_all") as kill:
+        cleanup_resources(db)
+    db.conn.execute.assert_called_once_with("PRAGMA wal_checkpoint(TRUNCATE)")
+    kill.assert_called_once()
+
+
 def test_cleanup_temp_artifacts_preserves_valid_batches(tmp_path):
     with patch("src.utils.TEMP_DIR", tmp_path):
         b1 = tmp_path / '_batch0_test.mp4'

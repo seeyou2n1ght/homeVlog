@@ -145,7 +145,9 @@ def test_resolve_local_timestamp(tmp_path):
 
 
 def test_audit_http_export():
+    import http.cookiejar
     import threading
+    import urllib.error
     import urllib.request
     from http.server import HTTPServer
     from scripts.audit_tool.app import AuditHandler
@@ -183,6 +185,35 @@ def test_audit_http_export():
             import json
             parsed = json.loads(raw_bytes.decode("utf-8"))
             assert isinstance(parsed, list)
+
+        # 写接口同时要求同源 Host/Origin 和启动时 token cookie。
+        unauth = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/review", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(unauth)
+        assert exc.value.code == 403
+
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+        )
+        opener.open(f"http://127.0.0.1:{port}/").read()
+        authenticated = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/review", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            opener.open(authenticated)
+        assert exc.value.code == 400
+
+        foreign = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/overview",
+            headers={"Origin": "https://example.invalid"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(foreign)
+        assert exc.value.code == 403
     finally:
         server.shutdown()
         server.server_close()
@@ -208,7 +239,7 @@ class TestReRenderWorkflow:
             {"filepath": str(f3)},
         ]
         can_proceed, valid, missing = check_source_files_accessibility(tasks)
-        assert can_proceed is True
+        assert can_proceed is False
         assert len(valid) == 2
         assert len(missing) == 1
         assert str(f3) in missing
@@ -250,6 +281,22 @@ class TestReRenderWorkflow:
         finally:
             db.close()
 
+    def test_cancel_is_scoped_to_the_rerender_task(self):
+        import threading
+
+        from scripts.audit_tool.rerender import ReRenderManager
+        from src.hardware.ffmpeg import FFmpegProcessRegistry
+
+        mgr = ReRenderManager()
+        mgr._init_manager()
+        key = mgr.get_task_key("20260901", 0)
+        mgr.cancel_flags[key] = threading.Event()
+        mgr.tasks[key] = {"status": "RENDERING"}
+        FFmpegProcessRegistry.reset_interrupted()
+        assert mgr.cancel_task("20260901", 0)
+        assert mgr.tasks[key]["status"] == "CANCELLED"
+        assert not FFmpegProcessRegistry.is_interrupted()
+
     def test_rerender_output_filename_resolution(self):
         from src.scanner import resolve_output_filename
         mock_cfg = {"cameras": {"B888805AA3CD": "living_room"}}
@@ -265,5 +312,3 @@ class TestReRenderWorkflow:
         suffix = Path(base).suffix
         final_name = f"{stem}_{output_version}{suffix}"
         assert final_name == "DailyVlog_20260402_B888805AA3CD_v2.mp4"
-
-

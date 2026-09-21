@@ -12,8 +12,8 @@ from typing import Any
 
 from src.utils import OUTPUT_DIR, load_config
 from src.database import VlogDatabase
-from src.timeline import build_timeline, partition_timeline_by_batches
-from src.renderer import build_batch_render, concat_output_files, FFmpegProcessRegistry
+from src.timeline import partition_timeline_by_batches
+from src.renderer import build_batch_render, concat_output_files
 
 logger = logging.getLogger("homevlog.rerender")
 
@@ -40,8 +40,7 @@ def check_source_files_accessibility(file_tasks: list[dict]) -> tuple[bool, list
         except Exception:
             missing_files.append(fp_str)
 
-    # 若 100% 缺失 (如 NAS 网络共享断开或路径失效)，硬阻断避免空跑
-    if len(valid_files) == 0 and len(missing_files) > 0:
+    if missing_files:
         return False, valid_files, missing_files
 
     return True, valid_files, missing_files
@@ -82,7 +81,6 @@ class ReRenderManager:
             event.set()
             if key in self.tasks:
                 self.tasks[key]["status"] = "CANCELLED"
-            FFmpegProcessRegistry.kill_all()
             return True
         return False
 
@@ -155,16 +153,10 @@ class ReRenderManager:
             update_state(missing_files=missing_files)
 
             if not can_proceed:
-                err_msg = f"全部素材文件 ({len(missing_files)} 个) 不可达！请检查 NAS 网络共享或物理存储连接"
+                err_msg = f"素材文件不完整：{len(missing_files)} 个不可达，请检查 NAS 网络共享或物理存储连接"
                 logger.error("Re-render blocked: %s", err_msg)
                 update_state(status="FAILED", error=err_msg)
                 return
-
-            if missing_files:
-                logger.warning(
-                    "Re-render %s cam%d: %d files missing, auto-dropping from timeline",
-                    date, cam_index, len(missing_files)
-                )
 
             if cancel_event.is_set():
                 update_state(status="CANCELLED")
@@ -175,9 +167,10 @@ class ReRenderManager:
             valid_set = set(valid_files)
             healthy_rows = [r for r in file_tasks if r["filepath"] in valid_set]
 
-            timeline = build_timeline(db, date, cam_index)
-            # 过滤掉缺失文件对应的时间轴片段
-            timeline = [t for t in timeline if t.filepath in valid_set]
+            from src.stages.timeline import build_timeline_from_rows
+            timeline = build_timeline_from_rows(
+                healthy_rows, date, config=config, resolve_presence=False
+            )
 
             if not timeline:
                 update_state(status="FAILED", error="Timeline is empty after filtering")
@@ -282,7 +275,7 @@ class ReRenderManager:
                     pass
                 tot_files = len(healthy_rows)
                 tot_dur = sum(float(r.get("file_duration") or 0.0) for r in healthy_rows)
-                _save_vlog_companion_assets(
+                assets_ok = _save_vlog_companion_assets(
                     output_path=final_output_path,
                     date=date,
                     cam_index=cam_index,
@@ -292,7 +285,11 @@ class ReRenderManager:
                     elapsed_wall=time.time() - t0,
                     db=db,
                     config=config,
+                    rows=healthy_rows,
                 )
+                if not assets_ok:
+                    update_state(status="FAILED", error="Companion asset generation failed")
+                    return
             except Exception as exc:
                 logger.warning("Failed to refresh companion assets after rerender: %s", exc)
 

@@ -75,6 +75,7 @@ def calculate_timeline_metrics(tasks: list[dict], date: str, config: dict) -> di
         keyframe_display_duration=kf_dur,
         min_static_display_duration=min_static_disp,
         max_static_display_duration=max_static_disp,
+        output_fps=float(config.get("output", {}).get("fps", 20)),
     )
 
     tot_disp = sum(p[0] for p in plans)

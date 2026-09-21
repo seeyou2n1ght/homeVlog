@@ -291,7 +291,10 @@ def main():
                 else:
                     res_item = batch_summary_list[0]
                     status_color = "green" if res_item["status"] == "SUCCESS" else "red"
-                    console.print(f"[bold {status_color}]✔ 处理完成: {res_item['date']} ({res_item['cam_name']})[/bold {status_color}]")
+                    status_label = "✔ 处理完成" if res_item["status"] == "SUCCESS" else "✘ 处理失败"
+                    console.print(f"[bold {status_color}]{status_label}: {res_item['date']} ({res_item['cam_name']})[/bold {status_color}]")
+                if fail_count:
+                    sys.exit(1)
             finally:
                 db.close()
             return
@@ -299,6 +302,8 @@ def main():
         # 8. 全量常规批处理 (run_pipeline)
         result = run_pipeline(skip_render=skip_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled)
         console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}")
+        if result["failed"]:
+            sys.exit(1)
 
     except KeyboardInterrupt:
         from src.renderer import FFmpegProcessRegistry

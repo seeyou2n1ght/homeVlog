@@ -44,6 +44,8 @@ def main():
                    micro_motion_cruise_speed=micro.get("cruise_speed", 16))
     if "micro_motion_anchor_s" in inspect.signature(compute_display_plans).parameters:
         options["micro_motion_anchor_s"] = micro.get("anchor_duration_s", 3)
+    if "output_fps" in inspect.signature(compute_display_plans).parameters:
+        options["output_fps"] = cfg.get("output", {}).get("fps", 20)
     plans = compute_display_plans(timeline, **options)
     source_seconds, display_seconds = defaultdict(float), defaultdict(float)
     by_file = defaultdict(list)

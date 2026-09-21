@@ -289,7 +289,7 @@ class TestPresenceAndMicroMotionPlans:
             speed_ramping=False,
         )
         disp_dur, ramp = plans[0]
-        assert disp_dur == pytest.approx(35.0 / 16, abs=0.001)
+        assert disp_dur == pytest.approx(44 / 20)  # Whole output frames, retaining the tail.
 
     def test_resolve_presence_segments_logic(self):
         """两段确认有人动态之间的静态停顿应升级为 PRESENCE。"""
@@ -329,7 +329,7 @@ class TestPresenceAndMicroMotionPlans:
             sparse_mixed=True,
         )
         # 验证 MICRO_MOTION 和 PRESENCE 支路上均注入了 trim=duration 与 setpts=PTS-STARTPTS
-        assert "trim=duration=" in fc
+        assert fc.count("trim=end_frame=") == len(timeline)
         assert "setpts=PTS-STARTPTS" in fc
 
 

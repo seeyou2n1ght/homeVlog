@@ -344,6 +344,10 @@ width × height × 3
 
 不要在 FFmpeg / decoder 输出 RGB/BGR 后再执行 CPU 灰度转换，除非新的实现经过明确基准验证并更新相关架构决策。
 
+阈值算法的规范输入是 8 位全范围灰度。只有 PyAV `gray` 帧可直接读取平面；limited-range YUV、10 位 YUV 和 RGB 必须经共享 `video_frame_to_gray()` 转换，Prescreen 与 Analysis 不得维护不同的像素解释。
+
+scanner 写入的文件名跨度只是名义时长。只有实际打开媒体容器后才可设置 `duration_verified=1`；未验证时长不能用于跳过媒体探测。
+
 ---
 
 ## 6.2 Candidate Frame Pool
@@ -555,6 +559,10 @@ Timeline 不负责重新分析视频内容。
 
 ## 10.1 Display Plan as Single Source of Truth
 
+展示计划显式接收输出帧率，每段目标向上量化到整数帧。视频 `trim=end_frame` 与音频目标同钟；字幕、高光、批次校验均传入相同 fps。每段最多增加不足一帧的尾部展示时间，避免音视频 concat 按较长轨道推进产生未计入计划的累积偏差。
+
+音频按目标样本数 `atrim=end_sample` 闭合，不能仅按源 PTS 时长截断后重排时间戳，否则摄像机重叠 PTS 会留下多余样本。最终 ffconcat 使用每批视频 duration；视频保持 stream copy，音频重新对齐 PTS 后编码，避免 AAC 延迟/尾部填充制造视频接缝空洞与音频 DTS 回退。
+
 展示计划唯一权威入口：
 
 ```text
@@ -688,9 +696,9 @@ ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MI
 
 因此，所有非纯静态段必须强制执行时长硬截断：
 ```text
-trim=duration={actual_display_dur:.3f},setpts=PTS-STARTPTS
+tpad → fps → trim=duration={actual_display_dur:.3f} → setpts=PTS-STARTPTS
 ```
-保证无论上游源视频 PTS 如何跳跃，流出该段滤镜链的时间戳跨度与帧数绝对不超越 `compute_display_plans` 的数学计划值。
+对应音频必须执行 `apad → atrim` 到同一展示时长。该规则覆盖 DYNAMIC、DYNAMIC_AUDIO、STATIC、PRESENCE、NIGHT_STATIONARY、MICRO_MOTION 及单动态快路径，保证源提前 EOF 时两轨都闭合到 `compute_display_plans` 的计划时钟。
 
 ---
 
@@ -804,6 +812,8 @@ produced batches ∪ terminal batches
 
 任何无法解释的缺失批次均属于完整性错误。
 
+主动取消由 abort_event 明确区分，保存已完成批次与 cancelled 遥测，不将尚未完成批次报告为静默丢失；不得把 stop_event 当作取消，因为它也用于正常派发结束。
+
 不得继续执行最终 merge。
 
 ---
@@ -814,6 +824,10 @@ produced batches ∪ terminal batches
 
 - **全量覆盖契约**：为杜绝异构编码在流切片接缝处出现不可观测的破损或丢帧，严禁在接缝处采用稀疏或随机抽样；
 - **并行分块校验**：采用多线程（`ThreadPoolExecutor(max_workers=min(8, N))`）将全量接缝分块并行解码验证，各线程独立持有解码容器且内部 Seek 严格单向递增，确保在保障 100% 接缝无损的同时，将校验耗时压至磁盘 I/O 物理下限。
+- **连续性契约**：串行与并行路径共用同一窗口校验，拒绝损坏帧、空 PTS、非单调 PTS 和超过 1.5 个帧周期的内部间隔；最终尾窗必须可解码。
+- **交付契约**：渲染产物必须有音轨，视频/音频时长与 display plan 在最多两个输出帧周期（上限 0.5s）内一致。可打开容器不等于可提交产物。
+
+最终完成标记是一个提交边界：视频校验、字幕与元数据原子写入、manifest 保存全部成功后，数据库才可进入 `COMPLETED`。恢复快路径必须同时验证媒体、manifest 和必需伴随资产。
 
 ---
 
@@ -1001,6 +1015,10 @@ human corrected (manual_label, notes, review_timestamp)
 - **`POST /api/review`**：提交人工裁决，合法标签：`CONFIRMED_MOTION` (TP) | `FALSE_ALARM` (FP) | `MISSED_MOTION` (FN) | `CONFIRMED_STATIC` (TN)。
 - **`GET /api/export`**：导出带 UTF-8 BOM 的分析报表（CSV / JSON 格式）。
 - **`POST /api/rerender` / `GET /api/rerender_status`**：异步触发秒级局部重新浓缩成片并轮询压制状态机。
+
+服务仅接受 loopback Host 与同源 Origin。页面首次加载取得随机 `HttpOnly`、`SameSite=Strict` 令牌 cookie，所有写请求必须携带该令牌；媒体参数只允许数据库已登记路径并限制请求体及数值范围。
+
+审核重渲染默认要求全部源文件可访问，使用只读逐文件 timeline 与实际渲染行快照生成伴随资产。单任务取消只设置本任务令牌，不得触发全局 FFmpeg 中断。
 
 ---
 

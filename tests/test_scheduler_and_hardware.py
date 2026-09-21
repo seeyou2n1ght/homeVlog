@@ -199,6 +199,21 @@ class TestHardwareSemaphoresAndProtection:
         # 极其夸张的 1000000 GB，必然返回 False 拦截
         assert not check_disk_space(tmp_path, min_gb=1_000_000)
 
+    def test_impossible_hardware_concurrency_is_rejected(self):
+        from src.core.config import validate_config
+
+        with pytest.raises(ValueError, match=r"analysis \+ render"):
+            validate_config({"hardware": {
+                "max_qsv_concurrency": 2,
+                "max_qsv_analysis_concurrency": 2,
+                "max_qsv_render_concurrency": 1,
+            }})
+        with pytest.raises(ValueError, match="at most 3"):
+            validate_config({
+                "pipeline": {"render_gpu_policy": "heterogeneous"},
+                "render": {"max_concurrency": 4},
+            })
+
 
 class TestSystemMonitoring:
     """测试监控与性能记录采集。"""

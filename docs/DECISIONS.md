@@ -75,6 +75,7 @@ Superseded by: ADR xxxx
 | ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
 | ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
 | ADR 0017 | 离线高质量编码重构与多特征迟滞动作判定 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0012, ADR 0013 |
+| ADR 0023 | 交付产物原子提交与共享媒体契约 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0013, ADR 0020, ADR 0022 |
 
 ---
 
@@ -1288,7 +1289,7 @@ docs/PROGRESS.md
 
 # ADR 0022 — QSV Tail Load Balancing, Parallel Checkpoint Validation, and Critical Path Operator Acceleration
 
-**Status:** Accepted  
+**Status:** Partially Superseded by ADR 0023
 **Date:** 2026-09-20  
 **Evolves:** ADR 0015, ADR 0019, ADR 0020
 
@@ -1321,4 +1322,45 @@ docs/PROGRESS.md
 - QSV 尾部空转由 168.16s 降至 **0.56s**（利用率 100%），三工人总空转损耗由 337s 降至 **2.61s**（消除 99.2%）；
 - 拼接接缝校验由 39.5s 压缩至 **10.66s (3.7x 提速)**；
 - 独显显存峰值降低 **-31.7%**（5,198MB $\rightarrow$ 3,551MB），全库 244 项单测 100% 通过。
+
+---
+
+# ADR 0023 — Delivery Artifact Atomic Commit and Shared Media Contracts
+
+**Status:** Accepted
+**Date:** 2026-09-21
+**Evolves:** ADR 0004, ADR 0013, ADR 0020, ADR 0022
+
+## Context
+
+交付审查发现“可打开媒体”“批次成功”和“整日交付完成”使用了不同门槛：短片、无音轨、接缝内部断帧或缺伴随资产仍可能进入完成状态；Prescreen 与 Analysis 对 YUV 灰度的解释也不一致。QSV 重试和审核重渲染另有独立完成语义，导致恢复与遥测失真。
+
+## Decision
+
+1. Prescreen 与 Analysis 共用 8 位全范围灰度转换；旧的任意 Y 平面直读优化撤销，只有原生 `gray` 可直接读平面。
+2. 文件名跨度保持名义值，容器探测后以 `duration_verified` 标记真实媒体时长。所有状态的视频用 `tpad/fps/trim`、音频用 `apad/atrim` 闭合到共享 display plan。
+3. `valid_video` 同时验证音轨、严格计划时长、音视频末端、接缝内部 PTS 连续性与尾部可解码性。
+4. 视频、字幕、元数据和 manifest 全部成功后才提交 `COMPLETED`；恢复必须验证同一资产集合。
+5. QSV 准入上限随已取任务传递，失败批次回到 NV 专用队列。审核重渲染复用只读逐文件 timeline、完整源文件门禁和任务级取消。
+6. 每次性能记录携带 run id、代码版本/脏状态、配置与分析快照指纹；批次只查询目标文件。
+
+## Consequences
+
+- ADR 0022 的“任意 Y 平面零拷贝”决策被撤销；历史性能数字保留为历史证据，必须用新正确性契约重新 A/B 才能成为当前结论。
+- 单元测试与软件 FFmpeg 媒体回归可验证代码契约，但不能替代整日逐帧解码、目标播放器与人物识别 holdout。
+
+---
+
+# ADR 0024 — Integer-Frame Display Plans and Cancellation Outcome
+
+**Status:** Accepted
+**Date:** 2026-09-21
+
+连续秒数分段分别经过 fps 后，音视频 concat 按较长轨道推进，导致分段误差累积。2026-09-21 日志中的时长拒绝已通过真实软件媒体复现。
+
+`compute_display_plans(output_fps=...)` 将每段目标向上量化为整数输出帧，保留源尾部；视频按帧数截断，音频补齐到同一计划，字幕、高光和校验也传入同一输出帧率。每段增加不足一帧展示时间，不修改识别标签或负判定门槛。快进曲线按量化后的目标重新求解。
+
+主动取消保留完成批次并保存 status=cancelled 的性能记录，不作为静默丢批报错；正常结束的缺批与真实失败仍阻止合成。CLI 对失败返回非零退出码，不能以进程正常退出代表成片完成。
+
+真实复验补充：源音频可能有重叠 PTS，所有音频段按整数样本数截断，变速子段拼接后也须闭合总样本数。最终 concat 显式使用视频 duration，复制视频并对齐、重新编码音频；单纯复制音频会在批次边界产生 non-monotonic DTS。额外音频编码的成本和质量必须进入整日验收。
 

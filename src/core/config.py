@@ -89,6 +89,22 @@ def validate_config(config):
     qsv_analysis = hw.get("max_qsv_analysis_concurrency")
     if qsv_total is not None and qsv_analysis is not None and float(qsv_analysis) > float(qsv_total):
         raise ValueError("hardware.max_qsv_analysis_concurrency cannot exceed max_qsv_concurrency")
+    qsv_render = hw.get("max_qsv_render_concurrency")
+    if qsv_total is not None and qsv_analysis is not None and qsv_render is not None:
+        if int(qsv_analysis) + int(qsv_render) > int(qsv_total):
+            raise ValueError("QSV analysis + render concurrency cannot exceed max_qsv_concurrency")
+    integer_keys = {
+        "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_qsv_analysis_concurrency",
+                     "max_qsv_render_concurrency", "max_io_concurrency"),
+        "detection": ("prescreen_parallel", "analysis_max_workers"),
+        "render": ("batch_max_files", "max_concurrency"),
+    }
+    for section, keys in integer_keys.items():
+        for key in keys:
+            if key in config.get(section, {}) and int(config[section][key]) != float(config[section][key]):
+                raise ValueError(f"{section}.{key} must be an integer")
+    if render_policy == "heterogeneous" and render_conc is not None and int(render_conc) > 3:
+        raise ValueError("heterogeneous rendering supports at most 3 workers (2 NVENC + 1 QSV)")
     seg_cfg = config.get("segment", {})
     min_disp = seg_cfg.get("min_static_display_duration")
     max_disp = seg_cfg.get("max_static_display_duration")

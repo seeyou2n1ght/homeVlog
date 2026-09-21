@@ -19,6 +19,7 @@ from src.algorithms.filters import (
     AudioEnergyVAD,
     EmaBackgroundModel,
     SpatialGridMotionFilter,
+    video_frame_to_gray,
     _median_filter,
     _smooth_labels,
 )
@@ -760,32 +761,11 @@ class MotionDetector:
                             raise MemoryError("YOLO candidate budget exceeded")
                         yolo_buffer[total_frames - 1] = item
 
-                    try:
-                        if frame.planes and hasattr(frame.planes[0], "line_size") and getattr(frame.planes[0], "line_size", 0) > 0:
-                            p0 = frame.planes[0]
-                            y_raw = np.frombuffer(p0, dtype=np.uint8).reshape((frame.height, p0.line_size))[:, :frame.width]
-                            gray = cv2.resize(y_raw, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-                        elif frame.planes:
-                            y_raw = frame.to_ndarray(format="gray")
-                            gray = cv2.resize(y_raw, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
-                        else:
-                            gray = frame.to_ndarray(format="gray")
-                    except Exception:
-                        try:
-                            gray = cv2.resize(
-                                frame.to_ndarray(format="gray"),
-                                (self.width, self.height),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-                        except Exception:
-                            gray = cv2.cvtColor(
-                                cv2.resize(
-                                    frame.to_ndarray(format="rgb24"),
-                                    (self.width, self.height),
-                                    interpolation=cv2.INTER_NEAREST,
-                                ),
-                                cv2.COLOR_RGB2GRAY,
-                            )
+                    gray = cv2.resize(
+                        video_frame_to_gray(frame),
+                        (self.width, self.height),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
 
                     decoded_frames.append(gray)
 
@@ -832,7 +812,8 @@ class MotionDetector:
         return decoded_frames, yolo_buffer, full_audio, meta
 
     def analyze(
-        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0, has_audio: int | None = None
+        self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0,
+        has_audio: int | None = None, duration_verified: bool = False,
     ) -> tuple[list[dict], dict[int, np.ndarray]]:
         """
         全文件分析入口。
@@ -846,7 +827,7 @@ class MotionDetector:
         self._analysis_start_offset = start_offset
         # Filename spans are day-relative placement metadata, not media duration.
         # Analysis is the lazy metadata boundary; probe only if metadata was not already resolved.
-        if file_duration <= 0 or has_audio is None:
+        if file_duration <= 0 or has_audio is None or not duration_verified:
             from src.hardware.scheduler import get_disk_semaphore
             disk = get_disk_semaphore()
             if not acquire_with_retry(disk):

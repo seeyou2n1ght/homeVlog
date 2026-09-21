@@ -66,9 +66,11 @@ def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
         before = db.get_all_file_tasks_for_date("20260901", 0)
         out = tmp_path / "day.mp4"
         out.write_bytes(b"placeholder")
-        with patch.object(db, "sync_timeline_segments") as sync, patch("src.ffmpeg.get_duration", return_value=11.5):
-            _save_vlog_companion_assets(out, "20260901", 0, "camera", 1, 20, 1, db,
-                                        {"render": {"generate_subtitles": False, "speed_ramping_enabled": False}})
+        with patch.object(db, "sync_timeline_segments") as sync, patch("src.stages.companion.get_duration", return_value=11.5):
+            assert _save_vlog_companion_assets(
+                out, "20260901", 0, "camera", 1, 20, 1, db,
+                {"render": {"generate_subtitles": False, "speed_ramping_enabled": False}},
+            )
             sync.assert_not_called()
         meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
         assert meta["timeline_highlights"][0]["vlog_start_s"] == 1.5
@@ -145,6 +147,44 @@ class TestStreamingOrchestratorLifecycle:
 class TestProcessDateCamPipeline:
     """测试 process_date_cam 全流程控制与跳过逻辑。"""
 
+    def test_keyboard_interrupt_preserves_cancelled_telemetry(self, tmp_path):
+        db = VlogDatabase(tmp_path / "cancel.db")
+        try:
+            with patch("src.pipeline.StreamingOrchestrator.run", side_effect=KeyboardInterrupt), \
+                 patch("src.pipeline._dump_perf") as dump:
+                with pytest.raises(KeyboardInterrupt):
+                    process_date_cam(db, "20260320", 0, dashboard_enabled=False)
+            dump.assert_called_once()
+            assert dump.call_args.kwargs["run_context"]["status"] == "cancelled"
+            assert not db.is_render_completed("20260320", 0)
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_render_no_output_distinguishes_cancellation(self, tmp_path, caplog, cancelled):
+        db = VlogDatabase(tmp_path / "cancel_render.db")
+        db.add_file_task("clip.mp4", 0, "20260320", "20260320000000", "20260320000100", 60)
+        db.set_prescreen_result("clip.mp4", "STATIC")
+        cfg = {"pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
+               "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False}}
+        orch = StreamingOrchestrator(db, "20260320", 0, cfg, dashboard_enabled=False)
+        orch.render_batch_queue.put({"filepath": "clip.mp4", "status": "STATIC"})
+        orch.stop_event.set()
+
+        def render(*args, **kwargs):
+            if cancelled:
+                orch.abort_event.set()
+            return None
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=render):
+                orch._render_manager()
+            assert not orch.batch_paths
+            assert bool(orch.errors) is (not cancelled)
+            assert "render reconciliation failed" not in caplog.text
+        finally:
+            db.close()
+
     def test_skip_already_completed(self, tmp_path):
         db_path = tmp_path / "test_skip.db"
         db = VlogDatabase(db_path=db_path)
@@ -189,6 +229,7 @@ class TestProcessDateCamPipeline:
                  patch("src.pipeline.get_monitor"), \
                  patch("src.pipeline.OUTPUT_DIR", out_dir), \
                  patch("src.pipeline._dump_perf"), \
+                 patch("src.stages.companion.get_duration", return_value=300.0), \
                  patch("src.pipeline.print_startup_banner"), \
                  patch("src.pipeline.print_summary_card"):
                 ok = process_date_cam(db, "20260901", 0, skip_render=False, dashboard_enabled=False)
@@ -432,6 +473,33 @@ class TestProcessDateCamPipeline:
                 assert render_done_flag[0] is True
                 assert len(paths) == 2
                 assert len(orch.batch_paths) == 2
+        finally:
+            db.close()
+
+    def test_qsv_failure_is_retried_by_a_live_nv_worker(self, tmp_path):
+        db = VlogDatabase(tmp_path / "qsv_retry.db")
+        filepath = "static.mp4"
+        db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result(filepath, "STATIC")
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
+            "render": {"batch_max_files": 1, "max_concurrency": 2, "local_staging_enabled": False},
+        }
+        orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+        orch.render_batch_queue.put({"filepath": filepath, "status": "STATIC"})
+        orch.stop_event.set()
+        calls = []
+
+        def render(_segments, _batch, gpu, *_args, **_kwargs):
+            calls.append(gpu)
+            return None if gpu == "qsv" else str(tmp_path / "nv_retry.mp4")
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=render):
+                orch._render_manager()
+            assert calls == ["qsv", "nv"]
+            assert [batch for batch, _ in orch.batch_paths] == [0]
+            assert not orch.errors
         finally:
             db.close()
 

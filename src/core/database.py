@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS file_tasks (
     error_msg TEXT,
     updated_at TEXT DEFAULT (datetime('now', 'localtime')),
     has_audio INTEGER DEFAULT 0,
+    duration_verified INTEGER DEFAULT 0,
     processing_fingerprint TEXT
 );
 
@@ -119,7 +120,7 @@ class VlogDatabase:
     def _migrate(self):
         with self._lock:
             version_row = self.conn.execute("PRAGMA user_version").fetchone()
-            if version_row and version_row[0] >= 2:
+            if version_row and version_row[0] >= 3:
                 return
 
             self.conn.execute("BEGIN IMMEDIATE")
@@ -129,6 +130,8 @@ class VlogDatabase:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN has_audio INTEGER DEFAULT 0")
             if "processing_fingerprint" not in columns:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN processing_fingerprint TEXT")
+            if "duration_verified" not in columns:
+                self.conn.execute("ALTER TABLE file_tasks ADD COLUMN duration_verified INTEGER DEFAULT 0")
 
             cursor_seg = self.conn.execute("PRAGMA table_info(segments)")
             seg_columns = [row["name"] for row in cursor_seg.fetchall()]
@@ -152,7 +155,7 @@ class VlogDatabase:
                 if index != row["cam_index"]:
                     self.conn.execute("UPDATE segments SET cam_index=? WHERE file_id=?", (index,row["id"]))
                     self.conn.execute("UPDATE render_tasks SET status='PENDING' WHERE date=?", (row["date"],))
-            self.conn.execute("PRAGMA user_version = 2")
+            self.conn.execute("PRAGMA user_version = 3")
             self.conn.commit()
 
     def _camera_index(self, identity, preferred):
@@ -196,8 +199,10 @@ class VlogDatabase:
         with self._lock:
             try:
                 self.conn.execute(
-                    "UPDATE file_tasks SET has_audio=?, file_duration=COALESCE(?,file_duration) WHERE filepath=?",
-                    (has_audio, duration, str(filepath))
+                    """UPDATE file_tasks SET has_audio=?, file_duration=COALESCE(?,file_duration),
+                       duration_verified=CASE WHEN ? IS NULL THEN duration_verified ELSE 1 END
+                       WHERE filepath=?""",
+                    (has_audio, duration, duration, str(filepath))
                 )
                 self.conn.commit()
             except Exception as e:
@@ -273,8 +278,9 @@ class VlogDatabase:
                     if segments.strip():
                         try:
                             segments_list = json.loads(segments)
-                        except Exception:
-                            segments_list = []
+                        except json.JSONDecodeError:
+                            if status == "ANALYZED":
+                                raise ValueError("ANALYZED segments must be valid JSON")
                 elif isinstance(segments, list):
                     segments_list = segments
                     try:
@@ -297,12 +303,13 @@ class VlogDatabase:
                     (str(filepath),)
                 ).fetchone()
 
-                if row and segments_list:
+                if row and status == "ANALYZED":
                     file_id = row["id"]
                     cam_index = row["cam_index"]
                     date_val = row["date"]
 
-                    # 幂等清理该文件旧分段
+                    # ANALYZED replaces prior algorithm segments, including an
+                    # explicitly empty result. Human reviews live separately.
                     self.conn.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
 
                     records = []
@@ -625,16 +632,25 @@ class VlogDatabase:
                 logger.error("DB error in get_file_task for %s: %s", filepath, e)
                 return None
 
-    def get_all_file_tasks_for_date(self, date: str, cam_index: int) -> list[dict]:
+    def get_all_file_tasks_for_date(
+        self, date: str, cam_index: int, filepaths: list[str] | None = None,
+    ) -> list[dict]:
         with self._lock:
             if self._conn is None:
                 return []
             try:
+                params: list = [date, cam_index]
+                path_filter = ""
+                if filepaths is not None:
+                    if not filepaths:
+                        return []
+                    path_filter = f" AND filepath IN ({','.join('?' * len(filepaths))})"
+                    params.extend(str(path) for path in filepaths)
                 rows = self.conn.execute(
-                    """SELECT * FROM file_tasks
-                       WHERE date=? AND cam_index=?
-                       ORDER BY file_start_time""",
-                    (date, cam_index),
+                    f"""SELECT * FROM file_tasks
+                        WHERE date=? AND cam_index=?{path_filter}
+                        ORDER BY file_start_time""",
+                    params,
                 ).fetchall()
                 result = [dict(r) for r in rows]
                 if not result:
@@ -643,9 +659,12 @@ class VlogDatabase:
                 # 一次性批量预加载全部 segments 与 human_reviews，避免 140 次循环串行查询引发 N+1 性能雪崩
                 from collections import defaultdict
                 segs_by_file = defaultdict(list)
+                file_ids = [r["id"] for r in result]
+                placeholders = ",".join("?" * len(file_ids))
                 seg_rows = self.conn.execute(
-                    """SELECT * FROM segments WHERE date=? AND cam_index=? ORDER BY file_id, start_time""",
-                    (date, cam_index),
+                    f"""SELECT * FROM segments WHERE file_id IN ({placeholders})
+                        ORDER BY file_id, start_time""",
+                    file_ids,
                 ).fetchall()
                 for sr in seg_rows:
                     segs_by_file[sr["file_id"]].append(dict(sr))

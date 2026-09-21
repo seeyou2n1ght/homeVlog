@@ -185,6 +185,7 @@ def compute_display_plans(
     presence_speed_factor: float = 4.0,
     night_stationary_speed_factor: float = 16.0,
     micro_motion_cruise_speed: float = 16.0,
+    output_fps: float = 20.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
     """计算每个 TimelineSegment 的成片展示时长，与 build_concat_filter 严格同源。
 
@@ -195,6 +196,8 @@ def compute_display_plans(
     - MICRO_MOTION: 微动巡航；显著动作已在分析阶段拆为独立常速片段；
     - STATIC: 纯静态抽帧压缩，受 min/max 双向边界约束；若相邻动态段且启用变速则返回 ramp_info。
     """
+    if not math.isfinite(output_fps) or output_fps <= 0:
+        raise ValueError("output_fps must be finite and positive")
     kf_interval = max(static_keyframe_interval, 1.0)
     display_dur = max(keyframe_display_duration, 0.1)
     global_speed_factor = kf_interval / display_dur
@@ -209,7 +212,7 @@ def compute_display_plans(
         has_out = (i < n - 1 and timeline[i + 1].filepath == seg.filepath
                    and timeline[i + 1].state in ACTIVE_STATES)
         if seg.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO):
-            plans.append((dur, None))
+            plans.append((math.ceil(dur * output_fps - 1e-9) / output_fps, None))
             continue
         elif seg.state == SegmentState.PRESENCE:
             target = min(max(0.25, dur / max(1.0, presence_speed_factor)), dur)
@@ -222,12 +225,15 @@ def compute_display_plans(
             if max_static_display_duration is not None and max_static_display_duration > 0:
                 target = min(target, max_static_display_duration)
 
+        # Each concat segment must have the same integer-frame video/audio clock.
+        # Round upward to retain the source tail; at most one display frame is added.
+        target = math.ceil(target * output_fps - 1e-9) / output_fps
         plans.append(_plan_speed_segment(
             dur=dur,
             target=target,
             has_in=has_in,
             has_out=has_out,
-            speed_ramping=speed_ramping,
+            speed_ramping=speed_ramping and target < dur,
             ramp_duration_s=ramp_duration_s,
         ))
     return plans
@@ -305,7 +311,7 @@ def build_retimed_audio(input_label, output_label, source_start, source_duration
             parts.append(
                 f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s0+src_dur:.6f},"
                 f"asetpts=PTS-STARTPTS,volume=0,"
-                f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
+                f"aformat=sample_rates={sample_rate},apad,atrim=end_sample={round((d1-d0)*sample_rate)},"
                 f"asetpts=N/SR/TB[{label}]"
             )
         else:
@@ -321,11 +327,14 @@ def build_retimed_audio(input_label, output_label, source_start, source_duration
             parts.append(
                 f"[{input_label}]atrim=start={source_start+s0:.6f}:end={source_start+s1:.6f},"
                 f"asetpts=PTS-STARTPTS,{','.join(tempo)},"
-                f"aformat=sample_rates={sample_rate},apad,atrim=duration={d1-d0:.6f},"
+                f"aformat=sample_rates={sample_rate},apad,atrim=end_sample={round((d1-d0)*sample_rate)},"
                 f"asetpts=N/SR/TB[{label}]"
             )
         outputs.append(f"[{label}]")
-    parts.append(f"{''.join(outputs)}concat=n={len(outputs)}:v=0:a=1[{output_label}]")
+    parts.append(
+        f"{''.join(outputs)}concat=n={len(outputs)}:v=0:a=1,apad,"
+        f"atrim=end_sample={round(display_duration*sample_rate)},asetpts=N/SR/TB[{output_label}]"
+    )
     return ";".join(parts)
 
 
@@ -415,6 +424,7 @@ def generate_timecode_subtitles(
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        output_fps=float(cfg.get("output", {}).get("fps", 20)),
     )
 
     is_ass = format_type.lower() in ("ass", "ssa")
@@ -857,26 +867,25 @@ def build_concat_filter(
 
     if simple_dynamic and len(timeline) == 1 and timeline[0].state in ("DYNAMIC", "DYNAMIC_AUDIO"):
         seg = timeline[0]
-        dur = max(0.04, seg.end_in_file - seg.start_in_file)
+        dur = compute_display_plans(timeline, output_fps=output_fps)[0][0]
         row = next((r for r in rows if r.get("filepath") == seg.filepath), None)
         has_audio = bool(row and row.get("has_audio"))
         video = (
             f"[0:v]trim=start={seg.start_in_file:.3f}:end={seg.end_in_file:.3f},"
-            f"setpts=PTS-STARTPTS,{scale_core},fps={output_fps}[v]"
+            f"setpts=PTS-STARTPTS,{scale_core},"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},fps={output_fps},"
+            f"trim=end_frame={round(dur * output_fps)},setpts=PTS-STARTPTS[v]"
         )
         if has_audio:
             audio = (
                 f"[0:a]atrim=start={seg.start_in_file:.3f}:end={seg.end_in_file:.3f},"
-                f"asetpts=PTS-STARTPTS,aformat=sample_rates={audio_sample_rate}[a]"
+                f"asetpts=PTS-STARTPTS,aformat=sample_rates={audio_sample_rate},"
+                f"apad,atrim=end_sample={round(dur*audio_sample_rate)},asetpts=N/SR/TB[a]"
             )
         else:
-            audio = f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a]"
+            audio = f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.9f}[a]"
         return f"{video};{audio}"
 
-
-    use_keyframe_slideshow = (scale_mode == "cpu")
-    if render_cfg.get("static_mode") == "hybrid_keyframe":
-        use_keyframe_slideshow = True
 
     # --- Step 1: Count segments per input file ---
     segs_per_file: dict[int, int] = {}
@@ -1012,6 +1021,7 @@ def build_concat_filter(
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        output_fps=output_fps,
     )
 
 
@@ -1057,8 +1067,14 @@ def build_concat_filter(
             osd_filter_str = f",{osd_filter}"
 
         if is_dynamic:
-            # Video: 1.0x PTS
-            parts_v.append(f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},setpts=PTS-STARTPTS[v{seg_count}]")
+            display_dur = display_plans[i][0]
+            # Clone a prematurely-ended source tail to the planned duration;
+            # the display plan, audio, and video must close on the same clock.
+            parts_v.append(
+                f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
+                f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={display_dur:.9f},"
+                f"fps=fps={output_fps},trim=end_frame={round(display_dur * output_fps)},setpts=PTS-STARTPTS[v{seg_count}]"
+            )
 
             # Audio: Linear cross-fade on cut boundaries
             if input_has_audio.get(idx, False):
@@ -1070,10 +1086,11 @@ def build_concat_filter(
                     afade_str = ""
                 parts_a.append(
                     f"[{audio_idx}:a]atrim=start={source_s:.3f}:end={source_e:.3f},asetpts=PTS-STARTPTS{afade_str},"
-                    f"aformat=sample_rates={audio_sample_rate}[a{seg_count}]"
+                    f"aformat=sample_rates={audio_sample_rate},apad,"
+                    f"atrim=end_sample={round(display_dur*audio_sample_rate)},asetpts=N/SR/TB[a{seg_count}]"
                 )
             else:
-                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.3f}[a{seg_count}]")
+                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={display_dur:.9f}[a{seg_count}]")
         else:
             # Static segment speed scaling and speed ramping (与字幕映射同源)
             actual_display_dur, ramp_info = display_plans[i]
@@ -1089,28 +1106,15 @@ def build_concat_filter(
                 v_fast = dur / actual_display_dur if actual_display_dur > 0 else 1.0
                 pts_filter = f"(PTS-STARTPTS)/{v_fast:.4f}"
 
-            if (preselected_static or use_sparse_mixed) and is_pure_static:
-                # A sparse EDL may contain only one picture for a static
-                # interval.  Clone its final frame to the exact display-plan
-                # duration before the segment enters concat; otherwise FFmpeg
-                # has no following timestamp from which to infer duration.
-                fps_filter = (
-                    f",tpad=stop_mode=clone:stop_duration={actual_display_dur:.3f}"
-                    f",fps=fps={output_fps},trim=duration={actual_display_dur:.3f}"
-                    ",setpts=PTS-STARTPTS"
-                )
-            else:
-                if use_keyframe_slideshow:
-                    # In sparse_mixed or hybrid_keyframe modes, cap duration to prevent EOF PTS jump from expanding duplicate frames
-                    fps_filter = (
-                        f",fps=fps={output_fps}"
-                        f",trim=duration={actual_display_dur:.3f}"
-                        ",setpts=PTS-STARTPTS"
-                    )
-                elif use_sparse_mixed or preselected_static:
-                    fps_filter = f",trim=duration={actual_display_dur:.3f},setpts=PTS-STARTPTS"
-                else:
-                    fps_filter = ""
+            # 无论是纯静态稀疏帧还是变速快进段（PRESENCE、NIGHT_STATIONARY、MICRO_MOTION等），
+            # 监控切片末尾常因物理录像提前断流短缺数秒，导致视频提前 EOF，而音频已被 apad 补齐至 actual_display_dur。
+            # 统一通过 tpad=stop_mode=clone 补齐末帧，并用 trim=duration 精确截断，
+            # 确保视频轨与音频轨在源素材提前断流时依然保持 100% 毫秒级等长，杜绝 Concat 拼接时出现视频 PTS 空洞与断流。
+            fps_filter = (
+                f",tpad=stop_mode=clone:stop_duration={actual_display_dur:.3f}"
+                f",fps=fps={output_fps},trim=end_frame={round(actual_display_dur * output_fps)}"
+                ",setpts=PTS-STARTPTS"
+            )
             parts_v.append(
                 f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
                 f"setpts={pts_filter}"
@@ -1122,7 +1126,7 @@ def build_concat_filter(
                     actual_display_dur, ramp_info, audio_sample_rate,
                 ))
             else:
-                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={actual_display_dur:.3f}[a{seg_count}]")
+                parts_a.append(f"anullsrc=r={audio_sample_rate}:cl=mono:d={actual_display_dur:.9f}[a{seg_count}]")
 
         seg_count += 1
 

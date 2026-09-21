@@ -10,6 +10,7 @@ import numpy as np
 from src.hardware.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args, FFmpegProcessRegistry
 from src.hardware.scheduler import acquire_with_retry, VideoLease
 from src.core.utils import parse_res
+from src.algorithms.filters import video_frame_to_gray
 
 logger = logging.getLogger("homevlog")
 
@@ -131,6 +132,10 @@ def _prescreen_keyframes(
                 return {"status": "FAILED", "error": "No video stream", "has_audio": 0}
             has_audio = 1 if len(container.streams.audio) > 0 else 0
             stream = container.streams.video[0]
+            media_duration = (float(stream.duration * stream.time_base) if stream.duration
+                              else float(container.duration or 0) / av.time_base)
+            if media_duration > 0:
+                duration = media_duration
             stream.codec_context.skip_frame = "NONKEY"
 
             first_frame: np.ndarray | None = None
@@ -147,17 +152,11 @@ def _prescreen_keyframes(
                 k += 1
                 if k > 1 and (k - 1) % kf_step != 0:
                     continue
-                try:
-                    if frame.planes and hasattr(frame.planes[0], "line_size") and getattr(frame.planes[0], "line_size", 0) > 0:
-                        p0 = frame.planes[0]
-                        y_raw = np.frombuffer(p0, dtype=np.uint8).reshape((frame.height, p0.line_size))[:, :frame.width]
-                    else:
-                        y_raw = frame.to_ndarray(format="gray")
-                except Exception:
-                    y_raw = frame.to_ndarray(format="gray")
+                y_raw = video_frame_to_gray(frame)
                 curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_LINEAR)
                 if time.monotonic() - _t_sem > timeout:
-                    return {"status": "SUSPICIOUS", "has_audio": has_audio, "error": "prescreen coverage timeout"}
+                    return {"status": "SUSPICIOUS", "has_audio": has_audio,
+                            "media_duration": media_duration, "error": "prescreen coverage timeout"}
 
                 t_frame = float(frame.pts * stream.time_base) if (frame.pts is not None and stream.time_base) else float(k)
                 sample_ts.append(t_frame)
@@ -231,6 +230,7 @@ def _prescreen_keyframes(
                     return {
                         "status": "SUSPICIOUS",
                         "has_audio": has_audio,
+                        "media_duration": media_duration,
                         "result_json": json.dumps({
                             "mode": "keyframes",
                             "sample_ts": sample_ts,
@@ -255,13 +255,16 @@ def _prescreen_keyframes(
         io_sem.release()
 
     if not diffs:
-        return {"status": "SUSPICIOUS", "has_audio": has_audio, "result_json": json.dumps({"mode": "keyframes", "reason": "insufficient_samples", "diffs": [], "sem_wait": sem_wait})}
+        return {"status": "SUSPICIOUS", "has_audio": has_audio,
+                "media_duration": media_duration,
+                "result_json": json.dumps({"mode": "keyframes", "reason": "insufficient_samples", "diffs": [], "sem_wait": sem_wait})}
 
     max_diff = max(diffs)
     # 所有检查帧均未满足局部动作条件（弥散光影已在循环中成功抑制），判定为静止
     return {
         "status": "STATIC",
         "has_audio": has_audio,
+        "media_duration": media_duration,
         "result_json": json.dumps({
             "mode": "keyframes",
             "sample_ts": sample_ts,

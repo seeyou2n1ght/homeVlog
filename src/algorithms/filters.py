@@ -10,6 +10,16 @@
 import numpy as np
 
 
+def video_frame_to_gray(frame) -> np.ndarray:
+    """Return the canonical 8-bit full-range grayscale used by motion thresholds."""
+    if getattr(getattr(frame, "format", None), "name", "") == "gray":
+        plane = frame.planes[0]
+        return np.frombuffer(plane, dtype=np.uint8).reshape(
+            (frame.height, plane.line_size)
+        )[:, :frame.width]
+    return frame.to_ndarray(format="gray")
+
+
 class EmaBackgroundModel:
     """
     Lightweight Temporal Sliding Background Model with Selective EMA Update.

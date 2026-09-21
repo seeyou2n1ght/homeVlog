@@ -7,11 +7,14 @@
 
 import sys
 import json
+import math
 import time
 import socket
+import secrets
 import logging
 import argparse
 import webbrowser
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
@@ -34,6 +37,7 @@ logger = logging.getLogger("homevlog.audit.server")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 service = AuditService()
 rerender_mgr = ReRenderManager()
+AUDIT_TOKEN = secrets.token_urlsafe(32)
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -46,35 +50,47 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_bytes(self, data: bytes, content_type: str, status: int = 200):
+    def _send_bytes(self, data: bytes, content_type: str, status: int = 200, set_token_cookie: bool = False):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if set_token_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"homevlog_audit_token={AUDIT_TOKEN}; HttpOnly; SameSite=Strict; Path=/",
+            )
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file(self, file_path: Path, content_type: str):
+    def _send_file(self, file_path: Path, content_type: str, set_token_cookie: bool = False):
         if not file_path.exists():
             self.send_error(404, "File not found")
             return
         try:
             with open(file_path, "rb") as f:
                 content = f.read()
-            self._send_bytes(content, content_type)
+            self._send_bytes(content, content_type, set_token_cookie=set_token_cookie)
         except Exception as e:
             self.send_error(500, str(e))
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        self.send_error(403, "Cross-origin requests are not allowed")
+
+    def _trusted_request(self, require_token: bool = False) -> bool:
+        host = self.headers.get("Host", "")
+        if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in {f"http://{host}", f"https://{host}"}:
+            return False
+        if not require_token:
+            return True
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        supplied = cookie.get("homevlog_audit_token")
+        return supplied is not None and secrets.compare_digest(supplied.value, AUDIT_TOKEN)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -83,10 +99,10 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         # 1. 静态资源路由
         if path in ("/", "/index.html"):
-            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8", set_token_cookie=True)
             return
         elif path in ("/prototype", "/prototype.html"):
-            self._send_file(STATIC_DIR / "prototype.html", "text/html; charset=utf-8")
+            self._send_file(STATIC_DIR / "prototype.html", "text/html; charset=utf-8", set_token_cookie=True)
             return
         elif path == "/prototype.js":
             self._send_file(STATIC_DIR / "prototype.js", "application/javascript; charset=utf-8")
@@ -102,6 +118,9 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         # 2. REST API 路由
+        if path.startswith("/api/") and not self._trusted_request():
+            self._send_json({"error": "Untrusted request origin"}, status=403)
+            return
         if path == "/api/overview":
             self._send_json(service.get_overview())
             return
@@ -110,6 +129,9 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/anomalies":
             limit = int(params.get("limit", [60])[0])
+            if not 1 <= limit <= 500:
+                self.send_error(400, "limit must be between 1 and 500")
+                return
             dt = params.get("date", [None])[0]
             cat = params.get("category", ["all"])[0]
             cam = params.get("cam_index", [None])[0]
@@ -124,8 +146,14 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/frame":
             fp = params.get("filepath", [""])[0]
+            if not service.is_registered_filepath(fp):
+                self.send_error(400, "Unknown filepath")
+                return
             t = float(params.get("t", [0.0])[0])
             w = int(params.get("w", [640])[0])
+            if not math.isfinite(t) or t < 0 or not 64 <= w <= 1920:
+                self.send_error(400, "Invalid frame range")
+                return
             out = service.extract_frame(fp, t, width=w)
             if out and out.exists():
                 self._send_file(out, "image/jpeg")
@@ -134,8 +162,14 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/clip":
             fp = params.get("filepath", [""])[0]
+            if not service.is_registered_filepath(fp):
+                self.send_error(400, "Unknown filepath")
+                return
             st = float(params.get("start", [0.0])[0])
             et = float(params.get("end", [st + 4.0])[0])
+            if not all(map(math.isfinite, (st, et))) or st < 0 or et <= st or et - st > 30:
+                self.send_error(400, "Invalid clip range")
+                return
             out = service.generate_preview_clip(fp, st, et)
             if out and out.exists():
                 self._send_file(out, "image/webp")
@@ -158,7 +192,6 @@ class AuditHandler(BaseHTTPRequestHandler):
             ts = time.strftime("%Y%m%d_%H%M%S")
             fn = f"homevlog_audit_{ts}.{fmt}"
             self.send_header("Content-Disposition", f'attachment; filename="{fn}"')
-            self.send_header("Access-Control-Allow-Origin", "*")
 
             if fmt == "csv":
                 body = b'\xef\xbb\xbf' + content.encode("utf-8")
@@ -182,8 +215,10 @@ class AuditHandler(BaseHTTPRequestHandler):
             fp = params.get("filepath", [""])[0]
             target_path = Path(fp) if fp else None
             import subprocess
-            if target_path and target_path.exists():
-                subprocess.Popen(f'explorer /select,"{target_path}"', shell=True)
+            from src.core.config import OUTPUT_DIR
+            if (target_path and target_path.exists()
+                    and target_path.resolve().is_relative_to(OUTPUT_DIR.resolve())):
+                subprocess.Popen(["explorer", "/select,", str(target_path.resolve())])
                 self._send_json({"success": True})
             else:
                 self._send_json({"error": "File not found"}, status=404)
@@ -192,9 +227,18 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Endpoint not found")
 
     def do_POST(self):
+        if not self._trusted_request(require_token=True):
+            self._send_json({"error": "Untrusted request origin"}, status=403)
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         length = int(self.headers.get("Content-Length", 0))
+        if length > 64 * 1024:
+            self._send_json({"error": "Request body too large"}, status=413)
+            return
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._send_json({"error": "Content-Type must be application/json"}, status=415)
+            return
         post_data = self.rfile.read(length) if length > 0 else b"{}"
 
         try:
@@ -217,8 +261,11 @@ class AuditHandler(BaseHTTPRequestHandler):
         elif path == "/api/yolo_detect":
             fp = payload.get("filepath", "")
             t = float(payload.get("timestamp", 0.0))
-            if not fp:
-                self._send_json({"error": "Missing filepath"}, status=400)
+            if not math.isfinite(t) or t < 0:
+                self._send_json({"error": "Invalid timestamp"}, status=400)
+                return
+            if not service.is_registered_filepath(fp):
+                self._send_json({"error": "Unknown filepath"}, status=400)
                 return
             res = service.detect_and_draw_yolo(fp, t)
             self._send_json(res)

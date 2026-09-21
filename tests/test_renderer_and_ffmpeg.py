@@ -83,6 +83,68 @@ def test_continuous_static_video_and_audio_share_display_duration(tmp_path, monk
     assert np.max(np.abs(samples[5*48000:7*48000])) > 100
 
 
+@pytest.mark.parametrize("fps", [20, 24])
+@pytest.mark.parametrize("state", ["DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION", "STATIC"])
+def test_fractional_segments_keep_one_video_audio_clock(tmp_path, fps, state):
+    import av
+    from src.timeline import compute_display_plans
+
+    segments = [TimelineSegment("source", 0, i * 1.026, (i + 1) * 1.026,
+                                state if i % 2 else "DYNAMIC", 1.026) for i in range(20)]
+    plans = compute_display_plans(segments, output_fps=fps, speed_ramping=True)
+    expected_frames = sum(round(duration * fps) for duration, _ in plans)
+    graph = build_concat_filter(
+        segments, [{"filepath": "source", "has_audio": True}],
+        output_fps=fps, output_width=64, output_height=64,
+        speed_ramping=True, audio_input_offset=1,
+    )
+    target = tmp_path / "fractional.nut"
+    graph_path = tmp_path / "filter.txt"
+    graph_path.write_text(graph, encoding="utf-8")
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=24:duration=22",
+        # Real camera audio may contain overlapping timestamps. Sample counts,
+        # rather than source PTS span, must determine the output segment clock.
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=22,asetpts=0.98*PTS",
+        "-filter_complex_script", str(graph_path), "-map", "[v]", "-map", "[a]",
+        "-c:v", "ffv1", "-c:a", "pcm_s16le", str(target),
+    ], capture_output=True, timeout=30, check=True)
+    with av.open(str(target)) as container:
+        timestamps = [float(f.pts * f.time_base) for f in container.decode(video=0)]
+    with av.open(str(target)) as container:
+        samples = sum(f.samples for f in container.decode(audio=0))
+    assert len(timestamps) == expected_frames
+    assert all(b - a == pytest.approx(1 / fps) for a, b in zip(timestamps, timestamps[1:]))
+    assert samples == round(expected_frames / fps * 48000)
+
+
+def test_dynamic_eof_is_padded_to_shared_video_audio_clock(tmp_path):
+    import av
+
+    segment = TimelineSegment("clip.mp4", 0, 0.0, 12.0, "DYNAMIC", 12.0)
+    graph = build_concat_filter(
+        [segment], [{"filepath": "clip.mp4", "has_audio": 1}],
+        output_fps=20, output_width=160, output_height=90, simple_dynamic=True,
+    )
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=20:duration=8",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=8",
+        "-shortest", "-c:v", "mpeg4", "-c:a", "aac", str(source),
+    ], capture_output=True, timeout=30, check=True)
+    target = tmp_path / "dynamic_eof.mkv"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-i", str(source),
+        "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+        "-c:v", "ffv1", "-c:a", "pcm_s16le", str(target),
+    ], capture_output=True, timeout=30, check=True)
+    with av.open(str(target)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 240
+    with av.open(str(target)) as container:
+        assert sum(frame.samples for frame in container.decode(audio=0)) == 12 * 48000
+
+
 class TestRenderWatchdog:
     def test_multi_input_startup_gets_longer_grace(self):
         assert _startup_watchdog_timeout(8, 120.0, 600.0, 4800.0) == 600.0
@@ -160,6 +222,42 @@ class TestFiltergraphGenerationAndClosure:
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 
+    def test_presence_segment_pads_video_tail_with_tpad(self):
+        """验证 PRESENCE 等变速快进段在视频末尾注入 tpad 尾帧补齐，杜绝因源切片提前断流导致音画时长漂移。"""
+        t1 = TimelineSegment(
+            filepath="clip1.mp4",
+            input_index=0,
+            start_in_file=0.0,
+            end_in_file=120.0,
+            state="PRESENCE",
+            duration=120.0,
+        )
+        rows = [{"filepath": "clip1.mp4", "has_audio": 1}]
+        filter_str = build_concat_filter(
+            timeline=[t1],
+            rows=rows,
+            output_fps=20,
+            output_width=1920,
+            output_height=1080,
+            speed_ramping=True,
+        )
+        assert "tpad=stop_mode=clone" in filter_str
+        assert "trim=end_frame=600" in filter_str
+        is_closed, reason = verify_filtergraph_labels_closure(filter_str)
+        assert is_closed, f"Filtergraph not closed: {reason}"
+
+    def test_dynamic_segment_also_closes_to_planned_duration(self):
+        segment = TimelineSegment(
+            filepath="clip1.mp4", input_index=0, start_in_file=0.0,
+            end_in_file=10.0, state="DYNAMIC", duration=10.0,
+        )
+        graph = build_concat_filter(
+            timeline=[segment], rows=[{"filepath": "clip1.mp4", "has_audio": 1}],
+            output_fps=20, output_width=1920, output_height=1080,
+        )
+        assert "tpad=stop_mode=clone:stop_duration=10.000" in graph
+        assert "fps=fps=20,trim=end_frame=200" in graph
+
     def test_keyframe_fastpath_pure_static_file(self, monkeypatch):
         """纯静态长文件走 select 抽帧快路径，滤镜图标签保持闭包。"""
         monkeypatch.setattr("src.stages.timeline.load_config", lambda: {"render": {"static_mode": "hybrid_keyframe"}})
@@ -228,7 +326,7 @@ class TestFiltergraphGenerationAndClosure:
         assert "between(t\\,119.950\\,150.050)" in graph
         assert graph.index("select=") < graph.index("scale_cuda=")
         assert "tpad=stop_mode=clone" in graph
-        assert "trim=duration=" in graph
+        assert ",trim=end_frame=" in graph
         is_closed, reason = verify_filtergraph_labels_closure(graph)
         assert is_closed, f"Filtergraph not closed: {reason}"
 
@@ -305,7 +403,7 @@ class TestFiltergraphGenerationAndClosure:
         assert "[1:a]atrim=" in graph
         assert "select='isnan(prev_selected_t)" not in graph
         assert "tpad=stop_mode=clone" in graph
-        assert "trim=duration=" in graph
+        assert ",trim=end_frame=" in graph
 
     def test_simple_dynamic_filter_bypasses_concat_graph(self):
         seg = TimelineSegment("clip.mp4", 0, 0.0, 30.0, "DYNAMIC", 30.0)
@@ -316,6 +414,7 @@ class TestFiltergraphGenerationAndClosure:
         assert "concat=n=" not in graph
         assert "split=" not in graph
         assert "scale_cuda=1920:1080" in graph
+        assert "tpad=stop_mode=clone:stop_duration=30.000" in graph
 
         short_static = [
             TimelineSegment(
@@ -357,6 +456,42 @@ class TestFiltergraphGenerationAndClosure:
 
 class TestConcatOutputFiles:
     """测试切片拼接器的边界条件。"""
+
+    def test_audio_padding_cannot_shift_video_seams(self, tmp_path):
+        import av
+        import hashlib
+        import numpy as np
+
+        clips = []
+        for i, color in enumerate(["red", "blue"]):
+            path = tmp_path / f"clip{i}.mp4"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                f"color=c={color}:s=64x64:r=20:d=2", "-f", "lavfi", "-i",
+                f"sine=frequency={440*(i+1)}:sample_rate=48000:duration=2.042",
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(path),
+            ], capture_output=True, timeout=30, check=True)
+            clips.append(path)
+
+        def video(path):
+            with av.open(str(path)) as container:
+                return [(float(f.pts * f.time_base), hashlib.sha256(f.to_ndarray().tobytes()).hexdigest())
+                        for f in container.decode(video=0)]
+
+        expected_hashes = [h for clip in clips for _, h in video(clip)]
+        output = tmp_path / "joined.mp4"
+        assert concat_output_files(clips, output)
+        frames = video(output)
+        assert [h for _, h in frames] == expected_hashes
+        assert len(frames) == 80
+        assert all(b[0] - a[0] == pytest.approx(0.05) for a, b in zip(frames, frames[1:]))
+        with av.open(str(output)) as container:
+            samples = np.concatenate([f.to_ndarray().ravel() for f in container.decode(audio=0)])
+        for start, expected_frequency in [(48000, 440), (120000, 880)]:
+            window = samples[start:start+24000]
+            assert np.sqrt(np.mean(window**2)) > 0.04
+            frequency = np.argmax(np.abs(np.fft.rfft(window))) * 2
+            assert abs(frequency - expected_frequency) <= 2
 
     def test_concat_output_files_empty_list(self, tmp_path):
         out = tmp_path / "final.mp4"

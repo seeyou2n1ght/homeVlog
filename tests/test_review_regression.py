@@ -1,5 +1,6 @@
 """Behavioral regressions for the 2026-09-08 architecture review."""
 import copy
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -127,10 +128,40 @@ def test_valid_video_duration_tolerance(tmp_path):
     path = make_video(tmp_path / "tol.mp4", seconds=10)
     # 期望 10s: 匹配 -> True
     assert valid_video(path, 10.0)
-    # 期望 13.0s: 偏差 3.0s (<= 5s 容差下限) -> True (保护轻微断流视频)
-    assert valid_video(path, 13.0)
+    # A planned 13s artifact cannot silently accept an actual 10s stream.
+    assert not valid_video(path, 13.0)
     # 期望 20.0s: 偏差 10.0s (> 5s 且 > 5%) -> False
     assert not valid_video(path, 20.0)
+    frame_rate_path = make_video(tmp_path / "frame_tolerance.mp4", seconds=2, fps=20)
+    # 2 - 1.9 is slightly greater than 0.1 in binary floating point.
+    assert valid_video(frame_rate_path, 1.9)
+    assert not valid_video(frame_rate_path, 1.899)
+
+
+def test_valid_video_requires_audio_and_rejects_internal_pts_gap(tmp_path):
+    from src.render_cache import _window_is_continuous, valid_video
+
+    path = make_video(tmp_path / "video_only.mp4", seconds=2)
+    assert not valid_video(path, 2, require_audio=True)
+
+    stream = SimpleNamespace(average_rate=20, time_base=Fraction(1, 20))
+    frames = [SimpleNamespace(pts=pts, time_base=stream.time_base, is_corrupt=False)
+              for pts in (190, 191, 192, 210, 211)]
+    container = SimpleNamespace(seek=lambda *args, **kwargs: None, decode=lambda stream: iter(frames))
+    assert not _window_is_continuous(container, stream, 10.0, 20.0)
+
+
+def test_yuv_limited_range_uses_canonical_gray_conversion():
+    from src.filters import video_frame_to_gray
+
+    frame = av.VideoFrame(16, 16, "yuv420p")
+    frame.planes[0].update(bytes([16]) * frame.planes[0].buffer_size)
+    for plane in frame.planes[1:]:
+        plane.update(bytes([128]) * plane.buffer_size)
+    gray = video_frame_to_gray(frame)
+    assert gray.dtype == np.uint8
+    assert gray.shape == (16, 16)
+    assert not gray.any()
 
 
 def test_valid_video_checkpoints_sequential_and_parallel(tmp_path):

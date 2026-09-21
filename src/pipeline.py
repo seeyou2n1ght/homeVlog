@@ -1,8 +1,11 @@
 import json
+import hashlib
 import logging
+import subprocess
 import time
 import threading
 import queue
+import uuid
 from pathlib import Path
 
 from src.ui import (
@@ -20,12 +23,12 @@ from src.stages.renderer import build_batch_render, concat_output_files
 from src.stages.companion import (
     dump_perf as _dump_perf,
     build_headline as _build_headline,
+    companion_assets_complete,
     save_vlog_companion_assets as _save_vlog_companion_assets,
 )
 from src.core.config import (
     load_config,
     OUTPUT_DIR,
-    LOGS_DIR,
 )
 from src.hardware.scheduler import (
     WorkStealingManager,
@@ -54,6 +57,7 @@ class PipelineTask:
     file_start_time: str = ""
     file_end_time: str = ""
     file_duration: float = 0.0
+    duration_verified: int = 0
     has_audio: int = 0
     prescreen_status: str = "PENDING"
     prescreen_result: str = ""
@@ -85,6 +89,7 @@ class PipelineTask:
             file_start_time=str(data.get("file_start_time", "")),
             file_end_time=str(data.get("file_end_time", "")),
             file_duration=float(data.get("file_duration") or 0.0),
+            duration_verified=int(data.get("duration_verified") or 0),
             has_audio=int(data.get("has_audio") or 0),
             prescreen_status=str(data.get("prescreen_status", "PENDING")),
             prescreen_result=str(data.get("prescreen_result") or ""),
@@ -220,6 +225,7 @@ class StreamingOrchestrator:
         self._prefetched_files = set()
         self._prefetched_lock = threading.Lock()
         self._active_nv_renders = 0
+        self._active_qsv_renders = 0
 
         # Rich 仪表盘 (tqdm 已下线，统一由 PipelineDashboard 呈现)
         self.dashboard_enabled = dashboard_enabled
@@ -341,6 +347,10 @@ class StreamingOrchestrator:
                 result_json = res.get("result_json", "")
                 prescreen_has_audio = res.get("has_audio")
                 self.db.set_prescreen_result(filepath, res["status"], result_json, has_audio=prescreen_has_audio)
+                if res.get("media_duration", 0) > 0:
+                    self.db.set_file_metadata(filepath, int(prescreen_has_audio or 0), res["media_duration"])
+                    task["file_duration"] = res["media_duration"]
+                    task["duration_verified"] = 1
                 if prescreen_has_audio is not None:
                     task["has_audio"] = int(prescreen_has_audio)
                 if res["status"] in ("STATIC", "SUSPICIOUS"):
@@ -543,6 +553,7 @@ class StreamingOrchestrator:
             start_offset=file_start_offset,
             file_duration=float(task.get("file_duration") or 300.0),
             has_audio=task.get("has_audio"),
+            duration_verified=bool(task.get("duration_verified")),
         )
         
         gpu = getattr(detector, "decode_gpu", gpu)
@@ -836,10 +847,6 @@ class StreamingOrchestrator:
                 if r.get("prescreen_status") == "STATIC":
                     ready_heavy[fp] = False
 
-        render_cost_by_file = {
-            r["filepath"]: float(r.get("file_duration") or 0.0)
-            for r in all_rows
-        }
         immediate_file_batches = self.batch_max_files == 1
         dispatched_files: set[str] = set()
         ready_status: dict[str, str] = {}
@@ -853,12 +860,12 @@ class StreamingOrchestrator:
             time.sleep(max(0, self.render_delay))
         heavy_queue = DualEndedBatchQueue()
         light_queue = queue.Queue()
+        nv_retry_queue = queue.Queue()
         all_dispatched_event = threading.Event()
         render_start_t: list[float] = []
         # 已进入终态（失败已上报 / 空时间轴跳过）的批次集合，用于收尾对账去重
         terminal_batch_ids: set[int] = set()
-        dispatch_sequence = 0
-        dispatch_lock = threading.Lock()
+        qsv_workers_alive = 0
 
         def _is_heavy_batch(files_to_batch: list[str]) -> bool:
             """检查批次中是否包含需复杂处理的 DYNAMIC 动作片段。"""
@@ -889,8 +896,8 @@ class StreamingOrchestrator:
         nv_duration_lock = threading.Lock()
 
         def _render_worker(gpu: str, worker_id: str = ""):
+            nonlocal qsv_workers_alive
             worker_name = worker_id or gpu
-            nonlocal dispatch_sequence
             t_worker_start = time.monotonic()
             busy_time = 0.0
             batches_count = 0
@@ -904,16 +911,25 @@ class StreamingOrchestrator:
                     item = None
                     is_stolen = False
                     is_light = False
+                    qsv_admission_limit = max_qsv_dynamic_s
                     if gpu == "nv":
                         # NVENC (3060Ti) 专职优先消费 heavy 动态任务 (LPT 最长优先)，空闲时协助消费 light 任务
-                        item = heavy_queue.pop_heaviest(timeout=0.5)
+                        try:
+                            item = nv_retry_queue.get_nowait()
+                        except queue.Empty:
+                            item = heavy_queue.pop_heaviest(timeout=0.5)
                         if item is None:
                             try:
                                 item = light_queue.get(timeout=0.5)
                                 if item is not None:
                                     is_light = True
                             except queue.Empty:
-                                if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                                with self.batch_lock:
+                                    active_qsv = self._active_qsv_renders
+                                    qsv_alive = qsv_workers_alive
+                                if (all_dispatched_event.is_set() and heavy_queue.empty()
+                                        and light_queue.empty() and nv_retry_queue.empty()
+                                        and active_qsv == 0 and qsv_alive == 0):
                                     break
                                 continue
                     else:
@@ -953,13 +969,19 @@ class StreamingOrchestrator:
                                         continue
                                     else:
                                         is_stolen = True
+                                        qsv_admission_limit = allowed_dyn_s
                                 else:
                                     item = heavy_queue.pop_heaviest(timeout=0.5)
                             except Exception:
                                 pass
 
                     if item is None:
-                        if all_dispatched_event.is_set() and heavy_queue.empty() and light_queue.empty():
+                        with self.batch_lock:
+                            active_qsv = self._active_qsv_renders
+                            qsv_alive = qsv_workers_alive
+                        if (all_dispatched_event.is_set() and heavy_queue.empty()
+                                and light_queue.empty() and nv_retry_queue.empty()
+                                and active_qsv == 0 and (gpu != "nv" or qsv_alive == 0)):
                             break
                         continue
 
@@ -983,12 +1005,17 @@ class StreamingOrchestrator:
                         with self.batch_lock:
                             self._active_nv_renders += 1
                         self.work_stealing.register_render_start()
+                    else:
+                        with self.batch_lock:
+                            self._active_qsv_renders += 1
                     try:
                         all_rows = []
                         try:
                             if self.abort_event.is_set() or getattr(self.db, "is_closed", False):
                                 break
-                            all_rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index)
+                            all_rows = self.db.get_all_file_tasks_for_date(
+                                self.date, self.cam_index, filepaths=files_to_batch,
+                            )
                         except Exception as e:
                             if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                                 break
@@ -1068,10 +1095,10 @@ class StreamingOrchestrator:
                         # 异构长尾保护：QSV 仅消费中轻量动态任务，若真实切片包含超过门限的 DYNAMIC 动作则交还 NVENC
                         if gpu == "qsv" and render_hw_policy == "heterogeneous":
                             dynamic_dur = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
-                            if dynamic_dur > max_qsv_dynamic_s:
+                            if is_stolen and dynamic_dur > qsv_admission_limit:
                                 logger.info(
                                     "render batch %d on qsv contains %.1fs dynamic motion (exceeds %.1fs), offloading to nv heavy queue",
-                                    b_idx, dynamic_dur, max_qsv_dynamic_s,
+                                    b_idx, dynamic_dur, qsv_admission_limit,
                                 )
                                 heavy_queue.put(b_idx, files_to_batch, dynamic_dur)
                                 continue
@@ -1122,7 +1149,6 @@ class StreamingOrchestrator:
                                 t_start = render_start_t[0] if render_start_t else t_r0
                                 el_sec = max(0.1, time.monotonic() - t_start)
                                 n_done = self.dashboard.render_done + 1
-                                n_total = max(n_done, self.dashboard.render_total)
                                 avg_s = el_sec / max(1, n_done)
                                 enc_name = "NVENC" if gpu == "nv" else gpu.upper()
                                 self.dashboard.update_render(
@@ -1134,28 +1160,15 @@ class StreamingOrchestrator:
                         else:
                             if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                                 break
-                            # Fallback retry on nv if QSV failed
+                            # Return QSV failures to an NV-only queue so retry
+                            # scheduling and telemetry remain owned by NV.
                             if gpu == "qsv" and render_hw_policy == "heterogeneous":
                                 logger.warning(
-                                    "render batch %d returned no output on qsv; retrying fallback on nv...",
+                                    "render batch %d returned no output on qsv; queued for nv retry",
                                     b_idx,
                                 )
-                                t_retry0 = time.monotonic()
-                                res_path = build_batch_render(
-                                    batch_segs, b_idx, "nv", fps, width, height,
-                                    seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
-                                    all_rows
-                                )
-                                if res_path:
-                                    r_dur = round(time.monotonic() - t_retry0, 3)
-                                    busy_time += r_dur
-                                    batches_count += 1
-                                    logger.info("render batch %d succeeded on nv retry in %.3fs", b_idx, r_dur)
-                                    with self.batch_lock:
-                                        self.batch_paths.append((b_idx, Path(res_path)))
-                                    if self.dashboard is not None:
-                                        self.dashboard.render_batch_finished(len(files_to_batch))
-                                    continue
+                                nv_retry_queue.put((b_idx, files_to_batch))
+                                continue
 
                             self._add_error(f"render batch {b_idx} returned no output")
                             with self.batch_lock:
@@ -1176,7 +1189,13 @@ class StreamingOrchestrator:
                             with self.batch_lock:
                                 self._active_nv_renders = max(0, self._active_nv_renders - 1)
                             self.work_stealing.register_render_end()
+                        else:
+                            with self.batch_lock:
+                                self._active_qsv_renders = max(0, self._active_qsv_renders - 1)
             finally:
+                if gpu == "qsv":
+                    with self.batch_lock:
+                        qsv_workers_alive = max(0, qsv_workers_alive - 1)
                 t_worker_total = max(0.001, time.monotonic() - t_worker_start)
                 idle_time = max(0.0, t_worker_total - busy_time)
                 with self.batch_lock:
@@ -1207,6 +1226,7 @@ class StreamingOrchestrator:
                 self.render_workers,
             )
             render_gpus = ["nv"] if self.render_workers == 1 else ["nv"] * min(2, self.render_workers - 1) + ["qsv"]
+        qsv_workers_alive = render_gpus.count("qsv")
         worker_counts: dict[str, int] = {}
         for gpu in render_gpus:
             idx = worker_counts.get(gpu, 0)
@@ -1320,7 +1340,9 @@ class StreamingOrchestrator:
                 produced_ids = {bi for bi, _ in self.batch_paths}
                 accounted = produced_ids | terminal_batch_ids
             missing = [bi for bi in dispatched_batch_ids if bi not in accounted]
-            if missing:
+            if self.abort_event.is_set():
+                logger.info("Rendering cancelled: %d completed batches retained for resume", len(produced_ids))
+            elif missing:
                 self._add_error(f"render batches silently dropped: {missing}")
                 logger.error("render reconciliation failed: dispatched=%s produced=%s missing=%s",
                              dispatched_batch_ids, sorted(produced_ids), missing)
@@ -1486,6 +1508,33 @@ def process_date_cam(
     all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
     total_files = len(all_tasks)
     total_input_dur = sum(float(t.get("file_duration") or 300.0) for t in all_tasks)
+    analysis_snapshot = [
+        {key: row.get(key) for key in (
+            "filepath", "file_duration", "duration_verified", "prescreen_status",
+            "analysis_status", "analysis_segments", "human_reviews",
+        )}
+        for row in all_tasks
+    ]
+    run_context = {
+        "run_id": uuid.uuid4().hex,
+        "config_sha256": hashlib.sha256(
+            json.dumps(config, sort_keys=True, default=str).encode()
+        ).hexdigest(),
+        "analysis_snapshot_sha256": hashlib.sha256(
+            json.dumps(analysis_snapshot, sort_keys=True, default=str).encode()
+        ).hexdigest(),
+    }
+    try:
+        run_context["code_revision"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        run_context["code_dirty"] = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        run_context["code_revision"] = "unknown"
 
     # Rich 启动 Banner (含机位别名与高度自定义成片命名解析)
     out_cfg = config.get("output", {})
@@ -1520,13 +1569,19 @@ def process_date_cam(
                                   "final", out_cfg.get("fps", 20), out_cfg, out_cfg.get("audio", {}), config)
     if (not force_render and not skip_render and db.is_render_completed(date, cam_index) and
             db.get_pending_file_count_for_date(date, cam_index) == 0 and
-            reusable(output_path, final_fingerprint())):
+            reusable(output_path, final_fingerprint(), require_audio=True) and
+            companion_assets_complete(output_path, config)):
         logger.info("Verified completed output: %s", output_path)
         return True
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render, dashboard_enabled=dashboard_enabled)
     try:
         with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
             batch_paths = orchestrator.run()
+    except (KeyboardInterrupt, SystemExit):
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
+                   worker_stats=orchestrator.render_worker_stats,
+                   run_context={**run_context, "status": "cancelled"})
+        raise
     except Exception:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
         db.set_render_status(date, cam_index, "FAILED")
@@ -1556,7 +1611,8 @@ def process_date_cam(
         )
         db.set_render_status(date, cam_index, "FAILED")
         elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
         return False
 
     # A render batch can succeed while an upstream file task failed. Never
@@ -1575,7 +1631,8 @@ def process_date_cam(
         )
         db.set_render_status(date, cam_index, "FAILED")
         elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
         return False
 
     db.upsert_render_task(date, cam_index, "RENDERING")
@@ -1594,7 +1651,8 @@ def process_date_cam(
                 logger.error("concat_output_files failed for %s cam%d", date, cam_index)
                 db.set_render_status(date, cam_index, "FAILED")
                 elapsed_wall = time.monotonic() - t_start
-                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall, worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
+                           worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
                 return False
     except Exception:
         logger.exception("finalize render output failed")
@@ -1611,10 +1669,8 @@ def process_date_cam(
         worker="concat",
     ))
 
-    save_manifest(output_path, final_fingerprint())
-
     # 生成标准化成片伴随资产包：.srt 现实世界时间码字幕 + .meta.json 结构化清单
-    _save_vlog_companion_assets(
+    assets_ok = _save_vlog_companion_assets(
         output_path=output_path,
         date=date,
         cam_index=cam_index,
@@ -1625,6 +1681,15 @@ def process_date_cam(
         db=db,
         config=config,
     )
+    if not assets_ok:
+        logger.error("required companion assets failed for %s", output_path)
+        db.set_render_status(date, cam_index, "FAILED", output_file=str(output_path))
+        elapsed_wall = time.monotonic() - t_start
+        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
+        return False
+
+    save_manifest(output_path, final_fingerprint())
 
     db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
     # End-to-end means the final container, manifest, optional subtitles and DB
@@ -1644,7 +1709,7 @@ def process_date_cam(
 
     _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                headline=_build_headline(output_path, total_input_dur, elapsed_wall),
-               worker_stats=getattr(orchestrator, "render_worker_stats", {}))
+               worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
 
     # 自动回收本地预暂存文件，释放磁盘存储空间
     from src.core.utils import cleanup_staging_files, cleanup_temp_artifacts

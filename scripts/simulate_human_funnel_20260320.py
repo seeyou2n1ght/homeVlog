@@ -72,6 +72,7 @@ def run_simulation(date: str = "20260320", cam: int = 0):
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        output_fps=float(cfg.get("output", {}).get("fps", 20)),
     )
 
     print(f"Timeline constructed: {len(timeline)} segments")
