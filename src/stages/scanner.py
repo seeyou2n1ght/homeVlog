@@ -53,6 +53,25 @@ def resolve_camera_identity(dir_path: str, cam_index: int = 0, config: dict | No
     return f"Cam {cam_index}", f"cam{cam_index}"
 
 
+def resolve_camera_ui_name(dir_path: str, cam_index: int = 0, config: dict | None = None) -> str:
+    """Human-facing label: semantic mapping, camera ID, then MAC address."""
+    if config is None:
+        config = load_config()
+    info = parse_camera_dir(dir_path)
+    mac = info.get("mac")
+    if not mac:
+        match = re.search(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{12}(?![A-Fa-f0-9])", Path(dir_path).name)
+        mac = match.group().upper() if match else None
+    alias = (config.get("cameras", {}) or {}).get(mac) if mac else None
+    if alias:
+        return str(alias)
+    if info.get("cam_id") is not None:
+        return f"摄像头 {info['cam_id']}"
+    if mac:
+        return mac
+    return resolve_camera_identity(dir_path, cam_index, config)[1]
+
+
 def resolve_output_filename(
     template: str,
     date: str,

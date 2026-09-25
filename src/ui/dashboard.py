@@ -112,9 +112,10 @@ def print_startup_banner(
     table.add_column(style="bold cyan", justify="right")
     table.add_column(style="white")
 
-    cam_label = f"{cam_name} (Cam {cam_index})" if cam_name and cam_name != f"cam{cam_index}" else f"Cam {cam_index}"
+    cam_label = cam_name or f"Cam {cam_index}"
     progress_tag = f" [bold cyan]{batch_progress}[/]" if batch_progress else ""
-    table.add_row("📅 处理日期:", f"[bold white]{date}[/] (机位: [bold yellow]{cam_label}[/]){progress_tag}")
+    table.add_row("📅 处理日期:", f"[bold white]{date}[/]{progress_tag}")
+    table.add_row("📷 监控机位:", f"[bold yellow]{cam_label}[/]")
 
     table.add_row(
         "🎬 输入素材:",
@@ -168,6 +169,7 @@ def print_summary_card(
     metric_table = Table(show_header=True, header_style="bold cyan", border_style="dim")
     metric_table.add_column("指标类别", style="bold", width=18)
     metric_table.add_column("数值与明细", style="white")
+    metric_table.add_row("监控机位", cam_name or f"Cam {cam_index}")
 
     metric_table.add_row(
         "输入素材",
@@ -229,10 +231,9 @@ def print_summary_card(
             stage_table.add_row(name.capitalize(), f"{dur:.2f}s", f"{pct:.1f}%")
         renderables.append(stage_table)
 
-    cam_label = f"{cam_name} (Cam {cam_index})" if cam_name and cam_name != f"cam{cam_index}" else f"Cam {cam_index}"
     panel = Panel(
         Group(*renderables),
-        title=f"[bold green]✨ HomeVlog 处理完成 | {date} {cam_label}[/bold green]",
+        title=f"[bold green]✨ HomeVlog 处理完成 | {date}[/bold green]",
         border_style="green",
         padding=(1, 2),
     )
@@ -308,9 +309,9 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
 
     render_tasks = {}
     try:
-        r_rows = db.conn.execute("SELECT date, cam_index, status, output_file FROM render_tasks").fetchall()
+        r_rows = db.conn.execute("SELECT date, cam_index, status, output_file, error_msg FROM render_tasks").fetchall()
         for r in r_rows:
-            render_tasks[(r["date"], r["cam_index"])] = (r["status"], r["output_file"])
+            render_tasks[(r["date"], r["cam_index"])] = (r["status"], r["output_file"], r["error_msg"])
     except Exception:
         pass
 
@@ -329,6 +330,7 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
     table.add_column("成片状态", justify="center", no_wrap=True)
     table.add_column("成片体积", justify="right", style="magenta", no_wrap=True)
 
+    failures = []
     for idx, r in enumerate(rows, 1):
         d = r["date"]
         cam = r["cam_index"]
@@ -348,21 +350,22 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
         else:
             a_str = f"{a_done}/{sus_cnt} ({int(a_done/sus_cnt*100)}%)"
 
-        r_info = render_tasks.get((d, cam), ("PENDING", None))
-        status, out_file = r_info
+        status, out_file, error_msg = render_tasks.get((d, cam), ("PENDING", None, None))
         out_p = Path(out_file) if out_file else None
         has_out = out_p.exists() if out_p else False
         out_size_mb = (out_p.stat().st_size / (1024 * 1024)) if has_out else 0.0
 
-        if has_out:
+        if status == "FAILED":
+            st_text = "[bold red]✖ 渲染失败[/bold red]"
+            sz_text = "-"
+            if error_msg:
+                failures.append(f"{d} · {cam_text}: {error_msg}")
+        elif has_out:
             st_text = "[bold green]✔ 已就绪[/bold green]"
             sz_text = f"{out_size_mb:.1f} MB"
         elif status == "COMPLETED":
             st_text = "[green]✔ 已渲染[/green]"
             sz_text = "[dim]未知路径[/dim]"
-        elif status == "FAILED":
-            st_text = "[bold red]✖ 渲染失败[/bold red]"
-            sz_text = "-"
         else:
             st_text = "[yellow]⏳ 待处理[/yellow]"
             sz_text = "-"
@@ -370,6 +373,8 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
         table.add_row(str(idx), str(d), cam_text, str(total_f), f"{dur_h:.2f} 小时", p_str, a_str, st_text, sz_text)
 
     console.print(table)
+    if failures:
+        print_error_summary(failures)
 
 
 def print_error_summary(errors: List[str]) -> None:
@@ -424,9 +429,10 @@ def print_scan_results(
 class PlainProgressTracker:
     """针对无头环境 (--no-tui / CI / 管道重定向) 的流式单行心跳进度汇报器。"""
 
-    def __init__(self, date: str, cam_index: int, total_files: int, interval_s: float = 12.0):
+    def __init__(self, date: str, cam_index: int, total_files: int, interval_s: float = 12.0, cam_name: str | None = None):
         self.date = date
         self.cam_index = cam_index
+        self.cam_name = cam_name or f"Cam {cam_index}"
         self.total_files = max(1, total_files)
         self.interval_s = interval_s
         self._last_report = 0.0
@@ -457,7 +463,7 @@ class PlainProgressTracker:
 
             now_str = time.strftime("%H:%M:%S")
             line = (
-                f"[{now_str}] [HomeVlog {self.date} Cam {self.cam_index}] "
+                f"[{now_str}] [HomeVlog {self.date} | 机位 {self.cam_name}] "
                 f"①粗筛: {prescreen_done}/{prescreen_total} ({p_pct}%) | "
                 f"②精析: {analysis_done}/{analysis_total} ({a_pct}%) | "
                 f"③渲染: {render_done}/{render_total} ({r_pct}%) | "
@@ -486,9 +492,11 @@ class PipelineDashboard:
         total_prescreen: int = 0,
         render_enabled: bool = True,
         enabled: bool = True,
+        cam_name: str | None = None,
     ):
         self.date = date
         self.cam_index = cam_index
+        self.cam_name = cam_name or f"Cam {cam_index}"
         self.render_enabled = render_enabled
         self.enabled = enabled and is_interactive_terminal()
 
@@ -526,7 +534,7 @@ class PipelineDashboard:
 
         # 无头/非交互环境流式汇报器
         self.tracker: Optional[PlainProgressTracker] = (
-            PlainProgressTracker(date, cam_index, self.total_files) if not self.enabled else None
+            PlainProgressTracker(date, cam_index, self.total_files, cam_name=self.cam_name) if not self.enabled else None
         )
 
         # 视图刷新节流与脉冲定时器
@@ -735,10 +743,11 @@ class PipelineDashboard:
             )
 
             hw_table.add_row(
-                f"[bold cyan]日期:[/] {self.date} (Cam {self.cam_index})",
+                f"[bold cyan]日期:[/] {self.date}",
                 f"[bold cyan]运行模式:[/] {sched_badge}{vram_badge}",
                 f"[bold cyan]待办:[/] {q_info} [dim](已运行 {time_str})[/dim]",
             )
+            hw_table.add_row(f"[bold cyan]机位:[/] {self.cam_name}", "", "")
 
             # 2. 方案 A: 各工序切片分布 (文件级真实计数，守恒归一化)
             total = max(1, self.total_files)

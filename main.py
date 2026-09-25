@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.utils import setup_logging, load_config, reset_semaphores, cleanup_resources, cleanup_temp_artifacts, get_input_dirs
 from src.pipeline import run_pipeline, process_date_cam
 from src.database import VlogDatabase
-from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_identity, resolve_output_filename
+from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name, resolve_output_filename
 from src.ui import (
     build_arg_parser,
     resolve_cli_dates,
@@ -89,8 +89,7 @@ def main():
                 if cam not in cam_map:
                     tasks = db.get_all_file_tasks_for_date(d, cam)
                     s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
-                    disp, _ = resolve_camera_identity(s_dir, cam_index=cam, config=config)
-                    cam_map[cam] = disp
+                    cam_map[cam] = resolve_camera_ui_name(s_dir, cam_index=cam, config=config)
             print_status_table(db, camera_display_names=cam_map)
         finally:
             db.close()
@@ -148,8 +147,7 @@ def main():
                         tasks = db.get_all_file_tasks_for_date(d, cam)
                         s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
                         if cam not in cam_map:
-                            disp, _ = resolve_camera_identity(s_dir, cam_index=cam, config=config)
-                            cam_map[cam] = disp
+                            cam_map[cam] = resolve_camera_ui_name(s_dir, cam_index=cam, config=config)
                         dur = sum(t.get("file_duration", 0.0) or 0.0 for t in tasks)
                         done_c = sum(1 for t in tasks if t.get("prescreen_status") != "PENDING")
                         st_tag = "[green]已就绪[/green]" if done_c == len(tasks) else f"[yellow]{done_c}/{len(tasks)}[/yellow]"
@@ -222,7 +220,12 @@ def main():
                 monitor.start()
 
                 dates_sorted = sorted(set(d for d, _ in active_groups))
-                cams_sorted = sorted(set(f"Cam {c}" for _, c in active_groups))
+                camera_names = set()
+                for d, cam in active_groups:
+                    tasks = db.get_all_file_tasks_for_date(d, cam)
+                    sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else ""
+                    camera_names.add(resolve_camera_ui_name(sample_dir, cam_index=cam, config=config))
+                cams_sorted = sorted(camera_names)
                 if len(active_groups) > 1:
                     print_batch_startup_banner(
                         total_groups=len(active_groups),
@@ -251,7 +254,7 @@ def main():
                     # 收集指标用于多任务总结
                     tasks = db.get_all_file_tasks_for_date(d, cam)
                     s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
-                    cam_disp, _ = resolve_camera_identity(s_dir, cam_index=cam, config=config)
+                    cam_disp = resolve_camera_ui_name(s_dir, cam_index=cam, config=config)
                     out_name = resolve_output_filename(
                         config.get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),
                         d, cam, tasks[0]["filepath"] if tasks else None, config=config

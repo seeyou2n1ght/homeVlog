@@ -239,22 +239,23 @@ class VlogDatabase:
                 self.conn.rollback()
                 return False
 
-    def set_prescreen_result(self, filepath: str, status: str, result_json: str = "", has_audio: int | None = None):
+    def set_prescreen_result(self, filepath: str, status: str, result_json: str = "", has_audio: int | None = None,
+                             error_msg: str | None = None):
         with self._lock:
             try:
                 if has_audio is not None:
                     self.conn.execute(
                         """UPDATE file_tasks
-                           SET prescreen_status=?, prescreen_result=?, has_audio=?, updated_at=datetime('now', 'localtime')
+                           SET prescreen_status=?, prescreen_result=?, has_audio=?, error_msg=?, updated_at=datetime('now', 'localtime')
                            WHERE filepath=?""",
-                        (status, result_json, has_audio, str(filepath)),
+                        (status, result_json, has_audio, error_msg, str(filepath)),
                     )
                 else:
                     self.conn.execute(
                         """UPDATE file_tasks
-                           SET prescreen_status=?, prescreen_result=?, updated_at=datetime('now', 'localtime')
+                           SET prescreen_status=?, prescreen_result=?, error_msg=?, updated_at=datetime('now', 'localtime')
                            WHERE filepath=?""",
-                        (status, result_json, str(filepath)),
+                        (status, result_json, error_msg, str(filepath)),
                     )
                 self.conn.commit()
             except Exception as e:
@@ -262,7 +263,8 @@ class VlogDatabase:
                 self.conn.rollback()
                 raise
 
-    def set_analysis_result(self, filepath: str, status: str | list = "ANALYZED", segments: list | str = ""):
+    def set_analysis_result(self, filepath: str, status: str | list = "ANALYZED", segments: list | str = "",
+                            error_msg: str | None = None):
         with self._lock:
             try:
                 import json
@@ -292,9 +294,9 @@ class VlogDatabase:
                 # 1. 更新 file_tasks 状态与兼容用 JSON
                 self.conn.execute(
                     """UPDATE file_tasks
-                       SET analysis_status=?, analysis_segments=?, updated_at=datetime('now', 'localtime')
+                       SET analysis_status=?, analysis_segments=?, error_msg=?, updated_at=datetime('now', 'localtime')
                        WHERE filepath=?""",
-                    (status, segments_json, str(filepath)),
+                    (status, segments_json, error_msg, str(filepath)),
                 )
 
                 # 2. 查询 file_task 元数据以供 segments 外键关联
@@ -591,7 +593,7 @@ class VlogDatabase:
             try:
                 cur = self.conn.execute(
                     """UPDATE file_tasks
-                       SET prescreen_status='PENDING', retry_count=retry_count+1,
+                       SET prescreen_status='PENDING', retry_count=retry_count+1, error_msg=NULL,
                            updated_at=datetime('now', 'localtime')
                        WHERE date=? AND cam_index=? AND prescreen_status='FAILED'
                          AND retry_count < ?""",
@@ -600,7 +602,7 @@ class VlogDatabase:
                 n_pre = cur.rowcount
                 cur = self.conn.execute(
                     """UPDATE file_tasks
-                       SET analysis_status='PENDING', retry_count=retry_count+1,
+                       SET analysis_status='PENDING', retry_count=retry_count+1, error_msg=NULL,
                            updated_at=datetime('now', 'localtime')
                        WHERE date=? AND cam_index=? AND analysis_status='FAILED'
                          AND retry_count < ?""",
@@ -719,7 +721,7 @@ class VlogDatabase:
                     """INSERT INTO render_tasks (date, cam_index, status, updated_at)
                        VALUES (?, ?, ?, datetime('now', 'localtime'))
                        ON CONFLICT(date, cam_index) DO UPDATE SET
-                         status=excluded.status, updated_at=excluded.updated_at""",
+                         status=excluded.status, error_msg=NULL, updated_at=excluded.updated_at""",
                     (date, cam_index, status),
                 )
                 self.conn.commit()
@@ -732,20 +734,22 @@ class VlogDatabase:
                 except Exception:
                     pass
 
-    def set_render_status(self, date: str, cam_index: int, status: str, output_file: str = ""):
+    def set_render_status(self, date: str, cam_index: int, status: str, output_file: str = "",
+                          error_msg: str | None = None):
         with self._lock:
             if self._conn is None:
                 return
             try:
                 self.conn.execute(
                     """INSERT INTO render_tasks
-                       (date, cam_index, status, output_file, updated_at)
-                       VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
+                       (date, cam_index, status, output_file, error_msg, updated_at)
+                       VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
                        ON CONFLICT(date, cam_index) DO UPDATE SET
                          status=excluded.status,
                          output_file=excluded.output_file,
+                         error_msg=excluded.error_msg,
                          updated_at=excluded.updated_at""",
-                    (date, cam_index, status, output_file),
+                    (date, cam_index, status, output_file, error_msg),
                 )
                 self.conn.commit()
             except Exception as e:

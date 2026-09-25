@@ -7,7 +7,7 @@ paths:
   # 支持跨 NAS 共享目录与本地磁盘同时配置，系统按顺序逐一精准扫描
   input_dirs:
     - '\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD'
-    # - '\\192.168.5.8\LyuShare\XiaomiCamera_02_6490C12345EF' # 多机位示例
+    - '\\192.168.5.8\LyuShare\XiaomiCamera_00_B888806BD537' # 多机位示例
     # - 'D:\LocalFootage\FrontDoor_Camera'                  # 本地机位示例
 
 
@@ -16,7 +16,7 @@ paths:
 # 可以在此处将 MAC 地址映射为人类可读的机位名称；若命名模板包含 {camera}，成片将自动使用该别名（未配置时降级为 MAC 或 cam{index}）
 cameras:
   B888805AA3CD: "baby_room"       # 婴儿房机位 (红外微光夜视敏感模式)
-  # 6490C12345EF: "living_room"   # 客厅机位示例
+  B888806BD537: "living_room"   # 客厅机位示例
   # 7811DC654321: "front_door"    # 门口机位示例
 
 hardware:

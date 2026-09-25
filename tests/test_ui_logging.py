@@ -120,11 +120,15 @@ def test_ui_components_render(tmp_path, capsys):
     print_startup_banner(
         date="20260903",
         cam_index=0,
+        cam_name="育儿房",
         total_files=42,
         total_duration_s=3600.0,
         output_path="C:/test/out.mp4",
         batch_progress="[1/7]",
     )
+    banner = capsys.readouterr().out
+    assert "处理日期" in banner and "监控机位" in banner
+    assert "育儿房" in banner and "Cam 0" not in banner
 
 
     # 2. 成果汇总卡片 (带/不带阶段耗时)
@@ -153,9 +157,12 @@ def test_ui_components_render(tmp_path, capsys):
 
 def test_pipeline_dashboard_lifecycle():
     """验证 PipelineDashboard 的更新逻辑、队列水位更新及生命周期开关。"""
+    from rich.console import Console
+
     dash = PipelineDashboard(
         date="20260903",
         cam_index=0,
+        cam_name="育儿房",
         total_prescreen=50,
         render_enabled=True,
         enabled=False,
@@ -167,6 +174,12 @@ def test_pipeline_dashboard_lifecycle():
     dash.set_queue_status(prescreen_q=30, analysis_q=10, render_q=2)
     dash.set_scheduler_state("COOPERATIVE_BURST", active_nv=1, max_nv=1)
     dash.add_alert("Test warning message")
+    console = Console(record=True, width=120)
+    console.print(dash._generate_view())
+    view = console.export_text()
+    assert "日期: 20260903" in view
+    assert "机位: 育儿房" in view
+    assert "Cam 0" not in view
     dash.stop()
 
     assert dash.prescreen_queue_size == 30
@@ -289,10 +302,15 @@ def test_batch_summary_table_and_status_table(tmp_path, capsys, monkeypatch):
             file_end_time="20260320101000",
             file_duration=600.0,
         )
+        incomplete_output = tmp_path / "incomplete.mp4"
+        incomplete_output.write_bytes(b"partial")
+        db.set_render_status("20260320", 0, "FAILED", output_file=str(incomplete_output),
+                             error_msg="required companion assets failed")
         print_status_table(db, camera_display_names={0: "baby_room (B888805AA3CD)"})
         output = capsys.readouterr().out
         assert "20260320" in output and "20260321" in output
         assert "baby_room" in output
+        assert "渲染失败" in output and "required companion assets failed" in output
     finally:
         db.close()
 

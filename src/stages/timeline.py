@@ -987,6 +987,13 @@ def build_concat_filter(
         else:
             scale_parts.append(f"{input_v}null[skip_{idx}]")
         base_label = f"scaled_{idx}" if (scale_filter is not None or use_kf_fastpath) else f"skip_{idx}"
+        # A final trim can be empty when the camera stops just before its nominal end.
+        # Pad before splitting so every planned slice can still see the last frame.
+        source_end = max(seg.end_in_file for seg in file_segs)
+        scale_parts.append(
+            f"[{base_label}]tpad=stop_mode=clone:stop_duration={source_end:.3f}[padded_{idx}]"
+        )
+        base_label = f"padded_{idx}"
 
         if n_segs > 1:
             out_labels = [f"[s{idx}_{k}]" for k in range(n_segs)]
@@ -1132,10 +1139,14 @@ def build_concat_filter(
 
     labels = "".join(f"[v{i}][a{i}]" for i in range(seg_count))
     all_parts = scale_parts + parts_v + parts_a
+    planned_frames = sum(round(duration * output_fps) for duration, _ in display_plans)
+    planned_samples = round(planned_frames * audio_sample_rate / output_fps)
     concat = (
         f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v_tmp][a_tmp];"
-        f"[v_tmp]fps={output_fps}[v];"
-        f"[a_tmp]aresample={audio_sample_rate}:async=1000:first_pts=0,asetpts=N/SR/TB[a]"
+        f"[v_tmp]tpad=stop_mode=clone:stop_duration={planned_frames/output_fps:.3f},"
+        f"fps={output_fps},trim=end_frame={planned_frames},setpts=PTS-STARTPTS[v];"
+        f"[a_tmp]aresample={audio_sample_rate}:async=1000:first_pts=0,"
+        f"apad,atrim=end_sample={planned_samples},asetpts=N/SR/TB[a]"
     )
 
     return concat

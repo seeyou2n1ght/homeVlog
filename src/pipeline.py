@@ -150,10 +150,12 @@ class StreamingOrchestrator:
         config: dict,
         render_enabled: bool = True,
         dashboard_enabled: bool = True,
+        cam_name: str | None = None,
     ):
         self.db = db
         self.date = date
         self.cam_index = cam_index
+        self.cam_name = cam_name
         self.config = config
         self.render_enabled = render_enabled
 
@@ -314,6 +316,8 @@ class StreamingOrchestrator:
 
             try:
                 res = prescreen_file(filepath, duration, self.config, gpu=gpu, is_prior_active=is_prior_active)
+                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                    continue
                 if (res["status"] == "STATIC" and res.get("has_audio") and
                         self.config.get("audio_vad", {}).get("prescreen_audio_gate", False)):
                     # A visual negative does not need the full video analysis
@@ -346,7 +350,10 @@ class StreamingOrchestrator:
                         res["status"] = "SUSPICIOUS"
                 result_json = res.get("result_json", "")
                 prescreen_has_audio = res.get("has_audio")
-                self.db.set_prescreen_result(filepath, res["status"], result_json, has_audio=prescreen_has_audio)
+                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                    continue
+                self.db.set_prescreen_result(filepath, res["status"], result_json,
+                                             has_audio=prescreen_has_audio, error_msg=res.get("error"))
                 if res.get("media_duration", 0) > 0:
                     self.db.set_file_metadata(filepath, int(prescreen_has_audio or 0), res["media_duration"])
                     task["file_duration"] = res["media_duration"]
@@ -419,9 +426,11 @@ class StreamingOrchestrator:
                     )
                     self._sync_queue_levels()
 
-            except Exception:
+            except Exception as exc:
+                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                    continue
                 logger.exception("Streaming: prescreen failed for %s", filepath)
-                self.db.set_prescreen_result(filepath, "FAILED", "")
+                self.db.set_prescreen_result(filepath, "FAILED", "", error_msg=str(exc))
                 self._add_error(f"prescreen failed: {Path(filepath).name}")
                 t_err = time.monotonic()
                 get_perf().add(
@@ -458,6 +467,9 @@ class StreamingOrchestrator:
         worker_id: str = "",
     ):
         from src.algorithms.segment import build_segments, segments_to_json
+
+        if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+            return
 
         analysis_queue_wait = max(0.0, t0 - float(task.get("_analysis_queued_at") or t0))
 
@@ -555,6 +567,8 @@ class StreamingOrchestrator:
             has_audio=task.get("has_audio"),
             duration_verified=bool(task.get("duration_verified")),
         )
+        if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+            return
         
         gpu = getattr(detector, "decode_gpu", gpu)
         if hasattr(detector, 'has_audio_detected'):
@@ -679,7 +693,7 @@ class StreamingOrchestrator:
                 }
             )
         else:
-            self.db.set_analysis_result(filepath, "FAILED", "")
+            self.db.set_analysis_result(filepath, "FAILED", "", error_msg="analysis produced no labels")
             self._add_error(f"analysis produced no labels: {Path(filepath).name}")
             t_ana_fail = time.monotonic()
             perf.add(
@@ -781,9 +795,11 @@ class StreamingOrchestrator:
                         task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id
                     )
 
-            except Exception:
+            except Exception as exc:
+                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                    continue
                 logger.exception("Streaming: analysis failed for %s", filepath)
-                self.db.set_analysis_result(filepath, "FAILED", "")
+                self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
                 self._add_error(f"analysis failed: {Path(filepath).name}")
                 t_ana_err = time.monotonic()
                 perf.add(
@@ -1369,6 +1385,7 @@ class StreamingOrchestrator:
             total_prescreen=max(1, len(all_tasks)),
             render_enabled=self.render_enabled,
             enabled=self.dashboard_enabled,
+            cam_name=self.cam_name,
         )
         self.dashboard.start()
         if self.dashboard.enabled:
@@ -1540,15 +1557,15 @@ def process_date_cam(
     out_cfg = config.get("output", {})
     naming_template = out_cfg.get("naming", "DailyVlog_{date}_{mac}.mp4")
     sample_filepath = all_tasks[0]["filepath"] if all_tasks else None
-    from src.stages.scanner import resolve_output_filename, resolve_camera_identity
+    from src.stages.scanner import resolve_output_filename, resolve_camera_ui_name
     output_name = resolve_output_filename(naming_template, date, cam_index, sample_filepath=sample_filepath, config=config)
 
     cam_display = None
     try:
         sample_dir = str(Path(sample_filepath).parent) if sample_filepath else ""
-        cam_display, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=config)
+        cam_display = resolve_camera_ui_name(sample_dir, cam_index=cam_index, config=config)
     except Exception:
-        cam_display = None
+        cam_display = f"Cam {cam_index}"
 
     print_startup_banner(
         date=date,
@@ -1573,7 +1590,8 @@ def process_date_cam(
             companion_assets_complete(output_path, config)):
         logger.info("Verified completed output: %s", output_path)
         return True
-    orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render, dashboard_enabled=dashboard_enabled)
+    orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render,
+                                         dashboard_enabled=dashboard_enabled, cam_name=cam_display)
     try:
         with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
             batch_paths = orchestrator.run()
@@ -1582,20 +1600,21 @@ def process_date_cam(
                    worker_stats=orchestrator.render_worker_stats,
                    run_context={**run_context, "status": "cancelled"})
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
-        db.set_render_status(date, cam_index, "FAILED")
+        db.set_render_status(date, cam_index, "FAILED", error_msg=f"streaming pipeline failed: {exc}")
         return False
 
     if skip_render:
         return True
+    with orchestrator.error_lock:
+        run_errors = list(orchestrator.errors)
     if not batch_paths:
-        db.set_render_status(date, cam_index, "FAILED")
+        db.set_render_status(date, cam_index, "FAILED",
+                             error_msg="; ".join(run_errors[:3]) or "no render batches produced")
         return False
 
     # 运行期间的告警与异常汇总 (含管线内部错误)
-    with orchestrator.error_lock:
-        run_errors = list(orchestrator.errors)
     if run_errors:
         print_error_summary(run_errors)
 
@@ -1609,7 +1628,7 @@ def process_date_cam(
             "render %s cam%d has %d batch failures, aborting concat to preserve valid batches for resume: %s",
             date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
         )
-        db.set_render_status(date, cam_index, "FAILED")
+        db.set_render_status(date, cam_index, "FAILED", error_msg="; ".join(render_batch_errors[:3]))
         elapsed_wall = time.monotonic() - t_start
         _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
@@ -1629,7 +1648,11 @@ def process_date_cam(
             "render %s cam%d blocked: %d source tasks incomplete (first=%s)",
             date, cam_index, len(incomplete), incomplete[0].get("filepath"),
         )
-        db.set_render_status(date, cam_index, "FAILED")
+        first = incomplete[0]
+        db.set_render_status(date, cam_index, "FAILED", error_msg=(
+            f"{len(incomplete)} source tasks incomplete; first={first['filepath']}: "
+            f"{first.get('error_msg') or first.get('prescreen_status') or first.get('analysis_status')}"
+        ))
         elapsed_wall = time.monotonic() - t_start
         _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
@@ -1649,14 +1672,14 @@ def process_date_cam(
                     p.with_name(p.name + ".json").unlink(missing_ok=True)
             else:
                 logger.error("concat_output_files failed for %s cam%d", date, cam_index)
-                db.set_render_status(date, cam_index, "FAILED")
+                db.set_render_status(date, cam_index, "FAILED", error_msg="final batch concat failed")
                 elapsed_wall = time.monotonic() - t_start
                 _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                            worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
                 return False
-    except Exception:
+    except Exception as exc:
         logger.exception("finalize render output failed")
-        db.set_render_status(date, cam_index, "FAILED")
+        db.set_render_status(date, cam_index, "FAILED", error_msg=f"finalize render output failed: {exc}")
         return False
 
     t_concat_done = time.monotonic()
@@ -1683,7 +1706,8 @@ def process_date_cam(
     )
     if not assets_ok:
         logger.error("required companion assets failed for %s", output_path)
-        db.set_render_status(date, cam_index, "FAILED", output_file=str(output_path))
+        db.set_render_status(date, cam_index, "FAILED", output_file=str(output_path),
+                             error_msg="required companion assets failed")
         elapsed_wall = time.monotonic() - t_start
         _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
@@ -1767,8 +1791,8 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 wall_s = time.monotonic() - t0
                 tasks = db.get_all_file_tasks_for_date(date, cam_index)
                 sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else ""
-                from src.stages.scanner import resolve_camera_identity, resolve_output_filename
-                disp, _ = resolve_camera_identity(sample_dir, cam_index=cam_index, config=load_config())
+                from src.stages.scanner import resolve_camera_ui_name, resolve_output_filename
+                disp = resolve_camera_ui_name(sample_dir, cam_index=cam_index, config=load_config())
                 out_name = resolve_output_filename(
                     load_config().get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),
                     date, cam_index, tasks[0]["filepath"] if tasks else None, config=load_config()

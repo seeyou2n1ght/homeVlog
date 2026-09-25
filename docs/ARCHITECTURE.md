@@ -694,11 +694,11 @@ ACTIVE_STATES = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MI
 **架构铁律**：
 在 FFmpeg `concat=n=N:v=1:a=1` 滤镜图中，单段展示时长取 `max(video_duration, audio_duration)`。若非纯静态段后挂载 `fps` 滤镜，下游 `fps` 滤镜会依据外溢的跳跃 `eof_pts` 疯狂克隆末帧数十至数百次，导致批次实际展示时长严重超越计划时长并触发渲染丢弃。
 
-因此，所有非纯静态段必须强制执行时长硬截断：
+因此，各段视频必须按展示计划截断到整数帧：
 ```text
-tpad → fps → trim=duration={actual_display_dur:.3f} → setpts=PTS-STARTPTS
+tpad → fps → trim=end_frame={planned_frames} → setpts=PTS-STARTPTS
 ```
-对应音频必须执行 `apad → atrim` 到同一展示时长。该规则覆盖 DYNAMIC、DYNAMIC_AUDIO、STATIC、PRESENCE、NIGHT_STATIONARY、MICRO_MOTION 及单动态快路径，保证源提前 EOF 时两轨都闭合到 `compute_display_plans` 的计划时钟。
+对应音频执行 `apad → atrim=end_sample` 到同一展示时钟。摄像头可能在最后一个计划切片之前就停止出帧，使该切片的 `trim` 结果为空；逐段 `tpad` 无法从空输入克隆帧。因此还需在每个输入的缩放/抽帧之后、`split` 之前补末帧，使所有计划切片都能取得视频帧。`concat` 输出再按 `compute_display_plans()` 的总帧数和样本数闭合。源文件完全没有可解码视频帧时仍应失败，不能发布缺画面成片。
 
 ---
 

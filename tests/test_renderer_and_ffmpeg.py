@@ -145,6 +145,31 @@ def test_dynamic_eof_is_padded_to_shared_video_audio_clock(tmp_path):
         assert sum(frame.samples for frame in container.decode(audio=0)) == 12 * 48000
 
 
+def test_empty_final_static_slice_closes_shared_clock(tmp_path):
+    import av
+
+    segments = [
+        TimelineSegment("source", 0, 0.0, 8.0, "DYNAMIC", 8.0),
+        TimelineSegment("source", 0, 8.0, 8.1, "STATIC", 0.1),
+    ]
+    graph = build_concat_filter(
+        segments, [{"filepath": "source", "has_audio": 1}],
+        output_fps=20, output_width=160, output_height=90,
+        speed_ramping=False, audio_input_offset=1,
+    )
+    target = tmp_path / "empty_tail.mkv"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=20:duration=8",
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=8.1",
+        "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+        "-c:v", "ffv1", "-c:a", "pcm_s16le", str(target),
+    ], capture_output=True, timeout=30, check=True)
+    with av.open(str(target)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 162
+    with av.open(str(target)) as container:
+        assert sum(frame.samples for frame in container.decode(audio=0)) == 162 * 48000 // 20
+
+
 class TestRenderWatchdog:
     def test_multi_input_startup_gets_longer_grace(self):
         assert _startup_watchdog_timeout(8, 120.0, 600.0, 4800.0) == 600.0
@@ -218,7 +243,7 @@ class TestFiltergraphGenerationAndClosure:
         )
 
         assert "concat=n=2:v=1:a=1" in filter_str
-        assert "async=1000:first_pts=0,asetpts=N/SR/TB[a]" in filter_str
+        assert "async=1000:first_pts=0,apad,atrim=end_sample=" in filter_str
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 

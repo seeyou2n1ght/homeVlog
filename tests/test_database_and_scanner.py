@@ -75,6 +75,14 @@ class TestFilenameParsingAndScanner:
         assert disp == "Cam 3"
         assert fid == "cam3"
 
+    def test_camera_ui_name_priority(self):
+        from src.scanner import resolve_camera_ui_name
+
+        path = "XiaomiCamera_01_B888805AA3CD"
+        assert resolve_camera_ui_name(path, 0, {"cameras": {"B888805AA3CD": "育儿房"}}) == "育儿房"
+        assert resolve_camera_ui_name(path, 0, {"cameras": {}}) == "摄像头 01"
+        assert resolve_camera_ui_name("Camera_B888805AA3CD", 0, {"cameras": {}}) == "B888805AA3CD"
+
     def test_resolve_output_filename_custom_templates(self):
         from src.scanner import resolve_output_filename
         mock_cfg = {"cameras": {"B888805AA3CD": "baby_room"}}
@@ -252,6 +260,23 @@ class TestVlogDatabaseLifecycle:
             assert res["prescreen"] == 0
             tasks = db.get_all_file_tasks_for_date("20260901", 0)
             assert tasks[0]["prescreen_status"] == "FAILED"
+        finally:
+            db.close()
+
+    def test_failure_reasons_are_persisted_and_cleared(self, tmp_path):
+        db = VlogDatabase(tmp_path / "reasons.db")
+        try:
+            db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
+            db.set_prescreen_result("clip.mp4", "FAILED", error_msg="invalid media")
+            assert db.get_file_task("clip.mp4")["error_msg"] == "invalid media"
+            db.reset_failed_tasks("20260901", 0)
+            assert db.get_file_task("clip.mp4")["error_msg"] is None
+            db.set_render_status("20260901", 0, "FAILED", error_msg="batch validation failed")
+            assert db.conn.execute("SELECT error_msg FROM render_tasks").fetchone()[0] == "batch validation failed"
+            db.upsert_render_task("20260901", 0, "RENDERING")
+            assert db.conn.execute("SELECT error_msg FROM render_tasks").fetchone()[0] is None
+            db.set_render_status("20260901", 0, "COMPLETED", output_file="out.mp4")
+            assert db.conn.execute("SELECT error_msg FROM render_tasks").fetchone()[0] is None
         finally:
             db.close()
 

@@ -316,7 +316,7 @@ class TestPresenceAndMicroMotionPlans:
         assert resolved[1].state == "STATIC"
 
     def test_sparse_mixed_non_static_trim_duration_clamped(self):
-        """非纯静态段在混合稀疏或关键帧模式下必须包含 trim=duration 截断，防止 EOF PTS 泄露导致帧克隆。"""
+        """稀疏段与合成出口均按计划帧数截断，防止 EOF PTS 泄露。"""
         from src.stages.timeline import TimelineSegment, build_concat_filter
         timeline = [
             TimelineSegment("f1.mp4", 0, 0.0, 10.0, "MICRO_MOTION", 10.0),
@@ -328,8 +328,8 @@ class TestPresenceAndMicroMotionPlans:
             rows=[{"filepath": "f1.mp4", "has_audio": False}],
             sparse_mixed=True,
         )
-        # 验证 MICRO_MOTION 和 PRESENCE 支路上均注入了 trim=duration 与 setpts=PTS-STARTPTS
-        assert fc.count("trim=end_frame=") == len(timeline)
+        assert fc.count("trim=end_frame=") == len(timeline) + 1
+        assert "[v_tmp]tpad=stop_mode=clone" in fc
         assert "setpts=PTS-STARTPTS" in fc
 
 

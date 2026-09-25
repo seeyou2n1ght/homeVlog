@@ -41,6 +41,51 @@ def test_analysis_result_survives_queue_metrics(tmp_path, with_labels):
         db.close()
 
 
+def test_cancelled_analysis_keeps_task_pending(tmp_path):
+    from types import SimpleNamespace
+    from src.monitor import PerfCollector
+
+    db = VlogDatabase(tmp_path / "cancelled_analysis.db")
+    try:
+        db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000010", 10)
+        orch = StreamingOrchestrator(db, "20260901", 0, {}, render_enabled=False, dashboard_enabled=False)
+
+        def cancelled_decode(*args, **kwargs):
+            orch.abort_event.set()
+            return [], {}
+
+        detector = SimpleNamespace(analyze=cancelled_decode, decode_gpu="cpu", last_perf={}, fps=1)
+        orch._execute_analysis_task({"file_duration": 10}, "clip.mp4", 0,
+                                    detector, None, "cpu", PerfCollector(), time.monotonic())
+        assert db.get_file_task("clip.mp4")["analysis_status"] == "PENDING"
+        assert db.get_file_task("clip.mp4")["retry_count"] == 0
+        assert orch.render_batch_queue.empty()
+    finally:
+        db.close()
+
+
+def test_cancelled_prescreen_keeps_task_pending(tmp_path):
+    db = VlogDatabase(tmp_path / "cancelled_prescreen.db")
+    try:
+        db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000010", 10)
+        orch = StreamingOrchestrator(db, "20260901", 0, {}, render_enabled=False, dashboard_enabled=False)
+        orch.prescreen_queue.put({"filepath": "clip.mp4", "file_duration": 10})
+
+        def cancelled_decode(*args, **kwargs):
+            orch.abort_event.set()
+            return {"status": "FAILED", "error": "interrupted"}
+
+        with patch("src.pipeline.prescreen_file", side_effect=cancelled_decode):
+            worker = threading.Thread(target=orch._prescreen_worker)
+            worker.start()
+            worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert db.get_file_task("clip.mp4")["prescreen_status"] == "PENDING"
+        assert orch.render_batch_queue.empty()
+    finally:
+        db.close()
+
+
 def test_analysis_queue_prioritizes_short_files_when_enabled():
     q = AnalysisQueue()
     q.cost_priority = True
