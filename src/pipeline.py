@@ -278,7 +278,12 @@ class StreamingOrchestrator:
 
     def _lookahead_prefetch_worker(self):
         """后台异步 I/O Worker：超前拉取即将压制的源文件至本地 SSD，消除 GPU 串行 I/O 等待气泡。"""
+        from src.algorithms.segment import ACTIVE_STATES
         from src.stages.renderer import _stage_source_for_render
+        from src.stages.timeline import build_timeline_from_rows
+
+        stream_config = dict(self.config)
+        stream_config["presence"] = {**self.config.get("presence", {}), "enabled": False}
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self._prefetch_queue.empty()):
             try:
                 fp = self._prefetch_queue.get(timeout=0.5)
@@ -288,6 +293,15 @@ class StreamingOrchestrator:
                 self._prefetch_queue.task_done()
                 break
             try:
+                try:
+                    rows = self.db.get_all_file_tasks_for_date(self.date, self.cam_index, filepaths=[fp])
+                    timeline = build_timeline_from_rows(
+                        rows, self.date, target_files=[fp], config=stream_config, resolve_presence=False,
+                    ) if rows else []
+                except Exception:
+                    timeline = []
+                if timeline and all(segment.state in ACTIVE_STATES for segment in timeline):
+                    continue
                 _stage_source_for_render(fp, needed=lambda: self._needs_prefetch(fp))
             except Exception:
                 pass

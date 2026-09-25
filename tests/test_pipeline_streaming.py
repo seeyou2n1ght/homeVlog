@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -18,6 +19,30 @@ import pytest
 from src.database import VlogDatabase
 from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
+
+
+def test_prefetch_skips_timeline_without_static_segments(tmp_path):
+    db = VlogDatabase(tmp_path / "prefetch.db")
+    try:
+        for name in ("active.mp4", "static.mp4"):
+            db.add_file_task(name, 0, "20260901", "20260901000000", "20260901000010", 10)
+        orch = StreamingOrchestrator(db, "20260901", 0, {}, dashboard_enabled=False)
+        orch._prefetched_files.update(("active.mp4", "static.mp4"))
+        for name in ("active.mp4", "static.mp4", None):
+            orch._prefetch_queue.put(name)
+        orch.stop_event.set()
+
+        def timeline(_rows, _date, target_files, **_kwargs):
+            state = "DYNAMIC" if target_files == ["active.mp4"] else "STATIC"
+            return [SimpleNamespace(state=state)]
+
+        with patch("src.stages.timeline.build_timeline_from_rows", side_effect=timeline):
+            with patch("src.stages.renderer._stage_source_for_render") as stage:
+                orch._lookahead_prefetch_worker()
+        stage.assert_called_once()
+        assert stage.call_args.args == ("static.mp4",)
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("with_labels", [False, True])
