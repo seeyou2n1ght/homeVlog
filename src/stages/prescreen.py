@@ -3,6 +3,7 @@ import logging
 import subprocess
 import threading
 import time
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -143,15 +144,24 @@ def _prescreen_keyframes(
             concentrations: list[float] = []
             mean_lumas: list[float] = []
             k = 0
+            last_skipped_frame = None
             # 关键帧稀疏步长采样：按 max_keyframes 均匀稀疏采样（默认目标 20 帧），杜绝遍历上千关键帧
             target_samples = max(10, max_keyframes) if max_keyframes > 0 else 20
             est_keyframes = max(1, int(duration / 2.5))
             kf_step = max(1, est_keyframes // target_samples)
 
-            for frame in container.decode(stream):
-                k += 1
-                if k > 1 and (k - 1) % kf_step != 0:
-                    continue
+            # The stride can omit the last keyframe even though decode reaches EOF.
+            for frame in chain(container.decode(stream), (None,)):
+                if frame is None:
+                    if last_skipped_frame is None:
+                        break
+                    frame = last_skipped_frame
+                else:
+                    k += 1
+                    if k > 1 and (k - 1) % kf_step != 0:
+                        last_skipped_frame = frame
+                        continue
+                    last_skipped_frame = None
                 y_raw = video_frame_to_gray(frame)
                 curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_LINEAR)
                 if time.monotonic() - _t_sem > timeout:

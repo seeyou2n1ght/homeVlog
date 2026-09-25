@@ -167,6 +167,36 @@ def test_prescreen_diffuse_light_suppressed_as_static():
         assert result_data["concentration"] < 1.2
 
 
+def test_prescreen_checks_last_keyframe_skipped_by_stride():
+    first = np.full((180, 320), 100, dtype=np.uint8)
+    last = first.copy()
+    last[135:180, 240:320] = 220
+    frames = []
+    for pts, pixels in ((0, first), (5000, first), (99000, last)):
+        frame = MagicMock()
+        frame.pts = pts
+        frame.to_ndarray.return_value = pixels
+        frames.append(frame)
+
+    stream = MagicMock()
+    stream.time_base = 0.001
+    stream.duration = None
+    container = MagicMock()
+    container.duration = None
+    container.streams.video = [stream]
+    container.streams.audio = []
+    container.decode.return_value = frames
+    with patch("av.open") as mock_open:
+        mock_open.return_value.__enter__.return_value = container
+        result = _prescreen_keyframes(
+            filepath="last_keyframe.mp4", duration=100.0,
+            max_keyframes=10, threshold=8.5,
+        )
+
+    assert result["status"] == "SUSPICIOUS"
+    assert json.loads(result["result_json"])["sample_ts"] == [0.0, 99.0]
+
+
 def test_tune_thresholds_simulation_and_grid_search():
     """验证超参数寻优算法对暗光漏检和强光误报样本的正确打分与最优推荐"""
     samples = [

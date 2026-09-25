@@ -76,6 +76,8 @@ Superseded by: ADR xxxx
 | ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
 | ADR 0017 | 离线高质量编码重构与多特征迟滞动作判定 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0012, ADR 0013 |
 | ADR 0023 | 交付产物原子提交与共享媒体契约 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0013, ADR 0020, ADR 0022 |
+| ADR 0024 | 整数帧展示计划与取消结果 | Accepted | 2026-09 | Evolves ADR 0004 |
+| ADR 0025 | 预筛末关键帧覆盖 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0015 |
 
 ---
 
@@ -1365,4 +1367,14 @@ docs/PROGRESS.md
 真实复验补充：源音频可能有重叠 PTS，所有音频段按整数样本数截断，变速子段拼接后也须闭合总样本数。最终 concat 显式使用视频 duration，复制视频并对齐、重新编码音频；单纯复制音频会在批次边界产生 non-monotonic DTS。额外音频编码的成本和质量必须进入整日验收。
 
 2026-09-24 补充：若最后一个计划切片完全落在物理视频 EOF 之后，逐段 `tpad` 接收空视频，无法克隆末帧。应在每个输入完成缩放或抽帧后、分给各计划切片之前补源末帧，并在批次 `concat` 出口按共享计划的总帧数和音频样本数闭合。源视频全程不可解码仍须失败。
+
+---
+
+# ADR 0025 — Cover the Final Decoded Keyframe in Prescreen
+
+**Status:** Accepted
+**Date:** 2026-09-25
+**Evolves:** ADR 0006, ADR 0015
+
+关键帧预筛虽解码到 EOF，稀疏步长可能跳过最后关键帧，使尾部人物入镜被判 `STATIC`。负判定前补查已解码但未采样的最后关键帧，复用原有差分、阈值和空间集中度规则；不再增加相邻文件先验或更改 YOLO 色彩输入。126 个生产 `STATIC` 文件及另 60 个不同日期的 `STATIC` 文件只读对照共翻转 3 个：两段经原片和精析确认的末尾成人入镜，以及一段夜间有人驻留。已知空床光照误报保持 `STATIC`。这证明具体漏检得到修复，不等于独立人工 holdout 或整日成片耗时验收。
 

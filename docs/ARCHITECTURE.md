@@ -282,6 +282,8 @@ full multimodal analysis
 
 Prescreen 不应承担最终语义判断。
 
+关键帧负判定必须覆盖已解码的最后一个关键帧；稀疏步长不能让文件尾部未经检查就判为 `STATIC`。该检查复用现有阈值与空间集中度规则，只有可疑文件才进入完整分析。
+
 ---
 
 ## 5.1 Low-Light Noise Handling
