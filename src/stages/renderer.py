@@ -287,6 +287,8 @@ def build_compact_virtual_concat_plan(
                 end_in_file=virtual_cursor + (b - start),
                 state=seg.state,
                 duration=b - a,
+                max_energy=seg.max_energy,
+                avg_confidence=seg.avg_confidence,
             ))
         virtual_cursor += end - start
 
@@ -321,6 +323,8 @@ def build_compact_virtual_concat_plan(
                 end_in_file=local_cursor + share,
                 state=seg.state,
                 duration=share,
+                max_energy=seg.max_energy,
+                avg_confidence=seg.avg_confidence,
             ))
             local_cursor += share
         virtual_cursor += sample_duration
@@ -942,8 +946,11 @@ def concat_output_files(
     timeout: float = 300,
     faststart: bool = False,
     durations: list[float] | None = None,
+    timings: dict | None = None,
 ) -> bool:
     from src.hardware.render_cache import valid_video
+    if timings is not None:
+        timings.clear()
     if not files:
         return False
     concat_list = output.with_name(f".concat_{output.stem}.txt")
@@ -951,6 +958,7 @@ def concat_output_files(
     def _concat_path(path):
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
     try:
+        probe_started = time.monotonic()
         if durations is None:
             from concurrent.futures import ThreadPoolExecutor
 
@@ -976,6 +984,9 @@ def concat_output_files(
             with ThreadPoolExecutor(max_workers=max_w) as pool:
                 durations = list(pool.map(_probe_duration, files))
 
+        if timings is not None:
+            timings["probe_s"] = round(time.monotonic() - probe_started, 6)
+
         if len(durations) != len(files) or any(duration is None or duration <= 0 for duration in durations):
             return False
         from itertools import accumulate
@@ -994,12 +1005,23 @@ def concat_output_files(
         if faststart:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(temporary))
+        ffmpeg_started = time.monotonic()
         result = run_ffmpeg(cmd, timeout=timeout)
-        if result.returncode != 0 or not valid_video(
-            temporary, sum(durations), checkpoints=checkpoints, require_audio=True
-        ):
+        if timings is not None:
+            timings["ffmpeg_s"] = round(time.monotonic() - ffmpeg_started, 6)
+        if result.returncode != 0:
             return False
+        validation_started = time.monotonic()
+        valid = valid_video(temporary, sum(durations), checkpoints=checkpoints, require_audio=True)
+        if timings is not None:
+            timings["validation_s"] = round(time.monotonic() - validation_started, 6)
+            timings["checkpoints"] = len(checkpoints)
+        if not valid:
+            return False
+        promote_started = time.monotonic()
         temporary.replace(output)
+        if timings is not None:
+            timings["promote_s"] = round(time.monotonic() - promote_started, 6)
         return True
     finally:
         concat_list.unlink(missing_ok=True)

@@ -132,7 +132,8 @@ def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
         db.set_prescreen_result("clip.mp4", "SUSPICIOUS")
         db.set_analysis_result("clip.mp4", [Segment(0, .5, "STATIC", "clip.mp4"),
                                             Segment(0, 10, "STATIC", "clip.mp4"),
-                                            Segment(10, 20, "DYNAMIC", "clip.mp4")])
+                                            Segment(10, 20, "DYNAMIC", "clip.mp4",
+                                                    max_energy=23.4, avg_confidence=0.76)])
         before = db.get_all_file_tasks_for_date("20260901", 0)
         out = tmp_path / "day.mp4"
         out.write_bytes(b"placeholder")
@@ -144,6 +145,8 @@ def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
             sync.assert_not_called()
         meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
         assert meta["timeline_highlights"][0]["vlog_start_s"] == 1.5
+        assert meta["timeline_highlights"][0]["max_energy"] == 23.4
+        assert meta["timeline_highlights"][0]["avg_confidence"] == 0.76
         assert db.get_all_file_tasks_for_date("20260901", 0) == before
     finally:
         db.close()
@@ -547,6 +550,8 @@ class TestProcessDateCamPipeline:
             db.close()
 
     def test_qsv_failure_is_retried_by_a_live_nv_worker(self, tmp_path):
+        from src.hardware.scheduler import DualEndedBatchQueue
+
         db = VlogDatabase(tmp_path / "qsv_retry.db")
         filepath = "static.mp4"
         db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
@@ -559,13 +564,23 @@ class TestProcessDateCamPipeline:
         orch.render_batch_queue.put({"filepath": filepath, "status": "STATIC"})
         orch.stop_event.set()
         calls = []
+        qsv_attempted = threading.Event()
+
+        def wait_for_qsv(*_args, **_kwargs):
+            # NV may legitimately steal the initial static job. Hold its empty
+            # heavy-queue poll until QSV owns this test's failure injection.
+            assert qsv_attempted.wait(5), "QSV did not receive the test batch"
+            return None
 
         def render(_segments, _batch, gpu, *_args, **_kwargs):
             calls.append(gpu)
+            if gpu == "qsv":
+                qsv_attempted.set()
             return None if gpu == "qsv" else str(tmp_path / "nv_retry.mp4")
 
         try:
-            with patch("src.pipeline.build_batch_render", side_effect=render):
+            with patch("src.pipeline.build_batch_render", side_effect=render), \
+                    patch.object(DualEndedBatchQueue, "pop_heaviest", side_effect=wait_for_qsv):
                 orch._render_manager()
             assert calls == ["qsv", "nv"]
             assert [batch for batch, _ in orch.batch_paths] == [0]

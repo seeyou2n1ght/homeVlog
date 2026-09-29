@@ -9,6 +9,28 @@ from src.filters import SpatialGridMotionFilter
 from src.detector import MotionDetector
 
 
+def test_worker_total_does_not_double_count_render_children():
+    from scripts.analyze_perf import primary_worker_time
+
+    summary = {stage: {"total": value} for stage, value in {
+        "prescreen": 2, "analysis": 10, "render": 20, "final_concat": 3,
+        "render_enc": 18, "render_stage": 5,
+    }.items()}
+    assert primary_worker_time(summary) == 35
+    assert primary_worker_time({"render_enc": {"total": 18}}) == 0
+
+
+def test_decoder_comparison_rejects_missing_or_different_frames():
+    from scripts.compare_analysis_decoders import compare_frames
+
+    frame = np.zeros((4, 4), dtype=np.uint8)
+    assert compare_frames([frame, frame], [frame, frame])["equivalent"]
+    assert not compare_frames([frame, frame], [frame])["equivalent"]
+    assert not compare_frames([frame], [frame + 1])["equivalent"]
+    assert not compare_frames([frame], [frame[:2]])["equivalent"]
+    assert not compare_frames([], [])["equivalent"]
+
+
 def test_perf_log_json_schema_validity(tmp_path):
     import json
     from src.monitor import PerfCollector, PerfRecord

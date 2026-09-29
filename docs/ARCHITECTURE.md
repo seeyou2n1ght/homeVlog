@@ -561,6 +561,8 @@ Timeline 不负责重新分析视频内容。
 
 ## 10.1 Display Plan as Single Source of Truth
 
+`TimelineSegment` 保留分析侧的 `max_energy` 与 `avg_confidence`，供高光元数据消费；它们不参与展示时钟或滤镜选择。裁剪后合并相邻同状态段时，能量取最大值，置信度按保留区间时长加权。人工审核产生的状态不应伪造模型置信度。
+
 展示计划显式接收输出帧率，每段目标向上量化到整数帧。视频 `trim=end_frame` 与音频目标同钟；字幕、高光、批次校验均传入相同 fps。每段最多增加不足一帧的尾部展示时间，避免音视频 concat 按较长轨道推进产生未计入计划的累积偏差。
 
 音频按目标样本数 `atrim=end_sample` 闭合，不能仅按源 PTS 时长截断后重排时间戳，否则摄像机重叠 PTS 会留下多余样本。最终 ffconcat 使用每批视频 duration；视频保持 stream copy，音频重新对齐 PTS 后编码，避免 AAC 延迟/尾部填充制造视频接缝空洞与音频 DTS 回退。
@@ -1065,7 +1067,9 @@ Preset / tier 等枚举配置必须具有明确的代码消费逻辑。
 - **Worker Time**：所有 Worker 实际工作时长的累计值，用于定位各子系统 CPU/GPU 算力开销与负载分布。
 - **Wall-clock Time**：用户从任务启动到成片交付实际等待的真实壁钟时间，是端到端优化的终极衡量依据。
 
-两者的比值直接体现硬件流水线与异构 Worker 的并行度。
+性能报告仅将 `prescreen`、`analysis`、`render`、`final_concat` 四个主阶段相加。`render_enc` 是渲染内部的 FFmpeg 链路，`render_stage` 暂存可发生在后台或渲染调用内，均单列而不再叠加进主阶段总工时。主阶段工时/壁钟只描述任务重叠，不是硬件利用率。
+
+`decode_time` 包含管道读取、同步逐帧运动计算及候选帧处理，不能当作纯解码时间；`render_enc` 包含解码、滤镜和编码。`final_concat.extra` 分别记录 `probe_s`、`ffmpeg_s`、`validation_s`、`promote_s`；FFmpeg 项包含音频对齐重编码和封装写盘，不可再与父阶段重复累计。
 
 ---
 
@@ -1099,8 +1103,8 @@ HomeVlog 的性能调优与资源限额锚定在标准生产硬件拓扑：
 
 1. **GA104 单 NVDEC 引擎的并发硬顶**：
    RTX 3060Ti 仅具备 1 个物理 NVDEC ASIC。在 2 NVENC 编码并发前提下，分析阶段分配的 NVDEC 解码器数量上限必须限制在 `max_nv_decoders: 2`，防止 5 个进程时间片竞争导致动态批次解码饥饿。
-2. **Intel UHD 770 异构窃取的算力边界**：
-   QSV 动态窃取上限收敛为 `max_qsv_dynamic_duration_s: 180.0s`。对于超过 180s 的重动态批次，QSV 编码倍率跌破 1.8x，必须留由 NVENC 独显处理。
+2. **Intel UHD 770 异构窃取准入**：
+   当前配置 `max_qsv_dynamic_duration_s: 420.0`，收尾满足条件时可放宽至 1.5 倍。它是调度策略，不能解释为硬件物理边界；常速动态时长尚未覆盖夜间快进等状态的解码成本。调整前须固定识别输入与展示计划验证整日收益。
 3. **异步前瞻预分期 (Lookahead Pre-staging)**：
    后台预读取线程在分析阶段将后续素材提前分期至本地 SSD，彻底消除 GPU 渲染线程在 SMB 慢速网络上的串行 I/O 阻塞。
 

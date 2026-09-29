@@ -29,6 +29,8 @@ class TimelineSegment:
     end_in_file: float
     state: str
     duration: float
+    max_energy: float = 0.0
+    avg_confidence: float = 0.0
 
 
 @dataclass
@@ -602,6 +604,13 @@ def normalize_file_timeline(timeline):
             and normalized[-1].state == seg.state
             and abs(normalized[-1].end_in_file - start) <= 1e-3
         ):
+            previous = normalized[-1]
+            weight = previous.duration + seg.duration
+            previous.avg_confidence = (
+                previous.avg_confidence * previous.duration
+                + seg.avg_confidence * seg.duration
+            ) / weight
+            previous.max_energy = max(previous.max_energy, seg.max_energy)
             normalized[-1].end_in_file = end
             normalized[-1].duration = normalized[-1].end_in_file - normalized[-1].start_in_file
         else:
@@ -761,6 +770,8 @@ def build_timeline_from_rows(
             end_in_file=end_in_file,
             state=s.state,
             duration=end_in_file - start_in_file,
+            max_energy=s.max_energy,
+            avg_confidence=s.avg_confidence,
         ))
 
     return normalize_file_timeline(timeline) if not resolve_presence else timeline

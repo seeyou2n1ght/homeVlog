@@ -29,8 +29,14 @@ def _fmt_s(v: float) -> str:
     return f"{v:.1f}s" if v < 120 else f"{v/60:.1f}min"
 
 
+def primary_worker_time(summary: dict) -> float:
+    """Sum parent stages only; render_enc and staging are not additive parents."""
+    return sum(summary.get(stage, {}).get("total", 0.0)
+               for stage in ("prescreen", "analysis", "render", "final_concat"))
+
+
 def analyze_file(path: Path, top_n: int) -> None:
-    d = json.load(open(path, encoding="utf-8"))
+    d = json.loads(path.read_text(encoding="utf-8-sig"))
     date = d.get("date", "?")
     wall = d.get("pipeline_duration", 0)
     headline = d.get("headline") or {}
@@ -64,9 +70,10 @@ def analyze_file(path: Path, top_n: int) -> None:
     )
 
     # 累计工时与并发度
-    total_worker_time = sum(s.get("total", 0.0) for s in summary.values())
+    total_worker_time = primary_worker_time(summary)
     concurrency_x = total_worker_time / max(wall, 0.1)
-    print(f"   ⏱ 工时汇总: 累计工时 {_fmt_s(total_worker_time)}  │  端到端壁钟 {_fmt_s(wall)}  │  并发重叠系数 {concurrency_x:.2f}x")
+    print(f"   ⏱ 工时汇总: 主阶段累计工时 {_fmt_s(total_worker_time)}  │  端到端壁钟 {_fmt_s(wall)}  │  主阶段工时/壁钟 {concurrency_x:.2f}x")
+    print("   口径: 仅累计 prescreen/analysis/render/final_concat；render_enc、render_stage 单列，不重复相加。比值不是硬件利用率。")
 
     # 分阶段统计 (注: 累计工时为各 Worker 并发总时长，由于多路并行，该和值大于端到端壁钟总耗时)
     print(f"   {'阶段 (Stage)':<16} {'数量(n)':>6} {'累计工时(Worker)':>16} {'均值(avg)':>10} {'P95':>10} {'最大(max)':>10}")
@@ -90,8 +97,8 @@ def analyze_file(path: Path, top_n: int) -> None:
         total_yolo = sum(yolo_durs)
         total_ovh = sum(overheads)
         print(
-            f"   分析工时拆解: 解码 {_fmt_s(total_dec)} (均 {statistics.mean(dec):.1f}s)"
-            f" │ 运动检测 {_fmt_s(total_mot)} (均 {statistics.mean(mot):.2f}s)"
+            f"   分析工时拆解: 解码及同步逐帧处理 {_fmt_s(total_dec)} (均 {statistics.mean(dec):.1f}s)"
+            f" │ 解码后分析 {_fmt_s(total_mot)} (均 {statistics.mean(mot):.2f}s)"
             f" │ YOLO验证 {_fmt_s(total_yolo)} (均 {statistics.mean(yolo_durs):.2f}s)"
             f" │ 拓扑/归档/DB {_fmt_s(total_ovh)}"
         )
@@ -150,11 +157,19 @@ def analyze_file(path: Path, top_n: int) -> None:
     if enc:
         speeds = [r["extra"]["encode_speed_x"] for r in enc]
         print(
-            f"   渲染编码: speed 均值 {statistics.mean(speeds):.2f}x"
+            f"   渲染 FFmpeg 链路 (解码/滤镜/编码): speed 均值 {statistics.mean(speeds):.2f}x"
             f"  最低 {min(speeds):.2f}x  最高 {max(speeds):.2f}x"
         )
 
     # 信号量等待汇总（饥饿探测）
+    for record in records:
+        if record.get("stage") == "final_concat":
+            phases = record.get("extra", {})
+            measured = {key: _fmt_s(phases[key]) for key in
+                        ("probe_s", "ffmpeg_s", "validation_s", "promote_s") if key in phases}
+            if measured:
+                print(f"   最终拼接分项: {measured}；FFmpeg 含音频重编码与封装，不是纯复制。")
+
     sem = {}
     for r in records:
         w = (r.get("extra") or {}).get("sem_wait")
@@ -194,7 +209,7 @@ def analyze_file(path: Path, top_n: int) -> None:
     if ana:
         total_dec = sum(r["extra"].get("decode_time_s", r["extra"].get("decode_time", 0)) for r in ana)
         if total_dec > total_worker_time * 0.40:
-            rca.append(f"视频解码占总工时 {total_dec/total_worker_time*100:.1f}%，是分析阶段最大物理开销。")
+            rca.append(f"解码及同步逐帧处理占主阶段工时 {total_dec/total_worker_time*100:.1f}%；不能据此区分纯解码、I/O 和运动计算成本。")
 
     if rca:
         print("   🔍 瓶颈自动研判 (Bottleneck RCA):")

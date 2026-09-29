@@ -1674,12 +1674,13 @@ def process_date_cam(
 
     db.upsert_render_task(date, cam_index, "RENDERING")
     concat_t0 = time.monotonic()
+    concat_timings = {}
     try:
         if len(batch_paths) == 1:
             batch_paths[0].replace(output_path)
             ok = True
         else:
-            ok = concat_output_files(batch_paths, output_path)
+            ok = concat_output_files(batch_paths, output_path, timings=concat_timings)
             if ok:
                 for p in batch_paths:
                     p.unlink(missing_ok=True)
@@ -1700,7 +1701,7 @@ def process_date_cam(
     get_perf().add(PerfRecord(
         stage="final_concat", file=output_path.name, gpu="cpu",
         duration=round(t_concat_done - concat_t0, 3),
-        extra={"batch_count": len(batch_paths)},
+        extra={"batch_count": len(batch_paths), **concat_timings},
         start_time=round(concat_t0, 3),
         end_time=round(t_concat_done, 3),
         worker="concat",

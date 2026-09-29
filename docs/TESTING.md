@@ -117,3 +117,7 @@ HomeVlog 基于多模态融合（空间集中度预筛选 + EMA 运动差分 + A
 常规套件必须覆盖：无音轨和时长不符拒绝、接缝内部 PTS 缺口、尾部解码、limited-range YUV 规范灰度、实际媒体时长验证标记、空分析原子替换、所有状态 EOF 音视频同钟、伴随资产提交、审核任务级取消、API 同源令牌及硬件并发配置约束。真实 FFmpeg 回归包括：8 秒源按 12 秒动态计划输出 240 帧视频和 576,000 个 48kHz 音频采样；最终静态切片在物理视频 EOF 后仍按 8.1 秒计划输出 162 帧与 388,800 个音频采样。
 
 整日交付仍需另行验证全片逐帧解码、目标播放器、字幕/元数据同钟、人工人物事件 holdout，以及同数据库、timeline、编码与硬件的 wall-clock A/B。
+
+### 分析解码路径等价性
+
+`uv run python scripts/compare_analysis_decoders.py SOURCE --report scratch/decoder_comparison.json` 以 QSV/CUDA/CUDA/QSV 顺序调用生产解码路径，比较完整灰度帧和固定时段条件下的运动标签。同设备重放用于排除自身漂移；帧数、形状、像素或标签不等价返回 2，未完整解码为错误。支持多个源文件和显式 `--reference`/`--candidate`。报告不含音频、YOLO 或人工 holdout，不能用来量化召回率，也不能把顺序单文件耗时当作整日提速。

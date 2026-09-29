@@ -505,7 +505,11 @@ class TestConcatOutputFiles:
 
         expected_hashes = [h for clip in clips for _, h in video(clip)]
         output = tmp_path / "joined.mp4"
-        assert concat_output_files(clips, output)
+        timings = {"stale": 1}
+        assert concat_output_files(clips, output, timings=timings)
+        assert set(timings) == {"probe_s", "ffmpeg_s", "validation_s", "checkpoints", "promote_s"}
+        assert timings["checkpoints"] == 1
+        assert all(timings[key] >= 0 for key in ("probe_s", "ffmpeg_s", "validation_s", "promote_s"))
         frames = video(output)
         assert [h for _, h in frames] == expected_hashes
         assert len(frames) == 80
@@ -536,6 +540,17 @@ class TestConcatOutputFiles:
         assert out.read_bytes() == b"previous"
         assert batch.read_bytes() == b"batch"
         assert not out.with_name("out.tmp.mp4").exists()
+
+    def test_timeline_normalization_preserves_clipped_confidence_and_peak(self):
+        segments = [
+            TimelineSegment("clip.mp4", 0, 0, 4, "DYNAMIC", 4, 10, 0.2),
+            TimelineSegment("clip.mp4", 0, 2, 10, "DYNAMIC", 8, 30, 0.8),
+        ]
+        actual = _normalize_file_timeline(segments)
+        assert len(actual) == 1
+        assert actual[0].duration == 10
+        assert actual[0].max_energy == 30
+        assert actual[0].avg_confidence == pytest.approx(0.56)
 
     def test_consumed_prefetch_does_not_recopy_source(self, tmp_path, monkeypatch):
         from src.renderer import _stage_source_for_render
