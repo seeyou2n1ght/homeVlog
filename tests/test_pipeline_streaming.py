@@ -588,6 +588,35 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
+    def test_nv_transient_failure_is_retried_by_live_nv_worker(self, tmp_path):
+        db = VlogDatabase(tmp_path / "nv_retry.db")
+        filepath = "heavy.mp4"
+        db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result(filepath, "STATIC")
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv"},
+            "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False},
+        }
+        orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+        orch.render_batch_queue.put({"filepath": filepath, "status": "STATIC"})
+        orch.stop_event.set()
+        calls = []
+
+        def render(_segments, _batch, gpu, *_args, **_kwargs):
+            calls.append(gpu)
+            if len(calls) == 1:
+                return None  # First attempt fails transiently
+            return str(tmp_path / "nv_success.mp4")
+
+        try:
+            with patch("src.pipeline.build_batch_render", side_effect=render):
+                orch._render_manager()
+            assert calls == ["nv", "nv"]
+            assert [batch for batch, _ in orch.batch_paths] == [0]
+            assert not orch.errors
+        finally:
+            db.close()
+
 
 def test_prescreen_audio_gate_disabled_by_default(tmp_path):
     db = VlogDatabase(db_path=tmp_path / "audio_gate.db")

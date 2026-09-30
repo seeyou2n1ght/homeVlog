@@ -891,6 +891,7 @@ class StreamingOrchestrator:
         heavy_queue = DualEndedBatchQueue()
         light_queue = queue.Queue()
         nv_retry_queue = queue.Queue()
+        batch_retries: dict[int, int] = {}
         all_dispatched_event = threading.Event()
         render_start_t: list[float] = []
         # 已进入终态（失败已上报 / 空时间轴跳过）的批次集合，用于收尾对账去重
@@ -1200,6 +1201,19 @@ class StreamingOrchestrator:
                                 nv_retry_queue.put((b_idx, files_to_batch))
                                 continue
 
+                            can_retry = False
+                            with self.batch_lock:
+                                if batch_retries.get(b_idx, 0) < 1:
+                                    batch_retries[b_idx] = batch_retries.get(b_idx, 0) + 1
+                                    can_retry = True
+                            if can_retry:
+                                logger.warning(
+                                    "render batch %d returned no output on %s; queued for retry (attempt 1/1)",
+                                    b_idx, gpu,
+                                )
+                                nv_retry_queue.put((b_idx, files_to_batch))
+                                continue
+
                             self._add_error(f"render batch {b_idx} returned no output")
                             with self.batch_lock:
                                 terminal_batch_ids.add(b_idx)
@@ -1209,6 +1223,27 @@ class StreamingOrchestrator:
                         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                             break
                         logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
+                        if gpu == "qsv" and render_hw_policy == "heterogeneous":
+                            logger.warning(
+                                "render batch %d crashed on qsv; queued for nv retry",
+                                b_idx,
+                            )
+                            nv_retry_queue.put((b_idx, files_to_batch))
+                            continue
+
+                        can_retry = False
+                        with self.batch_lock:
+                            if batch_retries.get(b_idx, 0) < 1:
+                                batch_retries[b_idx] = batch_retries.get(b_idx, 0) + 1
+                                can_retry = True
+                        if can_retry:
+                            logger.warning(
+                                "render batch %d crashed on %s; queued for retry (attempt 1/1)",
+                                b_idx, gpu,
+                            )
+                            nv_retry_queue.put((b_idx, files_to_batch))
+                            continue
+
                         self._add_error(f"render batch {b_idx} failed on {gpu}")
                         with self.batch_lock:
                             terminal_batch_ids.add(b_idx)

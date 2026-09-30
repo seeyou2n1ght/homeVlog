@@ -156,8 +156,8 @@ def scan_directory(
             stat = entry.stat()
             age_min = (time.time() - stat.st_mtime) / 60.0
 
-            # 如果启用了 skip_today，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
-            if not skip_today:
+            # 如果启用了 skip_today 或 freeze_minutes <= 0，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
+            if not skip_today and freeze_minutes > 0:
                 if age_min < freeze_minutes:
                     total_frozen += 1
                     continue

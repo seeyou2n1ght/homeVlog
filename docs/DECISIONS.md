@@ -79,6 +79,7 @@ Superseded by: ADR xxxx
 | ADR 0024 | 整数帧展示计划与取消结果 | Accepted | 2026-09 | Evolves ADR 0004 |
 | ADR 0025 | 预筛末关键帧覆盖 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0015 |
 | ADR 0026 | 交付元数据保留分析证据 | Accepted | 2026-09 | Evolves ADR 0023 |
+| ADR 0027 | 看门狗配置语义闭环与 NVENC 瞬态重试兜底 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008, ADR 0011, ADR 0023 |
 
 ---
 
@@ -1389,4 +1390,41 @@ docs/PROGRESS.md
 数据库中的置信度和能量在转换为 `TimelineSegment` 时丢失，使伴随元数据将所有高光字段默认为零。时间轴现携带这两个证据字段，虚拟 EDL 映射也予以保留；相邻同状态区间合并时取最大能量和按保留时长加权的置信度。字段仅用于交付解释，不改变分类、展示计划、编码或人工审核优先级。缺少模型分数仍保留零，不根据人工确认状态伪造分数。
 
 既有成片元数据回填必须先备份并逐条验证高光数量、状态、源文件和展示起止时间不变，确认媒体身份未变化后再原子替换；不重跑识别，不写生产数据库。
+
+---
+
+# ADR 0027 — Watchdog Timeout Configuration Semantics and NVENC Transient Retry Fallback
+
+**Status:** Accepted  
+**Date:** 2026-09-30  
+**Evolves:** ADR 0004, ADR 0008, ADR 0011, ADR 0023  
+
+## Context
+
+在全量连续生产批处理场景（如 `20260320` 真实全天素材）中，暴露了流水线超时预算与调度容错的重大脆弱点：
+
+1. **配置语义被下层计算覆盖失效**：
+   `config/settings.yaml` 显式设置的 `startup_inactivity_timeout_s: 600.0` 在旧代码中被单文件批次公式 `per_input_budget = 90.0s` 强行覆盖，再叠加上稳态下限逻辑后，启动看门狗被硬编码钳位在 120s。
+2. **冷启动与网络抖动导致单点崩溃**：
+   流水线刚启动时，前两个批次（文件物理跨度 >3200s）同时由 2 路 NVENC 直接读取 NAS，恰逢主线程 PyTorch YOLO 加载 CUDA 模型初始化，发生驱动与 SMB 握手竞争，在 120.6s 时因无数据产出被看门狗作为超时强行终止。
+3. **缺乏 NVENC 级别的退避重试兜底**：
+   调度器中仅 QSV 失败批次具备退避回退至 `nv_retry_queue` 的保护，NV 批次若发生瞬态抖动超时则直接报错，导致耗时 24 小时的整日拼接因单个单点失败被完全拦截，违背 ADR 0004 事务恢复与 AGENTS.md 弹性容错原则。
+4. **素材冻结时间边界抖动**：
+   扫描器入库时，素材冻结判定对 `age_min < freeze_minutes` 缺乏 `freeze_minutes > 0` 前置条件保护。在 Windows NTFS 高精度时钟微秒抖动下偶发出现 `age_min < 0`，被错误当成“未脱水冻结中”而漏扫入库。
+
+## Decision
+
+1. **看门狗配置真实语义恢复**：
+   重构 `_startup_watchdog_timeout`，以配置声明的 `startup_inactivity_timeout_s` 作为基线预算，多输入批次在配置基线上按 `per_input_budget` 增量叠加，确保配置声明的 600s 启动预算真正具有运行时语义。
+2. **NVENC 瞬态失败有限退避重试**：
+   在 `_render_dispatcher` 中引入批次级 `batch_retries` 计数器。NVENC 批次首次发生非优雅异常退出时，记录警告日志并重新放回 `nv_retry_queue`，在活跃 NV 工人空闲时进行至多 1 次退避重试；仅在重试再次失败时才作为终端硬故障中断流水线。
+3. **扫描器零冻结判定防御**：
+   在 `src/stages/scanner.py` 中增加 `freeze_minutes > 0` 前置判定，确保零冻结时间配置下任何新产生或微秒抖动素材均立即入库，根除间歇性漏扫。
+
+## Consequences
+
+- `20260320` 故障成功自愈，秒级复用 140 个既有批次并自愈修复 Batch 4/Batch 6，全日成片通过 141 个接缝切片关键帧探测校验顺利交付（4,736.93 MB，时长 246分28秒）；
+- 全量 290 项自动化测试全部通过，杜绝了 NAS 抖动与 CUDA 冷启动导致的长流程单点崩溃；
+- 保持了事务化批次不可篡改与端到端时间轴闭环的核心架构不变量。
+
 

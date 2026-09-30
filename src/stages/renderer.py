@@ -50,11 +50,16 @@ def _startup_watchdog_timeout(
     configured_timeout: float,
     render_timeout: float,
 ) -> float:
-    """Bounded startup grace for serial NAS input/container discovery."""
-    per_input_budget = max(60.0, max(1, input_count) * 90.0)
+    """Bounded startup grace for serial NAS input/container discovery.
+
+    Guarantees:
+    - Never weaker than steady_timeout (inactivity_timeout_s).
+    - Respects configured startup_inactivity_timeout_s as the startup grace budget.
+    - Never exceeds configured_timeout or render_timeout.
+    """
     return max(
         steady_timeout,
-        min(render_timeout, configured_timeout, per_input_budget),
+        min(render_timeout, configured_timeout),
     )
 
 

@@ -181,6 +181,9 @@ class TestRenderWatchdog:
     def test_startup_grace_never_weaker_than_steady_state(self):
         assert _startup_watchdog_timeout(1, 120.0, 30.0, 3600.0) == 120.0
 
+    def test_single_input_startup_respects_configured_timeout(self):
+        assert _startup_watchdog_timeout(1, 120.0, 600.0, 3600.0) == 600.0
+
 
 class TestFFmpegProcessRegistry:
     """测试 FFmpeg 进程追踪与清理守护机制。"""
