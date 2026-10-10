@@ -57,10 +57,10 @@
       <!-- 队列筛选胶囊 -->
       <div class="queue-filter-bar">
         <button class="filter-chip active" data-category="gold_candidates" id="chip-gold">
-          🌟 黄金精选 <span class="chip-count" id="count-gold">0</span>
+          🌟 黄金 <span class="chip-count" id="count-gold">0</span>
         </button>
         <button class="filter-chip" data-category="all" id="chip-all">
-          全部待审 <span class="chip-count" id="count-all">0</span>
+          全部 <span class="chip-count" id="count-all">0</span>
         </button>
         <button class="filter-chip" data-category="reviewed" id="chip-reviewed">
           已审 <span class="chip-count" id="count-reviewed">0</span>
@@ -96,15 +96,22 @@
 
       <!-- 核心微视频/动态视窗 (占据绝大部分视口) -->
       <div class="stage-canvas-box" id="stage-canvas-box">
+        <!-- 空状态占位 (无切片或初始未选中时展示) -->
+        <div class="stage-empty-placeholder" id="stage-empty-placeholder">
+          <div class="empty-icon">📺</div>
+          <div class="empty-title">等待选择待审切片</div>
+          <div class="empty-hint font-mono">按 <kbd>J</kbd> / <kbd>K</kbd> 切换切片 • 按 <kbd>1</kbd> / <kbd>2</kbd> 极速盲打</div>
+        </div>
+
         <!-- 主循环预览 (WebP/高清动态) -->
-        <img id="main-player-img" class="main-player" alt="Video Player" />
+        <img id="main-player-img" class="main-player hidden" alt="Video Player" />
         <div class="player-loading-spinner hidden" id="player-spinner">
           <div class="spinner-ring"></div>
           <span class="spinner-tip">正在载入动态画面...</span>
         </div>
 
         <!-- 悬停指示徽标 -->
-        <div class="hero-hover-badge font-mono" id="hero-badge">DYNAMIC LOOP</div>
+        <div class="hero-hover-badge font-mono hidden" id="hero-badge">DYNAMIC LOOP</div>
       </div>
 
       <!-- 底部三联微缩帧对比卡 (轻量高度 64px) -->
@@ -133,34 +140,36 @@
       <button class="btn-clear-sm" id="btn-clear" title="快捷键 U">↩ 撤销打标 (U)</button>
     </div>
 
-    <!-- 核心两键/四键极简打标卡组 -->
+    <!-- 核心两键/四键极简打标卡组 (原位内嵌自适应，不遮挡上方三联帧) -->
     <div class="footer-decisions">
-      <button class="decision-pill btn-keep" id="btn-action-keep" data-action="keep">
-        <span class="key-kbd">1</span>
-        <div class="action-texts">
-          <span class="action-main">有效动态 (Keep)</span>
-          <span class="action-sub font-mono" id="sub-keep-desc">维持原速 • 保留高光</span>
-        </div>
-      </button>
+      <div class="two-keys-group" id="two-keys-group">
+        <button class="decision-pill btn-keep" id="btn-action-keep" data-action="keep">
+          <span class="key-kbd">1</span>
+          <div class="action-texts">
+            <span class="action-main">有效动态 (Keep)</span>
+            <span class="action-sub font-mono" id="sub-keep-desc">维持原速 • 保留高光</span>
+          </div>
+        </button>
 
-      <button class="decision-pill btn-drop" id="btn-action-drop" data-action="drop">
-        <span class="key-kbd">2</span>
-        <div class="action-texts">
-          <span class="action-main">静态 / 误报 (Drop)</span>
-          <span class="action-sub font-mono" id="sub-drop-desc">快进掠过 • 标记背景</span>
-        </div>
-      </button>
+        <button class="decision-pill btn-drop" id="btn-action-drop" data-action="drop">
+          <span class="key-kbd">2</span>
+          <div class="action-texts">
+            <span class="action-main">静态 / 误报 (Drop)</span>
+            <span class="action-sub font-mono" id="sub-drop-desc">快进掠过 • 标记背景</span>
+          </div>
+        </button>
+      </div>
+
+      <!-- 四键原位平滑内联展开 (取代两键位置，杜绝遮挡) -->
+      <div class="quad-keys-group hidden" id="quad-keys-drawer">
+        <button class="btn-quad btn-quad-tp" id="btn-quad-tp" data-label="CONFIRMED_MOTION"><kbd>1</kbd> TP 有效动态</button>
+        <button class="btn-quad btn-quad-fp" id="btn-quad-fp" data-label="FALSE_ALARM"><kbd>2</kbd> FP 光影误报</button>
+        <button class="btn-quad btn-quad-fn" id="btn-quad-fn" data-label="MISSED_MOTION"><kbd>3</kbd> FN 漏报微动</button>
+        <button class="btn-quad btn-quad-tn" id="btn-quad-tn" data-label="CONFIRMED_STATIC"><kbd>4</kbd> TN 纯静止</button>
+      </div>
 
       <!-- 展开四键专业模式开关 -->
       <button class="btn-mode-toggle" id="btn-toggle-4keys" title="展开细粒度 TP/FP/FN/TN 四分类">四键模式 ▾</button>
-    </div>
-
-    <!-- 四键展开弹层 (默认隐藏) -->
-    <div class="quad-keys-drawer hidden" id="quad-keys-drawer">
-      <button class="btn-quad btn-quad-tp" id="btn-quad-tp" data-label="CONFIRMED_MOTION"><kbd>1</kbd> TP 有效动态</button>
-      <button class="btn-quad btn-quad-fp" id="btn-quad-fp" data-label="FALSE_ALARM"><kbd>2</kbd> FP 光影误报</button>
-      <button class="btn-quad btn-quad-fn" id="btn-quad-fn" data-label="MISSED_MOTION"><kbd>3</kbd> FN 漏报微动</button>
-      <button class="btn-quad btn-quad-tn" id="btn-quad-tn" data-label="CONFIRMED_STATIC"><kbd>4</kbd> TN 纯静止</button>
     </div>
 
     <div class="footer-right">

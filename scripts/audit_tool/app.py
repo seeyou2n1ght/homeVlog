@@ -23,7 +23,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # 引入项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -496,7 +496,7 @@ def main():
 
     port = find_free_port(args.port)
     server_addr = ("127.0.0.1", port)
-    httpd = HTTPServer(server_addr, AuditHandler)
+    httpd = ThreadingHTTPServer(server_addr, AuditHandler)
     url = f"http://127.0.0.1:{port}"
 
     print("=" * 60)

@@ -65,13 +65,17 @@ function initEventListeners() {
   const btnClear = document.getElementById('btn-clear');
   if (btnClear) btnClear.addEventListener('click', clearCurrentReview);
 
-  // 四键模式抽屉开关
+  // 四键模式开关 (原位平滑内嵌切换，两键与四键互斥，杜绝向上遮挡)
   const btnToggle4 = document.getElementById('btn-toggle-4keys');
   const drawer4 = document.getElementById('quad-keys-drawer');
+  const twoKeysGroup = document.getElementById('two-keys-group');
   if (btnToggle4 && drawer4) {
     btnToggle4.addEventListener('click', () => {
       state.fourKeysMode = !state.fourKeysMode;
       drawer4.classList.toggle('hidden', !state.fourKeysMode);
+      if (twoKeysGroup) {
+        twoKeysGroup.classList.toggle('hidden', state.fourKeysMode);
+      }
       btnToggle4.innerText = state.fourKeysMode ? '收起四键 ▴' : '四键模式 ▾';
     });
   }
@@ -124,6 +128,19 @@ function initEventListeners() {
     btnApplyCfg.addEventListener('click', applyTuningConfig);
   }
 
+  // 仿真输入回车监听
+  ['sim-input-energy', 'sim-input-dur', 'sim-input-yolo'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          runTuningSimulation();
+        }
+      });
+    }
+  });
+
   // 视频播放模态框
   const btnClosePlayer = document.getElementById('btn-close-player');
   const modalPlayer = document.getElementById('modal-player');
@@ -134,6 +151,20 @@ function initEventListeners() {
       if (videoEl) videoEl.pause();
     });
   }
+
+  // 模态框遮罩点击关闭 (惯性交互)
+  [modalWhatif, modalPlayer].forEach(modal => {
+    if (modal) {
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+          modal.classList.add('hidden');
+          if (modal === modalPlayer && videoEl) {
+            videoEl.pause();
+          }
+        }
+      });
+    }
+  });
 
   // 重新浓缩成片
   const btnRerender = document.getElementById('btn-open-rerender');
@@ -146,6 +177,24 @@ function initEventListeners() {
 }
 
 function handleKeydown(e) {
+  // ESC 键优先关闭打开的模态框
+  if (e.key === 'Escape') {
+    const modalWhatif = document.getElementById('modal-whatif');
+    if (modalWhatif && !modalWhatif.classList.contains('hidden')) {
+      e.preventDefault();
+      modalWhatif.classList.add('hidden');
+      return;
+    }
+    const modalPlayer = document.getElementById('modal-player');
+    if (modalPlayer && !modalPlayer.classList.contains('hidden')) {
+      e.preventDefault();
+      modalPlayer.classList.add('hidden');
+      const videoEl = document.getElementById('vlog-video-el');
+      if (videoEl) videoEl.pause();
+      return;
+    }
+  }
+
   // 如果在输入框内打字，不拦截按键
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -199,14 +248,43 @@ async function loadQueue() {
     applyFilterAndRender();
 
     // 默认定位到第一个未复核的切片
-    const firstUnreviewed = state.filteredItems.findIndex(it => !it.manual_label);
-    selectItem(firstUnreviewed >= 0 ? firstUnreviewed : 0);
+    if (state.filteredItems.length > 0) {
+      const firstUnreviewed = state.filteredItems.findIndex(it => !it.manual_label);
+      selectItem(firstUnreviewed >= 0 ? firstUnreviewed : 0);
+    } else {
+      showEmptyPlaceholder();
+    }
   } catch (err) {
     console.error('Load queue failed:', err);
     if (container) {
       container.innerHTML = '<div style="padding: 20px; text-align: center; color: #f43f5e; font-size: 12px;">⚠️ 加载切片队列失败</div>';
     }
+    showEmptyPlaceholder();
   }
+}
+
+function showEmptyPlaceholder() {
+  state.selectedIndex = -1;
+  const placeholder = document.getElementById('stage-empty-placeholder');
+  if (placeholder) placeholder.classList.remove('hidden');
+  const playerImg = document.getElementById('main-player-img');
+  if (playerImg) {
+    playerImg.src = '';
+    playerImg.classList.add('hidden');
+  }
+  const heroBadge = document.getElementById('hero-badge');
+  if (heroBadge) heroBadge.classList.add('hidden');
+  ['start', 'mid', 'end'].forEach(pos => {
+    const im = document.getElementById(`img-thumb-${pos}`);
+    if (im) im.removeAttribute('src');
+  });
+  setElementText('seg-id-badge', '#--');
+  setElementText('seg-state-badge', 'STATE');
+  setElementText('seg-time-range', '00:00:00 ~ 00:00:00');
+  setElementText('seg-dur-badge', '0.0s');
+  setElementText('seg-reason-badge', '--');
+  const clusterTag = document.getElementById('seg-cluster-badge');
+  if (clusterTag) clusterTag.classList.add('hidden');
 }
 
 function switchCategory(cat) {
@@ -261,6 +339,9 @@ function applyFilterAndRender() {
   state.filteredItems = list;
   renderQueueList();
   updateBatchProgressBar();
+  if (state.filteredItems.length === 0) {
+    showEmptyPlaceholder();
+  }
 }
 
 function renderQueueList() {
@@ -373,6 +454,9 @@ function selectNext(direction) {
 }
 
 function loadVisualsForSegment(item) {
+  const placeholder = document.getElementById('stage-empty-placeholder');
+  if (placeholder) placeholder.classList.add('hidden');
+
   const fp = item.filepath;
   const st = item.start_time;
   const et = item.end_time;
@@ -382,7 +466,10 @@ function loadVisualsForSegment(item) {
   const spinner = document.getElementById('player-spinner');
   const heroBadge = document.getElementById('hero-badge');
 
-  if (heroBadge) heroBadge.innerText = 'PEAK FRAME';
+  if (heroBadge) {
+    heroBadge.innerText = 'PEAK FRAME';
+    heroBadge.classList.remove('hidden');
+  }
 
   // 1. 优先加载峰值静态帧，确保 0ms 瞬间有画面
   const peakUrl = `/api/frame?filepath=${encodeURIComponent(fp)}&t=${mid.toFixed(3)}&w=800`;
@@ -403,10 +490,16 @@ function loadVisualsForSegment(item) {
   const clipLoader = new Image();
   clipLoader.onload = () => {
     // 仅在当前选中的切片依然是此切片时才替换
-    if (state.selectedIndex >= 0 && state.filteredItems[state.selectedIndex].id === item.id) {
-      if (playerImg) playerImg.src = clipUrl;
+    if (state.selectedIndex >= 0 && state.filteredItems[state.selectedIndex]?.id === item.id) {
+      if (playerImg) {
+        playerImg.src = clipUrl;
+        playerImg.classList.remove('hidden');
+      }
       if (spinner) spinner.classList.add('hidden');
-      if (heroBadge) heroBadge.innerText = 'DYNAMIC LOOP (10fps)';
+      if (heroBadge) {
+        heroBadge.innerText = 'DYNAMIC LOOP (10fps)';
+        heroBadge.classList.remove('hidden');
+      }
     }
   };
   clipLoader.onerror = () => {

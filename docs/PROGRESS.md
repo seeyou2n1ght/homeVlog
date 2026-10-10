@@ -20,7 +20,8 @@
 - 人工标注三位一体闭环 (Triad Human-in-the-Loop Architecture, ADR 0038)：
   1. 基准测试集：实现 `src.core.benchmark`，支持版本化快照归档与增量合并；`tests/test_accuracy_baseline.py` 升级场景分层（`ADULT_MOTION` 召回率、`EMPTY_ROOM` 纯静止过滤、`LIGHT_SHADOW` 误报抑制）质量门禁；
   2. 重渲染驱动闭环：时间轴严格遵循 `human_label` 一票否决权，工作台新增流式视频播放端点 (`/api/video_stream`，HTTP 206 Partial Content) 与重渲染后即时成片自适应预览视窗；
-  3. 调优仿真与配置落地：实现 `src.core.tuner.TuningSimulator` 离线推演候选参数对 F1-Score 与场景误报/漏报的净收益；提供结构化 Diff、自动时间戳备份与原子安全写回/回滚接口与工作台面板。
+  3. 调优仿真与配置落地：实现 `src.core.tuner.TuningSimulator` 离线推演候选参数对 F1-Score 与场景误报/漏报的净收益；提供结构化 Diff、自动时间戳备份与原子安全写回/回滚接口与工作台面板；
+  4. 工作台人机工效与多线程并发升级：`scripts/audit_tool/app.py` 升级为 `ThreadingHTTPServer`，消除微视频流/抽帧与 API 互斥；重构四键模式为原位内嵌无缝平移（In-place Toggle），彻底消除上方微缩帧视窗遮挡碰撞（保持 20px 安全净距）；增加空状态占位与破损图隐蔽防护；通过 Chrome CDP 原生无头浏览器实机测试验证（Zero-Scroll 100vh 单屏、盲打心流、Esc 模态框交互闭环）。
 
 ## 当前验证
 
