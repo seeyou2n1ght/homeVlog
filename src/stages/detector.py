@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import logging
 import os
 import subprocess
@@ -31,7 +32,61 @@ __all__ = [
     "MotionDetector",
     "_median_filter",
     "_smooth_labels",
+    "DecodeStreamDecision",
+    "evaluate_stream_completion",
 ]
+
+
+@dataclass(frozen=True)
+class DecodeStreamDecision:
+    complete: bool
+    truncated: bool
+    corrupted_tail: bool
+    reason: str
+
+
+def evaluate_stream_completion(
+    total_frames: int,
+    file_duration: float,
+    effective_fps: float,
+    is_aborted: bool = False,
+    is_interrupted: bool = False,
+    returncode: int | None = 0,
+    has_tail_error: bool = False,
+    min_expected_ratio: float = 0.85,
+) -> DecodeStreamDecision:
+    """统一评估管道流 (Pipe) 与内存解码 (PyAV) 的流完整性与截断判定策略。
+
+    不可变纯函数，杜绝双轨解码器的判定门限不同步。
+    """
+    if is_aborted or is_interrupted:
+        return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="INTERRUPTED")
+
+    if total_frames < 2:
+        return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="INSUFFICIENT_FRAMES")
+
+    min_expected_frames = max(1, int(file_duration * effective_fps * min_expected_ratio))
+    full_expected_frames = max(1, file_duration * effective_fps - 2)
+
+    is_complete = bool(
+        (returncode == 0)
+        or (total_frames >= min_expected_frames)
+        or (total_frames >= full_expected_frames)
+        or has_tail_error
+    )
+
+    if not is_complete:
+        return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="PROCESS_ERROR")
+
+    is_truncated = bool(total_frames < min_expected_frames)
+    reason = "CORRUPTED_TAIL" if has_tail_error else ("TRUNCATED_EOF" if is_truncated else "NORMAL_COMPLETION")
+    return DecodeStreamDecision(
+        complete=True,
+        truncated=is_truncated,
+        corrupted_tail=has_tail_error,
+        reason=reason,
+    )
+
 
 logger = logging.getLogger("homevlog")
 
@@ -543,15 +598,17 @@ class MotionDetector:
                     logger.warning("pipe decode stderr for %s: %s", Path(filepath).name, err_tail.strip())
             io_sem.release()
 
-            min_expected_frames = max(1, int(file_duration * effective_fps * 0.85))
-            is_complete = bool(
-                not is_aborted and total_frames >= 2 and (
-                    (proc and proc.returncode == 0) or
-                    total_frames >= min_expected_frames or
-                    total_frames >= max(1, file_duration * effective_fps - 2)
-                )
+            decision = evaluate_stream_completion(
+                total_frames=total_frames,
+                file_duration=file_duration,
+                effective_fps=effective_fps,
+                is_aborted=is_aborted,
+                is_interrupted=FFmpegProcessRegistry.is_interrupted(),
+                returncode=proc.returncode if proc else -1,
+                has_tail_error=False,
             )
-            is_truncated = bool(is_complete and total_frames < min_expected_frames)
+            is_complete = decision.complete
+            is_truncated = decision.truncated
             if is_truncated:
                 logger.info(
                     "Pipe decode for %s reached early EOF cleanly: container declared %.1fs, physical stream has %d frames (%.1fs)",
@@ -817,8 +874,17 @@ class MotionDetector:
 
         full_audio = audio_features
 
-        min_expected_frames = max(1, int(file_duration * effective_fps * 0.85))
-        meta_truncated = bool(decode_complete and total_frames < min_expected_frames)
+        decision = evaluate_stream_completion(
+            total_frames=total_frames,
+            file_duration=file_duration,
+            effective_fps=effective_fps,
+            is_aborted=False,
+            is_interrupted=FFmpegProcessRegistry.is_interrupted(),
+            returncode=0 if decode_complete else -1,
+            has_tail_error=meta_corrupted_tail,
+        )
+        decode_complete = decision.complete
+        meta_truncated = decision.truncated
         meta = {
             "has_audio": has_audio,
             "effective_fps": effective_fps,

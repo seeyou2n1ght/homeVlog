@@ -40,6 +40,7 @@ class Segment:
     avg_confidence: float = 0.0
     needs_review: bool = False
     review_reason: str = ""
+    is_human_reviewed: bool = False
 
     @property
     def duration(self) -> float:
@@ -384,6 +385,10 @@ def _filter_short(
         i = 0
         while i < len(segments):
             dur = segments[i].end_time - segments[i].start_time
+            if segments[i].is_human_reviewed:
+                # 人工审核绝对优先 (AGENTS.md 铁律): 人工标注切片拥有最高豁免权，严禁被平滑算法吸收吞噬！
+                i += 1
+                continue
             is_dynamic = segments[i].state in ("DYNAMIC", "DYNAMIC_AUDIO")
             if is_dynamic and has_uncertain_yolo_evidence(segments[i]):
                 # Smoothing must not erase a conservative fallback before the
@@ -518,6 +523,7 @@ def segments_from_json(json_str: str) -> list[Segment]:
                 avg_confidence=d.get("avg_confidence", 0.0),
                 needs_review=bool(d.get("needs_review", False)),
                 review_reason=str(d.get("review_reason", "")),
+                is_human_reviewed=bool(d.get("is_human_reviewed", False)),
             )
             for d in data
             if isinstance(d, dict) and "start_time" in d and "end_time" in d and "state" in d

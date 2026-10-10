@@ -151,6 +151,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="规划预览模式：仅统计待处理素材与阶段计划，不启动实际转码",
     )
+    group_pipeline.add_argument(
+        "--skip-corrupt",
+        action="store_true",
+        help="当遇到不可读或损坏原片时安全降级跳过，允许继续该日剩余正常素材的浓缩交付",
+    )
 
     # 3. 状态速查与系统诊断
     group_diag = parser.add_argument_group("📊 状态速查与诊断 (Status & Diagnostics)")

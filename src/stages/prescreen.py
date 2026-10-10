@@ -355,7 +355,7 @@ def prescreen_file(
 ) -> dict:
     """按需逐帧提取 + 即时早停 diff: 只要发现一次动静即终止提取，极速抛弃。"""
     det_cfg = config.get("detection", {})
-    mode = det_cfg.get("prescreen_mode", "legacy_seek")
+    mode = det_cfg.get("prescreen_mode", "keyframes")
     segments = det_cfg.get("prescreen_segments", 5)
     width, height = parse_res(
         det_cfg.get("prescreen_resolution", "320x180")

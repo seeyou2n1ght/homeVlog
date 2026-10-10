@@ -5,8 +5,10 @@ import logging
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
+import time
+
 from src.core.config import DB_PATH
-from src.core.identity import camera_key
+from src.core.identity import camera_key, ts_to_unix
 
 logger = logging.getLogger("homevlog")
 
@@ -199,15 +201,52 @@ class VlogDatabase:
     def set_file_metadata(self, filepath: str, has_audio: int, duration: float | None = None):
         with self._lock:
             try:
+                new_end_time = None
+                if duration is not None and duration > 0:
+                    row = self.conn.execute(
+                        "SELECT file_start_time FROM file_tasks WHERE filepath=?",
+                        (str(filepath),)
+                    ).fetchone()
+                    if row and row["file_start_time"]:
+                        try:
+                            start_unix = ts_to_unix(row["file_start_time"])
+                            end_unix = start_unix + float(duration)
+                            new_end_time = time.strftime("%Y%m%d%H%M%S", time.localtime(end_unix))
+                        except Exception as e:
+                            logger.debug("Failed to calculate new file_end_time for %s: %s", filepath, e)
+
                 self.conn.execute(
-                    """UPDATE file_tasks SET has_audio=?, file_duration=COALESCE(?,file_duration),
-                       duration_verified=CASE WHEN ? IS NULL THEN duration_verified ELSE 1 END
+                    """UPDATE file_tasks
+                       SET has_audio=?,
+                           file_duration=COALESCE(?, file_duration),
+                           file_end_time=COALESCE(?, file_end_time),
+                           duration_verified=CASE WHEN ? IS NULL THEN duration_verified ELSE 1 END
                        WHERE filepath=?""",
-                    (has_audio, duration, duration, str(filepath))
+                    (has_audio, duration, new_end_time, duration, str(filepath))
                 )
                 self.conn.commit()
             except Exception as e:
                 logger.error("DB error in set_file_metadata: %s", e)
+                self.conn.rollback()
+                raise
+
+    def exclude_file_task(self, filepath: str, reason: str = "MANUAL_EXCLUDED") -> bool:
+        """显式受控排除异常或损坏的原片，更新其为终态 SKIPPED_EXCLUDED，避免阻断全日交付。"""
+        with self._lock:
+            try:
+                cur = self.conn.execute(
+                    """UPDATE file_tasks
+                       SET prescreen_status='SKIPPED_EXCLUDED',
+                           analysis_status='SKIPPED_EXCLUDED',
+                           error_msg=?,
+                           updated_at=datetime('now', 'localtime')
+                       WHERE filepath=?""",
+                    (reason, str(filepath)),
+                )
+                self.conn.commit()
+                return cur.rowcount > 0
+            except Exception as e:
+                logger.error("DB error in exclude_file_task for %s: %s", filepath, e)
                 self.conn.rollback()
                 raise
 

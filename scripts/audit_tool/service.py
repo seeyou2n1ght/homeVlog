@@ -78,6 +78,10 @@ class AuditService:
             ).fetchone()
         return row is not None
 
+    def exclude_file(self, filepath: str, reason: str = "MANUAL_EXCLUDED") -> bool:
+        """从工作台手动排除坏片/无需处理的原片"""
+        return self.db.exclude_file_task(filepath, reason=reason)
+
     def get_overview(self) -> dict[str, Any]:
         """获取全局质量与审核统计大屏数据，严格依据预测状态与人工真值交叉构建混淆矩阵。"""
         with self.db._lock:

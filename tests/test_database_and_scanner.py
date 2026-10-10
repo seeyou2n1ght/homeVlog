@@ -321,15 +321,24 @@ class TestVlogDatabaseLifecycle:
             db.set_render_status("20260901", 0, "COMPLETED", output_file="DailyVlog_20260901_cam0.mp4")
             assert db.is_render_completed("20260901", 0)
 
-            # 5. 音频元数据更新
+            # 5. 音频元数据更新与截断时空同步
             db.set_file_metadata(filepath, has_audio=1)
             all_tasks = db.get_all_file_tasks_for_date("20260901", 0)
             assert all_tasks[0]["has_audio"] == 1
             assert all_tasks[0]["duration_verified"] == 0
-            db.set_file_metadata(filepath, has_audio=1, duration=299.5)
+            # 模拟截断流校准: 300s -> 58.0s，file_end_time 必须从 100500 精准同步为 100058
+            db.set_file_metadata(filepath, has_audio=1, duration=58.0)
             all_tasks = db.get_all_file_tasks_for_date("20260901", 0)
-            assert all_tasks[0]["file_duration"] == 299.5
+            assert all_tasks[0]["file_duration"] == 58.0
+            assert all_tasks[0]["file_end_time"] == "20260901100058"
             assert all_tasks[0]["duration_verified"] == 1
+
+            # 6. 异常坏片受控排除
+            assert db.exclude_file_task(filepath, reason="CORRUPTED_PHYSICAL_MEDIA")
+            all_tasks = db.get_all_file_tasks_for_date("20260901", 0)
+            assert all_tasks[0]["prescreen_status"] == "SKIPPED_EXCLUDED"
+            assert all_tasks[0]["analysis_status"] == "SKIPPED_EXCLUDED"
+            assert "CORRUPTED" in all_tasks[0]["error_msg"]
 
         finally:
             db.close()

@@ -739,3 +739,19 @@ def test_audit_api_benchmark_and_tuning_integration(tmp_path):
         for p in VERSIONS_DIR.glob("*2.0_test*"):
             p.unlink(missing_ok=True)
 
+
+def test_audit_service_exclude_file(tmp_path):
+    db_path = tmp_path / "test_exclude.db"
+    db = VlogDatabase(db_path=db_path)
+    service = AuditService(db=db)
+    fp = "corrupted_video.mp4"
+    db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+    assert service.is_registered_filepath(fp)
+    ok = service.exclude_file(fp, reason="PHYSICAL_CORRUPT")
+    assert ok
+    task = db.get_all_file_tasks_for_date("20260901", 0)[0]
+    assert task["prescreen_status"] == "SKIPPED_EXCLUDED"
+    assert task["analysis_status"] == "SKIPPED_EXCLUDED"
+    assert task["error_msg"] == "PHYSICAL_CORRUPT"
+
+

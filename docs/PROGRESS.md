@@ -25,12 +25,14 @@
 
 ## 当前验证
 
-- 2026-10-11 生产运行日志复核及修复：
-  1. 修复截断/尾部损坏原片虚标时长导致误判丢帧（20260610 cam0/cam1、20260704 cam0）：`_decode_file_pipe` 与 `_decode_file_pyav` 支持干净提前 EOF 及尾部错误容错（`total_frames >= 2`），保留已解码有效帧并校准真实物理时长 `file_duration_detected`，消除了误判清空导致的 `analysis produced no labels`；
-  2. 修复初筛对截断原片越界抽帧失败（`Could not open encoder before EOF`）及损坏尾部：安全降级为 `SUSPICIOUS` 移交精析，避免初筛 FAILED 阻塞全日交付；
-  3. 修复渲染 Worker 感知外部中断时的信号量虚假告警：显式感知 `FFmpegProcessRegistry.is_interrupted()`，消除虚假 `io semaphore acquire timeout`；
-  4. 生产媒体实测验证：20260610 cam0 (6/6 100%)、20260610 cam1 (4/4 100%)、20260704 cam0 (24/24 100%) 真实 NAS 媒体全量初筛与精析顺利完成并持久化正确时长。
-- 全量 468 项测试通过、6 项默认跳过；Ruff 代码风格与语法编译检查 100% 通过。
+- 2026-10-11 全面工程审计与健壮性加固 (Auditing & Hardening Delivery)：
+  1. 不可逆损坏原片受控跳过与对账放行：新增 `--skip-corrupt` 命令行参数与 `recovery.skip_corrupt` 配置，支持在人工确认或策略授权下将 0 帧/致命损坏废片标记为 `SKIPPED_EXCLUDED` 或 `SKIPPED_CORRUPT`，在 companion manifest 中如实记录缺失区间，解除坏片对全日交付的死锁阻断；工作台新增 `/api/exclude_file` API；
+  2. 截断视频时空元数据精准同步：在 `set_file_metadata` 校准真实物理时长时，联动更新 `file_end_time = file_start_time + file_duration`，彻底消除时间轴与外部分析元数据跨度脱节；
+  3. 双轨解码器流判定策略收敛：抽取不可变纯函数 `evaluate_stream_completion`，统一 `_decode_file_pipe` 与 `_decode_file_pyav` 的流完成度与截断 EOF 判定策略，杜绝双轨不同步维护陷阱；
+  4. 初筛模式收敛与性能优化：代码内核默认统一切至 `keyframes`（单进程多帧快速抽取），降低进程启停开销与越界异常；
+  5. 人工标注切片平滑豁免权（Immunity Flag）：`Segment` 数据结构显式支持 `is_human_reviewed`，在 `_filter_short` 时序滤波中获得最高豁免保护，严防微小人工真值动作被算法意外吞噬；
+  6. Web 工作台 NAS 远端流式体验优化：`/api/video_stream` 分块读取缓冲区从 256KB 扩充至 1MB，降低高延迟 SMB 网络的 I/O 往返频次。
+- 全量 478 项测试通过（472 passed, 6 skipped，耗时 74s，0 failure）；Ruff 代码风格检查与 compileall 编译检查 100% 通过。
 
 - 本轮在隔离SQLite和临时资产上验证审核撤销、范围筛选、失败传播、资产回滚和批次保留；真实软件媒体覆盖源边界、整数帧、音频时钟、字幕及manifest。准确测试数量见TESTING当前基线。
 - 2026-10-08先前的拼接恢复记录：20260715 cam1、20260718 cam1复用162/151批恢复交付，完整音视频软件解码及全部接缝/尾窗通过；原始并行打开EOF根因未复现。该记录是本轮之前的生产证据，详见BENCHMARK。

@@ -256,10 +256,13 @@ def save_vlog_companion_assets(
             "version": "1.0",
             "skipped_sources": [
                 {"source_file": Path(row["filepath"]).name,
-                 "reason": "empty_file", "size_bytes": 0,
+                 "reason": "empty_file" if row.get("prescreen_status") == "SKIPPED_EMPTY" else (row.get("error_msg") or "excluded_source"),
+                 "size_bytes": 0,
                  "source_start": row["file_start_time"], "source_end": row["file_end_time"],
                  "nominal_duration_s": row.get("file_duration")}
-                for row in rows if row.get("prescreen_status") == "SKIPPED_EMPTY"
+                for row in rows
+                if row.get("prescreen_status") in ("SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
+                or row.get("analysis_status") in ("SKIPPED_EXCLUDED", "SKIPPED_CORRUPT")
             ],
             "date": date,
             "camera": {

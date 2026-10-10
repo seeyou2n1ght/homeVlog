@@ -60,6 +60,8 @@ def main():
         reset_semaphores()
 
     config = load_config()
+    if getattr(args, "skip_corrupt", False):
+        config.setdefault("recovery", {})["skip_corrupt"] = True
     log_path = next((h.baseFilename for h in logger.handlers
                      if getattr(h, "homevlog_role", None) == "run"), "logs/runs")
     console.print(f"HomeVlog 已初始化，运行日志: {log_path}", markup=False)
@@ -244,6 +246,7 @@ def main():
                         skip_render=skip_render,
                         dashboard_enabled=dashboard_enabled,
                         force_render=getattr(args, "force_render", False),
+                        config=config,
                     )
                     wall_s = time.monotonic() - t0
                     if ok:
@@ -282,7 +285,7 @@ def main():
 
         # 8. 全量常规批处理 (run_pipeline)
         result = run_pipeline(skip_render=skip_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled,
-                              force_render=args.force_render)
+                              force_render=args.force_render, config=config)
         console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}, 已交付跳过={result.get('skipped', 0)}, 未处理={result.get('remaining', 0)}")
         if result.get("stopped_reason"):
             console.print(f"[yellow]流水线提前停止: {result['stopped_reason']}[/yellow]")

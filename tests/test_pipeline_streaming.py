@@ -1073,6 +1073,22 @@ def test_delivery_rejects_unavailable_source_reconciliation(delivery_workspace, 
     assert w.pipeline._dump_perf.call_args.kwargs["run_context"]["error"] == "source task reconciliation unavailable"
 
 
+@pytest.mark.parametrize("status", ["SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"])
+def test_delivery_accepts_controlled_skipped_sources(delivery_workspace, monkeypatch, status):
+    w = delivery_workspace
+    corrupt_fp = str(w.batches[0])
+    if status == "SKIPPED_EXCLUDED":
+        w.db.exclude_file_task(corrupt_fp, reason="manual_test_exclusion")
+    else:
+        w.db.set_analysis_result(corrupt_fp, "SKIPPED_CORRUPT", "", error_msg="unreadable_stream")
+    for b in w.batches[1:]:
+        w.db.set_prescreen_result(str(b), "SUSPICIOUS")
+        w.db.set_analysis_result(str(b), "ANALYZED", "[]")
+    w.orch.run.return_value = w.batches[1:]
+    ok = w.pipeline.process_date_cam(w.db, "20260901", 0, dashboard_enabled=False)
+    assert ok
+
+
 @pytest.mark.parametrize("count", [1, 2])
 def test_real_software_delivery_commits_media_subtitles_and_manifest(tmp_path, monkeypatch, count):
     import av

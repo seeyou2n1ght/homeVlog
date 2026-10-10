@@ -98,7 +98,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 with open(file_path, "rb") as f:
-                    while chunk := f.read(256 * 1024):
+                    while chunk := f.read(1024 * 1024):
                         self.wfile.write(chunk)
             except (ConnectionResetError, BrokenPipeError):
                 pass
@@ -129,7 +129,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 f.seek(start)
                 remaining = chunk_len
                 while remaining > 0:
-                    read_bytes = min(remaining, 256 * 1024)
+                    read_bytes = min(remaining, 1024 * 1024)
                     data = f.read(read_bytes)
                     if not data:
                         break
@@ -475,6 +475,16 @@ class AuditHandler(BaseHTTPRequestHandler):
             force = bool(payload.get("force", False))
             res = service.batch_archive_all(force=force)
             self._send_json(res)
+            return
+
+        elif path == "/api/exclude_file":
+            fp = payload.get("filepath", "")
+            reason = payload.get("reason", "MANUAL_EXCLUDED")
+            if not fp or not service.is_registered_filepath(fp):
+                self._send_json({"error": "Invalid or unregistered filepath"}, status=400)
+                return
+            ok = service.exclude_file(fp, reason=reason)
+            self._send_json({"success": ok})
             return
 
         self.send_error(404, "Endpoint not found")

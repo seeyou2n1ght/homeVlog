@@ -570,10 +570,13 @@ def _parse_row_segments(row: dict, default_offset: float) -> tuple[list[Segment]
         for s_rec in row["segments"]:
             # 人工审核绝对优先 (AGENTS.md 铁律): human_label 严格高于 algo_status
             manual = str(s_rec.get("manual_label") or s_rec.get("human_label") or "").strip().upper()
+            is_human = False
             if manual in ("CONFIRMED_MOTION", "MISSED_MOTION", "VERIFIED_MOTION", "FN", "TP", "DYNAMIC"):
                 eff_state = "DYNAMIC"
+                is_human = True
             elif manual in ("FALSE_ALARM", "CONFIRMED_STATIC", "FP", "TN", "STATIC"):
                 eff_state = "STATIC"
+                is_human = True
             else:
                 eff_state = s_rec.get("state", "STATIC")
 
@@ -585,6 +588,7 @@ def _parse_row_segments(row: dict, default_offset: float) -> tuple[list[Segment]
                 file_start_offset=float(s_rec.get("file_start_offset", default_offset)),
                 max_energy=float(s_rec.get("max_energy", 0.0) or 0.0),
                 avg_confidence=float(s_rec.get("avg_confidence", 0.0) or 0.0),
+                is_human_reviewed=is_human,
             ))
         return segs, True
     if row.get("analysis_segments"):
@@ -638,7 +642,11 @@ def build_timeline_from_rows(
     """
     基于给定的数据库任务行集合构建时间轴片段，支持按 target_files 精准局部过滤。
     """
-    rows = [row for row in rows if row.get("prescreen_status") != "SKIPPED_EMPTY"]
+    rows = [
+        row for row in rows
+        if row.get("prescreen_status") not in ("SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
+        and row.get("analysis_status") not in ("SKIPPED_EXCLUDED", "SKIPPED_CORRUPT")
+    ]
     if config is None:
         config = load_config()
 

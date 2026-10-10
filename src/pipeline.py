@@ -720,8 +720,18 @@ class StreamingOrchestrator:
                 if decode_frames < 2
                 else "analysis produced no labels"
             )
-            self.db.set_analysis_result(filepath, "FAILED", "", error_msg=err_msg)
-            self._add_error(f"{err_msg}: {Path(filepath).name}")
+            skip_corrupt = bool(self.config.get("recovery", {}).get("skip_corrupt", False))
+            if skip_corrupt and decode_frames < 2:
+                logger.warning(
+                    "Source %s has unreadable stream (%d frames); safely degraded/skipped by skip_corrupt policy",
+                    Path(filepath).name, decode_frames,
+                )
+                self.db.set_analysis_result(filepath, "SKIPPED_CORRUPT", "", error_msg=err_msg)
+                queue_status = "SKIPPED_CORRUPT"
+            else:
+                self.db.set_analysis_result(filepath, "FAILED", "", error_msg=err_msg)
+                self._add_error(f"{err_msg}: {Path(filepath).name}")
+                queue_status = "FAILED"
             t_ana_fail = time.monotonic()
             perf.add(
                 PerfRecord(
@@ -730,7 +740,7 @@ class StreamingOrchestrator:
                     gpu=gpu,
                     duration=round(t_ana_fail - t0, 3),
                     extra={
-                        "status": "NO_LABELS",
+                        "status": "CORRUPT_SKIPPED" if queue_status == "SKIPPED_CORRUPT" else "NO_LABELS",
                         "analysis_queue_wait_s": round(analysis_queue_wait, 3),
                     },
                     start_time=round(t0, 3),
@@ -739,7 +749,7 @@ class StreamingOrchestrator:
                 )
             )
             self.render_batch_queue.put(
-                {"filepath": filepath, "status": "FAILED"}
+                {"filepath": filepath, "status": queue_status}
             )
 
         if self.dashboard is not None:
@@ -1394,16 +1404,16 @@ class StreamingOrchestrator:
                     # immutable chronological ordinal is the batch id, so a
                     # later-ready file can render immediately while final
                     # concat remains deterministic after sorting by id.
-                    if status not in ("FAILED", "SKIPPED_EMPTY") and filepath not in dispatched_files:
+                    if status not in ("FAILED", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT") and filepath not in dispatched_files:
                         _enqueue_batch(order_index[filepath], [filepath])
                         dispatched_files.add(filepath)
                 elif filepath in ordered_set:
                     ready_status[filepath] = status
-                elif status not in ("FAILED", "SKIPPED_EMPTY"):
+                elif status not in ("FAILED", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"):
                     pending_files.append(filepath)
                 while head < len(ordered_files) and ordered_files[head] in ready_status:
                     fp_head = ordered_files[head]
-                    if ready_status[fp_head] not in ("FAILED", "SKIPPED_EMPTY"):
+                    if ready_status[fp_head] not in ("FAILED", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"):
                         pending_files.append(fp_head)
                     head += 1
                 while len(pending_files) >= self.batch_max_files:
@@ -1619,7 +1629,7 @@ def _reconcile_empty_files(db: VlogDatabase, date: str, cam_index: int) -> None:
 def process_date_cam(
     db: VlogDatabase, date: str, cam_index: int,
     skip_render: bool = False, dashboard_enabled: bool = True,
-    force_render: bool = False,
+    force_render: bool = False, config: dict | None = None,
 ) -> bool:
     # Completion records survive moving delivered assets to offline storage.
     # Check before fingerprint invalidation so configuration changes cannot
@@ -1632,7 +1642,8 @@ def process_date_cam(
             logger.warning("%s cam%d 已交付，但有 %d 个待处理素材（可能为新增素材）；"
                            "本次不自动重做，请使用 --force-render 纳入成片", date, cam_index, pending)
         return True
-    config = load_config()
+    if config is None:
+        config = load_config()
     monitor = get_monitor()
     t_start = time.monotonic()
     # 失败任务自愈：将历史 FAILED 预筛/分析重置为 PENDING（retry_count 上限防护），
@@ -1735,9 +1746,9 @@ def process_date_cam(
         return fail("source task reconciliation unavailable")
     incomplete = [
         row for row in task_rows
-        if row.get("prescreen_status") not in ("STATIC", "SUSPICIOUS", "SKIPPED_EMPTY")
+        if row.get("prescreen_status") not in ("STATIC", "SUSPICIOUS", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
         or (row.get("prescreen_status") == "SUSPICIOUS"
-            and row.get("analysis_status") != "ANALYZED")
+            and row.get("analysis_status") not in ("ANALYZED", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"))
     ]
     if skip_render:
         if run_errors or incomplete:
@@ -1891,7 +1902,7 @@ def process_date_cam(
 
 
 def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True,
-                 force_render: bool = False) -> dict:
+                 force_render: bool = False, config: dict | None = None) -> dict:
     from src.core.utils import cleanup_temp_artifacts
     logger.info("准备临时工作目录和任务数据库…", extra={"startup_progress": True})
     cleanup_temp_artifacts()
@@ -1928,7 +1939,7 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
             success = False
             try:
                 if process_date_cam(db, date, cam_index, skip_render=skip_render,
-                                    dashboard_enabled=dashboard_enabled, force_render=force_render):
+                                    dashboard_enabled=dashboard_enabled, force_render=force_render, config=config):
                     if already_completed:
                         skipped += 1
                     else:

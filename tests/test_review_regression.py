@@ -584,3 +584,21 @@ def test_static_audio_gate_keeps_audio_events_conservative(monkeypatch):
     monkeypatch.setattr("src.detector.MotionDetector", FakeDetector)
     events, _ = detect_audio_activity("ignored", 2, cfg)
     assert events
+
+
+def test_human_reviewed_segment_immune_to_short_smoothing():
+    from src.algorithms.segment import _filter_short, Segment
+    segs = [
+        Segment(start_time=0.0, end_time=100.0, state="STATIC", source_file="f.mp4"),
+        Segment(start_time=100.0, end_time=101.5, state="DYNAMIC", source_file="f.mp4", is_human_reviewed=True),
+        Segment(start_time=101.5, end_time=200.0, state="STATIC", source_file="f.mp4"),
+    ]
+    # min_motion 设定为 3.0 秒，原本 1.5s 的微小动态段会被吞噬。
+    # 但因其带有 is_human_reviewed=True 豁免标记，必须 100% 独立保留！
+    res = _filter_short(segs, min_motion=3.0, min_static=10.0)
+    assert len(res) == 3
+    assert res[1].state == "DYNAMIC"
+    assert res[1].start_time == 100.0
+    assert res[1].end_time == 101.5
+    assert res[1].is_human_reviewed is True
+
