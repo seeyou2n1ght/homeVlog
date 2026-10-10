@@ -735,3 +735,7 @@ def test_audit_api_benchmark_and_tuning_integration(tmp_path):
         server.shutdown()
         server.server_close()
         db.close()
+        from src.core.benchmark import VERSIONS_DIR
+        for p in VERSIONS_DIR.glob("*2.0_test*"):
+            p.unlink(missing_ok=True)
+
