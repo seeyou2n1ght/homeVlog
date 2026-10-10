@@ -11,12 +11,16 @@ from pathlib import Path
 from src.core.config import TEMP_DIR
 from src.hardware.scheduler import acquire_with_retry, VideoLease
 from src.hardware.ffmpeg import run_ffmpeg, get_duration, FFmpegProcessRegistry
-from src.stages.timeline import build_concat_filter, compute_display_plans, normalize_file_timeline as _normalize_file_timeline
+from src.stages.timeline import build_concat_filter, compute_display_plans, display_plan_options, normalize_file_timeline as _normalize_file_timeline
 from src.hardware.monitor import get_perf, PerfRecord
 
 from src.algorithms.segment import ACTIVE_STATES
 
 logger = logging.getLogger("homevlog")
+
+
+class RenderInterrupted(InterruptedError):
+    """A render subprocess received a conclusive external interruption."""
 
 _FFMPEG_PROGRESS_RE = re.compile(
 
@@ -579,21 +583,9 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     # 识别批次内纯静态文件（没有任何动态段），在解复用阶段跳过所有非关键帧解码
     files_with_dynamic = {s.filepath for s in batch_copy if s.state in ACTIVE_STATES}
     pure_static_files = {f for f in files if f not in files_with_dynamic}
-    presence_cfg = cfg.get("presence", {})
-    micro_cfg = cfg.get("micro_motion", {})
-
     expected_duration = sum(d for d, _ in compute_display_plans(
         batch_copy,
-        static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
-        keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
-        min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
-        max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
-        speed_ramping=render_cfg.get("speed_ramping_enabled", True),
-        ramp_duration_s=render_cfg.get("ramp_duration_s", 1.0),
-        presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
-        night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-        micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
-        output_fps=float(out_cfg.get("fps", 20)),
+        **display_plan_options(cfg, segment_config=seg_cfg, output_config=out_cfg),
     ))
     # Match decoder skipping to the same long-static predicate used by the filter graph.
     interval = seg_cfg.get("static_keyframe_interval", 30.0)
@@ -656,7 +648,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
 def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0, pure_static_files=None, expected_duration=None, input_args=None, fingerprint_salt="", prepare_input=None) -> str | None:
     output_path = Path(output_path)
     if FFmpegProcessRegistry.is_interrupted():
-        logger.info("batch-render cam%d batch%d terminated by signal (Ctrl+C)", cam_index, batch_idx)
+        logger.info("batch-render cam%d batch%d cancelled before launch", cam_index, batch_idx)
         return None
 
     from src.core.config import load_config
@@ -924,17 +916,26 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         pass
 
     clean_err = _clean_ffmpeg_error(err_tail)
-    # 判断是否为用户主动中断 / Ctrl+C 信号引起的正常退出
+    # STATUS_CONTROL_C_EXIT is conclusive even when stderr contains stream
+    # headers or progress. The signal's sender is not necessarily the user.
+    external_interruption = (
+        "received signal 2" in err_tail
+        or (proc is not None and proc.returncode in (3221225786, -1073741510))
+    )
     is_interrupted = (
         FFmpegProcessRegistry.is_interrupted()
-        or "received signal 2" in err_tail
-        or (proc is not None and proc.returncode in (255, -2, 130, -9, 15, 1, 3221225786, -1073741510) and not clean_err)
+        or external_interruption
+        or (proc is not None and proc.returncode in (255, -2, 130, -9, 15, 1) and not clean_err)
     )
     if is_interrupted:
         logger.info(
-            "batch-render cam%d batch%d terminated by signal (Ctrl+C)",
-            cam_index, batch_idx,
+            "batch-render cam%d batch%d terminated by signal (code=%s)",
+            cam_index, batch_idx, proc.returncode if proc is not None else "unknown",
         )
+        if external_interruption:
+            raise RenderInterrupted(
+                f"cam{cam_index} batch{batch_idx}: FFmpeg interrupted (code={proc.returncode})"
+            )
     else:
         logger.error(
             "batch-render cam%d batch%d failed after %.1fs (code=%s):\n%s",
@@ -943,6 +944,33 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             clean_err or "Process terminated abnormally without explicit error log.",
         )
     return None
+
+
+def _preserve_concat_failure(output, temporary, concat_list, report, stderr):
+    """Keep the first failure per output, within a bounded diagnostic budget."""
+    import json
+    root = output.parent / ".concat_failures"
+    destination = root / output.stem
+    try:
+        root.mkdir(exist_ok=True)
+        if destination.exists() or sum(p.is_dir() for p in root.iterdir()) >= 32:
+            logger.warning("concat diagnostics already retained or report budget reached: %s", root)
+            return
+        destination.mkdir()
+        retained_bytes = sum(p.stat().st_size for p in root.glob("*/failed.mp4"))
+        if temporary.exists() and retained_bytes + temporary.stat().st_size <= 16 * 1024**3:
+            temporary.replace(destination / "failed.mp4")
+            report["retained_media"] = str(destination / "failed.mp4")
+        elif temporary.exists():
+            report["media_retention_skipped"] = "16 GiB diagnostic budget reached"
+        if concat_list.exists():
+            concat_list.replace(destination / "inputs.ffconcat")
+        bounded_stderr = stderr.encode("utf-8")[-65536:].decode("utf-8", errors="ignore")
+        (destination / "stderr.log").write_bytes(bounded_stderr.encode("utf-8"))
+        (destination / "failure.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        logger.warning("concat failure diagnostics retained: %s", destination)
+    except OSError:
+        logger.exception("could not retain concat failure diagnostics for %s", output)
 
 
 def concat_output_files(
@@ -956,13 +984,18 @@ def concat_output_files(
     from src.hardware.render_cache import valid_video
     if timings is not None:
         timings.clear()
+    report = timings if timings is not None else {}
+    report.update(status="failed", failure_stage="inputs")
     if not files:
         return False
     concat_list = output.with_name(f".concat_{output.stem}.txt")
     temporary = output.with_name(output.stem + ".tmp.mp4")
+    stderr = ""
+    started = time.monotonic()
     def _concat_path(path):
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
     try:
+        report["failure_stage"] = "probe"
         probe_started = time.monotonic()
         if durations is None:
             from concurrent.futures import ThreadPoolExecutor
@@ -989,8 +1022,7 @@ def concat_output_files(
             with ThreadPoolExecutor(max_workers=max_w) as pool:
                 durations = list(pool.map(_probe_duration, files))
 
-        if timings is not None:
-            timings["probe_s"] = round(time.monotonic() - probe_started, 6)
+        report["probe_s"] = round(time.monotonic() - probe_started, 6)
 
         if len(durations) != len(files) or any(duration is None or duration <= 0 for duration in durations):
             return False
@@ -1010,25 +1042,49 @@ def concat_output_files(
         if faststart:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(temporary))
+        report["failure_stage"] = "ffmpeg"
         ffmpeg_started = time.monotonic()
-        result = run_ffmpeg(cmd, timeout=timeout)
-        if timings is not None:
-            timings["ffmpeg_s"] = round(time.monotonic() - ffmpeg_started, 6)
+        try:
+            result = run_ffmpeg(cmd, timeout=timeout)
+        finally:
+            report["ffmpeg_s"] = round(time.monotonic() - ffmpeg_started, 6)
+        stderr = result.stderr_text
+        report.update(ffmpeg_returncode=result.returncode, ffmpeg_timed_out=result.timed_out)
         if result.returncode != 0:
+            logger.error("final concat FFmpeg failed (%s): %s", result.returncode, stderr[-4096:])
             return False
+        report["failure_stage"] = "validation"
         validation_started = time.monotonic()
-        valid = valid_video(temporary, sum(durations), checkpoints=checkpoints, require_audio=True)
-        if timings is not None:
-            timings["validation_s"] = round(time.monotonic() - validation_started, 6)
-            timings["checkpoints"] = len(checkpoints)
+        validation = {}
+        try:
+            valid = valid_video(temporary, sum(durations), checkpoints=checkpoints, require_audio=True,
+                                diagnostics=validation)
+        finally:
+            report["validation_s"] = round(time.monotonic() - validation_started, 6)
+            report["checkpoints"] = len(checkpoints)
+            report["validation"] = validation
         if not valid:
+            if validation:
+                report["failure_stage"] = f"validation_{validation['stage']}"
             return False
+        report["failure_stage"] = "promote"
         promote_started = time.monotonic()
         temporary.replace(output)
-        if timings is not None:
-            timings["promote_s"] = round(time.monotonic() - promote_started, 6)
+        report["promote_s"] = round(time.monotonic() - promote_started, 6)
+        report.update(status="completed", failure_stage=None)
         return True
+    except (KeyboardInterrupt, SystemExit):
+        report["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
+        report["total_s"] = round(time.monotonic() - started, 6)
+        if report["failure_stage"] == "probe" and "probe_s" not in report:
+            report["probe_s"] = round(time.monotonic() - probe_started, 6)
+        if report["status"] != "completed":
+            _preserve_concat_failure(output, temporary, concat_list, report, stderr)
         concat_list.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
 

@@ -494,16 +494,6 @@ class AudioEnergyVAD:
         }
         return events, stats
 
-    def is_active_at(
-        self, t: float, events: list[tuple[float, float, str]], tolerance: float = 0.1
-    ) -> bool:
-        """Check whether timestamp t falls within any detected active audio event."""
-        for t_start, t_end, _ in events:
-            if (t_start - tolerance) <= t <= (t_end + tolerance):
-                return True
-        return False
-
-
 def _median_filter(signal: list[float], window: int) -> list[float]:
     """时域中值滤波。"""
     if window < 3:

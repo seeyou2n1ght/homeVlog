@@ -30,6 +30,49 @@ from src.timeline import (
 )
 
 
+@pytest.mark.parametrize("fps", [20, 24])
+@pytest.mark.parametrize("ramping", [False, True])
+def test_render_subtitles_and_metadata_share_custom_display_clock(tmp_path, monkeypatch, fps, ramping):
+    import json
+    import re
+    from unittest.mock import MagicMock
+    from src.stages import timeline, renderer, companion
+
+    duration = 120.013
+    states = ["PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION", "STATIC", "DYNAMIC", "DYNAMIC_AUDIO"]
+    segments = [TimelineSegment("clip.mp4", 0, i * duration, (i + 1) * duration, state, duration)
+                for i, state in enumerate(states)]
+    config = {
+        "segment": {"static_keyframe_interval": 10, "keyframe_display_duration": .25,
+                    "min_static_display_duration": .5, "max_static_display_duration": None},
+        "presence": {"speed_factor": 3, "night_speed_factor": 8},
+        "micro_motion": {"cruise_speed": 12},
+        "render": {"speed_ramping_enabled": ramping, "virtual_concat_enabled": False,
+                   "generate_subtitles": True},
+        "output": {"fps": fps},
+    }
+    expected = sum(math.ceil(duration / speed * fps - 1e-9) / fps for speed in (3, 8, 12, 40, 1, 1))
+    monkeypatch.setattr(timeline, "load_config", lambda: config)
+    monkeypatch.setattr("src.core.config.load_config", lambda: config)
+    monkeypatch.setattr(renderer, "TEMP_DIR", tmp_path)
+    render = MagicMock(return_value="rendered")
+    monkeypatch.setattr(renderer, "_run_batch_render", render)
+    assert renderer.build_batch_render(segments, 0, "cpu", fps, 320, 180,
+                                       config["segment"], config["output"], {}, "20260901", 0, []) == "rendered"
+    assert render.call_args.kwargs["expected_duration"] == pytest.approx(expected)
+    out = tmp_path / "day.mp4"
+    out.write_bytes(b"placeholder")
+    monkeypatch.setattr(companion, "build_timeline_from_rows", lambda *a, **k: segments)
+    monkeypatch.setattr(companion, "get_duration", lambda path: expected)
+    assert companion.save_vlog_companion_assets(out, "20260901", 0, "camera", 1,
+                                                duration * 6, 1, MagicMock(), config, rows=[])
+    metadata = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    assert metadata["timeline_highlights"][-1]["vlog_end_s"] == round(expected, 2)
+    endings = re.findall(r"--> (\d+):(\d+):(\d+),(\d+)", out.with_suffix(".srt").read_text(encoding="utf-8"))
+    h, m, s, ms = map(int, endings[-1])
+    assert h * 3600 + m * 60 + s + ms / 1000 == pytest.approx(expected, abs=.0005)
+
+
 class TestSegmentClusteringAndSmoothing:
     """测试片段聚类与跨文件平滑吸收。"""
 
@@ -66,6 +109,9 @@ class TestSegmentClusteringAndSmoothing:
         assert len(segs) >= 1
         dyn = [s for s in segs if s.is_dynamic]
         assert len(dyn) == 1
+        stat = [s for s in segs if s.is_static]
+        assert len(stat) >= 1
+        assert all(not s.is_dynamic for s in stat)
         # pre_roll/post_roll 垫底保护
         assert dyn[0].start_time <= 9.0
         assert dyn[0].end_time >= 16.0

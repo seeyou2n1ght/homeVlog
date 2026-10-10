@@ -62,7 +62,6 @@ def verifier(model, batch=2):
     instance = YoloVerifier.__new__(YoloVerifier)
     instance.enabled = True
     instance.confidence = 0.3
-    instance.sample_fps = 2
     instance.target_classes = {0}
     instance.device = "cpu"
     instance.batch_size = batch
@@ -89,7 +88,49 @@ def test_low_confidence_enters_predict_and_microbatches_are_bounded():
     result = verifier(predict).verify("x", [Segment(0,20,"DYNAMIC","x")], frames_buffer=frames, analysis_fps=2)
     assert result[0].state == "DYNAMIC"
     assert result[0].avg_confidence == .18
-    assert max(sizes) <= 2 and sum(sizes) == 8
+    assert max(sizes) <= 2 and sum(sizes) == len(frames)
+
+
+def test_long_candidate_checks_middle_event_without_extending_presence_to_empty_prefix():
+    seen = []
+
+    def predict(frames, **kwargs):
+        results = []
+        for frame in frames:
+            index = int(frame[0, 0, 0])
+            seen.append(index)
+            boxes = SimpleNamespace(cls=np.array([0]), conf=np.array([.9])) if 83 <= index <= 88 else None
+            results.append(SimpleNamespace(boxes=boxes))
+        return results
+
+    frames = {i: np.full((4, 4, 3), i, np.uint8) for i in range(101)}
+    result = verifier(predict).verify(
+        "x", [Segment(43200, 43301, "DYNAMIC", "x", file_start_offset=43200)],
+        frames_buffer=frames, analysis_fps=1,
+    )
+    assert seen == list(range(101))
+    assert result[0].state == "STATIC"
+    assert any(s.avg_confidence == .9 and s.start_time <= 43285 < s.end_time for s in result)
+    assert sum(s.duration for s in result) == 101
+    assert all(a.end_time == b.start_time for a, b in zip(result, result[1:]))
+
+
+@pytest.mark.parametrize("reason", ["YOLO_FAILED", "YOLO_UNAVAILABLE", "INSUFFICIENT_YOLO_EVIDENCE"])
+@pytest.mark.parametrize("offset", [0, 43200])
+def test_uncertain_motion_survives_smoothing_refinement_and_display(reason, offset):
+    from src.algorithms.segment import _filter_short, refine_activity_segments
+    from src.stages.timeline import TimelineSegment, compute_display_plans
+
+    segments = [Segment(offset, offset + 3, "STATIC", "x"),
+                Segment(offset + 3, offset + 4, "DYNAMIC", "x", needs_review=True, review_reason=reason),
+                Segment(offset + 4, offset + 7, "STATIC", "x")]
+    segments = _filter_short(segments, min_motion=2, min_static=2)
+    labels = [{"time": offset + i, "energy": 1, "raw_energy": 1} for i in range(8)]
+    result = refine_activity_segments(segments, labels, {})
+    protected = next(s for s in result if s.start_time <= offset + 3 < s.end_time)
+    assert protected.state == "DYNAMIC" and protected.needs_review
+    timeline = [TimelineSegment("x", 0, 3, 4, protected.state, 1)]
+    assert compute_display_plans(timeline)[0][0] == 1
 
 
 def test_partial_decode_falls_back_and_cancel_does_not(mock_config):
@@ -138,6 +179,47 @@ def test_valid_video_duration_tolerance(tmp_path):
     assert not valid_video(frame_rate_path, 1.899)
 
 
+@pytest.mark.parametrize("fps", [20, 24])
+@pytest.mark.parametrize("state", ["DYNAMIC", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"])
+@pytest.mark.parametrize("at_tail", [False, True])
+def test_subframe_active_interval_keeps_its_display_frame(tmp_path, fps, state, at_tail):
+    from src.hardware.ffmpeg import run_ffmpeg
+    from src.stages.timeline import build_timeline_from_rows, build_concat_filter, compute_display_plans
+    source = make_video(tmp_path / "subframe.mp4", seconds=4, fps=fps)
+    split = 3.75 if at_tail else 1.25
+    segments = [{"start_time": 0, "end_time": split, "state": "DYNAMIC_AUDIO"},
+                {"start_time": split, "end_time": split + .01, "state": state}]
+    if not at_tail:
+        segments.append({"start_time": split + .01, "end_time": 4, "state": "DYNAMIC_AUDIO"})
+    duration = split + .01 if at_tail else 4
+    timeline = build_timeline_from_rows([{
+        "filepath": str(source), "file_start_time": "20260901000000", "file_end_time": "20260901000004",
+        "file_duration": duration, "prescreen_status": "SUSPICIOUS", "segments": segments,
+    }], "20260901", config={}, resolve_presence=False)
+    assert timeline[1].start_in_file == split
+    assert timeline[1].end_in_file == split + .01
+    assert timeline[-1].end_in_file == duration
+    plans = compute_display_plans(timeline, output_fps=fps, speed_ramping=False)
+    expected_frames = sum(round(d * fps) for d, _ in plans)
+    fc = build_concat_filter(timeline, rows=[{"filepath": str(source), "has_audio": False}],
+                             output_fps=fps, output_width=128, output_height=128,
+                             speed_ramping=False, sparse_mixed=False)
+    script = tmp_path / "filter.txt"
+    script.write_text(fc, encoding="utf-8")
+    output = tmp_path / "clock.mkv"
+    result = run_ffmpeg(["-i", str(source), "-/filter_complex", str(script),
+                         "-map", "[v]", "-map", "[a]", "-c:v", "ffv1", "-c:a", "pcm_s16le", str(output)], timeout=30)
+    assert result.returncode == 0
+    with av.open(str(output)) as container:
+        frames = list(container.decode(video=0))
+        assert len(frames) == expected_frames
+        assert float(frames[-1].pts * frames[-1].time_base) == pytest.approx((expected_frames - 1) / fps, abs=.001)
+    with av.open(str(output)) as container:
+        audio = container.streams.audio[0]
+        samples = sum(f.samples for f in container.decode(audio=0))
+        assert samples == round(expected_frames * audio.rate / fps)
+
+
 def test_valid_video_requires_audio_and_rejects_internal_pts_gap(tmp_path):
     from src.render_cache import _window_is_continuous, valid_video
 
@@ -177,6 +259,63 @@ def test_valid_video_checkpoints_sequential_and_parallel(tmp_path):
     assert not valid_video(path, 20.0, checkpoints=[2.0, 50.0])
 
 
+@pytest.mark.parametrize("failure", ["open", "partial_open", "serial_gap", "serial_error", "checkpoint", "changed_before", "changed_after"])
+def test_checkpoint_open_fallback_preserves_integrity(tmp_path, monkeypatch, failure):
+    import av
+    import threading
+    from src.hardware import render_cache
+    path = make_video(tmp_path / "open_failure.mp4", seconds=20, fps=5)
+    boundaries = [2., 4., 6., 8., 10., 12., 14., 16.]
+    original_open = av.open
+    original_window = render_cache._window_is_continuous
+    main_thread = threading.current_thread()
+    serial_boundaries = []
+    open_lock = threading.Lock()
+    independent_opens = 0
+    def open_container(*args, **kwargs):
+        nonlocal independent_opens
+        if threading.current_thread() != main_thread and failure != "checkpoint":
+            with open_lock:
+                independent_opens += 1
+                fail = failure != "partial_open" or independent_opens == 1
+            if fail:
+                raise av.error.EOFError(541478725, "controlled container-open failure")
+        return original_open(*args, **kwargs)
+    def window(container, stream, boundary, duration):
+        if threading.current_thread() != main_thread and failure == "checkpoint":
+            return False
+        if threading.current_thread() == main_thread:
+            serial_boundaries.append(boundary)
+            if failure == "serial_gap" and boundary == 8:
+                return False
+            if failure == "serial_error" and boundary == 8:
+                raise av.error.InvalidDataError(1094995529, "controlled decode failure")
+        return original_window(container, stream, boundary, duration)
+    monkeypatch.setattr(av, "open", open_container)
+    monkeypatch.setattr(render_cache, "_window_is_continuous", window)
+    if failure.startswith("changed"):
+        identity = render_cache.file_identity(path)
+        identities = iter([identity, ["changed"]] if failure == "changed_before" else [identity, identity, ["changed"]])
+        monkeypatch.setattr(render_cache, "file_identity", lambda _: next(identities))
+    details = {}
+    assert render_cache.valid_video(path, 20, checkpoints=boundaries, diagnostics=details) == (failure in ("open", "partial_open"))
+    if failure in ("open", "partial_open"):
+        assert serial_boundaries[:-1] == boundaries
+        assert details["checkpoint_fallback"] == "serial_initial_container"
+        assert details["stage"] == "completed"
+    elif failure in ("checkpoint", "changed_before"):
+        assert not serial_boundaries
+        assert "checkpoint_fallback" not in details
+    elif failure in ("serial_gap", "serial_error"):
+        assert details["stage"] == "checkpoint"
+        if failure == "serial_gap":
+            assert details["boundary_s"] == 8
+        else:
+            assert details["error_type"] == "InvalidDataError"
+    else:
+        assert details["stage"] == "file_changed"
+
+
 
 
 def test_camera_indices_persist_across_scan_order(tmp_path):
@@ -207,6 +346,59 @@ def test_human_interval_survives_reanalysis_and_smoothing(tmp_path):
     timeline = build_timeline_from_rows(db.get_all_file_tasks_for_date("20260901",0), "20260901", config={})
     assert [(s.start_in_file,s.end_in_file) for s in timeline if s.state == "DYNAMIC"] == [(20,21)]
     db.close()
+
+
+@pytest.mark.parametrize("reanalysis", [False, True])
+def test_clear_review_revokes_persistent_timeline_override(tmp_path, reanalysis):
+    from src.timeline import build_timeline_from_rows
+    db = VlogDatabase(tmp_path / "clear.sqlite")
+    try:
+        db.add_file_task("x.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result("x.mp4", "SUSPICIOUS")
+        db.set_analysis_result("x.mp4", [Segment(20, 21, "STATIC", "x.mp4")])
+        db.update_segment_review(db.get_segments_for_file("x.mp4")[0]["id"], "FN")
+        if reanalysis:
+            db.set_analysis_result("x.mp4", [Segment(0, 60, "STATIC", "x.mp4")])
+        current = db.get_segments_for_file("x.mp4")[0]["id"]
+        assert db.clear_segment_review(current)
+        rows = db.get_all_file_tasks_for_date("20260901", 0)
+        assert not rows[0]["human_reviews"]
+        timeline = build_timeline_from_rows(rows, "20260901", config={}, resolve_presence=False)
+        assert all(s.state == "STATIC" for s in timeline)
+    finally:
+        db.close()
+
+
+def test_clear_review_preserves_labels_outside_current_source_interval(tmp_path):
+    db = VlogDatabase(tmp_path / "partial-clear.sqlite")
+    try:
+        db.add_file_task("x.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_analysis_result("x.mp4", [Segment(20, 30, "STATIC", "x.mp4"), Segment(50, 55, "STATIC", "x.mp4")])
+        for seg in db.get_segments_for_file("x.mp4"):
+            db.update_segment_review(seg["id"], "FN", "preserve notes")
+        db.set_analysis_result("x.mp4", [Segment(25, 27, "STATIC", "x.mp4")])
+        assert db.clear_segment_review(db.get_segments_for_file("x.mp4")[0]["id"])
+        reviews = db.get_all_file_tasks_for_date("20260901", 0)[0]["human_reviews"]
+        assert sorted((r["start_time"], r["end_time"]) for r in reviews) == [(20, 25), (27, 30), (50, 55)]
+        assert all(r["manual_label"] == "FN" and r["review_notes"] == "preserve notes" for r in reviews)
+    finally:
+        db.close()
+
+
+def test_clear_review_rolls_back_both_tables_on_failure(tmp_path):
+    db = VlogDatabase(tmp_path / "rollback-review.sqlite")
+    try:
+        db.add_file_task("x", 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_analysis_result("x", [Segment(0, 60, "STATIC", "x")])
+        seg_id = db.get_segments_for_file("x")[0]["id"]
+        db.update_segment_review(seg_id, "FN")
+        db.conn.execute("CREATE TRIGGER reject_clear BEFORE UPDATE ON segments WHEN NEW.manual_label IS NULL BEGIN SELECT RAISE(ABORT, 'reject clear'); END")
+        db.conn.commit()
+        assert not db.clear_segment_review(seg_id)
+        assert db.get_segment_by_id(seg_id)["manual_label"] == "FN"
+        assert len(db.get_all_file_tasks_for_date("20260901", 0)[0]["human_reviews"]) == 1
+    finally:
+        db.close()
 
 
 def test_failed_database_write_propagates(tmp_path):

@@ -107,6 +107,69 @@ def test_dashboard_alert_bridge():
         unregister_dashboard()
 
 
+def test_debug_reconfiguration_preserves_error_log_and_updates_existing_handlers(tmp_path, monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    import src.core.utils as utils
+    isolated = logging.Logger("diagnostic-test", logging.DEBUG)
+    real_get_logger = logging.getLogger
+    monkeypatch.setattr(utils.logging, "getLogger", lambda name=None: isolated if name == "homevlog" else real_get_logger(name))
+    monkeypatch.setattr(utils, "LOGS_DIR", tmp_path)
+    monkeypatch.setattr(utils, "load_config", lambda: {})
+    output = StringIO()
+    try:
+        utils.setup_logging()
+        bridge = next(h for h in isolated.handlers if isinstance(h, utils.RichConsoleBridgeHandler))
+        bridge._console = Console(file=output)
+        isolated.info("ordinary-info")
+        isolated.info("scan-visible", extra={"startup_progress": True})
+        assert "ordinary-info" not in output.getvalue()
+        assert "scan-visible" in output.getvalue()
+        handlers = list(isolated.handlers)
+        utils.setup_logging(logging.DEBUG)
+        isolated.debug("debug-visible")
+        for handler in isolated.handlers:
+            handler.flush()
+        assert isolated.handlers == handlers
+        assert "debug-visible" in output.getvalue()
+        assert "debug-visible" in next((tmp_path / "runs").glob("*.log")).read_text(encoding="utf-8")
+        assert "debug-visible" in next((tmp_path / "events").glob("*.jsonl")).read_text(encoding="utf-8")
+        assert "debug-visible" not in next((tmp_path / "error").glob("*.log")).read_text(encoding="utf-8")
+    finally:
+        for handler in isolated.handlers:
+            handler.close()
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_doctor_cli_exit_status(monkeypatch, passed):
+    import main as cli
+    monkeypatch.setattr("sys.argv", ["main.py", "--doctor"])
+    monkeypatch.setattr(cli, "print_doctor_report", lambda _console: passed)
+    if passed:
+        cli.main()
+    else:
+        with pytest.raises(SystemExit) as caught:
+            cli.main()
+        assert caught.value.code == 1
+
+
+def test_doctor_disk_warning_is_failure(monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    import src.ui.doctor as doctor
+    report = {
+        "python": {"passed": True, "version": "3.12", "packages": {}},
+        "ffmpeg": {"passed": True, "version": "test", "nvenc": True, "qsv": True},
+        "gpu": {"cuda_available": False, "devices": []},
+        "storage": {"inputs": [], "output_free_gb": 1, "output_min_gb": 20, "disk_ok": False},
+        "model": {"exists": True, "model_path": "model.pt", "size_mb": 1},
+    }
+    monkeypatch.setattr(doctor, "run_system_doctor", lambda: report)
+    output = StringIO()
+    assert not doctor.print_doctor_report(Console(file=output, width=180))
+    assert "全部核心环境已就绪" not in output.getvalue()
+
+
 def test_ui_components_render(tmp_path, capsys):
     """验证 Startup Banner, Summary Card, Error Summary 与 Scan Results 表格渲染无崩溃。"""
     # 1. 批量启动 Banner 与 单日启动 Banner
@@ -345,6 +408,7 @@ def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
     monkeypatch.setattr(cli, "scan_directory", lambda *a, **k: None)
     monkeypatch.setattr(cli, "process_date_cam", lambda *a, **k: success)
     monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
+    monkeypatch.setattr(cli, "check_disk_space", lambda *_a: True)
     monkeypatch.setattr("src.monitor.get_monitor", lambda: MagicMock())
     monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
@@ -357,3 +421,128 @@ def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
     output = capsys.readouterr().out
     assert ("处理完成" in output) is success
     assert ("处理失败" in output) is not success
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_cli_disk_stop_is_not_success(tmp_path, monkeypatch, capsys, selected):
+    from unittest.mock import MagicMock
+    import main as cli
+    from src.database import VlogDatabase
+    db = VlogDatabase(tmp_path / "disk_cli.db")
+    db.add_file_task("clip.mp4", 0, "20260320", "20260320000000", "20260320000100", 60)
+    monkeypatch.setattr("sys.argv", ["main.py", "--no-tui"] + (["--date", "20260320"] if selected else []))
+    monkeypatch.setattr(cli, "VlogDatabase", lambda: db)
+    monkeypatch.setattr(cli, "scan_directory", lambda *a, **k: None)
+    processor = MagicMock()
+    monkeypatch.setattr(cli, "process_date_cam", processor)
+    monkeypatch.setattr(cli, "check_disk_space", lambda *_a: False)
+    monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
+    monkeypatch.setattr(cli, "run_pipeline", lambda **_k: {"total": 1, "ok": 0, "failed": 0,
+                          "remaining": 1, "stopped_reason": "LOW_DISK_SPACE"})
+    monkeypatch.setattr("src.monitor.get_monitor", MagicMock())
+    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            cli.main()
+        assert caught.value.code == 1
+        processor.assert_not_called()
+        output = capsys.readouterr().out
+        assert "LOW_DISK_SPACE" in output and "未处理=1" in output
+        assert "处理完成" not in output
+    finally:
+        if not db.is_closed:
+            db.close()
+
+
+@pytest.fixture
+def cli_workspace(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import main as cli
+    from src.database import VlogDatabase
+    from src.segment import Segment
+    db = VlogDatabase(tmp_path / "selection.db")
+    original_close = db.close
+    for date in ("20260901", "20260902"):
+        for cam in (0, 1):
+            source = f"cam{cam}_{date}.mp4"
+            db.add_file_task(source, cam, date, date + "000000", date + "000100", 60)
+            db.set_prescreen_result(source, "SUSPICIOUS")
+            db.set_analysis_result(source, [Segment(0, 60, "STATIC", source)])
+            seg_id = db.get_segments_for_file(source)[0]["id"]
+            db.update_segment_review(seg_id, "FN")
+    processor = MagicMock(return_value=True)
+    cleanup = MagicMock()
+    monitor = MagicMock()
+    monkeypatch.setattr(cli, "VlogDatabase", lambda: db)
+    monkeypatch.setattr(db, "close", lambda: None)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "scan_directory", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "process_date_cam", processor)
+    monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
+    monkeypatch.setattr(cli, "cleanup_temp_artifacts", cleanup)
+    monkeypatch.setattr(cli, "check_disk_space", lambda *_a: True)
+    monkeypatch.setattr("src.monitor.get_monitor", lambda: monitor)
+    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
+    try:
+        yield SimpleNamespace(cli=cli, db=db, processor=processor, cleanup=cleanup, monitor=monitor)
+    finally:
+        original_close()
+
+
+@pytest.mark.parametrize("selector,expected", [
+    (["--cam", "1"], [("20260901", 1), ("20260902", 1)]),
+    (["--date", "20260902", "--cam", "0"], [("20260902", 0)]),
+    (["--date-range", "20260901..20260902", "--cam", "0"], [("20260901", 0), ("20260902", 0)]),
+])
+def test_cli_selection_matches_processing_and_reanalysis(cli_workspace, monkeypatch, selector, expected):
+    w = cli_workspace
+    monkeypatch.setattr("sys.argv", ["main.py", "--no-tui", "--reanalyze", *selector])
+    w.cli.main()
+    assert [(call.args[1], call.args[2]) for call in w.processor.call_args_list] == expected
+    for row in w.db.conn.execute("SELECT filepath,date,cam_index,analysis_status FROM file_tasks"):
+        selected = (row["date"], row["cam_index"]) in expected
+        assert row["analysis_status"] == ("PENDING" if selected else "ANALYZED")
+        assert bool(w.db.get_segments_for_file(row["filepath"])) is not selected
+    assert w.db.conn.execute("SELECT COUNT(*) FROM human_reviews").fetchone()[0] == 4
+    w.monitor.shutdown.assert_called_once()
+
+
+def test_cli_dry_run_does_not_reset_or_clean(cli_workspace, monkeypatch):
+    w = cli_workspace
+    w.db.set_render_status("20260901", 1, "COMPLETED")
+    before = list(w.db.conn.iterdump())
+    monkeypatch.setattr("sys.argv", ["main.py", "--cam", "1", "--dry-run", "--reanalyze", "--clean-temp"])
+    w.cli.main()
+    assert list(w.db.conn.iterdump()) == before
+    w.processor.assert_not_called()
+    w.cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_cli_reanalysis_requires_force_for_completed_groups(cli_workspace, monkeypatch, force):
+    w = cli_workspace
+    w.db.set_render_status("20260901", 1, "COMPLETED")
+    before = list(w.db.conn.iterdump())
+    monkeypatch.setattr("sys.argv", ["main.py", "--cam", "1", "--reanalyze", "--no-tui"] + (["--force-render"] if force else []))
+    if force:
+        w.cli.main()
+        assert w.processor.call_count == 2
+        assert all(call.kwargs["force_render"] for call in w.processor.call_args_list)
+        assert w.db.conn.execute("SELECT COUNT(*) FROM human_reviews").fetchone()[0] == 4
+    else:
+        with pytest.raises(SystemExit) as caught:
+            w.cli.main()
+        assert caught.value.code == 2
+        assert list(w.db.conn.iterdump()) == before
+        w.processor.assert_not_called()
+
+
+@pytest.mark.parametrize("flags", [["--stage", "prescreen"], ["--stage", "render"], ["--yes"], ["-y"]])
+def test_cli_rejects_unimplemented_options(flags):
+    from src.ui import build_arg_parser
+    with pytest.raises(SystemExit) as caught:
+        build_arg_parser().parse_args(flags)
+    assert caught.value.code == 2

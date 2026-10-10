@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.database import VlogDatabase
 from src.pipeline import StreamingOrchestrator
 from src.renderer import build_batch_render, FFmpegProcessRegistry
@@ -224,8 +226,98 @@ def test_batch_render_suppresses_progress_error_on_interruption(tmp_path, caplog
                 )
                 assert res is None
         # 验证输出为 INFO 中断提示，绝无 ERROR 倒灌逐帧进度
-        assert any("terminated by signal (Ctrl+C)" in record.message for record in caplog.records if record.levelname == "INFO")
+        assert any("cancelled before launch" in record.message for record in caplog.records if record.levelname == "INFO")
         assert not any("batch-render cam0 batch1 failed" in record.message for record in caplog.records if record.levelname == "ERROR")
     finally:
+        FFmpegProcessRegistry.reset_interrupted()
+
+
+@pytest.mark.parametrize("code", [3221225786, -1073741510, 255, 1])
+def test_windows_console_exit_with_nonempty_stderr(tmp_path, monkeypatch, caplog, code):
+    FFmpegProcessRegistry.reset_interrupted()
+    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    proc = MagicMock()
+    proc.returncode = code
+    stderr = (b"Stream #0:0: Video: hevc\nStarting second pass: moving the moov atom\n"
+              b"Exiting normally, received signal 15.\n") if code != 1 else b"OpenEncodeSessionEx failed: out of memory\n"
+    if code == 255:
+        stderr = b"Stream #0:0: Video: hevc\nExiting normally, received signal 2.\n"
+    def spawn(*args, **kwargs):
+        kwargs["stderr"].write(stderr)
+        kwargs["stderr"].flush()
+        return proc
+    with patch("subprocess.Popen", side_effect=spawn), \
+         patch("src.renderer._build_enc_args", return_value=[]), caplog.at_level("INFO"):
+        from src.renderer import RenderInterrupted
+        def render():
+            return build_batch_render(
+                [TimelineSegment(str(tmp_path / "source.mp4"), 0, 0, 5, "STATIC", 5)],
+                1, "nv", 20, 1920, 1080, {}, {}, {}, "20260901", 0, [],
+            )
+        if code == 1:
+            assert render() is None
+        else:
+            with pytest.raises(RenderInterrupted, match=str(code)):
+                render()
+    assert not (tmp_path / "_batch1_20260901_cam0.mp4").exists()
+    assert not FFmpegProcessRegistry.is_interrupted()
+    failures = [r for r in caplog.records if r.levelname == "ERROR" and "batch-render" in r.message]
+    if code == 1:
+        assert failures and "out of memory" in failures[-1].message
+    else:
+        assert not failures
+        assert any("terminated by signal" in r.message and str(code) in r.message for r in caplog.records)
+
+
+def test_external_interrupt_does_not_retry_virtual_render(tmp_path, monkeypatch):
+    from src.renderer import RenderInterrupted
+    FFmpegProcessRegistry.reset_interrupted()
+    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.core.config.load_config", lambda: {
+        "render": {"virtual_concat_enabled": True, "local_staging_enabled": False},
+    })
+    with patch("src.renderer._run_batch_render", side_effect=RenderInterrupted("external signal")) as render:
+        with pytest.raises(RenderInterrupted):
+            build_batch_render(
+                [TimelineSegment(str(tmp_path / "source.mp4"), 0, 0, 60, "STATIC", 60)],
+                1, "nv", 20, 1920, 1080, {}, {}, {}, "20260901", 0, [],
+            )
+        render.assert_called_once()
+        assert render.call_args.kwargs["input_args"]  # Exercised the EDL path.
+
+
+@pytest.mark.parametrize("policy", ["nv_only", "qsv_only", "heterogeneous"])
+def test_render_interrupt_propagates_to_run_and_preserves_batches(tmp_path, policy, caplog):
+    from src.renderer import RenderInterrupted
+    from src.pipeline import StreamingOrchestrator
+    from src.database import VlogDatabase
+    db = VlogDatabase(tmp_path / "interrupted.db")
+    fp = str(tmp_path / "source.mp4")
+    db.add_file_task(fp, 0, "20260901", "20260901000000", "20260901000100", 60)
+    db.set_prescreen_result(fp, "STATIC")
+    config = {
+        "pipeline": {"render_start_delay": 0, "render_gpu_policy": policy},
+        "detection": {"prescreen_parallel": 1, "analysis_max_workers": 1},
+        "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False},
+    }
+    orch = StreamingOrchestrator(db, "20260901", 0, config, dashboard_enabled=False)
+    saved = tmp_path / "completed.mp4"
+    saved.write_bytes(b"previously validated batch")
+    orch.batch_paths.append((-1, str(saved)))
+    try:
+        with patch("src.pipeline.build_batch_render", side_effect=RenderInterrupted("external signal")) as render, \
+             patch.object(FFmpegProcessRegistry, "kill_all") as kill, caplog.at_level("INFO"):
+            with pytest.raises(KeyboardInterrupt, match="external signal"):
+                orch.run()
+            render.assert_called_once()
+            kill.assert_called_once()
+        assert orch.abort_event.is_set() and orch.stop_event.is_set()
+        assert FFmpegProcessRegistry.is_interrupted()
+        assert not orch.errors and not db.is_render_completed("20260901", 0)
+        assert orch.batch_paths == [(-1, str(saved))]
+        assert saved.read_bytes() == b"previously validated batch"
+        assert "queued for retry" not in caplog.text and "queued for nv retry" not in caplog.text
+    finally:
+        db.close()
         FFmpegProcessRegistry.reset_interrupted()
 

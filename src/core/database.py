@@ -437,9 +437,30 @@ class VlogDatabase:
                 return False
 
     def clear_segment_review(self, segment_id: int) -> bool:
-        """撤销切片的人工审核标记与笔记。"""
+        """Revoke the current source interval, preserving reviews outside it."""
         with self._lock:
             try:
+                segment = self.conn.execute(
+                    "SELECT filepath,start_time,end_time FROM segments WHERE id=?", (segment_id,)
+                ).fetchone()
+                if segment is None:
+                    return False
+                filepath, start, end = segment
+                reviews = self.conn.execute(
+                    "SELECT * FROM human_reviews WHERE filepath=? AND start_time < ? AND end_time > ?",
+                    (filepath, end, start),
+                ).fetchall()
+                for review in reviews:
+                    self.conn.execute("DELETE FROM human_reviews WHERE id=?", (review["id"],))
+                    for left, right in ((review["start_time"], start), (end, review["end_time"])):
+                        if right > left:
+                            self.conn.execute(
+                                """INSERT OR IGNORE INTO human_reviews
+                                   (filepath,start_time,end_time,manual_label,review_notes,reviewed_at,archived_frame_path)
+                                   VALUES (?,?,?,?,?,?,?)""",
+                                (filepath, left, right, review["manual_label"], review["review_notes"],
+                                 review["reviewed_at"], review["archived_frame_path"]),
+                            )
                 self.conn.execute(
                     """UPDATE segments
                        SET manual_label=NULL, review_notes=NULL, reviewed_at=NULL
@@ -760,6 +781,8 @@ class VlogDatabase:
                     self.conn.rollback()
                 except Exception:
                     pass
+
+                raise
 
     def is_render_completed(self, date: str, cam_index: int) -> bool:
         with self._lock:

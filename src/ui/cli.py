@@ -130,9 +130,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     group_pipeline.add_argument(
         "--stage",
         type=str,
-        choices=["all", "prescreen", "analyze", "render"],
+        choices=["all", "analyze"],
         default="all",
-        help="指定执行阶段: all(完整流程), prescreen(仅预筛选), analyze(至精析), render(仅渲染)",
+        help="指定执行阶段: all(完整流程), analyze(预筛与精析，不渲染)",
     )
     group_pipeline.add_argument(
         "--no-render",
@@ -144,7 +144,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     group_pipeline.add_argument(
         "--force-render",
         action="store_true",
-        help="强制重新渲染，忽略已存在的同名成片",
+        help="重新处理已完成日期（可复用有效批次）；默认跳过已交付记录，即使成片已移走",
     )
     group_pipeline.add_argument(
         "--dry-run",
@@ -181,11 +181,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reanalyze",
         action="store_true",
         help="重置指定日期/机位的分析缓存，强制使用最新模型重新精析与渲染",
-    )
-    group_maint.add_argument(
-        "--yes", "-y",
-        action="store_true",
-        help="对维护或重析等操作自动确认，跳过交互式二次询问",
     )
 
     # 5. 终端交互与系统配置

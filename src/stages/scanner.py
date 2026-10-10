@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import threading
 from dataclasses import dataclass
 
 from src.core.database import VlogDatabase
@@ -53,14 +54,15 @@ def resolve_camera_identity(dir_path: str, cam_index: int = 0, config: dict | No
     return f"Cam {cam_index}", f"cam{cam_index}"
 
 
-def resolve_camera_ui_name(dir_path: str, cam_index: int = 0, config: dict | None = None) -> str:
+def resolve_camera_ui_name(dir_path: str | Path | None = None, cam_index: int = 0, config: dict | None = None) -> str:
     """Human-facing label: semantic mapping, camera ID, then MAC address."""
     if config is None:
         config = load_config()
-    info = parse_camera_dir(dir_path)
+    dir_str = str(dir_path) if dir_path is not None else ""
+    info = parse_camera_dir(dir_str)
     mac = info.get("mac")
-    if not mac:
-        match = re.search(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{12}(?![A-Fa-f0-9])", Path(dir_path).name)
+    if not mac and dir_str:
+        match = re.search(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{12}(?![A-Fa-f0-9])", Path(dir_str).name)
         mac = match.group().upper() if match else None
     alias = (config.get("cameras", {}) or {}).get(mac) if mac else None
     if alias:
@@ -69,7 +71,7 @@ def resolve_camera_ui_name(dir_path: str, cam_index: int = 0, config: dict | Non
         return f"摄像头 {info['cam_id']}"
     if mac:
         return mac
-    return resolve_camera_identity(dir_path, cam_index, config)[1]
+    return resolve_camera_identity(dir_str, cam_index, config)[1]
 
 
 def resolve_output_filename(
@@ -80,7 +82,7 @@ def resolve_output_filename(
     config: dict | None = None,
 ) -> str:
     """自适应格式化成片文件名，支持 {date}, {mac}, {camera}, {index} 占位符。
-    
+
     占位符定义:
     - {date}: 日期字符串 (如 '20260402')
     - {mac}: 摄像机物理 MAC 地址 (如 'B888805AA3CD'，若无则自适应降级为 'cam{cam_index}')
@@ -100,6 +102,35 @@ def resolve_output_filename(
     name = name.replace("{camera}", str(camera))
     name = name.replace("{index}", str(cam_index))
     return name
+
+
+class _ScanProgress:
+    """Report blocking scan operations without moving NAS/DB work to a thread."""
+
+    def __init__(self, interval_s=10.0):
+        self.interval_s = interval_s
+        self.started = time.monotonic()
+        self.state = ("准备扫描", 0)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._heartbeat, name="scan-progress", daemon=True)
+
+    def update(self, operation, count):
+        self.state = (operation, count)
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval_s):
+            operation, count = self.state
+            logger.info("扫描仍在进行: 已处理=%d，耗时=%.1fs，当前操作: %s",
+                        count, time.monotonic() - self.started, operation,
+                        extra={"startup_progress": True})
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        self._thread.join()
 
 
 @dataclass
@@ -133,68 +164,91 @@ def scan_directory(
     total_skipped = 0
     total_frozen = 0
 
-    for target_dir in target_dirs:
-        logger.info("scanning: %s (freeze=%dmin, skip_today=%s)", target_dir, freeze_minutes, skip_today)
-        if not os.path.isdir(target_dir):
-            logger.error("input_dir not found: %s", target_dir)
-            continue
+    with _ScanProgress() as progress:
+        try:
+            for target_dir in target_dirs:
+                progress.update(f"检查目录 {target_dir}", total_added + total_skipped + total_frozen)
+                logger.info("scanning: %s (freeze=%dmin, skip_today=%s)", target_dir, freeze_minutes, skip_today,
+                            extra={"startup_progress": True})
+                if not os.path.isdir(target_dir):
+                    raise FileNotFoundError(f"输入目录不可用，停止本轮处理: {target_dir}")
 
-        for entry in os.scandir(target_dir):
-            if not entry.is_file() or not entry.name.endswith(".mp4"):
-                continue
+                progress.update(f"枚举目录 {target_dir}", total_added + total_skipped + total_frozen)
+                with os.scandir(target_dir) as entries:
+                    for entry in entries:
+                        try:
+                            progress.update(f"检查文件 {entry.path}", total_added + total_skipped + total_frozen)
+                            if not entry.is_file() or not entry.name.endswith(".mp4"):
+                                continue
 
-            info = parse_filename(entry.name)
-            if info is None:
-                logger.debug("skip unrecognized filename: %s", entry.name)
-                continue
+                            info = parse_filename(entry.name)
+                            if info is None:
+                                logger.debug("skip unrecognized filename: %s", entry.name)
+                                continue
 
-            if skip_today and info["date"] == current_date:
-                logger.debug("skip today's file: %s", entry.name)
-                total_skipped += 1
-                continue
+                            if skip_today and info["date"] == current_date:
+                                logger.debug("skip today's file: %s", entry.name)
+                                total_skipped += 1
+                                continue
 
-            stat = entry.stat()
-            age_min = (time.time() - stat.st_mtime) / 60.0
+                            # 如果启用了 skip_today 或 freeze_minutes <= 0，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
+                            if not skip_today and freeze_minutes > 0:
+                                progress.update(f"读取文件属性 {entry.path}", total_added + total_skipped + total_frozen)
+                                stat = entry.stat()
+                                age_min = (time.time() - stat.st_mtime) / 60.0
+                                if age_min < freeze_minutes:
+                                    total_frozen += 1
+                                    continue
 
-            # 如果启用了 skip_today 或 freeze_minutes <= 0，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
-            if not skip_today and freeze_minutes > 0:
-                if age_min < freeze_minutes:
-                    total_frozen += 1
-                    continue
+                                # Stabilize check: only for files near the freeze boundary.
+                                if freeze_minutes > 0 and age_min < freeze_minutes + 5:
+                                    time.sleep(stabilize_wait)
+                                    try:
+                                        stat2 = os.stat(entry.path)
+                                        if stat2.st_size != stat.st_size:
+                                            total_frozen += 1
+                                            continue
+                                    except OSError:
+                                        total_frozen += 1
+                                        continue
 
-                # Stabilize check: only for files near the freeze boundary.
-                if freeze_minutes > 0 and age_min < freeze_minutes + 5:
-                    time.sleep(stabilize_wait)
-                    try:
-                        stat2 = os.stat(entry.path)
-                        if stat2.st_size != stat.st_size:
-                            total_frozen += 1
-                            continue
-                    except OSError:
-                        total_frozen += 1
-                        continue
-
-            duration = info["end_ts"] - info["start_ts"]
-            ok = db.add_file_task(
-                filepath=entry.path,
-                cam_index=info["cam_index"],
-                date=info["date"],
-                file_start_time=info["file_start_time"],
-                file_end_time=info["file_end_time"],
-                file_duration=duration,
-            )
-            if ok:
-                total_added += 1
-            else:
-                total_skipped += 1
-    logger.info("scan done: total_added=%d total_skipped=%d total_frozen=%d", total_added, total_skipped, total_frozen)
+                            duration = info["end_ts"] - info["start_ts"]
+                            progress.update(f"登记文件 {entry.path}", total_added + total_skipped + total_frozen)
+                            ok = db.add_file_task(
+                                filepath=entry.path,
+                                cam_index=info["cam_index"],
+                                date=info["date"],
+                                file_start_time=info["file_start_time"],
+                                file_end_time=info["file_end_time"],
+                                file_duration=duration,
+                            )
+                            if ok:
+                                total_added += 1
+                            else:
+                                total_skipped += 1
+                        except OSError:
+                            logger.exception("无法扫描文件: %s", entry.path)
+                            raise
+                        finally:
+                            progress.update(f"枚举目录 {target_dir}", total_added + total_skipped + total_frozen)
+        except OSError:
+            logger.exception("扫描失败，停止本轮处理；已入库记录保留，下次可继续。当前操作: %s", progress.state[0])
+            raise
+        logger.info("扫描完成: 新增=%d 跳过=%d 冻结=%d，耗时=%.1fs",
+                    total_added, total_skipped, total_frozen, time.monotonic() - progress.started,
+                    extra={"startup_progress": True})
     return ScanResult(added=total_added, skipped=total_skipped, frozen_pending=total_frozen)
 
 
 
-def get_date_cam_groups(db: VlogDatabase) -> list[tuple[str, int]]:
+def get_date_cam_groups(
+    db: VlogDatabase, dates: list[str] | None = None, cam_index: int | None = None,
+) -> list[tuple[str, int]]:
     rows = db.conn.execute(
         """SELECT DISTINCT date, cam_index FROM file_tasks
            ORDER BY date, cam_index"""
     ).fetchall()
-    return [(r["date"], r["cam_index"]) for r in rows]
+    selected_dates = set(dates) if dates else None
+    return [(r["date"], r["cam_index"]) for r in rows
+            if (selected_dates is None or r["date"] in selected_dates)
+            and (cam_index is None or r["cam_index"] == cam_index)]

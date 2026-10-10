@@ -58,7 +58,6 @@ def test_yolo_confidence_backfill_and_merge():
     verifier = YoloVerifier.__new__(YoloVerifier)
     verifier.enabled = True
     verifier.confidence = 0.25
-    verifier.sample_fps = 0.5
     verifier.skip_energy_threshold = 12.0
     verifier.target_classes = {0}
     verifier.device = "cpu"
@@ -262,7 +261,6 @@ def test_yolo_verifies_dynamic_audio():
     verifier = YoloVerifier.__new__(YoloVerifier)
     verifier.enabled = True
     verifier.confidence = 0.25
-    verifier.sample_fps = 0.5
     verifier.target_classes = {0}
     verifier.device = "cpu"
 

@@ -510,7 +510,9 @@ class TestConcatOutputFiles:
         output = tmp_path / "joined.mp4"
         timings = {"stale": 1}
         assert concat_output_files(clips, output, timings=timings)
-        assert set(timings) == {"probe_s", "ffmpeg_s", "validation_s", "checkpoints", "promote_s"}
+        assert {"probe_s", "ffmpeg_s", "validation_s", "checkpoints", "promote_s"} <= set(timings)
+        assert timings["status"] == "completed"
+        assert timings["failure_stage"] is None
         assert timings["checkpoints"] == 1
         assert all(timings[key] >= 0 for key in ("probe_s", "ffmpeg_s", "validation_s", "promote_s"))
         frames = video(output)
@@ -531,18 +533,75 @@ class TestConcatOutputFiles:
         assert not out.exists()
 
     def test_invalid_join_preserves_previous_output_and_batches(self, tmp_path):
-        from types import SimpleNamespace
+        from src.hardware.ffmpeg import FFmpegResult
         out, batch = tmp_path / "out.mp4", tmp_path / "batch.mp4"
         out.write_bytes(b"previous")
         batch.write_bytes(b"batch")
         def encode(args, **kwargs):
             Path(args[-1]).write_bytes(b"invalid join")
-            return SimpleNamespace(returncode=0)
+            return FFmpegResult(0, b"", b"encoder diagnostic")
         with patch("src.renderer.get_duration", return_value=2), patch("src.renderer.run_ffmpeg", side_effect=encode), patch("src.render_cache.valid_video", return_value=False):
             assert not concat_output_files([batch, batch], out)
         assert out.read_bytes() == b"previous"
         assert batch.read_bytes() == b"batch"
         assert not out.with_name("out.tmp.mp4").exists()
+        diagnostic = tmp_path / ".concat_failures" / "out"
+        assert (diagnostic / "failed.mp4").read_bytes() == b"invalid join"
+        assert (diagnostic / "stderr.log").read_text() == "encoder diagnostic"
+        import json
+        assert json.loads((diagnostic / "failure.json").read_text())["failure_stage"] == "validation"
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_concat_failure_records_phase_and_preserves_first_evidence(self, tmp_path, cancelled):
+        import json
+        from src.hardware.ffmpeg import FFmpegResult
+        output = tmp_path / "out.mp4"
+        batch = tmp_path / "batch.mp4"
+        batch.write_bytes(b"original batch")
+        timings = {}
+        def encode(args, **kwargs):
+            Path(args[-1]).write_bytes(b"partial output")
+            if cancelled:
+                raise KeyboardInterrupt
+            return FFmpegResult(-9, b"", b"timeout evidence", timed_out=True)
+        with patch("src.renderer.run_ffmpeg", side_effect=encode):
+            if cancelled:
+                with pytest.raises(KeyboardInterrupt):
+                    concat_output_files([batch, batch], output, durations=[2, 2], timings=timings)
+            else:
+                assert not concat_output_files([batch, batch], output, durations=[2, 2], timings=timings)
+        assert timings["status"] == ("cancelled" if cancelled else "failed")
+        assert timings["failure_stage"] == "ffmpeg"
+        assert timings["ffmpeg_s"] >= 0
+        assert timings["total_s"] >= timings["ffmpeg_s"]
+        diagnostic = output.parent / ".concat_failures" / output.stem
+        first = (diagnostic / "failure.json").read_bytes()
+        assert json.loads(first)["status"] == timings["status"]
+        assert (diagnostic / "failed.mp4").read_bytes() == b"partial output"
+        assert batch.read_bytes() == b"original batch"
+        # Later failures cannot overwrite the first retained artifact.
+        with patch("src.renderer.run_ffmpeg", return_value=FFmpegResult(1, b"", b"new error")):
+            assert not concat_output_files([batch, batch], output, durations=[2, 2])
+        assert (diagnostic / "failure.json").read_bytes() == first
+
+    def test_concat_failure_media_budget_keeps_report(self, tmp_path):
+        from src.stages.renderer import _preserve_concat_failure
+        temporary = tmp_path / "out.tmp.mp4"
+        temporary.write_bytes(b"partial")
+        real_stat = Path.stat
+        def stat(path, *args, **kwargs):
+            if path == temporary:
+                from types import SimpleNamespace
+                return SimpleNamespace(st_size=17 * 1024**3, st_mode=real_stat(path).st_mode)
+            return real_stat(path, *args, **kwargs)
+        report = {"failure_stage": "ffmpeg"}
+        with patch.object(Path, "stat", stat):
+            _preserve_concat_failure(tmp_path / "out.mp4", temporary, tmp_path / "missing.txt", report, "故障\r\n" * 100000)
+        diagnostic = tmp_path / ".concat_failures" / "out"
+        assert not (diagnostic / "failed.mp4").exists()
+        assert (diagnostic / "stderr.log").stat().st_size <= 65536
+        assert (diagnostic / "stderr.log").read_text(encoding="utf-8").endswith("故障\n")
+        assert "media_retention_skipped" in report
 
     def test_timeline_normalization_preserves_clipped_confidence_and_peak(self):
         segments = [

@@ -96,7 +96,6 @@ def mock_config(temp_test_dir):
             "min_motion_duration": 2.0,
             "min_static_duration": 30.0,
             "gap_tolerance": 0.5,
-            "min_segment_duration": 0.1,
             "static_keyframe_interval": 30.0,
             "keyframe_display_duration": 0.5,
             "min_static_display_duration": 1.5,
@@ -149,6 +148,56 @@ def mock_config(temp_test_dir):
             "monitor_interval": 1.0,
         },
     }
+
+
+@pytest.fixture
+def delivery_workspace(tmp_path, monkeypatch):
+    """Isolate delivery orchestration while keeping real SQLite/assets/rollback."""
+    from types import SimpleNamespace
+    from src import pipeline
+    from src.hardware.render_cache import processing_fingerprint, _manifest_path
+    config = {"output": {"naming": "DailyVlog_{date}_cam{index}.mp4"},
+              "render": {"generate_subtitles": False}}
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"controlled source")
+    db = VlogDatabase(tmp_path / "delivery.db")
+    db.add_file_task(str(source), 0, "20260901", "20260901000000", "20260901000100", 60)
+    db.set_prescreen_result(str(source), "STATIC")
+    db.set_processing_fingerprint(str(source), processing_fingerprint(source, config))
+    batches = [tmp_path / f"batch{i}.mp4" for i in range(2)]
+    for batch in batches:
+        batch.write_bytes(b"new media")
+        batch.with_name(batch.name + ".json").write_bytes(b"batch manifest")
+    output = out_dir / "DailyVlog_20260901_cam0.mp4"
+    protected = (output, output.with_suffix(".meta.json"), output.with_suffix(".srt"), _manifest_path(output))
+    original = {}
+    for index, path in enumerate(protected):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"old asset {index}".encode())
+        original[path] = path.read_bytes()
+    orch = MagicMock()
+    orch.errors = []
+    orch.run.return_value = batches
+    for name, replacement in {
+        "load_config": lambda: config, "OUTPUT_DIR": out_dir,
+        "StreamingOrchestrator": MagicMock(return_value=orch), "get_monitor": MagicMock(),
+        "print_startup_banner": MagicMock(), "print_summary_card": MagicMock(),
+        "_dump_perf": MagicMock(), "_build_headline": MagicMock(return_value={}),
+    }.items():
+        monkeypatch.setattr(pipeline, name, replacement)
+    def concat(paths, destination, **kwargs):
+        destination.write_bytes(b"new media")
+        return True
+    monkeypatch.setattr(pipeline, "concat_output_files", concat)
+    monkeypatch.setattr("src.stages.companion.get_duration", lambda _: 12.2501)
+    monkeypatch.setattr("src.core.utils.cleanup_staging_files", lambda: None)
+    try:
+        yield SimpleNamespace(db=db, config=config, output=output, batches=batches,
+                              original=original, source=source, orch=orch, pipeline=pipeline)
+    finally:
+        db.close()
 
 
 @pytest.fixture

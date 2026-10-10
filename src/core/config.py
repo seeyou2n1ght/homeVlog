@@ -15,7 +15,7 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 DB_PATH = PROJECT_ROOT / "data" / "vlog.db"
 
 SETTINGS: dict = {}
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()
 
 
 def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:

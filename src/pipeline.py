@@ -5,6 +5,8 @@ import subprocess
 import time
 import threading
 import queue
+import stat
+import shutil
 import uuid
 from pathlib import Path
 
@@ -19,12 +21,14 @@ from src.core.database import VlogDatabase
 from src.stages.scanner import scan_directory, get_date_cam_groups
 from src.stages.prescreen import prescreen_file
 from src.stages.detector import MotionDetector, detect_audio_activity
-from src.stages.renderer import build_batch_render, concat_output_files
+from src.stages.renderer import RenderInterrupted, build_batch_render, concat_output_files
 from src.stages.companion import (
     dump_perf as _dump_perf,
     build_headline as _build_headline,
-    companion_assets_complete,
     save_vlog_companion_assets as _save_vlog_companion_assets,
+    promote_vlog_assets,
+    cleanup_delivery_candidate,
+    build_batch_summary_item,
 )
 from src.core.config import (
     load_config,
@@ -180,7 +184,6 @@ class StreamingOrchestrator:
         analysis_workers = int(det_cfg.get("analysis_max_workers", 4))
         render_workers = max(1, int(render_cfg.get("max_concurrency", 2)))
         requested_prescreen = int(det_cfg.get("prescreen_parallel", 8))
-        self.io_limit = io_limit
         self.analysis_workers = max(1, analysis_workers)
         self.render_workers = render_workers
         self.prescreen_workers = max(1, min(requested_prescreen,
@@ -207,6 +210,7 @@ class StreamingOrchestrator:
         FFmpegProcessRegistry.reset_interrupted()
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
+        self._render_interruption_reason: str | None = None
         self.render_finished_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
@@ -338,6 +342,7 @@ class StreamingOrchestrator:
                     # path just to discover whether its audio is silent.
                     # Decode audio features only; failures stay conservative.
                     try:
+                        visual_result = json.loads(res.get("result_json") or "{}")
                         audio_events, audio_stats = detect_audio_activity(
                             filepath, duration, self.config
                         )
@@ -345,12 +350,14 @@ class StreamingOrchestrator:
                             res["status"] = "SUSPICIOUS"
                             res["result_json"] = json.dumps({
                                 "mode": "keyframes_audio_gate",
+                                "visual_result": visual_result,
                                 "audio_events": audio_events,
                                 "vad_stats": audio_stats,
                             })
                         else:
                             res["result_json"] = json.dumps({
                                 "mode": "keyframes_audio_gate",
+                                "visual_result": visual_result,
                                 "audio_events": [],
                                 "vad_stats": audio_stats,
                             })
@@ -863,7 +870,7 @@ class StreamingOrchestrator:
         for r in all_rows:
             fp = r["filepath"]
             raw_segs = r.get("analysis_segments")
-            if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
+            if raw_segs:
                 try:
                     from src.algorithms.segment import segments_from_json
                     segs = segments_from_json(raw_segs)
@@ -915,9 +922,13 @@ class StreamingOrchestrator:
                         continue
                     if r.get("prescreen_status") == "SUSPICIOUS":
                         raw_segs = r.get("analysis_segments")
-                        if raw_segs and ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs):
-                            ready_heavy[fp] = True
-                            return True
+                        if raw_segs:
+                            from src.algorithms.segment import segments_from_json
+                            active = sum(s.duration for s in segments_from_json(raw_segs) if s.is_dynamic)
+                            dynamic_duration_by_file[fp] = active
+                            ready_heavy[fp] = active > 0
+                            if active > 0:
+                                return True
                     ready_heavy[fp] = False
             except Exception:
                 pass
@@ -1165,6 +1176,10 @@ class StreamingOrchestrator:
                                         "batch_files": len(files_to_batch),
                                         "segments": len(batch_segs),
                                         "dynamic_duration_s": round(batch_dyn, 2),
+                                        "normal_speed_duration_s": round(batch_dyn, 2),
+                                        "active_source_duration_s": round(sum(s.duration for s in batch_segs if s.state != "STATIC"), 2),
+                                        "queue_active_source_duration_s": round(sum(dynamic_duration_by_file.get(fp, 0.0) for fp in files_to_batch), 2),
+                                        "source_duration_s": round(sum(float(r.get("file_duration") or 0) for r in all_rows), 2),
                                         "is_stolen": is_stolen,
                                         "is_light": is_light,
                                         "render_queue_wait_s": round(render_queue_wait, 3),
@@ -1203,7 +1218,7 @@ class StreamingOrchestrator:
 
                             can_retry = False
                             with self.batch_lock:
-                                if batch_retries.get(b_idx, 0) < 1:
+                                if gpu == "nv" and batch_retries.get(b_idx, 0) < 1:
                                     batch_retries[b_idx] = batch_retries.get(b_idx, 0) + 1
                                     can_retry = True
                             if can_retry:
@@ -1219,6 +1234,15 @@ class StreamingOrchestrator:
                                 terminal_batch_ids.add(b_idx)
                             if self.dashboard is not None:
                                 self.dashboard.render_batch_finished(len(files_to_batch))
+                    except RenderInterrupted as exc:
+                        with self.batch_lock:
+                            self._render_interruption_reason = str(exc)
+                        self.abort_event.set()
+                        self.stop_event.set()
+                        FFmpegProcessRegistry.mark_interrupted()
+                        FFmpegProcessRegistry.kill_all()
+                        logger.warning("Rendering interrupted; preserving completed batches: %s", exc)
+                        break
                     except Exception:
                         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                             break
@@ -1233,7 +1257,7 @@ class StreamingOrchestrator:
 
                         can_retry = False
                         with self.batch_lock:
-                            if batch_retries.get(b_idx, 0) < 1:
+                            if gpu == "nv" and batch_retries.get(b_idx, 0) < 1:
                                 batch_retries[b_idx] = batch_retries.get(b_idx, 0) + 1
                                 can_retry = True
                         if can_retry:
@@ -1310,7 +1334,7 @@ class StreamingOrchestrator:
             prefetch_thread.start()
 
         def _estimate_dynamic_duration(files: list[str]) -> float:
-            """估算批次的真实动态时长，用于 LPT/SPT 双端队列精准定价。"""
+            """Active source seconds (including presence/night), not 1x display time."""
             return sum(dynamic_duration_by_file.get(fp, 0.0) for fp in files)
 
         def _enqueue_batch(b_idx: int, files: list[str]):
@@ -1364,16 +1388,16 @@ class StreamingOrchestrator:
                     # immutable chronological ordinal is the batch id, so a
                     # later-ready file can render immediately while final
                     # concat remains deterministic after sorting by id.
-                    if status != "FAILED" and filepath not in dispatched_files:
+                    if status not in ("FAILED", "SKIPPED_EMPTY") and filepath not in dispatched_files:
                         _enqueue_batch(order_index[filepath], [filepath])
                         dispatched_files.add(filepath)
                 elif filepath in ordered_set:
                     ready_status[filepath] = status
-                elif status != "FAILED":
+                elif status not in ("FAILED", "SKIPPED_EMPTY"):
                     pending_files.append(filepath)
                 while head < len(ordered_files) and ordered_files[head] in ready_status:
                     fp_head = ordered_files[head]
-                    if ready_status[fp_head] != "FAILED":
+                    if ready_status[fp_head] not in ("FAILED", "SKIPPED_EMPTY"):
                         pending_files.append(fp_head)
                     head += 1
                 while len(pending_files) >= self.batch_max_files:
@@ -1461,7 +1485,8 @@ class StreamingOrchestrator:
                 else:
                     self.render_batch_queue.put({"filepath": task["filepath"], "status": task["analysis_status"]})
             elif task["prescreen_status"] != "PENDING":
-                self.render_batch_queue.put({"filepath": task["filepath"], "status": "FAILED"})
+                status = "SKIPPED_EMPTY" if task["prescreen_status"] == "SKIPPED_EMPTY" else "FAILED"
+                self.render_batch_queue.put({"filepath": task["filepath"], "status": status})
 
         # 若无需执行预筛（例如断点续跑），或预热队列已积压足量任务，即刻解除预热门控
         if not pending_prescreen or len(pending_analysis) >= 6:
@@ -1522,7 +1547,7 @@ class StreamingOrchestrator:
                     if self.render_finished_event.wait(timeout=0.2):
                         break
         except (KeyboardInterrupt, SystemExit):
-            logger.warning("StreamingOrchestrator interrupted by user (Ctrl+C). Terminating subprocesses...")
+            logger.warning("StreamingOrchestrator interrupted. Terminating subprocesses...")
             self.abort_event.set()
             self.stop_event.set()
             self.render_finished_event.set()
@@ -1547,6 +1572,9 @@ class StreamingOrchestrator:
             self.dashboard = None
         unregister_dashboard()
 
+        if self._render_interruption_reason is not None:
+            raise KeyboardInterrupt(self._render_interruption_reason)
+
         with self.batch_lock:
             self.batch_paths.sort(key=lambda x: x[0])
             final_paths = [p for _, p in self.batch_paths]
@@ -1559,17 +1587,52 @@ class StreamingOrchestrator:
         return final_paths
 
 
+def _reconcile_empty_files(db: VlogDatabase, date: str, cam_index: int) -> None:
+    """Skip only confirmed zero-byte sources; recheck exclusions on every retry."""
+    for row in db.get_all_file_tasks_for_date(date, cam_index):
+        previous = row["prescreen_status"]
+        if previous not in ("PENDING", "FAILED", "SKIPPED_EMPTY"):
+            continue
+        filepath = row["filepath"]
+        try:
+            info = Path(filepath).stat()
+            empty = stat.S_ISREG(info.st_mode) and info.st_size == 0
+        except OSError as exc:
+            # An unavailable NAS path must never be mistaken for an empty file.
+            if previous == "SKIPPED_EMPTY":
+                db.set_prescreen_result(filepath, "FAILED", error_msg=str(exc))
+            continue
+        if empty:
+            db.set_prescreen_result(filepath, "SKIPPED_EMPTY", error_msg="zero-byte source file")
+            logger.warning("跳过空文件（0 字节）: %s；缺失时段 %s 至 %s，将记录在成片元数据中",
+                           filepath, row["file_start_time"], row["file_end_time"])
+        elif previous == "SKIPPED_EMPTY":
+            db.set_prescreen_result(filepath, "PENDING")
+
+
 def process_date_cam(
     db: VlogDatabase, date: str, cam_index: int,
     skip_render: bool = False, dashboard_enabled: bool = True,
     force_render: bool = False,
 ) -> bool:
+    # Completion records survive moving delivered assets to offline storage.
+    # Check before fingerprint invalidation so configuration changes cannot
+    # silently reopen an already delivered day.
+    if not force_render and db.is_render_completed(date, cam_index):
+        pending = db.get_pending_file_count_for_date(date, cam_index)
+        logger.info("已完成，跳过 %s cam%d（产物可已移至备份介质）；重做请使用 --force-render",
+                    date, cam_index)
+        if pending:
+            logger.warning("%s cam%d 已交付，但有 %d 个待处理素材（可能为新增素材）；"
+                           "本次不自动重做，请使用 --force-render 纳入成片", date, cam_index, pending)
+        return True
     config = load_config()
     monitor = get_monitor()
     t_start = time.monotonic()
     # 失败任务自愈：将历史 FAILED 预筛/分析重置为 PENDING（retry_count 上限防护），
     # 使此前因信号量饥饿等原因丢失的文件在本次运行中补齐
     db.invalidate_stale_results(date, cam_index, config)
+    _reconcile_empty_files(db, date, cam_index)
     db.reset_failed_tasks(date, cam_index)
     all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
     total_files = len(all_tasks)
@@ -1627,20 +1690,26 @@ def process_date_cam(
     logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
     output_path = OUTPUT_DIR / output_name
 
-    from src.hardware.render_cache import render_fingerprint, reusable, save_manifest
+    from src.hardware.render_cache import render_fingerprint, save_manifest
     def final_fingerprint():
         rows = db.get_all_file_tasks_for_date(date, cam_index)
         decisions = [{k: r.get(k) for k in ("filepath", "file_duration", "prescreen_status", "analysis_segments", "human_reviews")} for r in rows]
         return render_fingerprint([r["filepath"] for r in rows], json.dumps(decisions, sort_keys=True),
                                   "final", out_cfg.get("fps", 20), out_cfg, out_cfg.get("audio", {}), config)
-    if (not force_render and not skip_render and db.is_render_completed(date, cam_index) and
-            db.get_pending_file_count_for_date(date, cam_index) == 0 and
-            reusable(output_path, final_fingerprint(), require_audio=True) and
-            companion_assets_complete(output_path, config)):
-        logger.info("Verified completed output: %s", output_path)
-        return True
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render,
                                          dashboard_enabled=dashboard_enabled, cam_name=cam_display)
+    def fail(message):
+        logger.error("Pipeline %s cam%d failed: %s", date, cam_index, message)
+        if not skip_render:
+            try:
+                db.set_render_status(date, cam_index, "FAILED", error_msg=message)
+            except Exception:
+                logger.exception("Could not persist failed delivery status")
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}),
+                   run_context={**run_context, "status": "failed", "error": message})
+        return False
+
     try:
         with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
             batch_paths = orchestrator.run()
@@ -1651,17 +1720,28 @@ def process_date_cam(
         raise
     except Exception as exc:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
-        db.set_render_status(date, cam_index, "FAILED", error_msg=f"streaming pipeline failed: {exc}")
-        return False
+        return fail(f"streaming pipeline failed: {exc}")
 
-    if skip_render:
-        return True
     with orchestrator.error_lock:
         run_errors = list(orchestrator.errors)
+    task_rows = db.get_all_file_tasks_for_date(date, cam_index)
+    if all_tasks and not task_rows:
+        return fail("source task reconciliation unavailable")
+    incomplete = [
+        row for row in task_rows
+        if row.get("prescreen_status") not in ("STATIC", "SUSPICIOUS", "SKIPPED_EMPTY")
+        or (row.get("prescreen_status") == "SUSPICIOUS"
+            and row.get("analysis_status") != "ANALYZED")
+    ]
+    if skip_render:
+        if run_errors or incomplete:
+            return fail("; ".join(run_errors[:3]) or f"{len(incomplete)} source tasks incomplete")
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}),
+                   run_context={**run_context, "status": "analysis_completed"})
+        return True
     if not batch_paths:
-        db.set_render_status(date, cam_index, "FAILED",
-                             error_msg="; ".join(run_errors[:3]) or "no render batches produced")
-        return False
+        return fail("; ".join(run_errors[:3]) or "no render batches produced")
 
     # 运行期间的告警与异常汇总 (含管线内部错误)
     if run_errors:
@@ -1677,95 +1757,100 @@ def process_date_cam(
             "render %s cam%d has %d batch failures, aborting concat to preserve valid batches for resume: %s",
             date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
         )
-        db.set_render_status(date, cam_index, "FAILED", error_msg="; ".join(render_batch_errors[:3]))
-        elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
-        return False
+        return fail("; ".join(render_batch_errors[:3]))
 
     # A render batch can succeed while an upstream file task failed. Never
     # publish a day that silently omits failed or unfinished source material.
-    task_rows = db.get_all_file_tasks_for_date(date, cam_index)
-    incomplete = [
-        row for row in task_rows
-        if row.get("prescreen_status") in ("PENDING", "FAILED")
-        or (row.get("prescreen_status") == "SUSPICIOUS"
-            and row.get("analysis_status") != "ANALYZED")
-    ]
     if incomplete:
         logger.error(
             "render %s cam%d blocked: %d source tasks incomplete (first=%s)",
             date, cam_index, len(incomplete), incomplete[0].get("filepath"),
         )
         first = incomplete[0]
-        db.set_render_status(date, cam_index, "FAILED", error_msg=(
+        return fail(
             f"{len(incomplete)} source tasks incomplete; first={first['filepath']}: "
             f"{first.get('error_msg') or first.get('prescreen_status') or first.get('analysis_status')}"
-        ))
-        elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
-        return False
+        )
 
-    db.upsert_render_task(date, cam_index, "RENDERING")
+    candidate = output_path.with_name(output_path.stem + ".pending.mp4")
     concat_t0 = time.monotonic()
     concat_timings = {}
+    ok = False
     try:
-        if len(batch_paths) == 1:
-            batch_paths[0].replace(output_path)
-            ok = True
-        else:
-            ok = concat_output_files(batch_paths, output_path, timings=concat_timings)
-            if ok:
-                for p in batch_paths:
-                    p.unlink(missing_ok=True)
-                    p.with_name(p.name + ".json").unlink(missing_ok=True)
+        try:
+            db.set_render_status(date, cam_index, "RENDERING")
+            if len(batch_paths) == 1:
+                shutil.copy2(batch_paths[0], candidate)
+                ok = True
             else:
-                logger.error("concat_output_files failed for %s cam%d", date, cam_index)
-                db.set_render_status(date, cam_index, "FAILED", error_msg="final batch concat failed")
-                elapsed_wall = time.monotonic() - t_start
-                _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-                           worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
-                return False
+                ok = concat_output_files(batch_paths, candidate, timings=concat_timings)
+        except (KeyboardInterrupt, SystemExit):
+            concat_timings["status"] = "cancelled"
+            raise
+        finally:
+            t_concat_done = time.monotonic()
+            get_perf().add(PerfRecord(
+                stage="final_concat", file=output_path.name, gpu="cpu",
+                duration=round(t_concat_done - concat_t0, 3),
+                extra={"batch_count": len(batch_paths),
+                       "status": "completed" if ok else "failed", **concat_timings},
+                start_time=round(concat_t0, 3), end_time=round(t_concat_done, 3),
+                worker="concat",
+            ))
+    except (KeyboardInterrupt, SystemExit):
+        cleanup_delivery_candidate(candidate)
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}),
+                   run_context={**run_context, "status": "cancelled"})
+        raise
     except Exception as exc:
         logger.exception("finalize render output failed")
-        db.set_render_status(date, cam_index, "FAILED", error_msg=f"finalize render output failed: {exc}")
-        return False
+        cleanup_delivery_candidate(candidate)
+        return fail(f"finalize render output failed: {exc}")
 
-    t_concat_done = time.monotonic()
-    get_perf().add(PerfRecord(
-        stage="final_concat", file=output_path.name, gpu="cpu",
-        duration=round(t_concat_done - concat_t0, 3),
-        extra={"batch_count": len(batch_paths), **concat_timings},
-        start_time=round(concat_t0, 3),
-        end_time=round(t_concat_done, 3),
-        worker="concat",
-    ))
+    if not ok:
+        stage = concat_timings.get("failure_stage", "unknown")
+        logger.error("concat_output_files failed for %s cam%d at %s", date, cam_index, stage)
+        cleanup_delivery_candidate(candidate)
+        return fail(f"final batch concat failed: {stage}")
 
     # 生成标准化成片伴随资产包：.srt 现实世界时间码字幕 + .meta.json 结构化清单
-    assets_ok = _save_vlog_companion_assets(
-        output_path=output_path,
-        date=date,
-        cam_index=cam_index,
-        cam_display=cam_display,
-        total_files=total_files,
-        total_input_dur=total_input_dur,
-        elapsed_wall=time.monotonic() - t_start,
-        db=db,
-        config=config,
-    )
-    if not assets_ok:
-        logger.error("required companion assets failed for %s", output_path)
-        db.set_render_status(date, cam_index, "FAILED", output_file=str(output_path),
-                             error_msg="required companion assets failed")
-        elapsed_wall = time.monotonic() - t_start
-        _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-                   worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
-        return False
-
-    save_manifest(output_path, final_fingerprint())
-
-    db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
+    media_metrics = {}
+    try:
+        assets_ok = _save_vlog_companion_assets(
+            output_path=candidate,
+            date=date,
+            cam_index=cam_index,
+            cam_display=cam_display,
+            total_files=total_files,
+            total_input_dur=total_input_dur,
+            elapsed_wall=time.monotonic() - t_start,
+            db=db,
+            config=config,
+            media_metrics=media_metrics,
+        )
+        if not assets_ok:
+            return fail("required companion assets failed")
+        fingerprint = final_fingerprint()
+        with promote_vlog_assets(candidate, output_path, config):
+            save_manifest(output_path, fingerprint)
+            db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
+            if not db.is_render_completed(date, cam_index):
+                raise RuntimeError("completion record was not committed")
+    except (KeyboardInterrupt, SystemExit):
+        try:
+            db.set_render_status(date, cam_index, "PENDING", error_msg="delivery commit cancelled")
+        except Exception:
+            logger.exception("Could not persist cancelled delivery status")
+        _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
+                   worker_stats=getattr(orchestrator, "render_worker_stats", {}),
+                   run_context={**run_context, "status": "cancelled"})
+        raise
+    except Exception as exc:
+        logger.exception("Delivery commit failed")
+        return fail(f"delivery commit failed: {exc}")
+    finally:
+        cleanup_delivery_candidate(candidate)
     # End-to-end means the final container, manifest, optional subtitles and DB
     # completion marker are all durable.  Previous reports stopped this clock
     # before concat and under-reported the user-observed runtime by ~20 seconds.
@@ -1782,28 +1867,37 @@ def process_date_cam(
     logger.info("Pipeline %s cam%d finished in %.1fs", date, cam_index, elapsed_wall)
 
     _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
-               headline=_build_headline(output_path, total_input_dur, elapsed_wall),
+               headline=_build_headline(output_path, total_input_dur, elapsed_wall,
+                                        output_duration_s=media_metrics.get("duration_s")),
                worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
 
     # 自动回收本地预暂存文件，释放磁盘存储空间
-    from src.core.utils import cleanup_staging_files, cleanup_temp_artifacts
+    from src.core.utils import cleanup_staging_files
     cleanup_staging_files()
     if config.get("render", {}).get("cleanup_batches_on_success", False):
-        cleanup_temp_artifacts(clean_batches=True)
+        for batch in batch_paths:
+            try:
+                batch.unlink(missing_ok=True)
+                batch.with_name(batch.name + ".json").unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Delivery committed; could not remove batch %s", batch)
     return True
 
 
-def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True) -> dict:
+def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True,
+                 force_render: bool = False) -> dict:
     from src.core.utils import cleanup_temp_artifacts
+    logger.info("准备临时工作目录和任务数据库…", extra={"startup_progress": True})
     cleanup_temp_artifacts()
     db = VlogDatabase()
+    logger.info("任务数据库已就绪，正在初始化硬件监控…", extra={"startup_progress": True})
     monitor = get_monitor()
     monitor.start()
     try:
         scan_directory(db, input_dir=input_dir)
         groups = get_date_cam_groups(db)
         if not groups:
-            return {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+            return {"total": 0, "ok": 0, "failed": 0, "skipped": 0, "remaining": 0, "stopped_reason": None}
 
         # Rich 批量任务启动 Banner
         dates = sorted(d for d, _ in groups)
@@ -1815,16 +1909,24 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
             output_dir=str(OUTPUT_DIR),
         )
 
-        ok, failed = 0, 0
+        ok, failed, skipped = 0, 0, 0
+        stopped_reason = None
         batch_summary_list = []
         for date, cam_index in groups:
-            if not check_disk_space(OUTPUT_DIR, min_gb=20):
+            already_completed = not force_render and db.is_render_completed(date, cam_index)
+            if not already_completed and not check_disk_space(OUTPUT_DIR):
+                stopped_reason = "LOW_DISK_SPACE"
+                logger.warning("Batch stopped: LOW_DISK_SPACE; %d groups remain", len(groups) - ok - failed - skipped)
                 break
             t0 = time.monotonic()
             success = False
             try:
-                if process_date_cam(db, date, cam_index, skip_render=skip_render, dashboard_enabled=dashboard_enabled):
-                    ok += 1
+                if process_date_cam(db, date, cam_index, skip_render=skip_render,
+                                    dashboard_enabled=dashboard_enabled, force_render=force_render):
+                    if already_completed:
+                        skipped += 1
+                    else:
+                        ok += 1
                     success = True
                 else:
                     failed += 1
@@ -1832,51 +1934,25 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 from src.hardware.ffmpeg import FFmpegProcessRegistry
                 FFmpegProcessRegistry.mark_interrupted()
                 FFmpegProcessRegistry.kill_all()
-                logger.warning("run_pipeline interrupted by user (Ctrl+C). Halting batch pipeline.")
+                logger.warning("run_pipeline interrupted. Halting batch pipeline.")
                 raise
             except Exception:
                 logger.exception("pipeline crash")
                 failed += 1
             finally:
                 wall_s = time.monotonic() - t0
-                tasks = db.get_all_file_tasks_for_date(date, cam_index)
-                sample_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else ""
-                from src.stages.scanner import resolve_camera_ui_name, resolve_output_filename
-                disp = resolve_camera_ui_name(sample_dir, cam_index=cam_index, config=load_config())
-                out_name = resolve_output_filename(
-                    load_config().get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),
-                    date, cam_index, tasks[0]["filepath"] if tasks else None, config=load_config()
-                )
-                out_p = Path(OUTPUT_DIR) / out_name
-                meta_p = out_p.with_suffix(".meta.json")
-                item = {
-                    "date": date,
-                    "cam_index": cam_index,
-                    "cam_name": disp,
-                    "total_files": len(tasks),
-                    "input_duration_s": sum(t.get("file_duration", 0.0) or 0.0 for t in tasks),
-                    "vlog_duration_s": 0.0,
-                    "output_size_mb": round(out_p.stat().st_size / (1024 * 1024), 2) if out_p.exists() else 0.0,
-                    "wall_clock_s": round(wall_s, 2),
-                    "status": "SUCCESS" if success else "FAILED",
-                }
-                if meta_p.exists():
-                    try:
-                        m_d = json.loads(meta_p.read_text(encoding="utf-8"))
-                        m_m = m_d.get("metrics", {})
-                        item["vlog_duration_s"] = m_m.get("vlog_duration_s", 0.0)
-                        item["condensation_ratio"] = m_m.get("condensation_ratio", 0.0)
-                        item["speedup_x"] = m_d.get("performance", {}).get("speedup_x", 0.0)
-                    except Exception:
-                        pass
-                batch_summary_list.append(item)
+                status = "SKIPPED" if success and already_completed else ("SUCCESS" if success else "FAILED")
+                batch_summary_list.append(build_batch_summary_item(
+                    db, date, cam_index, OUTPUT_DIR, load_config(), wall_s, status, skip_render=skip_render,
+                ))
             cleanup_resources()
 
         if len(groups) > 1:
             from src.ui import print_batch_summary_table
             print_batch_summary_table(batch_summary_list)
 
-        return {"total": len(groups), "ok": ok, "failed": failed}
+        return {"total": len(groups), "ok": ok, "failed": failed, "skipped": skipped,
+                "remaining": len(groups) - ok - failed - skipped, "stopped_reason": stopped_reason}
     finally:
         monitor.shutdown()
         db.close()

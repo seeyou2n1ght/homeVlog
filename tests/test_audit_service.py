@@ -6,6 +6,42 @@ from src.segment import Segment
 from scripts.audit_tool.service import AuditService
 
 
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("cleanup", [False, True])
+@pytest.mark.parametrize("failure", ["assets_false", "assets_exception", "manifest", "interrupted", "none"])
+def test_reviewed_delivery_keeps_batches_and_old_assets_until_commit(delivery_workspace, monkeypatch, count, cleanup, failure):
+    from unittest.mock import MagicMock
+    import threading
+    from scripts.audit_tool import rerender
+    w = delivery_workspace
+    w.config["render"]["cleanup_batches_on_success"] = cleanup
+    monkeypatch.setattr(rerender, "load_config", lambda: w.config)
+    monkeypatch.setattr(rerender, "OUTPUT_DIR", w.output.parent)
+    monkeypatch.setattr(rerender, "partition_timeline_by_batches", lambda timeline, **kwargs: [[timeline[0]]] * count)
+    monkeypatch.setattr(rerender, "build_batch_render", lambda **kwargs: str(w.batches[kwargs["bi"]]))
+    monkeypatch.setattr(rerender, "concat_output_files", w.pipeline.concat_output_files)
+    if failure.startswith("assets"):
+        replacement = MagicMock(return_value=False) if failure == "assets_false" else MagicMock(side_effect=OSError("assets exception"))
+        monkeypatch.setattr(w.pipeline, "_save_vlog_companion_assets", replacement)
+    elif failure == "manifest":
+        monkeypatch.setattr("src.hardware.render_cache.save_manifest", MagicMock(side_effect=OSError("manifest failure")))
+    elif failure == "interrupted":
+        monkeypatch.setattr(rerender, "build_batch_render", MagicMock(side_effect=rerender.RenderInterrupted("external signal")))
+    manager = rerender.ReRenderManager()
+    key = manager.get_task_key("20260901", 0)
+    monkeypatch.setattr(manager, "tasks", {key: {}})
+    manager._run_render_worker(w.db, "20260901", 0, "", threading.Event(), key)
+    expected_status = "CANCELLED" if failure == "interrupted" else ("COMPLETED" if failure == "none" else "FAILED")
+    assert manager.tasks[key]["status"] == expected_status
+    if failure != "none":
+        assert {path: path.read_bytes() for path in w.original} == w.original
+    for index, batch in enumerate(w.batches):
+        retained = failure != "none" or not cleanup or index >= count
+        assert batch.exists() is retained
+        assert batch.with_name(batch.name + ".json").exists() is retained
+    assert not w.db.is_render_completed("20260901", 0)  # reviewed copy does not commit the original delivery record
+
+
 def test_audit_service_overview_and_export(tmp_path):
     db_path = tmp_path / "test_audit.db"
     db = VlogDatabase(db_path=db_path)
@@ -348,6 +384,7 @@ def test_audit_scenario_and_clear_review(tmp_path):
         assert segs_cleared[0]["manual_label"] is None
         assert segs_cleared[0]["scenario"] == ""
         assert segs_cleared[0]["user_notes"] == ""
+        assert not db.get_all_file_tasks_for_date("20260901", 0)[0]["human_reviews"]
     finally:
         db.close()
 

@@ -21,6 +21,61 @@ from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
 
 
+@pytest.mark.parametrize("outcome", ["failed", "exception", "cancelled"])
+def test_final_concat_failure_and_cancellation_are_measured(tmp_path, outcome):
+    from src.monitor import PerfCollector
+    from src.render_cache import processing_fingerprint
+    config = {"output": {"naming": "DailyVlog_{date}_cam{index}.mp4"}}
+    db = VlogDatabase(tmp_path / "finalize.db")
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    batches = [tmp_path / f"batch{i}.mp4" for i in range(2)]
+    for batch in batches:
+        batch.write_bytes(b"completed batch")
+    db.add_file_task(str(source), 0, "20260901", "20260901000000", "20260901000100", 60)
+    db.set_prescreen_result(str(source), "STATIC")
+    db.set_processing_fingerprint(str(source), processing_fingerprint(source, config))
+    orch = MagicMock()
+    orch.run.return_value = batches
+    orch.errors = []
+    orch.render_worker_stats = {}
+    perf = PerfCollector()
+    def concat(*args, **kwargs):
+        kwargs["timings"].update(ffmpeg_s=2, validation_s=3, failure_stage="checkpoint_open")
+        if outcome == "exception":
+            raise OSError("failed to open output")
+        if outcome == "cancelled":
+            raise KeyboardInterrupt
+        return False
+    try:
+        with patch("src.pipeline.load_config", return_value=config), \
+             patch("src.pipeline.StreamingOrchestrator", return_value=orch), \
+             patch("src.pipeline.OUTPUT_DIR", tmp_path), \
+             patch("src.pipeline.get_monitor"), \
+             patch("src.pipeline.print_startup_banner"), \
+             patch("src.pipeline.get_perf", return_value=perf), \
+             patch("src.pipeline._dump_perf") as dump, \
+             patch("src.pipeline.concat_output_files", side_effect=concat):
+            if outcome == "cancelled":
+                with pytest.raises(KeyboardInterrupt):
+                    process_date_cam(db, "20260901", 0, dashboard_enabled=False)
+            else:
+                assert not process_date_cam(db, "20260901", 0, dashboard_enabled=False)
+            dump.assert_called_once()
+        import json
+        perf.dump(tmp_path / "perf.json")
+        records = [r for r in json.loads((tmp_path / "perf.json").read_text())["records"] if r["stage"] == "final_concat"]
+        assert len(records) == 1
+        assert records[0]["extra"]["status"] == ("cancelled" if outcome == "cancelled" else "failed")
+        assert records[0]["extra"]["failure_stage"] == "checkpoint_open"
+        assert records[0]["extra"]["ffmpeg_s"] == 2
+        assert records[0]["extra"]["validation_s"] == 3
+        assert all(batch.read_bytes() == b"completed batch" for batch in batches)
+        assert not db.is_render_completed("20260901", 0)
+    finally:
+        db.close()
+
+
 def test_prefetch_skips_timeline_without_static_segments(tmp_path):
     db = VlogDatabase(tmp_path / "prefetch.db")
     try:
@@ -137,13 +192,20 @@ def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
         before = db.get_all_file_tasks_for_date("20260901", 0)
         out = tmp_path / "day.mp4"
         out.write_bytes(b"placeholder")
-        with patch.object(db, "sync_timeline_segments") as sync, patch("src.stages.companion.get_duration", return_value=11.5):
+        media_metrics = {}
+        with patch.object(db, "sync_timeline_segments") as sync, patch("src.stages.companion.get_duration", return_value=12.2501) as probe:
             assert _save_vlog_companion_assets(
                 out, "20260901", 0, "camera", 1, 20, 1, db,
                 {"render": {"generate_subtitles": False, "speed_ramping_enabled": False}},
+                media_metrics=media_metrics,
             )
             sync.assert_not_called()
+            from src.stages.companion import build_headline
+            headline = build_headline(out, 20, 1, output_duration_s=media_metrics["duration_s"])
+            assert headline["output_dur_s"] == 12.3
+            probe.assert_called_once()
         meta = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        assert meta["metrics"]["vlog_duration_s"] == 12.25
         assert meta["timeline_highlights"][0]["vlog_start_s"] == 1.5
         assert meta["timeline_highlights"][0]["max_energy"] == 23.4
         assert meta["timeline_highlights"][0]["avg_confidence"] == 0.76
@@ -220,6 +282,35 @@ class TestStreamingOrchestratorLifecycle:
 class TestProcessDateCamPipeline:
     """测试 process_date_cam 全流程控制与跳过逻辑。"""
 
+    def test_empty_file_exclusion_is_verified_and_reversible(self, tmp_path, caplog):
+        from src.pipeline import _reconcile_empty_files
+        from src.stages.timeline import build_timeline_from_rows
+        db = VlogDatabase(tmp_path / "empty.db")
+        empty, broken, missing = [tmp_path / name for name in ("empty.mp4", "broken.mp4", "missing.mp4")]
+        empty.touch()
+        broken.write_bytes(b"not a video")
+        try:
+            for path in (empty, broken, missing):
+                db.add_file_task(str(path), 0, "20260901", "20260901000000", "20260901000100", 60)
+                db.set_prescreen_result(str(path), "FAILED")
+            _reconcile_empty_files(db, "20260901", 0)
+            rows = {Path(row["filepath"]).name: row for row in db.get_all_file_tasks_for_date("20260901", 0)}
+            assert rows["empty.mp4"]["prescreen_status"] == "SKIPPED_EMPTY"
+            assert rows["broken.mp4"]["prescreen_status"] == "FAILED"
+            assert rows["missing.mp4"]["prescreen_status"] == "FAILED"
+            assert "跳过空文件" in caplog.text and "20260901000100" in caplog.text
+            assert build_timeline_from_rows([rows["empty.mp4"]], "20260901", config={}) == []
+            empty.write_bytes(b"restored material")
+            _reconcile_empty_files(db, "20260901", 0)
+            assert db.get_all_file_tasks_for_date("20260901", 0)[0]["prescreen_status"] == "PENDING"
+            empty.write_bytes(b"")
+            _reconcile_empty_files(db, "20260901", 0)
+            empty.unlink()
+            _reconcile_empty_files(db, "20260901", 0)
+            assert db.get_all_file_tasks_for_date("20260901", 0)[0]["prescreen_status"] == "FAILED"
+        finally:
+            db.close()
+
     def test_keyboard_interrupt_preserves_cancelled_telemetry(self, tmp_path):
         db = VlogDatabase(tmp_path / "cancel.db")
         try:
@@ -258,27 +349,67 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
-    def test_skip_already_completed(self, tmp_path):
+    @pytest.mark.parametrize("skip_render", [False, True])
+    @pytest.mark.parametrize("new_material", [False, True])
+    def test_skip_already_completed(self, tmp_path, caplog, skip_render, new_material):
         db_path = tmp_path / "test_skip.db"
         db = VlogDatabase(db_path=db_path)
+        output = tmp_path / "out.mp4"
+        output.write_bytes(b"delivered")
+        output.replace(tmp_path / "backup.mp4")
+        db.add_file_task("old.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result("old.mp4", "STATIC")
+        db.set_processing_fingerprint("old.mp4", "old-config-fingerprint")
+        db.set_render_status("20260901", 0, "COMPLETED", output_file=str(output))
+        db.close()
+        db = VlogDatabase(db_path=db_path)  # Persist across process restarts.
         try:
-            db.set_render_status("20260901", 0, "COMPLETED", output_file="out.mp4")
-            # 模拟已完成且无待处理切片
-
-            with patch("src.pipeline.load_config", return_value={}):
-                with patch("src.pipeline.get_monitor"):
-                    ok = process_date_cam(db, "20260901", 0, skip_render=True, dashboard_enabled=False)
-                    assert ok
+            if new_material:
+                db.add_file_task("new.mp4", 0, "20260901", "20260901000100", "20260901000200", 60)
+            before = db.get_all_file_tasks_for_date("20260901", 0)
+            with patch("src.pipeline.load_config", return_value={"detection": {"changed": True}}), \
+                 patch.object(db, "invalidate_stale_results", wraps=db.invalidate_stale_results) as invalidate, \
+                 patch("src.pipeline.StreamingOrchestrator") as orchestrator:
+                assert process_date_cam(db, "20260901", 0, skip_render=skip_render, dashboard_enabled=False)
+                invalidate.assert_not_called()
+                orchestrator.assert_not_called()
+            assert db.is_render_completed("20260901", 0)
+            assert db.get_all_file_tasks_for_date("20260901", 0) == before
+            assert not output.exists()
+            assert ("待处理素材" in caplog.text) is new_material
         finally:
             db.close()
 
-    def test_subtitle_wiring_after_render(self, tmp_path):
+    @pytest.mark.parametrize("status,force", [("COMPLETED", True), ("FAILED", False), ("PENDING", False)])
+    def test_explicit_rebuild_or_unfinished_day_runs(self, tmp_path, status, force):
+        db = VlogDatabase(tmp_path / "rebuild.db")
+        db.set_render_status("20260901", 0, status)
+        try:
+            with patch("src.pipeline.StreamingOrchestrator") as orchestrator, \
+                 patch("src.pipeline.load_config", return_value={}), \
+                 patch("src.pipeline.get_monitor"), \
+                 patch("src.pipeline.print_startup_banner"):
+                orchestrator.return_value.run.return_value = []
+                orchestrator.return_value.errors = []
+                assert not process_date_cam(db, "20260901", 0, force_render=force, dashboard_enabled=False)
+                orchestrator.return_value.run.assert_called_once()
+            assert not db.is_render_completed("20260901", 0)
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("empty_source", [False, True])
+    def test_subtitle_wiring_after_render(self, tmp_path, empty_source, caplog):
         """集成回归: 成片成功后必须生成 .srt 字幕（此前 rows 变量名错误导致全量静默失败）。"""
         db_path = tmp_path / "test_srt.db"
         db = VlogDatabase(db_path=db_path)
-        fname = "00_20260901100000_20260901100500.mp4"
+        fname = str(tmp_path / "00_20260901100000_20260901100500.mp4")
         db.add_file_task(fname, 0, "20260901", "20260901100000", "20260901100500", 300.0)
         db.set_prescreen_result(fname, "STATIC")
+        if empty_source:
+            empty = tmp_path / "empty.mp4"
+            empty.touch()
+            db.add_file_task(str(empty), 0, "20260901", "20260901100500", "20260901100600", 60)
+            db.set_prescreen_result(str(empty), "FAILED")
 
         fake_batch = tmp_path / "_batch0.mp4"
         fake_batch.write_bytes(b"0" * (600 * 1024))
@@ -302,10 +433,12 @@ class TestProcessDateCamPipeline:
                  patch("src.pipeline.get_monitor"), \
                  patch("src.pipeline.OUTPUT_DIR", out_dir), \
                  patch("src.pipeline._dump_perf"), \
-                 patch("src.stages.companion.get_duration", return_value=300.0), \
+                 patch("src.core.utils.cleanup_staging_files"), \
+                 patch("src.stages.companion.get_duration", return_value=300.0) as probe, \
                  patch("src.pipeline.print_startup_banner"), \
                  patch("src.pipeline.print_summary_card"):
                 ok = process_date_cam(db, "20260901", 0, skip_render=False, dashboard_enabled=False)
+                probe.assert_called_once()
 
             assert ok is True
             assert (out_dir / "DailyVlog_20260901_cam0.mp4").exists()
@@ -313,6 +446,50 @@ class TestProcessDateCamPipeline:
             assert srt.exists(), "SRT subtitle was not generated"
             content = srt.read_text(encoding="utf-8")
             assert "2026-09-01 10:00:00" in content
+            assert db.is_render_completed("20260901", 0)
+            if empty_source:
+                import json
+                metadata = json.loads((out_dir / "DailyVlog_20260901_cam0.meta.json").read_text(encoding="utf-8"))
+                assert metadata["skipped_sources"] == [{
+                    "source_file": "empty.mp4", "reason": "empty_file", "size_bytes": 0,
+                    "source_start": "20260901100500", "source_end": "20260901100600",
+                    "nominal_duration_s": 60.0,
+                }]
+                assert "跳过空文件" in caplog.text
+                assert "2026-09-01 10:05:00" not in content
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("batch_max_files", [1, 2])
+    def test_empty_source_advances_render_queue_without_rendering(self, tmp_path, batch_max_files):
+        db = VlogDatabase(tmp_path / "empty_queue.db")
+        files = [str(tmp_path / f"clip{i}.mp4") for i in range(3)]
+        try:
+            for i, filepath in enumerate(files):
+                db.add_file_task(filepath, 0, "20260901", f"20260901000{i}00", f"20260901000{i+1}00", 60)
+                db.set_prescreen_result(filepath, "SKIPPED_EMPTY" if i == 1 else "STATIC")
+            orch = StreamingOrchestrator(db, "20260901", 0, {
+                "pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
+                "render": {"batch_max_files": batch_max_files, "local_staging_enabled": False},
+            }, dashboard_enabled=False)
+            for i in (2, 0, 1):
+                orch.render_batch_queue.put({"filepath": files[i], "status": "SKIPPED_EMPTY" if i == 1 else "STATIC"})
+            orch.stop_event.set()
+            rendered = set()
+            def render(segments, batch, *args, **kwargs):
+                rendered.update(segment.filepath for segment in segments)
+                return str(tmp_path / f"batch{batch}.mp4")
+            thread = threading.Thread(target=orch._render_manager, daemon=True)
+            with patch("src.pipeline.build_batch_render", side_effect=render):
+                thread.start()
+                try:
+                    thread.join(timeout=10)
+                    assert not thread.is_alive()
+                    assert not orch.errors
+                    assert rendered == {files[0], files[2]}
+                finally:
+                    orch.abort_event.set()
+                    thread.join(timeout=5)
         finally:
             db.close()
 
@@ -588,13 +765,51 @@ class TestProcessDateCamPipeline:
         finally:
             db.close()
 
-    def test_nv_transient_failure_is_retried_by_live_nv_worker(self, tmp_path):
+    @pytest.mark.parametrize("failure", ["no_output", "exception"])
+    def test_qsv_only_failure_finishes_with_error(self, tmp_path, failure):
+        db = VlogDatabase(tmp_path / "qsv_only_failure.db")
+        filepath = "static.mp4"
+        db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result(filepath, "STATIC")
+        cfg = {
+            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "qsv_only"},
+            "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False},
+        }
+        orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+        orch.render_batch_queue.put({"filepath": filepath, "status": "STATIC"})
+        orch.stop_event.set()
+        thread = threading.Thread(target=orch._render_manager, daemon=True)
+        expected_error = (
+            "render batch 0 returned no output" if failure == "no_output"
+            else "render batch 0 failed on qsv"
+        )
+
+        try:
+            effect = RuntimeError("controlled QSV failure") if failure == "exception" else None
+            with patch("src.pipeline.build_batch_render", side_effect=effect, return_value=None) as render:
+                thread.start()
+                try:
+                    thread.join(timeout=5.0)
+                    assert not thread.is_alive(), "QSV-only failure stranded a retry without an NV worker"
+                    assert orch.render_finished_event.is_set()
+                    assert orch.errors == [expected_error]
+                    assert not orch.batch_paths
+                    render.assert_called_once()
+                    assert render.call_args.args[2] == "qsv"
+                finally:
+                    orch.abort_event.set()
+                    thread.join(timeout=5.0)
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("failure", ["no_output", "exception"])
+    def test_nv_transient_failure_is_retried_by_live_nv_worker(self, tmp_path, failure):
         db = VlogDatabase(tmp_path / "nv_retry.db")
         filepath = "heavy.mp4"
         db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
         db.set_prescreen_result(filepath, "STATIC")
         cfg = {
-            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv"},
+            "pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
             "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False},
         }
         orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
@@ -605,6 +820,8 @@ class TestProcessDateCamPipeline:
         def render(_segments, _batch, gpu, *_args, **_kwargs):
             calls.append(gpu)
             if len(calls) == 1:
+                if failure == "exception":
+                    raise RuntimeError("controlled NV failure")
                 return None  # First attempt fails transiently
             return str(tmp_path / "nv_success.mp4")
 
@@ -641,8 +858,10 @@ def test_prescreen_audio_gate_disabled_by_default(tmp_path):
     db.close()
 
 
-def test_prescreen_audio_gate_enabled_wakes_up_suspicious(tmp_path):
+@pytest.mark.parametrize("events", [[], [(10.0, 15.0, -28.0)]])
+def test_prescreen_audio_gate_enabled_wakes_up_suspicious(tmp_path, events):
     """验证当启用 prescreen_audio_gate 时，画面静态但有声音事件的文件被成功唤醒为 SUSPICIOUS。"""
+    import json
     db = VlogDatabase(db_path=tmp_path / "audio_gate_enabled.db")
     filepath = "cam0_crying_baby_dark.mp4"
     db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901001000", 600.0)
@@ -656,10 +875,255 @@ def test_prescreen_audio_gate_enabled_wakes_up_suspicious(tmp_path):
     orch.prescreen_queue.put({"filepath": filepath, "file_duration": 600.0})
     orch.stop_event.set()
 
-    with patch("src.pipeline.prescreen_file", return_value={"status": "STATIC", "has_audio": True, "result_json": "{}"}), \
-         patch("src.pipeline.detect_audio_activity", return_value=([(10.0, 15.0, -28.0)], {"active_ratio": 0.05})) as mock_vad:
+    with patch("src.pipeline.prescreen_file", return_value={"status": "STATIC", "has_audio": True, "result_json": '{"visual_score": 0.01}'}), \
+         patch("src.pipeline.detect_audio_activity", return_value=(events, {"active_ratio": 0.05})) as mock_vad:
             orch._prescreen_worker("cpu")
             mock_vad.assert_called_once()
-            row = db.conn.execute("SELECT prescreen_status FROM file_tasks WHERE filepath = ?", (filepath,)).fetchone()
-            assert row[0] == "SUSPICIOUS"
+            row = db.get_all_file_tasks_for_date("20260901", 0)[0]
+            assert row["prescreen_status"] == ("SUSPICIOUS" if events else "STATIC")
+            evidence = json.loads(row["prescreen_result"])
+            assert evidence["visual_result"] == {"visual_score": 0.01}
+            assert evidence["audio_events"] == [list(e) for e in events]
     db.close()
+
+
+def test_batch_disk_stop_preserves_delivery_and_reports_remaining(tmp_path, monkeypatch):
+    import src.pipeline as pipeline
+    db = VlogDatabase(tmp_path / "stop.db")
+    for date in ("20260901", "20260902"):
+        db.add_file_task(date + ".mp4", 0, date, date + "000000", date + "000100", 60)
+    db.set_render_status("20260901", 0, "COMPLETED", output_file="offline.mp4")
+    monkeypatch.setattr(pipeline, "VlogDatabase", lambda: db)
+    monkeypatch.setattr(pipeline, "scan_directory", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "get_monitor", MagicMock())
+    monkeypatch.setattr(pipeline, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(pipeline, "cleanup_resources", lambda: None)
+    monkeypatch.setattr("src.core.utils.cleanup_temp_artifacts", lambda: None)
+    guard = MagicMock(return_value=False)
+    monkeypatch.setattr(pipeline, "check_disk_space", guard)
+    result = pipeline.run_pipeline(dashboard_enabled=False)
+    assert result == {"total": 2, "ok": 0, "failed": 0, "skipped": 1,
+                      "remaining": 1, "stopped_reason": "LOW_DISK_SPACE"}
+    guard.assert_called_once_with(tmp_path)  # configured threshold, no hard-coded override
+
+
+@pytest.mark.parametrize("state", ["PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"])
+def test_cached_active_states_keep_fresh_queue_weight(tmp_path, state):
+    from src.algorithms.segment import Segment, segments_to_json
+    from src.hardware.scheduler import DualEndedBatchQueue
+    db = VlogDatabase(tmp_path / "weights.db")
+    fp = "night.mp4"
+    db.add_file_task(fp, 0, "20260901", "20260901000000", "20260901000100", 60)
+    db.set_prescreen_result(fp, "SUSPICIOUS")
+    db.set_analysis_result(fp, "ANALYZED", segments_to_json([Segment(0, 60, state, fp)]))
+    config = {"pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
+              "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False}}
+    orch = StreamingOrchestrator(db, "20260901", 0, config, dashboard_enabled=False)
+    orch.render_batch_queue.put({"filepath": fp, "status": "ANALYZED"})
+    orch.stop_event.set()
+    weights = []
+    original = DualEndedBatchQueue.put
+    def observe(self, batch, files, weight):
+        weights.append(weight)
+        return original(self, batch, files, weight)
+    try:
+        with patch.object(DualEndedBatchQueue, "put", observe), patch("src.pipeline.build_batch_render", return_value=str(tmp_path / "batch.mp4")):
+            orch._render_manager()
+        assert weights == [60]
+        assert len(orch.batch_paths) == 1 and not orch.errors
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["probe", "commit"])
+def test_companion_failure_does_not_publish_reusable_media_metrics(tmp_path, failure):
+    from src.stages.companion import save_vlog_companion_assets
+    out = tmp_path / "day.mp4"
+    out.write_bytes(b"placeholder")
+    media_metrics = {}
+    with patch("src.stages.companion.get_duration", return_value=0 if failure == "probe" else 12.2501), \
+         patch("src.stages.companion.build_timeline_from_rows", return_value=[]), \
+         patch("pathlib.Path.replace", side_effect=OSError("commit failed")):
+        assert not save_vlog_companion_assets(
+            out, "20260901", 0, "camera", 1, 20, 1, MagicMock(),
+            {"render": {"generate_subtitles": False}}, rows=[], media_metrics=media_metrics,
+        )
+    assert media_metrics == {}
+
+
+def test_headline_standalone_probe_and_failure_behavior(tmp_path):
+    from src.stages.companion import build_headline
+    out = tmp_path / "day.mp4"
+    out.write_bytes(b"placeholder")
+    with patch("src.stages.companion.get_duration", return_value=12.2501) as probe:
+        assert build_headline(out, 20, 1)["output_dur_s"] == 12.3
+        probe.assert_called_once()
+    with patch("src.stages.companion.get_duration", side_effect=OSError("probe failed")):
+        assert "output_dur_s" not in build_headline(out, 20, 1)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("cleanup", [False, True])
+@pytest.mark.parametrize("failure", ["assets_false", "assets_exception", "promotion", "manifest", "database", "cancelled", "after_database_cancelled", "none"])
+def test_delivery_commits_before_cleanup_and_preserves_previous_assets(delivery_workspace, monkeypatch, count, cleanup, failure):
+    w = delivery_workspace
+    pipeline = w.pipeline
+    w.orch.run.return_value = w.batches[:count]
+    w.config["render"]["cleanup_batches_on_success"] = cleanup
+    unrelated = w.output.parent / "unrelated_batch.mp4"
+    unrelated.write_bytes(b"preserve unrelated")
+    if failure.startswith("assets"):
+        replacement = MagicMock(return_value=False) if failure == "assets_false" else MagicMock(side_effect=OSError("assets exception"))
+        monkeypatch.setattr(pipeline, "_save_vlog_companion_assets", replacement)
+    elif failure in ("manifest", "cancelled"):
+        def manifest_failure(path, fingerprint):
+            from src.hardware.render_cache import _manifest_path
+            _manifest_path(path).write_bytes(b"partially written manifest")
+            raise KeyboardInterrupt if failure == "cancelled" else OSError("manifest failure")
+        monkeypatch.setattr("src.hardware.render_cache.save_manifest", manifest_failure)
+    elif failure == "database":
+        w.db.conn.execute("CREATE TRIGGER reject_completed BEFORE INSERT ON render_tasks WHEN NEW.status='COMPLETED' BEGIN SELECT RAISE(ABORT, 'completion rejected'); END")
+        w.db.conn.commit()
+    elif failure == "promotion":
+        replace = Path.replace
+        def reject_metadata(source, destination):
+            if source.name.endswith(".pending.meta.json"):
+                raise OSError("partial promotion failure")
+            return replace(source, destination)
+        monkeypatch.setattr(Path, "replace", reject_metadata)
+    elif failure == "after_database_cancelled":
+        completed = w.db.is_render_completed
+        def interrupt_completed_check(*args):
+            if completed(*args):
+                raise KeyboardInterrupt
+            return False
+        monkeypatch.setattr(w.db, "is_render_completed", interrupt_completed_check)
+    if failure.endswith("cancelled"):
+        with pytest.raises(KeyboardInterrupt):
+            pipeline.process_date_cam(w.db, "20260901", 0, dashboard_enabled=False)
+    else:
+        assert pipeline.process_date_cam(w.db, "20260901", 0, dashboard_enabled=False) is (failure == "none")
+    if failure != "none":
+        assert {path: path.read_bytes() for path in w.original} == w.original
+        assert not w.db.is_render_completed("20260901", 0)
+    else:
+        assert w.db.is_render_completed("20260901", 0)
+        assert w.output.read_bytes() == b"new media"
+        assert not w.output.with_suffix(".srt").exists()  # disabled subtitles remove the previous SRT only on commit
+        from src.hardware.render_cache import _manifest_path, file_identity
+        import json
+        assert json.loads(_manifest_path(w.output).read_text())["output"] == file_identity(w.output)
+    for index, batch in enumerate(w.batches):
+        retained = failure != "none" or not cleanup or index >= count
+        assert batch.exists() is retained
+        assert batch.with_name(batch.name + ".json").exists() is retained
+    assert unrelated.read_bytes() == b"preserve unrelated"
+    assert not list(w.output.parent.glob("*.pending.*"))
+    assert not list(w.output.parent.glob(".delivery_backup_*"))
+    pipeline._dump_perf.assert_called_once()
+
+
+def test_delivery_rollback_failure_retains_previous_files_and_recovery_map(delivery_workspace, monkeypatch):
+    from src.stages.companion import promote_vlog_assets
+    import json
+    w = delivery_workspace
+    candidate = w.output.with_name(w.output.stem + ".pending.mp4")
+    candidate.write_bytes(b"new media")
+    candidate.with_suffix(".meta.json").write_text("{}")
+    replace = Path.replace
+    def reject_restore(source, destination):
+        if source.name == "0" and source.parent.name.startswith(".delivery_backup_"):
+            raise OSError("restore unavailable")
+        return replace(source, destination)
+    monkeypatch.setattr(Path, "replace", reject_restore)
+    with pytest.raises(OSError, match="restore unavailable"):
+        with promote_vlog_assets(candidate, w.output, w.config):
+            raise OSError("commit failed")
+    backups = list(w.output.parent.glob(".delivery_backup_*"))
+    assert len(backups) == 1
+    recovery = json.loads((backups[0] / "recovery.json").read_text())
+    for index, path in enumerate(w.original):
+        assert recovery[str(index)] == str(path.resolve())
+        assert (backups[0] / str(index)).read_bytes() == w.original[path]
+
+
+@pytest.mark.parametrize("status", ["STATIC", "FAILED", "PENDING", "SUSPICIOUS"])
+def test_analysis_only_reports_source_outcome_and_dumps_perf(delivery_workspace, status):
+    w = delivery_workspace
+    def analyze():
+        w.db.set_prescreen_result(str(w.source), status)
+        return []
+    w.orch.run.side_effect = analyze
+    assert w.pipeline.process_date_cam(w.db, "20260901", 0, skip_render=True, dashboard_enabled=False) is (status == "STATIC")
+    assert not w.db.is_render_completed("20260901", 0)
+    assert {path: path.read_bytes() for path in w.original} == w.original
+    w.pipeline._dump_perf.assert_called_once()
+    assert w.pipeline._dump_perf.call_args.kwargs["run_context"]["status"] == ("analysis_completed" if status == "STATIC" else "failed")
+
+
+def test_delivery_rejects_unavailable_source_reconciliation(delivery_workspace, monkeypatch):
+    w = delivery_workspace
+    def lose_source_query():
+        monkeypatch.setattr(w.db, "get_all_file_tasks_for_date", lambda *a, **k: [])
+        return w.batches
+    w.orch.run.side_effect = lose_source_query
+    assert not w.pipeline.process_date_cam(w.db, "20260901", 0, dashboard_enabled=False)
+    assert {path: path.read_bytes() for path in w.original} == w.original
+    assert all(batch.exists() for batch in w.batches)
+    assert w.pipeline._dump_perf.call_args.kwargs["run_context"]["error"] == "source task reconciliation unavailable"
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_real_software_delivery_commits_media_subtitles_and_manifest(tmp_path, monkeypatch, count):
+    import av
+    import json
+    from src import pipeline
+    from src.segment import Segment
+    from src.hardware.ffmpeg import run_ffmpeg
+    from src.hardware.render_cache import processing_fingerprint, file_identity, _manifest_path, valid_video
+    cfg = {"render": {"generate_subtitles": True},
+           "output": {"fps": 20, "naming": "DailyVlog_{date}_cam{index}.mp4", "audio": {"codec": "aac"}}}
+    db = VlogDatabase(tmp_path / "media.db")
+    batches = []
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    try:
+        for i in range(count):
+            batch = tmp_path / f"batch{i}.mp4"
+            encoded = run_ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=128x128:rate=20",
+                                  "-f", "lavfi", "-i", f"sine=frequency={440 + i * 100}:sample_rate=48000",
+                                  "-t", "1", "-c:v", "libx264", "-c:a", "aac", str(batch)], timeout=30)
+            assert encoded.returncode == 0
+            batches.append(batch)
+            db.add_file_task(str(batch), 0, "20260901", f"2026090100000{i}", f"2026090100000{i + 1}", 1)
+            db.set_prescreen_result(str(batch), "SUSPICIOUS")
+            db.set_analysis_result(str(batch), [Segment(i, i + 1, "DYNAMIC_AUDIO", str(batch), file_start_offset=i)])
+            db.set_processing_fingerprint(str(batch), processing_fingerprint(batch, cfg))
+        orch = MagicMock()
+        orch.errors = []
+        orch.run.return_value = batches
+        monkeypatch.setattr(pipeline, "load_config", lambda: cfg)
+        monkeypatch.setattr("src.stages.timeline.load_config", lambda: cfg)
+        monkeypatch.setattr(pipeline, "StreamingOrchestrator", MagicMock(return_value=orch))
+        monkeypatch.setattr(pipeline, "OUTPUT_DIR", out_dir)
+        for name in ("get_monitor", "print_startup_banner", "print_summary_card", "_dump_perf"):
+            monkeypatch.setattr(pipeline, name, MagicMock())
+        monkeypatch.setattr("src.core.utils.cleanup_staging_files", lambda: None)
+        assert pipeline.process_date_cam(db, "20260901", 0, dashboard_enabled=False)
+        output = out_dir / "DailyVlog_20260901_cam0.mp4"
+        assert valid_video(output, count, checkpoints=[1] if count == 2 else (), require_audio=True)
+        with av.open(str(output)) as media:
+            assert len(list(media.decode(video=0))) == count * 20
+        with av.open(str(output)) as media:
+            for stream in (media.streams.video[0], media.streams.audio[0]):
+                assert float(stream.duration * stream.time_base) == pytest.approx(count, abs=.001)
+        metadata = json.loads(output.with_suffix(".meta.json").read_text())
+        # ffprobe format duration includes AAC container padding; stream clocks remain exact.
+        assert metadata["metrics"]["vlog_duration_s"] == pytest.approx(count, abs=1 / 20)
+        assert metadata["timeline_highlights"][-1]["vlog_end_s"] == count
+        assert f"00:00:0{count},000" in output.with_suffix(".srt").read_text()
+        assert json.loads(_manifest_path(output).read_text())["output"] == file_identity(output)
+        assert db.is_render_completed("20260901", 0)
+        assert all(batch.exists() for batch in batches)
+    finally:
+        db.close()

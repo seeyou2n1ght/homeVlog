@@ -2,11 +2,20 @@
 import hashlib
 import json
 import math
+import time
 from pathlib import Path
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=2048)
+def _resolve_canonical_path(p_str: str) -> Path:
+    return Path(p_str).resolve()
+
+
 def file_identity(path):
-    p = Path(path).resolve()
+    p = _resolve_canonical_path(str(path))
     try:
         stat = p.stat()
         return [str(p), stat.st_size, stat.st_mtime_ns]
@@ -26,7 +35,7 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
 
 def processing_fingerprint(filepath, config):
     selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")}
-    return render_fingerprint([filepath], "analysis-v3-temporal-activity", "analysis", 0, {}, {}, selected)
+    return render_fingerprint([filepath], "analysis-v4-window-evidence", "analysis", 0, {}, {}, selected)
 
 
 def _window_is_continuous(container, stream, boundary: float, duration: float) -> bool:
@@ -51,38 +60,50 @@ def _window_is_continuous(container, stream, boundary: float, duration: float) -
     )
 
 
-def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: float) -> bool:
+def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: float,
+                               *, diagnostics: dict | None = None) -> bool:
     import av
     import logging
     _log = logging.getLogger("homevlog")
+    details = diagnostics if diagnostics is not None else {}
+    started = time.monotonic()
+    details["stage"] = "open"
     try:
-        # 本地成片（尤其 4.5GB 大文件多线程解析尾部 moov atom 时）需要充足的 I/O 寻道容限，
-        # 放宽至 60s 避免 Windows 磁盘刷盘争用时误触 PyAV AVERROR_EOF 超时中断
         with av.open(str(path), timeout=60.0) as container:
+            details["open_s"] = round(time.monotonic() - started, 6)
+            details["stage"] = "checkpoint"
             if not container.streams.video:
                 _log.warning("valid_video checkpoint chunk: file %s has no video stream", path)
                 return False
             stream = container.streams.video[0]
             for boundary in chunk:
+                details["boundary_s"] = boundary
                 if not _window_is_continuous(container, stream, boundary, duration):
                     _log.warning("valid_video: boundary %.2fs gap or frame discontinuity in %s", boundary, path)
                     return False
         return True
     except Exception as e:
+        if details["stage"] == "open":
+            details["open_s"] = round(time.monotonic() - started, 6)
+        details.update(error_type=type(e).__name__, error=str(e), errno=getattr(e, "errno", None))
         _log.warning("valid_video checkpoint chunk exception for %s: %s", path, e, exc_info=True)
         return False
 
 
-def valid_video(path, expected_duration=None, checkpoints=(), require_audio=False):
+def valid_video(path, expected_duration=None, checkpoints=(), require_audio=False, *, diagnostics=None):
     """Reject empty/corrupt output, not legitimate small videos."""
     import av
     import logging
     _log = logging.getLogger("homevlog")
+    details = diagnostics if diagnostics is not None else {}
+    details.clear()
+    details["stage"] = "container"
     try:
         p = Path(path)
         if not p.exists() or p.stat().st_size <= 0:
             _log.warning("valid_video: file %s does not exist or is 0 bytes", path)
             return False
+        identity = file_identity(path)
         with av.open(str(path), timeout=60.0) as container:
             if not container.streams.video:
                 _log.warning("valid_video: file %s has no video stream", path)
@@ -125,21 +146,51 @@ def valid_video(path, expected_duration=None, checkpoints=(), require_audio=Fals
                     )
                     return False
             if checkpoints:
+                details["stage"] = "checkpoint"
                 checkpoints_list = list(checkpoints)
                 if len(checkpoints_list) <= 4:
                     for boundary in checkpoints_list:
                         if not _window_is_continuous(container, stream, boundary, duration):
+                            details["boundary_s"] = boundary
                             return False
                 else:
                     from concurrent.futures import ThreadPoolExecutor
                     num_workers = min(8, len(checkpoints_list))
                     chunks = [checkpoints_list[i::num_workers] for i in range(num_workers) if checkpoints_list[i::num_workers]]
+                    chunk_details = [{} for _ in chunks]
                     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                        results = list(pool.map(lambda c: _validate_checkpoint_chunk(c, path, duration), chunks))
+                        results = list(pool.map(
+                            lambda item: _validate_checkpoint_chunk(item[0], path, duration, diagnostics=item[1]),
+                            zip(chunks, chunk_details),
+                        ))
                     if not all(results):
-                        return False
-            return _window_is_continuous(container, stream, max(0.5, duration - 0.5), duration)
+                        failed = [info for ok, info in zip(results, chunk_details) if not ok]
+                        details["checkpoint_errors"] = failed
+                        # Only an independent container-open failure can retry.
+                        # Decode/PTS/continuity failures remain terminal.
+                        if any(info.get("stage") != "open" for info in failed):
+                            return False
+                        details["stage"] = "checkpoint_open"
+                        if file_identity(path) != identity:
+                            details["stage"] = "file_changed"
+                            return False
+                        _log.warning("parallel checkpoint open failed; rechecking every boundary on the initial container: %s", path)
+                        details["checkpoint_fallback"] = "serial_initial_container"
+                        details["stage"] = "checkpoint"
+                        for boundary in sorted(checkpoints_list):
+                            if not _window_is_continuous(container, stream, boundary, duration):
+                                details.update(stage="checkpoint", boundary_s=boundary)
+                                return False
+            details["stage"] = "tail"
+            valid = _window_is_continuous(container, stream, max(0.5, duration - 0.5), duration)
+            if "checkpoint_fallback" in details and file_identity(path) != identity:
+                details["stage"] = "file_changed"
+                return False
+            if valid:
+                details["stage"] = "completed"
+            return valid
     except Exception as e:
+        details.update(error_type=type(e).__name__, error=str(e), errno=getattr(e, "errno", None))
         _log.warning("valid_video: file %s validation exception: %s", path, e, exc_info=True)
         return False
 

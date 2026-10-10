@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import json
 import logging
 import subprocess
@@ -78,26 +79,84 @@ def _calc_dynamic_threshold(base_threshold: float, mean_luma: float, is_prior_ac
     return round(float(dyn), 2)
 
 
+@dataclass(frozen=True)
+class MotionDecision:
+    """运动初筛单帧判定结果与抑制原因。"""
+    is_motion: bool
+    suppressed: bool = False
+    reason: str = ""
+
+
+def _calc_spatial_metrics(diff_map: np.ndarray) -> tuple[float, float]:
+    """计算 4x4 空间网格的能量集中度与最大单格能量峰值。
+
+    返回: (concentration, max_cell_energy)
+    - concentration: 最大网格均值 / 全图均值（反映能量是否局域聚集）
+    - max_cell_energy: 4x4 网格中局部均值的最大值（用于局部小目标剧烈运动唤醒）
+    """
+    if diff_map.size == 0:
+        return 1.0, 0.0
+    h, w = diff_map.shape[:2]
+    gh, gw = max(1, h // 4), max(1, w // 4)
+    grid_means = [
+        float(np.mean(diff_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]))
+        for r in range(4) for c in range(4)
+    ]
+    if not grid_means:
+        return 1.0, 0.0
+    max_cell_energy = max(grid_means)
+    mean_val = float(np.mean(diff_map))
+    if max_cell_energy == 0.0 or mean_val == 0.0:
+        return 1.0, 0.0
+    concentration = float(max_cell_energy / (mean_val + 1e-4))
+    return concentration, max_cell_energy
+
+
 def _calc_spatial_concentration(diff_map: np.ndarray) -> float:
     """计算 4x4 空间网格的能量集中度。
     
     真实前景移动（集中度高 >= 1.35）；全局光照/白平衡跳变（集中度低 < 1.2，整图弥漫）。
     """
-    h, w = diff_map.shape[:2]
-    gh, gw = max(1, h // 4), max(1, w // 4)
-    grid_means = []
-    for r in range(4):
-        for c in range(4):
-            cell = diff_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]
-            if cell.size > 0:
-                grid_means.append(float(np.mean(cell)))
-    if not grid_means:
-        return 1.0
-    mean_val = float(np.mean(diff_map))
-    max_val = max(grid_means)
-    if max_val == 0.0 or mean_val == 0.0:
-        return 1.0
-    return float(max_val / (mean_val + 1e-4))
+    return _calc_spatial_metrics(diff_map)[0]
+
+
+def _evaluate_prescreen_motion(
+    d: float,
+    current_threshold: float,
+    mean_luma: float,
+    concentration: float,
+    max_cell_energy: float,
+    is_prior_active: bool = False,
+) -> MotionDecision:
+    """评估单帧差分是否达到可疑运动 (SUSPICIOUS) 判定门槛。
+
+    规则：
+    1. 均值突破阈值 (d > current_threshold)：
+       a. 暗光/红外环境 (mean_luma < 50.0)：严格剔除弥漫型噪点，必须具备局部能量聚集或显著局部运动。
+       b. 正常光照环境：满足集中度门限、绝对差分极大或局部峰值突破门限。
+    2. 双轨防漏检保护：当局部网格能量单点爆发 (max_cell_energy >= max(14.0, current_threshold * 2.2))，
+       即使全图均值 d 被大背景稀释，依然强制唤醒判定为运动。
+    """
+    conc_thresh = 1.15 if is_prior_active else 1.35
+
+    if d > current_threshold:
+        if mean_luma < 50.0:
+            if (concentration >= 1.25 and max_cell_energy >= 6.5) or max_cell_energy >= 12.0:
+                return MotionDecision(is_motion=True, reason="night_motion_confirmed")
+            return MotionDecision(is_motion=False, suppressed=True, reason="night diffuse noise")
+        else:
+            if (
+                concentration >= conc_thresh
+                or d >= current_threshold * 1.5
+                or max_cell_energy >= current_threshold * 1.8
+            ):
+                return MotionDecision(is_motion=True, reason="normal_motion_confirmed")
+            return MotionDecision(is_motion=False, suppressed=True, reason="diffuse motion")
+
+    if max_cell_energy >= max(14.0, current_threshold * 2.2):
+        return MotionDecision(is_motion=True, reason="dual_track_burst_motion")
+
+    return MotionDecision(is_motion=False, reason="below_threshold")
 
 
 def _prescreen_keyframes(
@@ -192,49 +251,29 @@ def _prescreen_keyframes(
                 diffs.append(d)
 
                 active_map = diff_prev_map if diff_prev >= diff_first else diff_first_map
-                concentration = _calc_spatial_concentration(active_map)
+                concentration, max_cell_energy = _calc_spatial_metrics(active_map)
                 concentrations.append(concentration)
 
-                # 空间集中度智能早停与双轨防漏检保护:
-                # 1. 时间邻域先验保护下放宽集中度门限至 1.15
-                # 2. 局部高能集中 (concentration >= conc_thresh)
-                # 3. 或全图绝对差分极大 (d >= current_threshold * 1.5)
-                # 4. 或任意 4x4 局部网格单点峰值突破安全门限 (max_cell_energy >= current_threshold * 1.8)
-                conc_thresh = 1.15 if is_prior_active else 1.35
-                h, w = active_map.shape[:2]
-                gh, gw = max(1, h // 4), max(1, w // 4)
-                max_cell_energy = max(
-                    [float(np.mean(active_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]))
-                     for r in range(4) for c in range(4)]
-                ) if active_map.size > 0 else 0.0
+                decision = _evaluate_prescreen_motion(
+                    d=d,
+                    current_threshold=current_threshold,
+                    mean_luma=mean_luma,
+                    concentration=concentration,
+                    max_cell_energy=max_cell_energy,
+                    is_prior_active=is_prior_active,
+                )
+                if decision.suppressed:
+                    logger.debug(
+                        "Prescreen %s suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
+                        decision.reason,
+                        Path(filepath).name,
+                        d,
+                        current_threshold,
+                        concentration,
+                        max_cell_energy,
+                    )
 
-                is_motion = False
-                if d > current_threshold:
-                    if mean_luma < 50.0:
-                        # 暗光/红外防噪点专项逻辑：严格剔除弥漫型全图白噪点
-                        # 必须具备局部能量聚集 (concentration >= 1.25 且局部块达到有效能量 6.5)，或局部出现显著动作 (max_cell_energy >= 12.0)
-                        if (concentration >= 1.25 and max_cell_energy >= 6.5) or max_cell_energy >= 12.0:
-                            is_motion = True
-                        else:
-                            logger.debug(
-                                "Prescreen night diffuse noise suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
-                                Path(filepath).name, d, current_threshold, concentration, max_cell_energy,
-                            )
-                    else:
-                        if (
-                            concentration >= conc_thresh
-                            or d >= current_threshold * 1.5
-                            or max_cell_energy >= current_threshold * 1.8
-                        ):
-                            is_motion = True
-                        else:
-                            logger.debug(
-                                "Prescreen diffuse motion suppressed for %s: d=%.2f, th=%.2f, conc=%.2f, max_cell=%.2f",
-                                Path(filepath).name, d, current_threshold, concentration, max_cell_energy,
-                            )
-                elif max_cell_energy >= max(14.0, current_threshold * 2.2):
-                    # [双轨防漏检保护] 远距离/角落局部小目标剧烈运动：即使全图均值 d 被大背景稀释，单点能量爆发依然强制唤醒
-                    is_motion = True
+                is_motion = decision.is_motion
 
                 if is_motion:
                     return {

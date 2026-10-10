@@ -1,6 +1,7 @@
 import logging
 import time
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,6 @@ class YoloVerifier:
         self.target_classes = set(yolo_cfg.get("target_classes", [0, 1, 2, 3, 15, 16]))
 
         self.confidence = yolo_cfg.get("confidence", 0.25)
-        self.sample_fps = yolo_cfg.get("sample_fps", 0.5)
         self.batch_size = max(1, int(yolo_cfg.get("batch_size", 4)))
         
         if device is None:
@@ -105,6 +105,25 @@ class YoloVerifier:
 
         frames_buffer = frames_buffer or {}
         keys = sorted(frames_buffer)
+        # Inspect every retained candidate. The decoder already bounds this pool.
+        # Local windows keep a late positive from labelling an entire long file,
+        # and avoid the blind intervals created by eight samples per parent.
+        windows = []
+        for seg in segments:
+            start = max(0, seg.start_time - seg.file_start_offset) * analysis_fps
+            end = max(0, seg.end_time - seg.file_start_offset) * analysis_fps
+            matched = keys[bisect_left(keys, start):bisect_left(keys, end)]
+            if not seg.is_dynamic or len(matched) <= 8:
+                windows.append(seg)
+                continue
+            groups = np.array_split(matched, int(np.ceil(len(matched) / 8)))
+            left = seg.start_time
+            for n, group in enumerate(groups):
+                right = (seg.file_start_offset + (group[-1] + groups[n + 1][0]) / (2 * analysis_fps)
+                         if n + 1 < len(groups) else seg.end_time)
+                windows.append(replace(seg, start_time=left, end_time=right))
+                left = right
+        segments = windows
         jobs = []
         counts, confirmed, confidences = {}, {}, {}
         for i, seg in enumerate(segments):
@@ -113,8 +132,6 @@ class YoloVerifier:
             start = max(0, seg.start_time - seg.file_start_offset) * analysis_fps
             end = max(0, seg.end_time - seg.file_start_offset) * analysis_fps
             matched = keys[bisect_left(keys, start):bisect_left(keys, end)]
-            if len(matched) > 8:
-                matched = [matched[j] for j in np.linspace(0, len(matched)-1, 8, dtype=int)]
             jobs.extend((i, k) for k in matched)
             counts[i], confirmed[i], confidences[i] = 0, False, 0.0
         person_boxes_by_seg: dict[int, list[np.ndarray]] = {i: [] for i in counts}

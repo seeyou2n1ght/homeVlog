@@ -262,3 +262,68 @@ def test_tune_thresholds_simulation_and_grid_search():
     best = results[0]
     assert best.night_factor == 0.4
     assert best.fn == 0
+
+
+def test_calc_spatial_metrics_and_pure_evaluation_policy():
+    """验证重构后的纯函数算子与多轨运动决策策略行为准确性。"""
+    from src.stages.prescreen import _calc_spatial_metrics, _evaluate_prescreen_motion, MotionDecision
+
+    # 1. 空间指标计算边界验证
+    empty_map = np.zeros((0, 0), dtype=np.float32)
+    conc, max_cell = _calc_spatial_metrics(empty_map)
+    assert conc == 1.0 and max_cell == 0.0
+
+    # 均匀扩散
+    diffuse_map = np.full((180, 320), fill_value=10.0, dtype=np.float32)
+    conc, max_cell = _calc_spatial_metrics(diffuse_map)
+    assert abs(conc - 1.0) < 1e-3
+    assert abs(max_cell - 10.0) < 1e-3
+
+    # 局部高能单网格
+    local_map = np.zeros((180, 320), dtype=np.float32)
+    local_map[0:45, 0:80] = 60.0
+    conc, max_cell = _calc_spatial_metrics(local_map)
+    assert conc > 3.0
+    assert abs(max_cell - 60.0) < 1e-3
+
+    # 2. 纯决策策略：双轨爆发防漏检（全图均值被稀释但单格爆发）
+    dec_burst = _evaluate_prescreen_motion(
+        d=4.0, current_threshold=8.0, mean_luma=120.0,
+        concentration=2.0, max_cell_energy=20.0, is_prior_active=False
+    )
+    assert dec_burst.is_motion is True
+    assert dec_burst.reason == "dual_track_burst_motion"
+
+    # 3. 纯决策策略：夜视全图白噪点抑制
+    dec_night_noise = _evaluate_prescreen_motion(
+        d=5.0, current_threshold=3.2, mean_luma=30.0,
+        concentration=1.1, max_cell_energy=5.5, is_prior_active=False
+    )
+    assert dec_night_noise.is_motion is False
+    assert dec_night_noise.suppressed is True
+    assert dec_night_noise.reason == "night diffuse noise"
+
+    # 4. 纯决策策略：夜视局部有效动作确认
+    dec_night_valid = _evaluate_prescreen_motion(
+        d=5.0, current_threshold=3.2, mean_luma=30.0,
+        concentration=1.35, max_cell_energy=7.0, is_prior_active=False
+    )
+    assert dec_night_valid.is_motion is True
+    assert dec_night_valid.reason == "night_motion_confirmed"
+
+    # 5. 纯决策策略：白天弥漫运动抑制
+    dec_day_diffuse = _evaluate_prescreen_motion(
+        d=9.0, current_threshold=8.0, mean_luma=120.0,
+        concentration=1.1, max_cell_energy=10.0, is_prior_active=False
+    )
+    assert dec_day_diffuse.is_motion is False
+    assert dec_day_diffuse.suppressed is True
+    assert dec_day_diffuse.reason == "diffuse motion"
+
+    # 6. 纯决策策略：先验保护下放宽集中度
+    dec_prior_relaxed = _evaluate_prescreen_motion(
+        d=6.0, current_threshold=5.2, mean_luma=120.0,
+        concentration=1.20, max_cell_energy=9.0, is_prior_active=True
+    )
+    assert dec_prior_relaxed.is_motion is True
+    assert dec_prior_relaxed.reason == "normal_motion_confirmed"

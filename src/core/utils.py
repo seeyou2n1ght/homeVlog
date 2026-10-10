@@ -15,8 +15,8 @@ from src.core.config import (
     DB_PATH,
 )
 
-CONFIG_PATH = _config.CONFIG_PATH
-SETTINGS = _config.SETTINGS
+CONFIG_PATH: Path
+SETTINGS: dict
 
 
 def size_metrics(size_bytes: int | float) -> dict[str, float | int]:
@@ -31,20 +31,18 @@ def size_metrics(size_bytes: int | float) -> dict[str, float | int]:
 
 
 def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:
-    import src.utils as _self
-    if getattr(_self, "CONFIG_PATH", None) != _config.CONFIG_PATH:
-        _config.CONFIG_PATH = _self.CONFIG_PATH
-    if getattr(_self, "SETTINGS", None) is not _config.SETTINGS:
-        _config.SETTINGS = _self.SETTINGS
-    try:
-        res = _config.load_config(config_path=config_path, reload=reload)
-        _self.SETTINGS = _config.SETTINGS
-        return res
-    finally:
-        _self.SETTINGS = _config.SETTINGS
+    # Legacy assignments are explicit overrides, not a second configuration cache.
+    # Consume them under the loader's lock; ordinary reads delegate via __getattr__.
+    with _config._config_lock:
+        for name in ("CONFIG_PATH", "SETTINGS"):
+            if name in globals():
+                setattr(_config, name, globals().pop(name))
+        return _config.load_config(config_path=config_path, reload=reload)
 
 
 def __getattr__(name):
+    if name in ("CONFIG_PATH", "SETTINGS"):
+        return getattr(_config, name)
     if name in (
         "reset_semaphores",
         "get_disk_semaphore",
@@ -119,12 +117,16 @@ class RichConsoleBridgeHandler(logging.Handler):
 
     def __init__(self, level=logging.WARNING):
         super().__init__(level=level)
+        self.normal_level = level
         from rich.console import Console
         self._console = Console(stderr=True)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = self.format(record)
+            if (record.levelno < self.normal_level
+                    and not getattr(record, "startup_progress", False)):
+                return
+            self.format(record)
             with _dashboard_lock:
                 dash = _active_dashboard
 
@@ -206,6 +208,14 @@ def setup_logging(level_override: int | None = None) -> logging.Logger:
     logger.setLevel(logging.DEBUG)  # 允许底层捕获全级别，具体级别由 Handler 自行把控
 
     if logger.handlers:
+        if level_override is not None:
+            for handler in logger.handlers:
+                role = getattr(handler, "homevlog_role", None)
+                if role in ("run", "events"):
+                    handler.setLevel(level)
+                elif role == "console":
+                    handler.setLevel(logging.DEBUG if level == logging.DEBUG else min(level, logging.INFO))
+                    handler.normal_level = logging.DEBUG if level == logging.DEBUG else max(level, logging.WARNING)
         return logger
 
     runs_dir = LOGS_DIR / "runs"
@@ -233,6 +243,7 @@ def setup_logging(level_override: int | None = None) -> logging.Logger:
 
     # 1. 主日志 (INFO 及以上)
     fh_main = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    fh_main.homevlog_role = "run"
     fh_main.setLevel(level)
     fh_main.setFormatter(human_fmt)
     logger.addHandler(fh_main)
@@ -245,12 +256,15 @@ def setup_logging(level_override: int | None = None) -> logging.Logger:
 
     # 3. 结构化 JSONL 日志流 (记录 INFO 及以上事件)
     fh_jsonl = RotatingFileHandler(jsonl_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    fh_jsonl.homevlog_role = "events"
     fh_jsonl.setLevel(level)
     fh_jsonl.setFormatter(JsonLinesFormatter())
     logger.addHandler(fh_jsonl)
 
     # 4. 控制台桥接 Handler (WARNING/ERROR 或交互式通知)
-    sh = RichConsoleBridgeHandler(level=max(level, logging.WARNING))
+    sh = RichConsoleBridgeHandler(level=logging.DEBUG if level == logging.DEBUG else min(level, logging.INFO))
+    sh.homevlog_role = "console"
+    sh.normal_level = logging.DEBUG if level == logging.DEBUG else max(level, logging.WARNING)
     sh.setFormatter(human_fmt)
     logger.addHandler(sh)
 
@@ -385,4 +399,8 @@ def get_input_dirs(config: dict | None = None) -> list[str]:
     elif isinstance(raw_dirs, list):
         return [str(p).strip() for p in raw_dirs if str(p).strip()]
     return []
+
+
+# Keep wildcard imports of the legacy configuration names working without snapshots.
+__all__ = [name for name in globals() if not name.startswith("_")] + ["CONFIG_PATH", "SETTINGS"]
 

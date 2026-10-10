@@ -6,6 +6,8 @@
 
 import time
 import logging
+import json
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,8 @@ from typing import Any
 from src.utils import OUTPUT_DIR, load_config
 from src.database import VlogDatabase
 from src.timeline import partition_timeline_by_batches
-from src.renderer import build_batch_render, concat_output_files
+from src.renderer import RenderInterrupted, build_batch_render, concat_output_files
+from src.stages.companion import promote_vlog_assets, cleanup_delivery_candidate
 
 logger = logging.getLogger("homevlog.rerender")
 
@@ -140,6 +143,7 @@ class ReRenderManager:
                 self.tasks[task_key].update(kwargs)
                 self.tasks[task_key]["elapsed_s"] = round(time.time() - t0, 1)
 
+        candidate = None
         try:
             # 1. 查询当天任务行
             file_tasks = db.get_all_file_tasks_for_date(date, cam_index)
@@ -202,6 +206,7 @@ class ReRenderManager:
                 final_out_name = base_name
 
             final_output_path = out_dir / final_out_name
+            candidate = final_output_path.with_name(final_output_path.stem + ".pending.mp4")
 
             # 6. 执行批次渲染
             batch_outputs = []
@@ -252,19 +257,12 @@ class ReRenderManager:
             update_state(status="CONCATING", progress=90)
             cleanup_batches = config.get("render", {}).get("cleanup_batches_on_success", False)
             if len(batch_outputs) == 1:
-                if cleanup_batches:
-                    batch_outputs[0].replace(final_output_path)
-                else:
-                    import shutil
-                    shutil.copy2(batch_outputs[0], final_output_path)
+                shutil.copy2(batch_outputs[0], candidate)
                 ok = True
             else:
-                ok = concat_output_files(batch_outputs, final_output_path)
-                if ok and cleanup_batches:
-                    for p in batch_outputs:
-                        p.unlink(missing_ok=True)
+                ok = concat_output_files(batch_outputs, candidate)
 
-            if not ok or not final_output_path.exists():
+            if not ok or not candidate.exists():
                 update_state(status="FAILED", error="Final concat failed")
                 return
 
@@ -281,7 +279,7 @@ class ReRenderManager:
                 tot_files = len(healthy_rows)
                 tot_dur = sum(float(r.get("file_duration") or 0.0) for r in healthy_rows)
                 assets_ok = _save_vlog_companion_assets(
-                    output_path=final_output_path,
+                    output_path=candidate,
                     date=date,
                     cam_index=cam_index,
                     cam_display=cam_disp,
@@ -297,6 +295,17 @@ class ReRenderManager:
                     return
             except Exception as exc:
                 logger.warning("Failed to refresh companion assets after rerender: %s", exc)
+                raise
+
+            from src.hardware.render_cache import render_fingerprint, save_manifest
+            fingerprint = render_fingerprint(
+                valid_files, json.dumps([vars(s) for s in timeline], sort_keys=True),
+                "reviewed", fps, out_cfg, audio_cfg, config,
+            )
+            with promote_vlog_assets(candidate, final_output_path, config):
+                save_manifest(final_output_path, fingerprint)
+                if cancel_event.is_set():
+                    raise InterruptedError("Review render cancelled before commit")
 
             # 9. 成功终态
             file_size_mb = round(final_output_path.stat().st_size / (1024 * 1024), 2)
@@ -307,7 +316,20 @@ class ReRenderManager:
                 output_file=str(final_output_path),
                 file_size_mb=file_size_mb
             )
+            if cleanup_batches:
+                for batch in batch_outputs:
+                    try:
+                        batch.unlink(missing_ok=True)
+                        batch.with_name(batch.name + ".json").unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Review delivery committed; could not remove batch %s", batch)
 
+        except RenderInterrupted as e:
+            logger.warning("Re-render interrupted; preserving completed batches: %s", e)
+            update_state(status="CANCELLED", error=str(e))
         except Exception as e:
             logger.exception("Re-render worker encountered unhandled exception: %s", e)
-            update_state(status="FAILED", error=str(e))
+            update_state(status="CANCELLED" if cancel_event.is_set() else "FAILED", error=str(e))
+        finally:
+            if candidate is not None:
+                cleanup_delivery_candidate(candidate)

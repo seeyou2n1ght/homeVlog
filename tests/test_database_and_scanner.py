@@ -82,6 +82,10 @@ class TestFilenameParsingAndScanner:
         assert resolve_camera_ui_name(path, 0, {"cameras": {"B888805AA3CD": "育儿房"}}) == "育儿房"
         assert resolve_camera_ui_name(path, 0, {"cameras": {}}) == "摄像头 01"
         assert resolve_camera_ui_name("Camera_B888805AA3CD", 0, {"cameras": {}}) == "B888805AA3CD"
+        assert resolve_camera_ui_name(None, 0) == "cam0"
+        assert resolve_camera_ui_name(None, 2) == "cam2"
+        assert resolve_camera_ui_name("", 1) == "cam1"
+        assert resolve_camera_ui_name(Path("Camera_B888805AA3CD"), 0, {"cameras": {}}) == "B888805AA3CD"
 
     def test_resolve_output_filename_custom_templates(self):
         from src.scanner import resolve_output_filename
@@ -186,6 +190,99 @@ class TestFilenameParsingAndScanner:
         finally:
             db.close()
 
+
+
+def test_scan_failure_preserves_registered_files_and_can_resume(tmp_path, monkeypatch, caplog):
+    import src.stages.scanner as scanner
+    monkeypatch.setattr(scanner, "load_config", lambda: {"recovery": {"scanner_freeze_minutes": 0}})
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    name = "00_20260901080000_20260901080500.mp4"
+    (first / name).write_bytes(b"dummy")
+    db = VlogDatabase(tmp_path / "scan.db")
+    try:
+        with pytest.raises(FileNotFoundError):
+            scanner.scan_directory(db, [str(first), str(second)])
+        assert db.conn.execute("SELECT count(*) FROM file_tasks").fetchone()[0] == 1
+        assert "扫描失败" in caplog.text
+        second.mkdir()
+        (second / name).write_bytes(b"dummy")
+        result = scanner.scan_directory(db, [str(first), str(second)])
+        assert result.added == 1 and result.skipped == 1
+        assert not any(t.name == "scan-progress" for t in __import__("threading").enumerate())
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("freeze_minutes", [0, 10])
+def test_scan_only_reads_attributes_when_freeze_check_requires_them(tmp_path, monkeypatch, caplog, freeze_minutes):
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+    import src.stages.scanner as scanner
+    entry = Mock()
+    entry.name = "00_20260901080000_20260901080500.mp4"
+    entry.path = str(tmp_path / entry.name)
+    entry.is_file.return_value = True
+    entry.stat.side_effect = PermissionError("NAS attributes unavailable")
+    monkeypatch.setattr(scanner, "load_config", lambda: {"recovery": {"scanner_freeze_minutes": freeze_minutes}})
+    monkeypatch.setattr(scanner.os, "scandir", lambda _path: nullcontext(iter([entry])))
+    db = VlogDatabase(tmp_path / "scan.db")
+    try:
+        if freeze_minutes:
+            with pytest.raises(PermissionError):
+                scanner.scan_directory(db, str(tmp_path))
+            assert entry.path in caplog.text
+            assert db.conn.execute("SELECT count(*) FROM file_tasks").fetchone()[0] == 0
+        else:
+            assert scanner.scan_directory(db, str(tmp_path)).added == 1
+            entry.stat.assert_not_called()
+    finally:
+        db.close()
+
+
+def test_blocking_nas_enumeration_reports_heartbeat_and_stops_reporter(tmp_path, monkeypatch, caplog):
+    import threading
+    import logging
+    import src.stages.scanner as scanner
+    caplog.set_level(logging.INFO, logger="homevlog")
+    entered, reported, release = threading.Event(), threading.Event(), threading.Event()
+    original_scandir = scanner.os.scandir
+    original_progress = scanner._ScanProgress
+    monkeypatch.setattr(scanner, "_ScanProgress", lambda: original_progress(interval_s=0.01))
+    monkeypatch.setattr(scanner, "load_config", lambda: {"recovery": {"scanner_freeze_minutes": 0}})
+    def blocked(path):
+        entered.set()
+        assert release.wait(2)
+        return original_scandir(path)
+    monkeypatch.setattr(scanner.os, "scandir", blocked)
+    records = []
+    class Capture(logging.Handler):
+        def emit(self, record):
+            if "扫描仍在进行" in record.getMessage():
+                records.append(record)
+                reported.set()
+    capture = Capture()
+    scanner.logger.addHandler(capture)
+    db = VlogDatabase(tmp_path / "scan.db")
+    errors = []
+    def run():
+        try:
+            scanner.scan_directory(db, str(tmp_path))
+        except BaseException as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=run)
+    try:
+        worker.start()
+        assert entered.wait(1) and reported.wait(1)
+        assert "枚举目录" in records[0].getMessage()
+        assert records[0].startup_progress
+    finally:
+        release.set()
+        worker.join(3)
+        scanner.logger.removeHandler(capture)
+        db.close()
+    assert not errors and not worker.is_alive()
+    assert not any(t.name == "scan-progress" for t in threading.enumerate())
 
 
 class TestVlogDatabaseLifecycle:

@@ -24,12 +24,16 @@ try:
 except Exception:
     pass
 
+if __name__ == "__main__":
+    print("HomeVlog 正在加载配置和运行环境…", flush=True)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.utils import setup_logging, load_config, reset_semaphores, cleanup_resources, cleanup_temp_artifacts, get_input_dirs
+from src.utils import setup_logging, load_config, reset_semaphores, cleanup_resources, cleanup_temp_artifacts, get_input_dirs, check_disk_space
 from src.pipeline import run_pipeline, process_date_cam
+from src.stages.companion import build_batch_summary_item
 from src.database import VlogDatabase
-from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name, resolve_output_filename
+from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name
 from src.ui import (
     build_arg_parser,
     resolve_cli_dates,
@@ -56,10 +60,14 @@ def main():
         reset_semaphores()
 
     config = load_config()
+    log_path = next((h.baseFilename for h in logger.handlers
+                     if getattr(h, "homevlog_role", None) == "run"), "logs/runs")
+    console.print(f"HomeVlog 已初始化，运行日志: {log_path}", markup=False)
 
     # 1. 独立系统与硬件就绪体检 (--doctor)
     if args.doctor:
-        print_doctor_report(console)
+        if not print_doctor_report(console):
+            sys.exit(1)
         return
 
     # 输入目录解析（支持多次 --input-dir 指定与 settings.yaml 配置混合）
@@ -69,15 +77,7 @@ def main():
         input_dirs = get_input_dirs(config)
 
     dashboard_enabled = not args.no_tui
-    skip_render = args.no_render or (args.stage in ("prescreen", "analyze"))
-
-    # 2. 独立或前置清理临时批次文件 (--clean-temp)
-    if args.clean_temp:
-        cleanup_temp_artifacts(clean_batches=True)
-        console.print("[bold green]✔ 临时渲染批次与中间碎片已全部清理完毕。[/bold green]")
-        # 若未指定任何其他操作或目标，清理完成后直接退出
-        if not (args.date or args.date_range or args.days or args.scan or args.status or args.reanalyze):
-            return
+    skip_render = args.no_render or args.stage == "analyze"
 
     # 3. 数据库状态速查总览表 (--status)
     if args.status:
@@ -103,35 +103,39 @@ def main():
         console.print(f"[bold red]参数错误:[/] {e}")
         sys.exit(1)
 
-    if args.reanalyze:
+    if args.reanalyze and not args.dry_run:
         db = VlogDatabase()
         try:
-            if target_dates:
-                for d in target_dates:
-                    if args.cam is not None:
+            groups = get_date_cam_groups(db, dates=target_dates, cam_index=args.cam)
+            with db._lock:
+                if not args.force_render and any(
+                    db.conn.execute("SELECT 1 FROM render_tasks WHERE date=? AND cam_index=? AND status='COMPLETED'", (d, c)).fetchone()
+                    for d, c in groups
+                ):
+                    parser.error("所选范围包含已交付日期；重析请同时使用 --force-render（尚未重置任何数据）")
+                try:
+                    for d, cam in groups:
                         db.conn.execute(
-                            "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL WHERE date=? AND cam_index=?",
-                            (d, args.cam),
+                            """UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL,
+                               analysis_status='PENDING', analysis_segments=NULL, processing_fingerprint=NULL,
+                               retry_count=0, error_msg=NULL WHERE date=? AND cam_index=?""", (d, cam),
                         )
-                        db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, args.cam))
-                    else:
-                        db.conn.execute(
-                            "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL WHERE date=?",
-                            (d,),
-                        )
-                        db.conn.execute("DELETE FROM segments WHERE date=?", (d,))
-                dates_str = ", ".join(target_dates)
-                cam_str = f"机位 {args.cam}" if args.cam is not None else "全机位"
-                console.print(f"[bold cyan]ℹ 已重置日期 [{dates_str}] ({cam_str}) 的分析缓存，将重新精析并渲染。[/bold cyan]")
-            else:
-                db.conn.execute(
-                    "UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL, analysis_status='PENDING', analysis_segments=NULL"
-                )
-                db.conn.execute("DELETE FROM segments")
-                console.print("[bold cyan]ℹ 已重置数据库中所有任务的分析缓存，将全局重新精析并渲染。[/bold cyan]")
-            db.conn.commit()
+                        db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, cam))
+                    db.conn.commit()
+                except BaseException:
+                    db.conn.rollback()
+                    raise
+            console.print(f"[bold cyan]ℹ 已重置所选 {len(groups)} 个日期机位组的分析缓存；人工审核保留。[/bold cyan]")
         finally:
             db.close()
+
+    # 2. 独立或前置清理临时批次文件 (--clean-temp)
+    if args.clean_temp and not args.dry_run:
+        cleanup_temp_artifacts(clean_batches=True)
+        console.print("[bold green]✔ 临时渲染批次与中间碎片已全部清理完毕。[/bold green]")
+        # 若未指定任何其他操作或目标，清理完成后直接退出
+        if not (args.date or args.date_range or args.days or args.scan or args.status or args.reanalyze):
+            return
 
     try:
         # 5. 纯扫描模式 (--scan)
@@ -171,13 +175,7 @@ def main():
             db = VlogDatabase()
             try:
                 scan_directory(db, input_dir=input_dirs)
-                all_groups = get_date_cam_groups(db)
-                if target_dates:
-                    active_groups = [(d, c) for d, c in all_groups if d in target_dates and (args.cam is None or c == args.cam)]
-                elif args.cam is not None:
-                    active_groups = [(d, c) for d, c in all_groups if c == args.cam]
-                else:
-                    active_groups = all_groups
+                active_groups = get_date_cam_groups(db, dates=target_dates, cam_index=args.cam)
 
                 table = Table.grid(padding=(0, 2))
                 table.add_column(style="bold cyan", justify="right")
@@ -201,17 +199,14 @@ def main():
             return
 
         # 7. 指定日期或日期范围批处理 (--date, --date-range, --days)
-        if target_dates:
+        if target_dates or args.cam is not None:
             db = VlogDatabase()
+            monitor = None
             try:
                 scan_directory(db, input_dir=input_dirs)
-                all_groups = get_date_cam_groups(db)
-                active_groups = [
-                    (d, c) for d, c in all_groups
-                    if d in target_dates and (args.cam is None or c == args.cam)
-                ]
+                active_groups = get_date_cam_groups(db, dates=target_dates, cam_index=args.cam)
                 if not active_groups:
-                    console.print(f"[yellow]未在任务库中找到日期 {target_dates} 对应的监控切片。[/yellow]")
+                    console.print("[yellow]未在任务库中找到所选日期/机位对应的监控切片。[/yellow]")
                     return
 
                 from src.monitor import get_monitor
@@ -235,9 +230,14 @@ def main():
                     )
 
                 batch_summary_list = []
-                ok_count, fail_count = 0, 0
+                ok_count, fail_count, skip_count = 0, 0, 0
+                stopped_reason = None
 
                 for d, cam in active_groups:
+                    already_completed = not args.force_render and db.is_render_completed(d, cam)
+                    if not already_completed and not check_disk_space(OUTPUT_DIR):
+                        stopped_reason = "LOW_DISK_SPACE"
+                        break
                     t0 = time.monotonic()
                     ok = process_date_cam(
                         db, d, cam,
@@ -247,72 +247,53 @@ def main():
                     )
                     wall_s = time.monotonic() - t0
                     if ok:
-                        ok_count += 1
+                        if already_completed:
+                            skip_count += 1
+                        else:
+                            ok_count += 1
                     else:
                         fail_count += 1
 
-                    # 收集指标用于多任务总结
-                    tasks = db.get_all_file_tasks_for_date(d, cam)
-                    s_dir = str(Path(tasks[0]["filepath"]).parent) if tasks else (input_dirs[0] if input_dirs else "")
-                    cam_disp = resolve_camera_ui_name(s_dir, cam_index=cam, config=config)
-                    out_name = resolve_output_filename(
-                        config.get("output", {}).get("naming", "DailyVlog_{date}_{mac}.mp4"),
-                        d, cam, tasks[0]["filepath"] if tasks else None, config=config
-                    )
-                    out_p = Path(OUTPUT_DIR) / out_name
-                    meta_p = out_p.with_suffix(".meta.json")
-
-                    item = {
-                        "date": d,
-                        "cam_index": cam,
-                        "cam_name": cam_disp,
-                        "total_files": len(tasks),
-                        "input_duration_s": sum(t.get("file_duration", 0.0) or 0.0 for t in tasks),
-                        "vlog_duration_s": 0.0,
-                        "output_size_mb": round(out_p.stat().st_size / (1024 * 1024), 2) if out_p.exists() else 0.0,
-                        "wall_clock_s": round(wall_s, 2),
-                        "status": "SUCCESS" if ok else "FAILED",
-                    }
-                    if meta_p.exists():
-                        try:
-                            import json
-                            m_d = json.loads(meta_p.read_text(encoding="utf-8"))
-                            m_m = m_d.get("metrics", {})
-                            item["vlog_duration_s"] = m_m.get("vlog_duration_s", 0.0)
-                            item["condensation_ratio"] = m_m.get("condensation_ratio", 0.0)
-                            item["speedup_x"] = m_d.get("performance", {}).get("speedup_x", 0.0)
-                        except Exception:
-                            pass
-                    batch_summary_list.append(item)
+                    status = "SKIPPED" if ok and already_completed else ("SUCCESS" if ok else "FAILED")
+                    batch_summary_list.append(build_batch_summary_item(
+                        db, d, cam, OUTPUT_DIR, config, wall_s, status, skip_render=skip_render,
+                    ))
                     cleanup_resources()
 
-                monitor.shutdown()
                 logging.shutdown()
 
                 if len(active_groups) > 1:
                     print_batch_summary_table(batch_summary_list)
-                else:
+                elif batch_summary_list:
                     res_item = batch_summary_list[0]
-                    status_color = "green" if res_item["status"] == "SUCCESS" else "red"
-                    status_label = "✔ 处理完成" if res_item["status"] == "SUCCESS" else "✘ 处理失败"
+                    status_color = "red" if res_item["status"] == "FAILED" else "green"
+                    status_label = {"SUCCESS": "✔ 处理完成", "SKIPPED": "已交付跳过"}.get(res_item["status"], "✘ 处理失败")
                     console.print(f"[bold {status_color}]{status_label}: {res_item['date']} ({res_item['cam_name']})[/bold {status_color}]")
-                if fail_count:
+                if stopped_reason:
+                    remaining = len(active_groups) - ok_count - fail_count - skip_count
+                    console.print(f"[yellow]流水线提前停止: {stopped_reason}，未处理={remaining}[/yellow]")
+                if fail_count or stopped_reason:
                     sys.exit(1)
             finally:
+                if monitor is not None:
+                    monitor.shutdown()
                 db.close()
             return
 
         # 8. 全量常规批处理 (run_pipeline)
-        result = run_pipeline(skip_render=skip_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled)
-        console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}")
-        if result["failed"]:
+        result = run_pipeline(skip_render=skip_render, input_dir=input_dirs, dashboard_enabled=dashboard_enabled,
+                              force_render=args.force_render)
+        console.print(f"[bold cyan]流水线总览:[/] 处理组合总数={result['total']}, 成功={result['ok']}, 失败={result['failed']}, 已交付跳过={result.get('skipped', 0)}, 未处理={result.get('remaining', 0)}")
+        if result.get("stopped_reason"):
+            console.print(f"[yellow]流水线提前停止: {result['stopped_reason']}[/yellow]")
+        if result["failed"] or result.get("remaining") or result.get("stopped_reason"):
             sys.exit(1)
 
     except KeyboardInterrupt:
         from src.renderer import FFmpegProcessRegistry
         FFmpegProcessRegistry.mark_interrupted()
         FFmpegProcessRegistry.kill_all()
-        console.print("\n[bold yellow]⚠ 用户中断 (Ctrl+C)。已平稳终止子进程与硬件会话，当前已分析任务与批次已安全落盘。下次启动将自动断点续传。[/bold yellow]")
+        console.print("\n[bold yellow]⚠ 任务已中断。已终止受管子进程与硬件会话，保留已保存的分析结果和有效批次。下次启动将自动断点续传。[/bold yellow]")
         cleanup_resources()
         sys.exit(130)
 

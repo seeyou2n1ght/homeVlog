@@ -8,18 +8,16 @@
 5. YOLO 模型权重文件完整性。
 """
 
-import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from src.core.config import load_config, PROJECT_ROOT, OUTPUT_DIR, TEMP_DIR
 
@@ -128,7 +126,7 @@ def check_gpu_and_cuda() -> Dict[str, Any]:
 def check_storage_and_paths() -> Dict[str, Any]:
     """检测素材输入目录、输出磁盘空间与临时目录状态。"""
     config = load_config()
-    from src.core.utils import get_input_dirs, check_disk_space
+    from src.core.utils import get_input_dirs
 
     input_dirs = get_input_dirs(config)
     input_status = []
@@ -248,6 +246,9 @@ def print_doctor_report(console: Console = None) -> bool:
             storage_msgs.append(f"[red]✖ 未挂载:[/] {inp['path']}")
             all_passed = False
     storage_msgs.append(f"输出盘剩余空间: [bold]{st_data['output_free_gb']} GB[/bold] (阈值 {st_data['output_min_gb']} GB)")
+
+    if not st_data["disk_ok"]:
+        all_passed = False
 
     st_status = "[bold green]✔ 就绪[/bold green]" if st_data["disk_ok"] and all(i["exists"] for i in st_data["inputs"]) else "[bold red]✖ 警告[/bold red]"
     table.add_row("存储与网络挂载", st_status, " | ".join(storage_msgs))

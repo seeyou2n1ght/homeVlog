@@ -176,6 +176,32 @@ def _plan_speed_segment(
     return (target, None)
 
 
+def display_plan_options(
+    config: dict,
+    *,
+    segment_config: dict | None = None,
+    output_config: dict | None = None,
+) -> dict[str, Any]:
+    """Translate runtime settings to the shared display clock's parameters."""
+    seg = config.get("segment", {}) if segment_config is None else segment_config
+    out = config.get("output", {}) if output_config is None else output_config
+    render = config.get("render", {})
+    presence = config.get("presence", {})
+    micro = config.get("micro_motion", {})
+    return {
+        "static_keyframe_interval": seg.get("static_keyframe_interval", 30.0),
+        "keyframe_display_duration": seg.get("keyframe_display_duration", 0.5),
+        "min_static_display_duration": seg.get("min_static_display_duration", 1.5),
+        "max_static_display_duration": seg.get("max_static_display_duration", 2.0),
+        "speed_ramping": render.get("speed_ramping_enabled", True),
+        "ramp_duration_s": float(render.get("ramp_duration_s", 1.0)),
+        "presence_speed_factor": float(presence.get("speed_factor", 4.0)),
+        "night_stationary_speed_factor": float(presence.get("night_speed_factor", 16.0)),
+        "micro_motion_cruise_speed": float(micro.get("cruise_speed", 16.0)),
+        "output_fps": float(out.get("fps", 20)),
+    }
+
+
 def compute_display_plans(
     timeline: list[TimelineSegment],
     static_keyframe_interval: float = 12.0,
@@ -410,24 +436,7 @@ def generate_timecode_subtitles(
     day_start_unix = ts_to_unix(base_date + "000000")
 
     # 展示时长计划与渲染滤镜图严格同源，含 speed ramping 非线性映射
-    cfg = load_config()
-    seg_cfg = cfg.get("segment", {})
-    render_cfg = cfg.get("render", {})
-    presence_cfg = cfg.get("presence", {})
-    micro_cfg = cfg.get("micro_motion", {})
-    plans = compute_display_plans(
-        timeline,
-        static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
-        keyframe_display_duration=seg_cfg.get("keyframe_display_duration", 0.5),
-        min_static_display_duration=seg_cfg.get("min_static_display_duration", 1.5),
-        max_static_display_duration=seg_cfg.get("max_static_display_duration", 2.0),
-        speed_ramping=render_cfg.get("speed_ramping_enabled", True),
-        ramp_duration_s=float(render_cfg.get("ramp_duration_s", 1.0)),
-        presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
-        night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
-        micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
-        output_fps=float(cfg.get("output", {}).get("fps", 20)),
-    )
+    plans = compute_display_plans(timeline, **display_plan_options(load_config()))
 
     is_ass = format_type.lower() in ("ass", "ssa")
     entries = []
@@ -629,6 +638,7 @@ def build_timeline_from_rows(
     """
     基于给定的数据库任务行集合构建时间轴片段，支持按 target_files 精准局部过滤。
     """
+    rows = [row for row in rows if row.get("prescreen_status") != "SKIPPED_EMPTY"]
     if config is None:
         config = load_config()
 
@@ -756,13 +766,14 @@ def build_timeline_from_rows(
     unique_files = list(dict.fromkeys(s.source_file for s in split_segs))
     file_to_idx = {f: i for i, f in enumerate(unique_files)}
 
-    min_seg_dur = seg_cfg.get("min_segment_duration", 0.1)
     timeline: list[TimelineSegment] = []
     for s in split_segs:
         idx = file_to_idx[s.source_file]
         file_start = s.file_start_offset
         start_in_file = max(s.start_time - file_start, 0.0)
-        end_in_file = max(s.end_time - file_start, start_in_file + min_seg_dur)
+        end_in_file = s.end_time - file_start
+        if end_in_file <= start_in_file:
+            continue
         timeline.append(TimelineSegment(
             filepath=s.source_file,
             input_index=idx,
@@ -1054,6 +1065,12 @@ def build_concat_filter(
         audio_idx = idx + audio_input_offset
         s = seg.start_in_file
         e = seg.end_in_file
+        # Dense input has already been resampled to output_fps. FFmpeg rounds
+        # trim endpoints onto that clock: a sub-frame span can round to an empty
+        # interval (e.g. 325.700..325.724 at 20 fps). Keep one source frame for
+        # the display plan's minimum one-frame slot; audio/source mapping stays
+        # on the original interval. Padding before split covers physical EOF.
+        video_end = max(e, s + 1 / output_fps) if not preselected_static and seg.state in ACTIVE_STATES else e
         source_seg = source_timeline[i]
         source_s = source_seg.start_in_file
         source_e = source_seg.end_in_file
@@ -1089,7 +1106,7 @@ def build_concat_filter(
             # Clone a prematurely-ended source tail to the planned duration;
             # the display plan, audio, and video must close on the same clock.
             parts_v.append(
-                f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
+                f"[{src_label}]trim=start={s:.3f}:end={video_end:.3f}{osd_filter_str},"
                 f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={display_dur:.9f},"
                 f"fps=fps={output_fps},trim=end_frame={round(display_dur * output_fps)},setpts=PTS-STARTPTS[v{seg_count}]"
             )
@@ -1134,7 +1151,7 @@ def build_concat_filter(
                 ",setpts=PTS-STARTPTS"
             )
             parts_v.append(
-                f"[{src_label}]trim=start={s:.3f}:end={e:.3f}{osd_filter_str},"
+                f"[{src_label}]trim=start={s:.3f}:end={video_end:.3f}{osd_filter_str},"
                 f"setpts={pts_filter}"
                 f"{fps_filter}[v{seg_count}]"
             )

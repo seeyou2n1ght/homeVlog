@@ -22,6 +22,13 @@ ACTIVE_STATES = (
 )
 
 
+UNCERTAIN_YOLO_REASONS = ("YOLO_FAILED", "YOLO_UNAVAILABLE", "INSUFFICIENT_YOLO_EVIDENCE")
+
+
+def has_uncertain_yolo_evidence(segment) -> bool:
+    return any(reason in (segment.review_reason or "") for reason in UNCERTAIN_YOLO_REASONS)
+
+
 @dataclass
 class Segment:
     start_time: float
@@ -47,7 +54,12 @@ class Segment:
     @property
     def is_active_motion(self) -> bool:
         """Returns True if segment represents high-speed/1x active dynamic motion or audio."""
-        return self.state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        return self.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO)
+
+    @property
+    def is_static(self) -> bool:
+        """Returns True if segment represents static background footage."""
+        return self.state == SegmentState.STATIC
 
 
 def build_segments(
@@ -313,7 +325,7 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
         for start, end in zip(ordered, ordered[1:]):
             state = next((e[2] for e in relevant if e[0] < end and e[1] > start), None)
             if state is None:
-                if "YOLO_FAILED" in parent.review_reason:
+                if has_uncertain_yolo_evidence(parent):
                     state = parent.state
                 elif is_night(start) and presence.get("night_stationary_enabled", True):
                     state = "NIGHT_STATIONARY"
@@ -373,6 +385,11 @@ def _filter_short(
         while i < len(segments):
             dur = segments[i].end_time - segments[i].start_time
             is_dynamic = segments[i].state in ("DYNAMIC", "DYNAMIC_AUDIO")
+            if is_dynamic and has_uncertain_yolo_evidence(segments[i]):
+                # Smoothing must not erase a conservative fallback before the
+                # subsequent activity refinement gets to inspect it.
+                i += 1
+                continue
             threshold = min_motion if is_dynamic else min_static
             if dur >= threshold:
                 i += 1

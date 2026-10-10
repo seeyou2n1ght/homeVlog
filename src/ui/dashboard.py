@@ -280,7 +280,8 @@ def print_batch_summary_table(results: List[Dict[str, Any]]) -> None:
         w_s = int(r.get("wall_clock_s", 0.0))
         w_str = f"{w_s // 60:02d}:{w_s % 60:02d}"
         spd = f"{r.get('speedup_x', 0.0):.1f}×"
-        st = "[bold green]✔ 完成[/bold green]" if r.get("status") == "SUCCESS" else "[bold red]✖ 失败[/bold red]"
+        st = {"SUCCESS": "[bold green]✔ 完成[/bold green]",
+              "SKIPPED": "[cyan]已交付跳过[/cyan]"}.get(r.get("status"), "[bold red]✖ 失败[/bold red]")
 
         table.add_row(str(idx), d, cam, n_files, in_h, v_m, condense, sz, w_str, spd, st)
 

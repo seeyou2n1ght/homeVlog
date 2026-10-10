@@ -169,7 +169,6 @@ segment:
   keyframe_display_duration: 0.25
   min_static_display_duration: 0.3
   max_static_display_duration: 1.5
-  min_segment_duration: 0.1
   macro_collapse_static: false  # 保留所有源区间，静止区间通过倍速缩短
 
 presence:

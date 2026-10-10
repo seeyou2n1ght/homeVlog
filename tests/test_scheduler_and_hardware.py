@@ -444,4 +444,52 @@ def test_qsv_adaptive_duration_formula_and_elastic_expansion():
     assert calc_allowed(0) == 30.0
 
 
+def test_legacy_config_tracks_core_reload_and_preserves_explicit_overrides(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import src.core.config as core
+    import src.utils as legacy
+
+    saved_overrides = {name: legacy.__dict__[name] for name in ("SETTINGS", "CONFIG_PATH")
+                       if name in legacy.__dict__}
+    for name in saved_overrides:
+        legacy.__dict__.pop(name)
+    first, second, invalid = [tmp_path / name for name in ("first.yaml", "second.yaml", "invalid.yaml")]
+    first.write_text("marker: first\n", encoding="utf-8")
+    second.write_text("marker: second\n", encoding="utf-8")
+    invalid.write_text("hardware:\n  max_nv_concurrency: 0\n", encoding="utf-8")
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(core, "SETTINGS", {})
+            m.setattr(core, "CONFIG_PATH", first)
+            for name in ("OUTPUT_DIR", "TEMP_DIR", "TEMP_STAGING_DIR", "TEMP_BATCHES_DIR",
+                         "TEMP_SCRIPTS_DIR", "LOGS_DIR", "DB_PATH"):
+                m.setattr(core, name, tmp_path / name)
+            assert legacy.load_config()["marker"] == "first"
+            updated = core.load_config(second)
+            assert legacy.load_config() is updated
+            assert legacy.SETTINGS is updated
+            assert legacy.CONFIG_PATH == second
+            exported = {}
+            exec("from src.utils import *", exported)
+            assert exported["SETTINGS"] is updated
+            assert exported["CONFIG_PATH"] == second
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda i: (core if i % 2 else legacy).load_config(), range(24)))
+            assert all(result is updated for result in results)
+            legacy.SETTINGS = {"marker": "explicit"}
+            assert legacy.load_config() is core.SETTINGS
+            assert core.SETTINGS["marker"] == "explicit"
+            legacy.CONFIG_PATH = first
+            assert legacy.load_config(reload=True)["marker"] == "first"
+            good = core.SETTINGS
+            with pytest.raises(ValueError):
+                legacy.load_config(invalid)
+            assert core.SETTINGS is legacy.SETTINGS is good
+            assert legacy.load_config() is good
+    finally:
+        for name in ("SETTINGS", "CONFIG_PATH"):
+            legacy.__dict__.pop(name, None)
+        legacy.__dict__.update(saved_overrides)
+
+
 
