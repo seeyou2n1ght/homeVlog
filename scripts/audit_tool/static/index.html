@@ -40,6 +40,7 @@
         <button class="btn-menu-trigger" id="btn-tools-menu">⚙️ 工具与导出 ▾</button>
         <div class="dropdown-menu-panel hidden" id="tools-menu-panel">
           <button class="menu-item" id="btn-export-gold">🏆 导出评测基准 (Benchmark)</button>
+          <button class="menu-item" id="btn-open-whatif">🔬 参数仿真 (What-If 预测)</button>
           <button class="menu-item" id="btn-open-tuning">💡 调参量化建议</button>
           <button class="menu-item" id="btn-open-yolo">🏷️ 导出 YOLO 数据集</button>
           <button class="menu-item" id="btn-open-rerender">🚀 重新浓缩成片</button>
@@ -168,6 +169,86 @@
       </span>
     </div>
   </footer>
+
+  <!-- 调参仿真 (What-If) 模态框 -->
+  <div class="modal-overlay hidden" id="modal-whatif">
+    <div class="modal-card modal-whatif-card">
+      <div class="modal-header">
+        <span class="modal-title">🔬 What-If 参数敏感性离线仿真器</span>
+        <button class="btn-modal-close" id="btn-close-whatif">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">基于黄金真值测试集（100 样本平衡基准），离线仿真候选参数对混淆矩阵、F1-Score 及各场景误报/漏报的净收益。</p>
+        
+        <div class="whatif-form-grid">
+          <div class="form-field">
+            <label>动能敏感门限 (min_motion_threshold)</label>
+            <input type="number" step="0.1" id="sim-input-energy" class="sim-input" value="3.5" />
+            <span class="field-hint">当前基线: 2.5 (调高抑制树影/刚性光影)</span>
+          </div>
+          <div class="form-field">
+            <label>最小运动时长 (min_motion_duration)</label>
+            <input type="number" step="0.5" id="sim-input-dur" class="sim-input" value="2.5" />
+            <span class="field-hint">当前基线: 2.0s (调高平滑吸收极短毛刺)</span>
+          </div>
+          <div class="form-field">
+            <label>YOLO 目标置信度 (confidence)</label>
+            <input type="number" step="0.05" id="sim-input-yolo" class="sim-input" value="0.25" />
+            <span class="field-hint">当前基线: 0.30 (调低提升微弱/暗光召回)</span>
+          </div>
+        </div>
+
+        <div class="whatif-actions-bar">
+          <button class="btn-sim-action" id="btn-run-simulation">⚡ 执行 What-If 推演</button>
+          <button class="btn-apply-action hidden" id="btn-apply-tuning-config">💾 安全应用至 settings.yaml</button>
+        </div>
+
+        <!-- 仿真结果输出面板 -->
+        <div class="sim-report-box hidden" id="sim-report-box">
+          <div class="sim-verdict-banner" id="sim-verdict-banner">
+            <span class="verdict-tag" id="sim-verdict-tag">IMPROVED</span>
+            <span class="verdict-reason font-mono" id="sim-verdict-reason">--</span>
+          </div>
+
+          <div class="sim-stats-grid font-mono">
+            <div class="stat-cell">
+              <span class="stat-label">基准 F1</span>
+              <span class="stat-val" id="stat-base-f1">--</span>
+            </div>
+            <div class="stat-cell highlight">
+              <span class="stat-label">仿真 F1</span>
+              <span class="stat-val" id="stat-sim-f1">--</span>
+            </div>
+            <div class="stat-cell">
+              <span class="stat-label">Δ F1 净增</span>
+              <span class="stat-val" id="stat-delta-f1">--</span>
+            </div>
+            <div class="stat-cell">
+              <span class="stat-label">误报减少 (FP)</span>
+              <span class="stat-val text-green" id="stat-fp-red">--</span>
+            </div>
+            <div class="stat-cell">
+              <span class="stat-label">漏报代价 (FN)</span>
+              <span class="stat-val text-yellow" id="stat-fn-inc">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 成片播放模态框 (自适应视频视窗) -->
+  <div class="modal-overlay hidden" id="modal-player">
+    <div class="modal-card modal-player-card">
+      <div class="modal-header">
+        <span class="modal-title font-mono" id="player-modal-title">▶ Daily Vlog 成片即时预览</span>
+        <button class="btn-modal-close" id="btn-close-player">✕</button>
+      </div>
+      <div class="modal-body modal-video-wrap">
+        <video id="vlog-video-el" class="vlog-native-video" controls autoplay></video>
+      </div>
+    </div>
+  </div>
 
   <!-- 吐司消息通知 (Toast) -->
   <div class="toast-container" id="toast-container"></div>

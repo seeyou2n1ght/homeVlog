@@ -184,6 +184,7 @@ def test_audit_http_export():
     import http.cookiejar
     import threading
     import urllib.error
+    import json
     import urllib.request
     from http.server import HTTPServer
     from scripts.audit_tool.app import AuditHandler
@@ -539,6 +540,7 @@ def test_audit_http_new_endpoints(tmp_path, monkeypatch):
     import http.cookiejar
     import json
     import threading
+    import json
     import urllib.request
     from http.server import HTTPServer
     from scripts.audit_tool.app import AuditHandler
@@ -610,3 +612,126 @@ def test_audit_http_new_endpoints(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_audit_api_benchmark_and_tuning_integration(tmp_path):
+    """测试基准版本化、What-If 仿真与流式视频播放的 HTTP 端点集成"""
+    import json
+    import urllib.request
+    import urllib.parse
+    import socket
+    import http.cookiejar
+    from http.server import HTTPServer
+    import threading
+    from scripts.audit_tool import app
+    from src.core.config import OUTPUT_DIR
+
+    db_path = tmp_path / "test_api_bm.db"
+    db = VlogDatabase(db_path=db_path)
+    test_service = AuditService(db=db)
+
+    # 预置 1 个样本供测试
+    fp = "sample_test.mp4"
+    db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
+    segs = [
+        Segment(start_time=10.0, end_time=20.0, state="DYNAMIC", source_file=fp, max_energy=4.5, avg_confidence=0.8)
+    ]
+    db.set_analysis_result(fp, "ANALYZED", segs)
+    db_segs = db.get_segments_for_file(fp)
+    test_service.submit_review(db_segs[0]["id"], "CONFIRMED_MOTION", scenario="ADULT_MOTION")
+
+    # 动态端口
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    app.service = test_service
+    server = HTTPServer(("127.0.0.1", port), app.AuditHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    try:
+        # 1. 握手获取 Cookie Token
+        req_root = urllib.request.Request(f"http://127.0.0.1:{port}/")
+        with opener.open(req_root) as resp:
+            assert resp.status == 200
+
+        # 2. POST /api/export_gold_benchmark (版本化导出)
+        gold_out = tmp_path / "api_gold.json"
+        exp_payload = json.dumps({
+            "output_path": str(gold_out),
+            "version": "2.0_test",
+            "incremental_merge": False,
+        }).encode("utf-8")
+        req_exp = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/export_gold_benchmark",
+            data=exp_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_exp) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert data["version"] == "2.0_test"
+            assert gold_out.exists()
+
+        # 3. GET /api/benchmark_versions
+        req_v = urllib.request.Request(f"http://127.0.0.1:{port}/api/benchmark_versions")
+        with opener.open(req_v) as resp:
+            assert resp.status == 200
+            v_data = json.loads(resp.read().decode("utf-8"))
+            assert isinstance(v_data, list)
+
+        # 4. POST /api/tuning_simulate
+        sim_payload = json.dumps({
+            "candidate_params": {"detection.min_motion_threshold": 3.5}
+        }).encode("utf-8")
+        req_sim = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/tuning_simulate",
+            data=sim_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_sim) as resp:
+            assert resp.status == 200
+            sim_res = json.loads(resp.read().decode("utf-8"))
+            assert "verdict" in sim_res
+
+        # 5. POST /api/tuning_diff
+        diff_payload = json.dumps({
+            "params": {"detection.min_motion_threshold": 3.5}
+        }).encode("utf-8")
+        req_diff = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/tuning_diff",
+            data=diff_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_diff) as resp:
+            assert resp.status == 200
+            diff_res = json.loads(resp.read().decode("utf-8"))
+            assert "total_changes" in diff_res
+
+        # 6. GET /api/video_stream (Range 请求分片播放)
+        test_video = OUTPUT_DIR / f"test_stream_{port}.mp4"
+        test_video.write_bytes(b"ABCDEFGHIJ" * 50)
+        try:
+            req_stream = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/video_stream?filepath={urllib.parse.quote(str(test_video))}",
+                headers={"Range": "bytes=0-9"}
+            )
+            with opener.open(req_stream) as resp:
+                assert resp.status == 206
+                assert resp.headers.get("Content-Range") == f"bytes 0-9/{test_video.stat().st_size}"
+                assert resp.read() == b"ABCDEFGHIJ"
+        finally:
+            test_video.unlink(missing_ok=True)
+
+    finally:
+        server.shutdown()
+        server.server_close()
+        db.close()

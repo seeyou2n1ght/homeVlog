@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "format": "homevlog_gold_benchmark_v2",
+  "created_at": "2026-10-11 02:11:36",
+  "total_samples": 100,
+  "distribution": {
+    "CONFIRMED_MOTION": 30,
+    "MISSED_MOTION": 25,
+    "FALSE_ALARM": 25,
+    "CONFIRMED_STATIC": 20
+  },
+  "scenario_distribution": {
+    "ADULT_MOTION": 30,
+    "INFANT_MOTION": 25,
+    "LIGHT_SHADOW": 25,
+    "EMPTY_ROOM": 20
+  }
+}

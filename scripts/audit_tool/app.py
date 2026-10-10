@@ -81,6 +81,65 @@ class AuditHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
+    def _send_video_stream(self, file_path: Path):
+        """支持 HTTP 206 Partial Content 的流式视频分发"""
+        if not file_path.exists() or not file_path.is_file():
+            self.send_error(404, "Video file not found")
+            return
+
+        file_size = file_path.stat().st_size
+        range_header = self.headers.get("Range")
+
+        if not range_header:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            try:
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(256 * 1024):
+                        self.wfile.write(chunk)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
+
+        try:
+            range_val = range_header.strip().lower()
+            if not range_val.startswith("bytes="):
+                self.send_error(416, "Requested Range Not Satisfiable")
+                return
+            range_spec = range_val[6:].strip()
+            parts = range_spec.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+            if start >= file_size or end >= file_size or start > end:
+                self.send_error(416, "Requested Range Not Satisfiable")
+                return
+
+            chunk_len = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Content-Length", str(chunk_len))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = chunk_len
+                while remaining > 0:
+                    read_bytes = min(remaining, 256 * 1024)
+                    data = f.read(read_bytes)
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as e:
+            logger.debug("Video stream error: %s", e)
+
     def do_OPTIONS(self):
         self.send_error(403, "Cross-origin requests are not allowed")
 
@@ -236,6 +295,27 @@ class AuditHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "File not found"}, status=404)
             return
+        elif path == "/api/video_stream":
+            fp = params.get("filepath", [""])[0]
+            if not fp:
+                self.send_error(400, "Missing filepath")
+                return
+            p = Path(fp).resolve()
+            from src.core.config import OUTPUT_DIR
+            is_in_output = False
+            try:
+                is_in_output = p.is_relative_to(OUTPUT_DIR.resolve())
+            except Exception:
+                is_in_output = False
+
+            if not (is_in_output or service.is_registered_filepath(str(p))):
+                self.send_error(403, "Access to specified video path is forbidden")
+                return
+            self._send_video_stream(p)
+            return
+        elif path == "/api/benchmark_versions":
+            self._send_json(service.get_benchmark_versions())
+            return
 
         self.send_error(404, "Endpoint not found")
 
@@ -327,7 +407,36 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/export_gold_benchmark":
             out_path = payload.get("output_path")
-            res = service.export_gold_benchmark(output_path=out_path)
+            version = str(payload.get("version", "1.0"))
+            inc = bool(payload.get("incremental_merge", True))
+            res = service.export_gold_benchmark(output_path=out_path, version=version, incremental_merge=inc)
+            self._send_json(res)
+            return
+
+        elif path == "/api/tuning_simulate":
+            cand = payload.get("candidate_params", {})
+            res = service.simulate_tuning(cand)
+            self._send_json(res)
+            return
+
+        elif path == "/api/tuning_diff":
+            cand = payload.get("params", {})
+            res = service.get_tuning_diff(cand)
+            self._send_json(res)
+            return
+
+        elif path == "/api/tuning_apply":
+            cand = payload.get("params", {})
+            res = service.apply_tuning(cand)
+            self._send_json(res)
+            return
+
+        elif path == "/api/tuning_rollback":
+            bk = payload.get("backup_path", "")
+            if not bk:
+                self._send_json({"error": "Missing backup_path"}, status=400)
+                return
+            res = service.rollback_tuning(bk)
             self._send_json(res)
             return
 

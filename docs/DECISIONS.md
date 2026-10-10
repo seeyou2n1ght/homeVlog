@@ -1588,3 +1588,43 @@ CLI 预览、重析、处理共用日期/机位筛选；dry-run 可扫描入库�
 渲染器在本批清理及租约释放后，对明确的控制台中断码或 SIGINT 抛出 RenderInterrupted。主流水线沿现有 abort/stop/FFmpeg 注册表收尾，由主线程传播取消，保留有效批次和 cancelled 遥测，不交付半成品。审核入口将对应任务设为 CANCELLED，不新增全局取消副作用。普通编码失败、硬件回退和有限重试规则保持；不将正常 stderr、stop_event 或工作线程崩溃当作用户取消。信号发送者仍未知。
 
 受控回归覆盖 EDL 无备用重试、NV/QSV/异构停止、有效批次保留及审核取消。真实第 9 批重现输入 DTS 警告但完整音视频/接缝验证通过，故未改变时间轴或编码配置；三份不完整原片继续阻止交付。
+
+
+---
+
+# ADR 0038 — Triad Human-in-the-Loop Architecture: Benchmark, Priority Re-rendering, and Tuning Simulator
+
+## Status
+
+Accepted (2026-10-11)
+
+## Context
+
+在智能家庭监控视频超长浓缩流水线中，单纯依赖无监督运动能级和轻量 YOLO 目标检测，难以穷尽弱光夜视、大面积慢速光影漫射、树影车灯以及婴儿微弱动静等长尾场景。
+此前系统虽然具备人工审核工作台原型，但人工复核行为处于“单点即时纠偏”状态：
+1. 缺乏权威、版本化的黄金真值测试集，算法迭代发版缺乏质量门禁；
+2. 纠偏后缺乏在工作台内直接流式回看成片效果的闭环；
+3. 缺少基于打标真值量化评估算法参数调整（如动能门限、最小运动时长、目标置信度）的仿真工具，调参处于主观试错状态。
+
+## Decision
+
+确立并实现人工打标三位一体（Triad Human-in-the-Loop）架构：
+
+1. **目标一：权威评测基准 (Ground Truth Holdout Benchmark)**：
+   - 依托 `src.core.benchmark`，将高信息熵复核切片规范化沉淀至 `tests/benchmark_data/gold_ground_truth.json`；
+   - 伴随 `.meta.json` 记录版本号与分布，归档历史快照至 `versions/` 并支持增量合并去重；
+   - 纳入 `tests/test_accuracy_baseline.py`，建立全局 Precision / Recall / F1-Score 混淆矩阵与分场景（`ADULT_MOTION` 召回率、`EMPTY_ROOM` 纯静止过滤率、`LIGHT_SHADOW` 误报抑制）质量门禁。
+2. **目标二：重新渲染决定依据 (Direct Re-rendering Driver)**：
+   - `src.stages.timeline.py` 严格遵循人工标签最高优先级（Timeline Invariant）：`FALSE_ALARM`/`FP` 强制降级快进，`MISSED_MOTION`/`FN` 强制提级原速；
+   - `ReRenderManager` 负责基于修正切片在后台秒级重建时间轴并重编成片；
+   - 工作台集成 `/api/video_stream` 流式播放（HTTP 206 Partial Content），成片压制完成后可一键唤醒自适应视窗播放审查，形成即时正反馈。
+3. **目标三：算法调优与科学量化反哺 (What-If Calibration Simulator)**：
+   - 依托 `src.core.tuner.TuningSimulator`，利用黄金真值样本离线推演候选参数（能量门限、运动时长、目标置信度等）对整体指标的量化扰动；
+   - 产出可解释的收益报告（ΔF1、误报消除数、漏报代价）与决策判定（`IMPROVED` / `FAVORABLE_TRADEOFF` / `REGRESSED`）；
+   - 提供安全配置 Diff 审查、自动时间戳备份与原子写回回滚，打通从人类打标到参数寻优的闭环。
+
+## Consequences
+
+- 人工打标彻底从“单点纠偏”演进为系统的数据飞轮中枢；
+- 每次算法发版与重构受到 100 样本权威黄金真值门禁守卫，严防核心场景退化；
+- 参数寻优建立在量化仿真证据之上，配合自动备份与热重载，杜绝生产配置误伤。

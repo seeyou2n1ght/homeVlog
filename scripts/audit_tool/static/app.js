@@ -103,6 +103,44 @@ function initEventListeners() {
     btnExportGold.addEventListener('click', exportGoldBenchmark);
   }
 
+  // 调参仿真 (What-If) 模态框
+  const btnOpenWhatif = document.getElementById('btn-open-whatif');
+  const modalWhatif = document.getElementById('modal-whatif');
+  const btnCloseWhatif = document.getElementById('btn-close-whatif');
+  if (btnOpenWhatif && modalWhatif) {
+    btnOpenWhatif.addEventListener('click', () => modalWhatif.classList.remove('hidden'));
+  }
+  if (btnCloseWhatif && modalWhatif) {
+    btnCloseWhatif.addEventListener('click', () => modalWhatif.classList.add('hidden'));
+  }
+
+  const btnRunSim = document.getElementById('btn-run-simulation');
+  if (btnRunSim) {
+    btnRunSim.addEventListener('click', runTuningSimulation);
+  }
+
+  const btnApplyCfg = document.getElementById('btn-apply-tuning-config');
+  if (btnApplyCfg) {
+    btnApplyCfg.addEventListener('click', applyTuningConfig);
+  }
+
+  // 视频播放模态框
+  const btnClosePlayer = document.getElementById('btn-close-player');
+  const modalPlayer = document.getElementById('modal-player');
+  const videoEl = document.getElementById('vlog-video-el');
+  if (btnClosePlayer && modalPlayer) {
+    btnClosePlayer.addEventListener('click', () => {
+      modalPlayer.classList.add('hidden');
+      if (videoEl) videoEl.pause();
+    });
+  }
+
+  // 重新浓缩成片
+  const btnRerender = document.getElementById('btn-open-rerender');
+  if (btnRerender) {
+    btnRerender.addEventListener('click', triggerRerender);
+  }
+
   // 全局键盘盲打
   window.addEventListener('keydown', handleKeydown);
 }
@@ -504,7 +542,7 @@ async function exportGoldBenchmark() {
     const res = await fetch('/api/export_gold_benchmark', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
+      body: JSON.stringify({ version: '1.0', incremental_merge: true })
     });
     const data = await res.json();
     if (data.success) {
@@ -515,6 +553,161 @@ async function exportGoldBenchmark() {
   } catch (err) {
     showToast('网络异常: ' + err.message, 'error');
   }
+}
+
+let lastSimulationParams = null;
+
+async function runTuningSimulation() {
+  const energyVal = parseFloat(document.getElementById('sim-input-energy').value) || 2.5;
+  const durVal = parseFloat(document.getElementById('sim-input-dur').value) || 2.0;
+  const yoloVal = parseFloat(document.getElementById('sim-input-yolo').value) || 0.3;
+
+  const candidateParams = {
+    'detection.min_motion_threshold': energyVal,
+    'segment.min_motion_duration': durVal,
+    'yolo.confidence': yoloVal,
+  };
+  lastSimulationParams = candidateParams;
+
+  showToast('⚡ 正在对 100 样本黄金基准执行 What-If 推演...', 'info');
+  try {
+    const res = await fetch('/api/tuning_simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidate_params: candidateParams })
+    });
+    const data = await res.json();
+    if (data.error) {
+      showToast('仿真失败: ' + data.error, 'error');
+      return;
+    }
+
+    // 渲染报告
+    const box = document.getElementById('sim-report-box');
+    box.classList.remove('hidden');
+
+    const vTag = document.getElementById('sim-verdict-tag');
+    const vReason = document.getElementById('sim-verdict-reason');
+    vTag.innerText = data.verdict;
+    vReason.innerText = data.rationale;
+
+    if (data.verdict === 'IMPROVED') {
+      vTag.style.background = '#10b981';
+    } else if (data.verdict === 'FAVORABLE_TRADEOFF') {
+      vTag.style.background = '#3b82f6';
+    } else if (data.verdict === 'REGRESSED') {
+      vTag.style.background = '#ef4444';
+    } else {
+      vTag.style.background = '#64748b';
+    }
+
+    setElementText('stat-base-f1', `${data.baseline.f1}%`);
+    setElementText('stat-sim-f1', `${data.simulated.f1}%`);
+    const deltaSign = data.deltas.f1 >= 0 ? '+' : '';
+    setElementText('stat-delta-f1', `${deltaSign}${data.deltas.f1}%`);
+    setElementText('stat-fp-red', `-${data.deltas.fp_reduction}`);
+    setElementText('stat-fn-inc', `+${data.deltas.fn_increase}`);
+
+    // 显示应用配置按钮
+    const btnApply = document.getElementById('btn-apply-tuning-config');
+    btnApply.classList.remove('hidden');
+
+    showToast(`推演完成: F1 预计变化 ${deltaSign}${data.deltas.f1}%`, 'success');
+  } catch (err) {
+    showToast('网络错误: ' + err.message, 'error');
+  }
+}
+
+async function applyTuningConfig() {
+  if (!lastSimulationParams) {
+    showToast('未检测到仿真参数，请先执行推演', 'info');
+    return;
+  }
+  if (!confirm('确定将当前仿真参数应用至生产配置文件 settings.yaml 吗？系统将自动创建备份文件。')) {
+    return;
+  }
+
+  showToast('💾 正在安全写入配置并热重载...', 'info');
+  try {
+    const res = await fetch('/api/tuning_apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: lastSimulationParams })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast('✅ 配置已安全更新并备份，热重载已生效！', 'success');
+      const btnApply = document.getElementById('btn-apply-tuning-config');
+      btnApply.classList.add('hidden');
+    } else {
+      showToast('写入配置失败: ' + (data.error || '校验不通过'), 'error');
+    }
+  } catch (err) {
+    showToast('网络异常: ' + err.message, 'error');
+  }
+}
+
+function openVideoPlayer(filepath, title = '') {
+  const modalPlayer = document.getElementById('modal-player');
+  const videoEl = document.getElementById('vlog-video-el');
+  const titleEl = document.getElementById('player-modal-title');
+  if (!modalPlayer || !videoEl) return;
+
+  if (title && titleEl) {
+    titleEl.innerText = `▶ ${title}`;
+  }
+  videoEl.src = `/api/video_stream?filepath=${encodeURIComponent(filepath)}`;
+  modalPlayer.classList.remove('hidden');
+  videoEl.play().catch(e => console.log('Autoplay blocked:', e));
+}
+
+async function triggerRerender() {
+  const currentItem = state.selectedIndex >= 0 ? state.filteredItems[state.selectedIndex] : (state.items[0] || null);
+  const defaultDate = currentItem?.date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const defaultCam = currentItem?.cam_index ?? 0;
+
+  const inputDate = prompt('请输入需要基于当前复核重新浓缩的日期 (YYYYMMDD):', defaultDate);
+  if (!inputDate) return;
+
+  showToast(`🚀 正在为 ${inputDate} (机位${defaultCam}) 启动后台重渲染...`, 'info');
+  try {
+    const res = await fetch('/api/rerender', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: inputDate, cam_index: defaultCam, version: 'reviewed' })
+    });
+    const data = await res.json();
+    if (data.status === 'ALREADY_RUNNING' || data.status === 'CHECKING' || data.status === 'RENDERING') {
+      pollRerenderProgress(inputDate, defaultCam);
+    } else {
+      showToast('启动重渲染失败: ' + (data.message || data.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('网络请求失败: ' + err.message, 'error');
+  }
+}
+
+function pollRerenderProgress(date, camIndex) {
+  const timer = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/rerender_status?date=${date}&cam_index=${camIndex}`);
+      const st = await res.json();
+      if (st.status === 'COMPLETED') {
+        clearInterval(timer);
+        showToast(`🎉 重渲染完成 (${st.file_size_mb} MB)，正在开启成片预览！`, 'success');
+        if (st.output_file) {
+          openVideoPlayer(st.output_file, `Daily Vlog 重渲染成片 (${date})`);
+        }
+      } else if (st.status === 'FAILED') {
+        clearInterval(timer);
+        showToast(`❌ 重渲染失败: ${st.error || '未知错误'}`, 'error');
+      } else if (st.status === 'RENDERING' || st.status === 'CONCATING') {
+        showToast(`⏳ 正在重渲染 (${st.progress}%: Batch ${st.current_batch}/${st.total_batches})`, 'info');
+      }
+    } catch (err) {
+      clearInterval(timer);
+    }
+  }, 3000);
 }
 
 // 辅助函数
@@ -535,3 +728,5 @@ function showToast(msg, type = 'info') {
     setTimeout(() => t.remove(), 200);
   }, 1800);
 }
+
+

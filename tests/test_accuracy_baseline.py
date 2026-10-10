@@ -104,6 +104,38 @@ def test_confusion_matrix_and_accuracy_metrics():
     assert tn + fp > 0, "负样本总数不能为 0"
 
 
+def test_stratified_scenario_quality_gates():
+    """验证分场景切片细分指标 (Stratified Scenario Quality Gates) 达到发版质量门禁标准。"""
+    from src.core.benchmark import load_benchmark_dataset, evaluate_stratified_metrics
+
+    samples, meta = load_benchmark_dataset(BENCHMARK_FILE)
+    assert len(samples) >= 50
+    assert meta.get("version"), "基准元数据必须包含版本标识"
+
+    stratified = evaluate_stratified_metrics(samples, group_key="scenario")
+
+    print("\n" + "=" * 55)
+    print("      HomeVlog Stratified Scenario Quality Report")
+    print("=" * 55)
+    for sc, metrics in sorted(stratified.items()):
+        print(f" [{sc:14s}] N={metrics['total']:2d} | TP={metrics['tp']:2d} FP={metrics['fp']:2d} FN={metrics['fn']:2d} TN={metrics['tn']:2d} | F1={metrics['f1']:5.1f}%")
+    print("=" * 55)
+
+    # 1. 门禁 1: 核心成人活动场景 (ADULT_MOTION) 召回率严禁低于 90% (守卫日常精彩镜头)
+    if "ADULT_MOTION" in stratified:
+        adult_recall = stratified["ADULT_MOTION"]["recall"]
+        assert adult_recall >= 90.0, f"核心人物动态召回率劣化: {adult_recall}% < 90%"
+
+    # 2. 门禁 2: 纯静止背景空镜 (EMPTY_ROOM) 过滤准确率严禁低于 95% (守卫浓缩压缩率)
+    if "EMPTY_ROOM" in stratified:
+        empty_acc = stratified["EMPTY_ROOM"]["accuracy"]
+        assert empty_acc >= 95.0, f"空镜背景过滤率劣化: {empty_acc}% < 95%"
+
+    # 3. 门禁 3: 必须包含典型难例挑战集 (光影假阳性与婴儿微动假阴性)
+    assert "LIGHT_SHADOW" in stratified, "基准集必须覆盖光影误报挑战集"
+    assert "INFANT_MOTION" in stratified, "基准集必须覆盖微动漏报挑战集"
+
+
 def test_human_feedback_remedy_guarantee(tmp_path):
     """验证人机协同复核机制对争议切片具有 100% 纠偏保护力 (Timeline Invariant)."""
     from src.segment import Segment
@@ -131,3 +163,4 @@ def test_human_feedback_remedy_guarantee(tmp_path):
     assert all(t.state == "STATIC" for t in corrected_tl)
 
     db.close()
+

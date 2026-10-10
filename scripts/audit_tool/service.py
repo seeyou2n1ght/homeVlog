@@ -16,6 +16,19 @@ from typing import Any
 from src.utils import PROJECT_ROOT, load_config
 from src.database import VlogDatabase
 from src.feedback import normalize_label
+from src.core.benchmark import (
+    DEFAULT_BENCHMARK_FILE,
+    VERSIONS_DIR,
+    load_benchmark_dataset,
+    merge_benchmark_samples,
+    save_benchmark_dataset,
+)
+from src.core.tuner import (
+    TuningSimulator,
+    apply_config_safe,
+    generate_config_diff,
+    rollback_config,
+)
 
 logger = logging.getLogger("homevlog.audit")
 CACHE_DIR = PROJECT_ROOT / "temp" / "audit_cache"
@@ -505,10 +518,15 @@ class AuditService:
             t.start()
         return count
 
-    def export_gold_benchmark(self, output_path: str | Path | None = None) -> dict[str, Any]:
-        """导出人工复核切片为标准的基准评测数据集 (Gold Standard Holdout Benchmark)."""
-        out_file = Path(output_path) if output_path else (PROJECT_ROOT / "tests" / "benchmark_data" / "gold_ground_truth.json")
-        out_file.parent.mkdir(parents=True, exist_ok=True)
+    def export_gold_benchmark(
+        self,
+        output_path: str | Path | None = None,
+        version: str = "1.0",
+        incremental_merge: bool = True,
+        archive_version: bool = True,
+    ) -> dict[str, Any]:
+        """导出人工复核切片为标准的基准评测数据集，支持增量合并与历史快照版本化。"""
+        out_file = Path(output_path) if output_path else DEFAULT_BENCHMARK_FILE
 
         with self.db._lock:
             rows = self.db.conn.execute(
@@ -541,14 +559,68 @@ class AuditService:
                 "reviewed_at": r["reviewed_at"],
             })
 
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(benchmark_items, f, ensure_ascii=False, indent=2)
+        if incremental_merge and out_file.exists():
+            try:
+                existing_items, _ = load_benchmark_dataset(out_file)
+                benchmark_items = merge_benchmark_samples(existing_items, benchmark_items)
+            except Exception as e:
+                logger.warning("合并已有基准失败，将直接覆写: %s", e)
+
+        saved_path = save_benchmark_dataset(
+            benchmark_items,
+            output_path=out_file,
+            version=version,
+            archive_version_copy=archive_version,
+        )
 
         return {
             "success": True,
             "count": len(benchmark_items),
-            "output_path": str(out_file),
+            "output_path": str(saved_path),
+            "version": version,
         }
+
+    def get_benchmark_versions(self) -> list[dict[str, Any]]:
+        """列出已归档的基准评测数据集版本历史。"""
+        if not VERSIONS_DIR.exists():
+            return []
+        versions = []
+        for meta_p in sorted(VERSIONS_DIR.glob("*.meta.json"), reverse=True):
+            try:
+                with open(meta_p, "r", encoding="utf-8") as f:
+                    m = json.load(f)
+                v_data = meta_p.with_name(meta_p.name[:-10] + ".json")
+                versions.append({
+                    "version": m.get("version", "unknown"),
+                    "file": str(v_data),
+                    "created_at": m.get("created_at"),
+                    "total_samples": m.get("total_samples", 0),
+                    "distribution": m.get("distribution", {}),
+                })
+            except Exception:
+                continue
+        return versions
+
+    def simulate_tuning(self, candidate_params: dict[str, Any]) -> dict[str, Any]:
+        """运行 What-If 离线参数灵敏度仿真。"""
+        simulator = TuningSimulator(config=self.config)
+        return simulator.simulate(candidate_params)
+
+    def get_tuning_diff(self, proposed_params: dict[str, Any]) -> dict[str, Any]:
+        """获取候选参数与当前 settings.yaml 的 Diff 比较。"""
+        return generate_config_diff(proposed_params)
+
+    def apply_tuning(self, proposed_params: dict[str, Any]) -> dict[str, Any]:
+        """安全应用调优参数并刷新当前服务的配置缓存。"""
+        res = apply_config_safe(proposed_params, create_backup=True)
+        self.config = load_config(reload=True)
+        return res
+
+    def rollback_tuning(self, backup_path: str) -> dict[str, Any]:
+        """回滚指定备份的配置并刷新缓存。"""
+        res = rollback_config(backup_path)
+        self.config = load_config(reload=True)
+        return res
 
     def save_bounding_box(
         self,

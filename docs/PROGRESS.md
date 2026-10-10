@@ -17,12 +17,15 @@
 - 两交付入口先生成候选资产，再提交manifest/成功状态；正常失败或取消恢复上一份资产，批次仅在完整成功后按配置清理。骤停/回滚失败遗留备份不自动清除（ADR0036）。
 - CLI预览、重析和处理共用日期/机位范围；dry-run可扫描入库，但不重置分析或清理批次。已交付重析要求force-render；stage只提供all/analyze。仅分析失败不再报告成功。
 - 明确FFmpeg外部中断向主线程传播取消，不再进入EDL备用渲染/NV重试；有效批次保留，主流水线取消以130退出，审核任务标记CANCELLED（ADR0037）。
-- 人工标注与基准建立 (Active Learning & Gold Benchmark)：实现多维不确定性与时空聚类去重采样 (`get_gold_candidates`)，单日复核量由 ~900 收敛至 Top 50 高信息熵切片；工作台加入 0ms 内存预加载环与 Hover Scrubbing 连续擦洗；导出首期 100 样本黄金真值基线 (`tests/benchmark_data/gold_ground_truth.json`) 并纳入自动化质量门禁 (`tests/test_accuracy_baseline.py`)。
+- 人工标注三位一体闭环 (Triad Human-in-the-Loop Architecture, ADR 0038)：
+  1. 基准测试集：实现 `src.core.benchmark`，支持版本化快照归档与增量合并；`tests/test_accuracy_baseline.py` 升级场景分层（`ADULT_MOTION` 召回率、`EMPTY_ROOM` 纯静止过滤、`LIGHT_SHADOW` 误报抑制）质量门禁；
+  2. 重渲染驱动闭环：时间轴严格遵循 `human_label` 一票否决权，工作台新增流式视频播放端点 (`/api/video_stream`，HTTP 206 Partial Content) 与重渲染后即时成片自适应预览视窗；
+  3. 调优仿真与配置落地：实现 `src.core.tuner.TuningSimulator` 离线推演候选参数对 F1-Score 与场景误报/漏报的净收益；提供结构化 Diff、自动时间戳备份与原子安全写回/回滚接口与工作台面板。
 
 ## 当前验证
 
 - 2026-10-08 20:29 运行日志复核及修复：两批次Windows中断不再误记编码ERROR或继续备用渲染/重试；信号发送者尚未确认。隔离复现第9批仍有输入DTS警告，但36.15秒/723帧、完整音视频解码、全部片段接缝和尾窗通过。三份原片只读软件解码确认实际覆盖不足或损坏，不能按容器声明时长视为完整；本轮未恢复缺失数据。证据见BENCHMARK。
-- 全量 449 项测试通过、6 项默认跳过；新增黄金评测基准套件与聚类批量复核测试，Ruff 代码风格与语法编译检查 100% 通过。
+- 全量 457 项测试通过、6 项默认跳过；新增基准管理、调参仿真、流式视频播放与分场景质量门禁测试，Ruff 代码风格与语法编译检查 100% 通过。
 
 - 本轮在隔离SQLite和临时资产上验证审核撤销、范围筛选、失败传播、资产回滚和批次保留；真实软件媒体覆盖源边界、整数帧、音频时钟、字幕及manifest。准确测试数量见TESTING当前基线。
 - 2026-10-08先前的拼接恢复记录：20260715 cam1、20260718 cam1复用162/151批恢复交付，完整音视频软件解码及全部接缝/尾窗通过；原始并行打开EOF根因未复现。该记录是本轮之前的生产证据，详见BENCHMARK。

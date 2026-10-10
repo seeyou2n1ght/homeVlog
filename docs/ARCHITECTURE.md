@@ -1042,10 +1042,33 @@ human corrected (manual_label, notes, review_timestamp)
 - **`POST /api/review`**：提交人工裁决，合法标签：`CONFIRMED_MOTION` (TP) | `FALSE_ALARM` (FP) | `MISSED_MOTION` (FN) | `CONFIRMED_STATIC` (TN)。
 - **`GET /api/export`**：导出带 UTF-8 BOM 的分析报表（CSV / JSON 格式）。
 - **`POST /api/rerender` / `GET /api/rerender_status`**：异步触发秒级局部重新浓缩成片并轮询压制状态机。
+- **`GET /api/video_stream`**：基于 HTTP 206 Partial Content (Range Requests) 的流媒体成片在线预览分发。
+- **`POST /api/export_gold_benchmark` / `GET /api/benchmark_versions`**：导出权威黄金真值基准集并管理版本快照。
+- **`POST /api/tuning_simulate`**：执行 What-If 参数敏感性离线仿真，返回混淆矩阵与场景分层净收益预测。
+- **`POST /api/tuning_diff` / `POST /api/tuning_apply` / `POST /api/tuning_rollback`**：参数结构化 Diff 对比、带自动时间戳备份的原子安全写回与一键回滚。
 
-服务仅接受 loopback Host 与同源 Origin。页面首次加载取得随机 `HttpOnly`、`SameSite=Strict` 令牌 cookie，所有写请求必须携带该令牌；媒体参数只允许数据库已登记路径并限制请求体及数值范围。
+服务仅接受 loopback Host 与同源 Origin。页面首次加载取得随机 `HttpOnly`、`SameSite=Strict` 令牌 cookie，所有写请求必须携带该令牌；媒体参数只允许数据库已登记路径或 `OUTPUT_DIR` 下的已渲染视频，并严格限制请求体及数值范围。
 
 审核重渲染默认要求全部源文件可访问，使用只读逐文件 timeline 与实际渲染行快照生成伴随资产。单任务取消只设置本任务令牌，不得触发全局 FFmpeg 中断。
+
+---
+
+## 17.6 Triad Human-in-the-Loop Architecture: Benchmark, Re-render, and Tuning
+
+系统将人工审核打标确立为三位一体的核心架构支柱：
+
+1. **目标一：权威评测基准 (Ground Truth Holdout Benchmark)**：
+   - 依托 `src.core.benchmark`，将高信息熵复核切片规范化沉淀至 `tests/benchmark_data/gold_ground_truth.json`；
+   - 伴随 `.meta.json` 记录版本号与分布，归档历史快照至 `versions/` 并支持增量合并去重；
+   - 纳入 `tests/test_accuracy_baseline.py`，建立全局 Precision / Recall / F1-Score 混淆矩阵与分场景（`ADULT_MOTION` 召回率、`EMPTY_ROOM` 纯静止过滤率、`LIGHT_SHADOW` 误报抑制）质量门禁。
+2. **目标二：重新渲染决定依据 (Direct Re-rendering Driver)**：
+   - `src.stages.timeline.py` 严格遵循人工标签最高优先级（Timeline Invariant）：`FALSE_ALARM`/`FP` 强制降级快进，`MISSED_MOTION`/`FN` 强制提级原速；
+   - `ReRenderManager` 负责基于修正切片在后台秒级重建时间轴并重编成片；
+   - 工作台集成 `/api/video_stream` 流式播放，成片压制完成后可一键唤醒自适应视窗播放审查，形成即时正反馈。
+3. **目标三：算法调优与科学量化反哺 (What-If Calibration Simulator)**：
+   - 依托 `src.core.tuner.TuningSimulator`，利用黄金真值样本离线推演候选参数（能量门限、运动时长、目标置信度等）对整体指标的量化扰动；
+   - 产出可解释的收益报告（ΔF1、误报消除数、漏报代价）与决策判定（`IMPROVED` / `FAVORABLE_TRADEOFF` / `REGRESSED`）；
+   - 提供安全配置 Diff 审查、自动时间戳备份与原子写回回滚，打通从人类打标到参数寻优的闭环。
 
 ---
 
