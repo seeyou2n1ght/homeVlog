@@ -79,6 +79,9 @@
         <button class="btn btn-accent" id="btn-open-rerender" title="应用当前人工审核打标并重新压制 Vlog">
           <span class="icon">🚀</span> 重新浓缩成片
         </button>
+        <button class="btn btn-cyan" id="btn-export-gold" title="一键导出为权威评测基准数据集 (tests/benchmark_data/gold_ground_truth.json)">
+          <span class="icon">🏆</span> 导出评测基准
+        </button>
         <button class="btn btn-glass" id="btn-open-yolo-modal" title="导出 YOLO 目标检测训练集 (带 BBox 标注)">
           <span class="icon">🏷️</span> 导出 YOLO 数据集
         </button>
@@ -117,7 +120,8 @@
 
       <!-- 错检多维分类胶囊栏 (Categorization Filter) -->
       <div class="category-filter-bar" id="category-filter-bar">
-        <button class="cat-chip active" data-category="all" id="cat-all">全部 <span class="cat-badge" id="badge-cat-all">0</span></button>
+        <button class="cat-chip active" data-category="gold_candidates" id="cat-gold">🌟 黄金精选 (Top 50) <span class="cat-badge gold" id="badge-cat-gold">0</span></button>
+        <button class="cat-chip" data-category="all" id="cat-all">全部 <span class="cat-badge" id="badge-cat-all">0</span></button>
         <button class="cat-chip" data-category="fp_suspect" id="cat-fp">疑似误报 <span class="cat-badge fp" id="badge-cat-fp">0</span></button>
         <button class="cat-chip" data-category="fn_suspect" id="cat-fn">疑似漏报 <span class="cat-badge fn" id="badge-cat-fn">0</span></button>
         <button class="cat-chip" data-category="jitter" id="cat-jitter">短碎片 <span class="cat-badge jitter" id="badge-cat-jitter">0</span></button>
@@ -351,6 +355,7 @@
             <span class="kbd-hint"><kbd>2</kbd> 误报(FP)</span>
             <span class="kbd-hint"><kbd>3</kbd> 漏报(FN)</span>
             <span class="kbd-hint"><kbd>4</kbd> 纯静止(TN)</span>
+            <span class="kbd-hint" style="color:#fde047;"><kbd>Shift+1~4</kbd> 批量标记聚类</span>
             <span class="kbd-hint"><kbd>K</kbd>/<kbd>J</kbd> 上下切片</span>
             <span class="kbd-hint"><kbd>B</kbd> 框选目标</span>
             <span class="kbd-hint"><kbd>U</kbd> 撤销打标</span>

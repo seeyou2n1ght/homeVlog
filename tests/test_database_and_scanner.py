@@ -477,3 +477,52 @@ class TestSegmentsTableLifecycle:
         rows = db.get_all_file_tasks_for_date("20260901", 0, filepaths=["clip_1.mp4"])
         assert [row["filepath"] for row in rows] == ["clip_1.mp4"]
         db.close()
+
+    def test_gold_candidates_clustering_and_batch_review(self, tmp_path):
+        from src.segment import Segment
+
+        db = VlogDatabase(tmp_path / "gold.sqlite")
+        fp = "sample_video.mp4"
+        db.add_file_task(fp, 0, "20260901", "20260901120000", "20260901123000", 1800)
+
+        # 构造模拟切片:
+        # 1. 连续 5 个树影晃动切片 (同文件、同类型 high_energy_no_target、相邻时间 < 300s)
+        # 2. 1 个置信度摇摆切片 (borderline_confidence)
+        # 3. 1 个微动临界切片 (fn_suspect)
+        segs = [
+            Segment(10.0, 15.0, "DYNAMIC", fp, max_energy=18.0, avg_confidence=0.0),
+            Segment(20.0, 25.0, "DYNAMIC", fp, max_energy=22.0, avg_confidence=0.0),
+            Segment(30.0, 35.0, "DYNAMIC", fp, max_energy=15.0, avg_confidence=0.0),
+            Segment(40.0, 45.0, "DYNAMIC", fp, max_energy=12.0, avg_confidence=0.0),
+            Segment(50.0, 55.0, "DYNAMIC", fp, max_energy=19.0, avg_confidence=0.0),
+            Segment(600.0, 605.0, "DYNAMIC", fp, max_energy=5.0, avg_confidence=0.28),
+            Segment(800.0, 810.0, "STATIC", fp, max_energy=2.5, avg_confidence=0.0),
+        ]
+        db.set_analysis_result(fp, segs)
+
+        # 召回主动学习黄金候选集
+        candidates = db.get_anomaly_segments(category="gold_candidates", date="20260901", cam_index=0, limit=10)
+        assert len(candidates) >= 3
+
+        # 验证聚类聚合生效: 5 个连续树影应被聚合成 1 个代表切片
+        high_energy_reps = [c for c in candidates if c["anomaly_type"] == "high_energy_no_target"]
+        assert len(high_energy_reps) == 1
+        rep = high_energy_reps[0]
+        assert rep["cluster_count"] == 5
+        assert len(rep["cluster_ids"]) == 5
+        assert rep["max_energy"] == 22.0  # 代表切片应当选能量/得分最高的一个
+
+        # 验证多样性
+        types = {c["anomaly_type"] for c in candidates}
+        assert "borderline_confidence" in types
+        assert "fn_suspect" in types
+
+        # 验证批量更新
+        updated_count = db.batch_update_segment_review(rep["cluster_ids"], "FALSE_ALARM", notes="树影晃动聚类一键纠偏")
+        assert updated_count == 5
+
+        # 再次获取候选集，已被标记的 5 个切片不应再出现
+        next_candidates = db.get_anomaly_segments(category="gold_candidates", date="20260901", cam_index=0)
+        assert not any(c["anomaly_type"] == "high_energy_no_target" for c in next_candidates)
+
+        db.close()

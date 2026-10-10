@@ -272,6 +272,23 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_json({"success": ok})
             return
 
+        elif path == "/api/batch_review":
+            seg_ids = payload.get("segment_ids", [])
+            label = payload.get("manual_label")
+            notes = payload.get("notes", "")
+            scenario = payload.get("scenario", "")
+            if not seg_ids or not label or not isinstance(seg_ids, list):
+                self._send_json({"error": "Missing segment_ids list or manual_label"}, status=400)
+                return
+            count = service.submit_batch_review(
+                [int(sid) for sid in seg_ids],
+                str(label),
+                notes=str(notes),
+                scenario=str(scenario),
+            )
+            self._send_json({"success": count > 0, "count": count})
+            return
+
         elif path == "/api/clear_review":
             seg_id = payload.get("segment_id")
             if not seg_id:
@@ -300,6 +317,12 @@ class AuditHandler(BaseHTTPRequestHandler):
             val_ratio = float(payload.get("val_ratio", 0.2))
             out_dir = payload.get("output_dir")
             res = service.export_yolo_dataset(val_ratio=val_ratio, output_dir=out_dir)
+            self._send_json(res)
+            return
+
+        elif path == "/api/export_gold_benchmark":
+            out_path = payload.get("output_path")
+            res = service.export_gold_benchmark(output_path=out_path)
             self._send_json(res)
             return
 

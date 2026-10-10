@@ -481,6 +481,75 @@ class AuditService:
                 logger.error("Failed to clear review for segment %s: %s", segment_id, e)
                 return False
 
+    def submit_batch_review(
+        self,
+        segment_ids: list[int],
+        manual_label: str,
+        notes: str = "",
+        scenario: str = "",
+    ) -> int:
+        """批量提交一组聚类切片的人工打标。"""
+        if not segment_ids:
+            return 0
+        packed = pack_notes(notes=notes, scenario=scenario)
+        count = self.db.batch_update_segment_review(segment_ids, manual_label, packed)
+        if count > 0:
+            def _async_archive():
+                try:
+                    from src.archiver import extract_and_archive_frame
+                    extract_and_archive_frame(self.db, segment_ids[0])
+                except Exception as e:
+                    logger.debug("Async frame archive error for batch %s: %s", segment_ids, e)
+
+            t = threading.Thread(target=_async_archive, daemon=True)
+            t.start()
+        return count
+
+    def export_gold_benchmark(self, output_path: str | Path | None = None) -> dict[str, Any]:
+        """导出人工复核切片为标准的基准评测数据集 (Gold Standard Holdout Benchmark)."""
+        out_file = Path(output_path) if output_path else (PROJECT_ROOT / "tests" / "benchmark_data" / "gold_ground_truth.json")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.db._lock:
+            rows = self.db.conn.execute(
+                """SELECT id, filepath, cam_index, date, start_time, end_time, duration,
+                          state, max_energy, avg_confidence, manual_label, review_notes, reviewed_at
+                   FROM segments
+                   WHERE manual_label IS NOT NULL
+                   ORDER BY date DESC, filepath ASC, start_time ASC"""
+            ).fetchall()
+
+        benchmark_items = []
+        for r in rows:
+            sc, user_notes = unpack_notes(r["review_notes"])
+            benchmark_items.append({
+                "segment_id": r["id"],
+                "filepath": r["filepath"],
+                "filename": Path(r["filepath"]).name,
+                "cam_index": r["cam_index"],
+                "date": r["date"],
+                "start_time": round(float(r["start_time"]), 2),
+                "end_time": round(float(r["end_time"]), 2),
+                "duration": round(float(r["duration"] or (r["end_time"] - r["start_time"])), 2),
+                "algo_state": r["state"],
+                "max_energy": round(float(r["max_energy"] or 0.0), 2),
+                "avg_confidence": round(float(r["avg_confidence"] or 0.0), 3),
+                "gold_label": normalize_label(r["manual_label"]),
+                "raw_label": r["manual_label"],
+                "scenario": sc,
+                "notes": user_notes,
+                "reviewed_at": r["reviewed_at"],
+            })
+
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(benchmark_items, f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": True,
+            "count": len(benchmark_items),
+            "output_path": str(out_file),
+        }
+
     def save_bounding_box(
         self,
         boxes: list[dict],

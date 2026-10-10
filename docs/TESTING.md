@@ -65,6 +65,9 @@ uv run python -m pytest tests/test_pipeline_streaming.py tests/test_resumption_a
 
 # 验证 Web 审核平台与数据接口
 uv run python -m pytest tests/test_audit_service.py
+
+# 验证黄金评测基准数据集契约与精度门禁
+uv run python -m pytest tests/test_accuracy_baseline.py
 ```
 
 启动诊断回归位于 `test_database_and_scanner.py` 与 `test_ui_logging.py`：覆盖受控目录枚举阻塞期间的可见心跳、报告线程回收、扫描部分提交后失败及增量恢复、无冻结时避免属性请求、DEBUG Handler 重配置和 Doctor 磁盘失败/退出码。受控阻塞不证明实际 NAS 系统调用可超时或取消；真实启动验证应使用隔离数据库并在分析/渲染边界停止，避免改写生产交付。

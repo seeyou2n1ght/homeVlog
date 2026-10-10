@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import threading
 import logging
@@ -110,7 +111,7 @@ class VlogDatabase:
     def __init__(self, db_path: Path | None = None):
         self.db_path = Path(db_path) if db_path is not None else DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout = 10000;")
@@ -436,6 +437,26 @@ class VlogDatabase:
                 self.conn.rollback()
                 return False
 
+    def batch_update_segment_review(self, segment_ids: list[int], manual_label: str, notes: str = "") -> int:
+        """批量更新一组切片的人工复核标签（用于聚类切片一键刷标）。"""
+        if not segment_ids:
+            return 0
+        with self._lock:
+            try:
+                placeholders = ",".join("?" for _ in segment_ids)
+                cur = self.conn.execute(
+                    f"""UPDATE segments
+                        SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime')
+                        WHERE id IN ({placeholders})""",
+                    [manual_label, notes, *segment_ids],
+                )
+                self.conn.commit()
+                return cur.rowcount
+            except Exception as e:
+                logger.error("DB error in batch_update_segment_review: %s", e)
+                self.conn.rollback()
+                return 0
+
     def clear_segment_review(self, segment_id: int) -> bool:
         """Revoke the current source interval, preserving reviews outside it."""
         with self._lock:
@@ -520,6 +541,8 @@ class VlogDatabase:
         """
         with self._lock:
             try:
+                if category in ("gold_candidates", "active_entropy"):
+                    return self.get_gold_candidates(date=date, cam_index=cam_index, limit=limit)
                 where_clauses = []
                 params = []
 
@@ -601,6 +624,146 @@ class VlogDatabase:
                 logger.error("DB error in get_anomaly_segments: %s", e)
                 return []
 
+
+    def get_gold_candidates(
+        self,
+        date: str | None = None,
+        cam_index: int | None = None,
+        limit: int = 50,
+        cluster_window: float = 300.0,
+    ) -> list[dict]:
+        """主动学习高信息熵候选集召回 (Active Learning Uncertainty & Diversity Sampling).
+
+        从海量未复核切片中筛选置信度摇摆、多模态冲突、临界微动、高能无目标等高价值切片，
+        并在同一文件/机位下进行时空连续性聚类去重，将单日待审量收敛至 30~50 个黄金候选样本。
+        """
+        with self._lock:
+            try:
+                where_clauses = [
+                    "manual_label IS NULL",
+                    "(needs_review = 1 "
+                    "OR (avg_confidence > 0.05 AND avg_confidence < 0.45) "
+                    "OR (state IN ('DYNAMIC', 'DYNAMIC_AUDIO', 'PRESENCE') AND avg_confidence = 0.0 AND max_energy >= 5.0) "
+                    "OR (state IN ('STATIC', 'NIGHT_STATIONARY') AND max_energy BETWEEN 1.8 AND 5.0) "
+                    "OR (duration < 3.0 AND state IN ('DYNAMIC', 'PRESENCE')))",
+                ]
+                params: list = []
+                if date:
+                    where_clauses.append("date = ?")
+                    params.append(date)
+                if cam_index is not None:
+                    where_clauses.append("cam_index = ?")
+                    params.append(cam_index)
+
+                where_str = " AND ".join(where_clauses)
+                query = f"""
+                    SELECT * FROM segments
+                    WHERE {where_str}
+                    ORDER BY filepath ASC, start_time ASC
+                """
+                rows = self.conn.execute(query, params).fetchall()
+                if not rows:
+                    return []
+
+                # 1. 语义特征打分与分类
+                scored_items = []
+                for r in rows:
+                    item = dict(r)
+                    conf = float(item.get("avg_confidence") or 0.0)
+                    energy = float(item.get("max_energy") or 0.0)
+                    dur = float(item.get("duration") or 0.0)
+                    st = item.get("state") or "UNKNOWN"
+                    r_reason = item.get("review_reason") or ""
+
+                    if 0.15 <= conf <= 0.40:
+                        a_type = "borderline_confidence"
+                        desc = "置信度临界摇摆 (模型极不确定)"
+                        score = 95.0 - abs(conf - 0.28) * 150.0
+                    elif "MULTIMODAL" in r_reason or (st == "DYNAMIC_AUDIO" and conf == 0.0):
+                        a_type = "multimodal_conflict"
+                        desc = "多模态矛盾 (有声动但无视觉目标)"
+                        score = 88.0 + min(energy, 40.0) * 0.2
+                    elif st in ("DYNAMIC", "PRESENCE") and conf == 0.0 and energy >= 8.0:
+                        a_type = "high_energy_no_target"
+                        desc = "高动能未识别目标 (疑似光影或漏检)"
+                        score = 80.0 + min(energy, 50.0) * 0.2
+                    elif st in ("STATIC", "NIGHT_STATIONARY") and energy >= 1.8:
+                        a_type = "fn_suspect"
+                        desc = "疑似微动漏报 (静止但动能临界)"
+                        score = 75.0
+                    elif dur < 3.0 and st in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE"):
+                        a_type = "jitter"
+                        desc = f"极短突发碎片 ({dur:.1f}s)"
+                        score = 65.0
+                    else:
+                        a_type = "needs_review"
+                        desc = r_reason or "待审样本"
+                        score = 50.0
+
+                    item["anomaly_type"] = a_type
+                    item["reason_desc"] = desc
+                    item["entropy_score"] = round(score, 2)
+                    scored_items.append(item)
+
+                # 2. 时空连续性聚类去重 (按 filepath + cam_index + anomaly_type 分组聚类)
+                groups: dict[tuple, list[dict]] = {}
+                for it in scored_items:
+                    k = (it.get("filepath", ""), it.get("cam_index", 0), it.get("anomaly_type"))
+                    groups.setdefault(k, []).append(it)
+
+                clusters = []
+                for k, group_items in groups.items():
+                    current_cluster: list[dict] = []
+                    for seg in group_items:
+                        if not current_cluster:
+                            current_cluster.append(seg)
+                        else:
+                            last_start = current_cluster[-1]["start_time"]
+                            if float(seg["start_time"]) - float(last_start) <= cluster_window:
+                                current_cluster.append(seg)
+                            else:
+                                clusters.append(current_cluster)
+                                current_cluster = [seg]
+                    if current_cluster:
+                        clusters.append(current_cluster)
+
+                # 3. 提取代表切片 (Representative) 并丰富聚类元数据
+                candidates = []
+                for cl in clusters:
+                    cl_sorted = sorted(cl, key=lambda x: (x["entropy_score"], x.get("max_energy", 0.0)), reverse=True)
+                    rep = dict(cl_sorted[0])
+                    cluster_ids = [c["id"] for c in cl]
+                    cluster_count = len(cl)
+                    rep["cluster_count"] = cluster_count
+                    rep["cluster_ids"] = cluster_ids
+                    rep["final_rank_score"] = round(rep["entropy_score"] + min(math.log2(cluster_count) * 4.0, 15.0), 2)
+                    if cluster_count > 1:
+                        rep["cluster_summary"] = f"同机位时序关联相似切片共 {cluster_count} 处"
+                    else:
+                        rep["cluster_summary"] = "独立高价值样本"
+                    rep["is_gold_candidate"] = True
+                    candidates.append(rep)
+
+                # 4. 多样性轮询 (Round-robin selection across anomaly_types)
+                type_buckets: dict[str, list[dict]] = {}
+                for c in candidates:
+                    type_buckets.setdefault(c["anomaly_type"], []).append(c)
+
+                for b_list in type_buckets.values():
+                    b_list.sort(key=lambda x: x["final_rank_score"], reverse=True)
+
+                selected: list[dict] = []
+                while len(selected) < limit and any(type_buckets.values()):
+                    for b_type in list(type_buckets.keys()):
+                        if type_buckets[b_type]:
+                            selected.append(type_buckets[b_type].pop(0))
+                            if len(selected) >= limit:
+                                break
+
+                return selected
+            except Exception as e:
+                logger.error("DB error in get_gold_candidates: %s", e)
+                return []
 
     def reset_failed_tasks(self, date: str, cam_index: int, max_retries: int = 3) -> dict:
         """将 FAILED 预筛/分析任务重置为 PENDING，使重跑时自愈补齐丢失内容。

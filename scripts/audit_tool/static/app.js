@@ -3,7 +3,7 @@
 // 全局应用状态
 const state = {
   currentTab: 'anomalies', // 'anomalies' | 'tree'
-  currentCategory: 'all',  // 'all' | 'fp_suspect' | 'fn_suspect' | 'jitter' | 'reviewed'
+  currentCategory: 'gold_candidates',  // 'gold_candidates' | 'all' | 'fp_suspect' | 'fn_suspect' | 'jitter' | 'reviewed'
   sortMode: 'energy',      // 'energy' | 'time_asc' | 'time_desc' | 'duration'
   searchQuery: '',
   filterDate: '',
@@ -13,6 +13,7 @@ const state = {
   anomalies: [],
   filteredAnomalies: [],
   categoryCounts: {
+    gold_candidates: 0,
     all: 0,
     fp_suspect: 0,
     fn_suspect: 0,
@@ -238,6 +239,36 @@ function initEventListeners() {
     });
   }
 
+  // 导出黄金评测基准
+  const btnExportGold = document.getElementById('btn-export-gold');
+  if (btnExportGold) {
+    btnExportGold.addEventListener('click', async () => {
+      try {
+        btnExportGold.disabled = true;
+        btnExportGold.innerHTML = '⏳ 正在导出...';
+        const res = await fetch('/api/export_gold_benchmark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`🏆 成功导出 ${data.count} 条黄金基准切片至: ${data.output_path}`, 'success');
+        } else {
+          showToast('导出基准失败: ' + (data.error || '未知错误'), 'error');
+        }
+      } catch (err) {
+        showToast('导出网络异常: ' + err.message, 'error');
+      } finally {
+        btnExportGold.disabled = false;
+        btnExportGold.innerHTML = '<span class="icon">🏆</span> 导出评测基准';
+      }
+    });
+  }
+
+  // 悬停动态擦洗交互 (Hover Frame Scrubbing)
+  initHoverScrubbing();
+
   // 全局快捷键
   window.addEventListener('keydown', handleKeydown);
 }
@@ -306,14 +337,15 @@ function handleKeydown(e) {
     }
   }
 
-  if (e.key === '1') {
-    submitCurrentReview('CONFIRMED_MOTION');
-  } else if (e.key === '2') {
-    submitCurrentReview('FALSE_ALARM');
-  } else if (e.key === '3') {
-    submitCurrentReview('MISSED_MOTION');
-  } else if (e.key === '4') {
-    submitCurrentReview('CONFIRMED_STATIC');
+  const isShift = e.shiftKey;
+  if (e.key === '1' || e.code === 'Digit1') {
+    submitCurrentReview('CONFIRMED_MOTION', isShift);
+  } else if (e.key === '2' || e.code === 'Digit2') {
+    submitCurrentReview('FALSE_ALARM', isShift);
+  } else if (e.key === '3' || e.code === 'Digit3') {
+    submitCurrentReview('MISSED_MOTION', isShift);
+  } else if (e.key === '4' || e.code === 'Digit4') {
+    submitCurrentReview('CONFIRMED_STATIC', isShift);
   } else if (e.key === 'j' || e.key === 'J' || e.key === 'ArrowDown') {
     selectNextSegment(1);
   } else if (e.key === 'k' || e.key === 'K' || e.key === 'ArrowUp') {
@@ -623,6 +655,9 @@ function renderAnomalyList() {
     const durSec = (item.duration || 0).toFixed(1);
     const engVal = (item.max_energy || 0).toFixed(1);
     const scTag = item.scenario ? `<span class="scenario-badge-mini">${item.scenario}</span>` : '';
+    const clusterTag = (item.cluster_count && item.cluster_count > 1)
+      ? `<div class="cluster-pill" title="${item.cluster_summary}">⚡ 聚合 x${item.cluster_count} <small>Shift+1~4 批处理</small></div>`
+      : '';
 
     div.innerHTML = `
       <div class="anomaly-card-top">
@@ -634,6 +669,7 @@ function renderAnomalyList() {
         <span>${reason}</span>
         ${scTag}
       </div>
+      ${clusterTag}
       <div class="anomaly-card-footer font-mono">
         <span>⚡ 峰值: ${engVal}</span>
         <span class="file-ellipsis" title="${item.filepath}">${fn}</span>
@@ -1125,11 +1161,93 @@ function loadFramesForSegment(seg) {
     if (state.bboxMode) syncBBoxCanvasSize();
   });
   setSafeFrameImage('end', fp, tEnd);
+
+  // 触发相邻切片静默预加载环形缓冲
+  prefetchAdjacentSegments();
 }
 
 function setElementText(id, text) {
   const el = document.getElementById(id);
   if (el) el.innerText = text;
+}
+
+const memoryLoadedUrls = new Set();
+const prefetchUrlSet = new Set();
+
+function prefetchAdjacentSegments() {
+  if (!state.currentSegments || state.currentSegments.length === 0) return;
+  const curIdx = state.selectedSegIndex;
+  const fp = state.currentFile ? state.currentFile.filepath : '';
+  if (!fp || curIdx < 0) return;
+
+  const targetIndices = [curIdx + 1, curIdx + 2, curIdx + 3, curIdx - 1];
+  targetIndices.forEach(idx => {
+    if (idx >= 0 && idx < state.currentSegments.length) {
+      const seg = state.currentSegments[idx];
+      const tMid = (seg.start_time + seg.end_time) / 2.0;
+      const tStart = seg.start_time;
+      const tEnd = Math.max(seg.end_time - 0.1, seg.start_time);
+
+      [tStart, tMid, tEnd].forEach(t => {
+        const url = `/api/frame?filepath=${encodeURIComponent(fp)}&t=${t.toFixed(3)}&w=640`;
+        if (!prefetchUrlSet.has(url)) {
+          prefetchUrlSet.add(url);
+          const preloadImg = new Image();
+          preloadImg.onload = () => {
+            memoryLoadedUrls.add(url);
+          };
+          preloadImg.src = url;
+        }
+      });
+    }
+  });
+}
+
+function initHoverScrubbing() {
+  const wrapMid = document.getElementById('wrap-mid');
+  const imgMid = document.getElementById('img-mid');
+  const imgStart = document.getElementById('img-start');
+  const imgEnd = document.getElementById('img-end');
+  const heroBadge = document.getElementById('hero-badge');
+  if (!wrapMid || !imgMid) return;
+
+  let originalMidSrc = '';
+
+  wrapMid.addEventListener('mouseenter', () => {
+    if (state.bboxMode) return;
+    originalMidSrc = imgMid.src;
+  });
+
+  wrapMid.addEventListener('mousemove', (e) => {
+    if (state.bboxMode || !imgMid || !imgMid.src) return;
+    const rect = wrapMid.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+
+    if (ratio < 0.33) {
+      if (imgStart && imgStart.src && imgStart.src !== window.location.href) {
+        imgMid.src = imgStart.src;
+        if (heroBadge) heroBadge.innerText = '⏮ 起点进入帧';
+      }
+    } else if (ratio < 0.66) {
+      if (originalMidSrc) {
+        imgMid.src = originalMidSrc;
+        if (heroBadge) heroBadge.innerText = '★ 峰值能量帧';
+      }
+    } else {
+      if (imgEnd && imgEnd.src && imgEnd.src !== window.location.href) {
+        imgMid.src = imgEnd.src;
+        if (heroBadge) heroBadge.innerText = '⏭ 终点离开帧';
+      }
+    }
+  });
+
+  wrapMid.addEventListener('mouseleave', () => {
+    if (originalMidSrc && imgMid) {
+      imgMid.src = originalMidSrc;
+    }
+    if (heroBadge) heroBadge.innerText = 'CENTER PEAK';
+  });
 }
 
 function setSafeFrameImage(pos, filepath, timestamp, onLoadCallback) {
@@ -1139,6 +1257,18 @@ function setSafeFrameImage(pos, filepath, timestamp, onLoadCallback) {
 
   if (!img || !placeholder) return;
 
+  const src = `/api/frame?filepath=${encodeURIComponent(filepath)}&t=${timestamp.toFixed(3)}&w=640`;
+
+  // 命中预加载内存缓存，0ms 极速呈现，避免重置为占位符闪烁
+  if (memoryLoadedUrls.has(src)) {
+    img.src = src;
+    img.classList.remove('hidden');
+    placeholder.classList.add('hidden');
+    if (shimmer) shimmer.classList.add('hidden');
+    if (onLoadCallback) onLoadCallback();
+    return;
+  }
+
   img.classList.add('hidden');
   placeholder.classList.remove('hidden');
   placeholder.innerHTML = `
@@ -1147,10 +1277,9 @@ function setSafeFrameImage(pos, filepath, timestamp, onLoadCallback) {
   `;
   if (shimmer) shimmer.classList.remove('hidden');
 
-  const src = `/api/frame?filepath=${encodeURIComponent(filepath)}&t=${timestamp.toFixed(3)}&w=640`;
-
   const tempImg = new Image();
   tempImg.onload = () => {
+    memoryLoadedUrls.add(src);
     img.src = src;
     img.classList.remove('hidden');
     placeholder.classList.add('hidden');
@@ -1444,23 +1573,24 @@ function showClipPreview() {
 
 // ================== 裁决打标、撤销与自动步进 ==================
 
-async function submitCurrentReview(manualLabel) {
+async function submitCurrentReview(manualLabel, isBatch = false) {
   if (state.selectedSegIndex < 0) return;
   const seg = state.currentSegments[state.selectedSegIndex];
   const notesInput = document.getElementById('review-notes-input');
   const userNotes = notesInput ? notesInput.value.trim() : '';
   const scenario = state.selectedScenario || '';
 
+  const doBatch = isBatch && Array.isArray(seg.cluster_ids) && seg.cluster_ids.length > 1;
+  const endpoint = doBatch ? '/api/batch_review' : '/api/review';
+  const payload = doBatch
+    ? { segment_ids: seg.cluster_ids, manual_label: manualLabel, notes: userNotes, scenario: scenario }
+    : { segment_id: seg.id, manual_label: manualLabel, notes: userNotes, scenario: scenario };
+
   try {
-    const res = await fetch('/api/review', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        segment_id: seg.id,
-        manual_label: manualLabel,
-        notes: userNotes,
-        scenario: scenario
-      })
+      body: JSON.stringify(payload)
     });
     const data = await res.json();
     if (data.success) {
@@ -1468,7 +1598,17 @@ async function submitCurrentReview(manualLabel) {
       seg.scenario = scenario;
       seg.user_notes = userNotes;
 
-      // 若在当前切片上手动绘制了 BBox，伴随一并自动保存为侧边标注
+      if (doBatch && state.currentSegments) {
+        const idSet = new Set(seg.cluster_ids);
+        state.currentSegments.forEach(s => {
+          if (idSet.has(s.id)) {
+            s.manual_label = manualLabel;
+            s.scenario = scenario;
+            s.user_notes = userNotes;
+          }
+        });
+      }
+
       if (state.currentBBoxes.length > 0) {
         saveCurrentBBoxes();
       }
@@ -1486,7 +1626,8 @@ async function submitCurrentReview(manualLabel) {
       };
       const labelName = labelMap[manualLabel] || manualLabel;
       const extraSc = scenario ? ` • 归因: [${scenario}]` : '';
-      showToast(`已标记为 [${labelName}]${extraSc} 并同步归档代表帧`, 'success');
+      const batchHint = doBatch ? ` [⚡ 批量应用 ${data.count} 处聚类]` : '';
+      showToast(`已标记为 [${labelName}]${extraSc}${batchHint}`, 'success');
 
       selectNextSegment(1);
     }
