@@ -714,8 +714,14 @@ class StreamingOrchestrator:
                 }
             )
         else:
-            self.db.set_analysis_result(filepath, "FAILED", "", error_msg="analysis produced no labels")
-            self._add_error(f"analysis produced no labels: {Path(filepath).name}")
+            decode_frames = getattr(detector, "last_perf", {}).get("frames", 0)
+            err_msg = (
+                f"corrupted media or unreadable stream ({decode_frames} frames decoded)"
+                if decode_frames < 2
+                else "analysis produced no labels"
+            )
+            self.db.set_analysis_result(filepath, "FAILED", "", error_msg=err_msg)
+            self._add_error(f"{err_msg}: {Path(filepath).name}")
             t_ana_fail = time.monotonic()
             perf.add(
                 PerfRecord(

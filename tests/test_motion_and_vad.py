@@ -236,3 +236,51 @@ class TestAudioVADAndMultimodal:
         assert rms == 0.0
         dbfs = 20 * math.log10(max(rms, 1e-9) / 32768.0)
         assert dbfs < -90.0
+
+
+class TestTruncatedMediaAndDegradation:
+    """测试截断/部分损坏原片的容错处理与真实时长校准。"""
+
+    def test_detector_truncated_media_preserves_frames_and_corrects_duration(self):
+        """当原片物理提前到达 EOF (解码帧数远小于声明时长) 时，
+        MotionDetector 应保留已解码帧，校准 file_duration_detected 并产出有效标签。"""
+        from unittest.mock import patch
+        detector = MotionDetector({"detection": {"analysis_fps": 5, "motion_sensitivity": 1.0}})
+        synthetic_frames = [np.full((180, 320), fill_value=i * 2, dtype=np.uint8) for i in range(30)]
+        meta = {
+            "has_audio": 0,
+            "effective_fps": 5.0,
+            "complete": True,
+            "truncated": True,
+            "decode_time": 0.5,
+            "frames": 30,
+        }
+
+        with patch.object(detector, "_decode_file", return_value=(synthetic_frames, {}, np.array([], dtype=np.float32), meta)):
+            labels, yolo_buf = detector.analyze("truncated_sample.mp4", file_duration=300.0, has_audio=0, duration_verified=True)
+
+        assert len(labels) >= 30
+        assert detector.file_duration_detected == 6.0  # 30 帧 / 5.0 fps = 6.0s
+        assert labels[-1]["time"] <= 6.0
+
+    def test_detector_audio_decode_failure_degrades_to_silent_video(self):
+        """当音频管道解码抛出异常时，_decode_file 应安全降级为静音视频，禁止清空视频帧。"""
+        from unittest.mock import patch
+        detector = MotionDetector({"detection": {"analysis_fps": 5}})
+        synthetic_frames = [np.zeros((180, 320), dtype=np.uint8) for _ in range(10)]
+        pipe_meta = {
+            "has_audio": 0,
+            "effective_fps": 5.0,
+            "complete": True,
+            "truncated": False,
+            "decode_time": 0.2,
+            "frames": 10,
+        }
+
+        with patch.object(detector, "_decode_file_pipe", return_value=(synthetic_frames, {}, pipe_meta)), \
+             patch.object(detector, "_decode_audio_pipe", side_effect=RuntimeError("Audio decode truncated")):
+            frames, yolo_buf, full_audio, meta = detector._decode_file("sample_audio_corrupt.mp4", file_duration=2.0)
+
+        assert len(frames) == 10
+        assert meta["complete"] is True
+        assert full_audio.size == 0  # 降级为静音

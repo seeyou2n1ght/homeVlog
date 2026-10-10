@@ -375,9 +375,9 @@ class MotionDetector:
                 try:
                     full_audio = self._decode_audio_pipe(filepath, file_duration)
                 except Exception as exc:
-                    logger.warning("Audio decode failed for %s: %s", filepath, exc)
-                    meta["complete"] = False
-                    return [], {}, np.array([], np.float32), meta
+                    logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, exc)
+                    from src.algorithms.audio_features import AudioFeatures
+                    full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
                 meta["has_audio"] = int(bool(full_audio.size) or bool(getattr(self, "has_audio_detected", 0)))
                 try:
                     self.has_audio_detected = meta["has_audio"]
@@ -545,11 +545,18 @@ class MotionDetector:
 
             min_expected_frames = max(1, int(file_duration * effective_fps * 0.85))
             is_complete = bool(
-                not is_aborted and total_frames > 0 and (
-                    (proc and proc.returncode == 0 and total_frames >= min_expected_frames) or
+                not is_aborted and total_frames >= 2 and (
+                    (proc and proc.returncode == 0) or
+                    total_frames >= min_expected_frames or
                     total_frames >= max(1, file_duration * effective_fps - 2)
                 )
             )
+            is_truncated = bool(is_complete and total_frames < min_expected_frames)
+            if is_truncated:
+                logger.info(
+                    "Pipe decode for %s reached early EOF cleanly: container declared %.1fs, physical stream has %d frames (%.1fs)",
+                    Path(filepath).name, file_duration, total_frames, total_frames / effective_fps,
+                )
 
         meta = {
             "has_audio": 0,
@@ -559,6 +566,7 @@ class MotionDetector:
             "sem_wait": sem_wait,
             "aborted": is_aborted,
             "complete": is_complete,
+            "truncated": is_truncated,
         }
         return decoded_frames, yolo_buffer, meta
 
@@ -628,6 +636,7 @@ class MotionDetector:
         total_frames = 0
         video_frame_count = 0
         decode_complete = False
+        meta_corrupted_tail = False
 
         try:
             from av.audio.resampler import AudioResampler
@@ -780,7 +789,7 @@ class MotionDetector:
                 else:
                     decode_complete = (
                         not FFmpegProcessRegistry.is_interrupted() and
-                        total_frames >= max(1, int(file_duration * effective_fps * 0.85))
+                        total_frames >= 2
                     )
 
                 if audio_resampler:
@@ -794,6 +803,13 @@ class MotionDetector:
 
         except Exception as e:
             logger.warning("PyAV decode error for %s: %s", Path(filepath).name, e)
+            if not FFmpegProcessRegistry.is_interrupted() and total_frames >= 2:
+                decode_complete = True
+                meta_corrupted_tail = True
+                logger.info(
+                    "PyAV decode error for %s at frame %d: %s. Preserving %d decoded frames.",
+                    Path(filepath).name, total_frames, e, total_frames,
+                )
         finally:
             io_sem.release()
 
@@ -801,6 +817,8 @@ class MotionDetector:
 
         full_audio = audio_features
 
+        min_expected_frames = max(1, int(file_duration * effective_fps * 0.85))
+        meta_truncated = bool(decode_complete and total_frames < min_expected_frames)
         meta = {
             "has_audio": has_audio,
             "effective_fps": effective_fps,
@@ -808,6 +826,8 @@ class MotionDetector:
             "decode_time": round(t_decode_end - t_decode_start, 3),
             "frames": total_frames,
             "sem_wait": sem_wait,
+            "truncated": meta_truncated,
+            "corrupted_tail": meta_corrupted_tail,
         }
         return decoded_frames, yolo_buffer, full_audio, meta
 
@@ -872,6 +892,11 @@ class MotionDetector:
                 "sem_wait": decode_meta.get("sem_wait", 0.0),
             }
             return [], yolo_buffer
+
+        actual_dur = round(len(decoded_frames) / max(0.001, effective_fps), 3)
+        if actual_dur < file_duration or decode_meta.get("truncated"):
+            file_duration = actual_dur
+            self.file_duration_detected = actual_dur
 
         # One continuous background model per file; the outer worker pool bounds CPU concurrency.
         results, frames_meta = self.analyze_frames(

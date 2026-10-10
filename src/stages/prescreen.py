@@ -299,6 +299,23 @@ def _prescreen_keyframes(
                 # A negative decision requires reaching EOF, never just the first N keyframes.
     except Exception as e:
         logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
+        if first_frame is not None or sample_ts:
+            logger.info(
+                "Prescreen keyframes encountered error after reading %d samples for %s (%s); routing to analysis as SUSPICIOUS",
+                len(sample_ts), Path(filepath).name, e,
+            )
+            return {
+                "status": "SUSPICIOUS",
+                "has_audio": has_audio,
+                "media_duration": media_duration if "media_duration" in locals() else duration,
+                "result_json": json.dumps({
+                    "mode": "keyframes",
+                    "reason": f"stream_error_after_{len(sample_ts)}_samples: {e}",
+                    "sample_ts": sample_ts,
+                    "diffs": diffs,
+                    "truncated": True,
+                }),
+            }
         return {"status": "FALLBACK", "error": str(e), "has_audio": has_audio}
     finally:
         io_sem.release()
@@ -389,7 +406,20 @@ def prescreen_file(
     for i in range(1, len(ts_list)):
         curr_frame = _extract_frame(filepath, ts_list[i], width, height, gpu=gpu)
         if curr_frame is None:
-            return {"status": "FAILED", "error": f"failed to extract frame at t={ts_list[i]:.1f}s"}
+            logger.warning(
+                "Prescreen: failed to extract frame at t=%.1fs for %s (possible truncated media); routing to analysis as SUSPICIOUS",
+                ts_list[i], Path(filepath).name,
+            )
+            return {
+                "status": "SUSPICIOUS",
+                "result_json": json.dumps({
+                    "mode": "legacy_seek",
+                    "reason": f"seek_past_eof_at_t_{ts_list[i]:.1f}s",
+                    "sample_ts": ts_list[:i],
+                    "diffs": diffs,
+                    "truncated": True,
+                }),
+            }
 
         # 动态环境光自适应与先验保护
         mean_luma = float(np.mean(curr_frame))

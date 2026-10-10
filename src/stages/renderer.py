@@ -727,12 +727,16 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
     # 渲染是产出关键路径，预算放宽至 30s×10：等待解码租约释放远优于批次 abort
+    if FFmpegProcessRegistry.is_interrupted():
+        fc_script.unlink(missing_ok=True)
+        return None
     lease_wait_t0 = time.monotonic()
     if not acquire_with_retry(io_sem, timeout=30.0, retries=10):
-        logger.warning(
-            "batch-render cam%d batch%d: io semaphore acquire timeout, aborting",
-            cam_index, batch_idx,
-        )
+        if not FFmpegProcessRegistry.is_interrupted():
+            logger.warning(
+                "batch-render cam%d batch%d: io semaphore acquire timeout, aborting",
+                cam_index, batch_idx,
+            )
         fc_script.unlink(missing_ok=True)
         return None
     lease_wait = round(time.monotonic() - lease_wait_t0, 3)

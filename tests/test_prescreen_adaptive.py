@@ -327,3 +327,65 @@ def test_calc_spatial_metrics_and_pure_evaluation_policy():
     )
     assert dec_prior_relaxed.is_motion is True
     assert dec_prior_relaxed.reason == "normal_motion_confirmed"
+
+
+def test_prescreen_legacy_seek_truncated_stream_routes_to_suspicious():
+    """当视频物理流截断导致后续时间戳 seek 越界返回 None 时，安全降级为 SUSPICIOUS。"""
+    config = {
+        "detection": {
+            "prescreen_mode": "legacy_seek",
+            "prescreen_segments": 5,
+            "prescreen_diff_threshold": 10.0,
+        }
+    }
+
+    def mock_extract(filepath, timestamp, width, height, **kwargs):
+        if timestamp == 0.0:
+            return np.ones((height, width, 3), dtype=np.uint8) * 100
+        return None  # 越界 EOF
+
+    with patch("src.stages.prescreen._extract_frame", side_effect=mock_extract):
+        res = prescreen_file("mock_truncated.mp4", duration=300.0, config=config)
+
+    assert res["status"] == "SUSPICIOUS"
+    result_meta = json.loads(res["result_json"])
+    assert result_meta.get("truncated") is True
+    assert "seek_past_eof" in result_meta.get("reason", "")
+
+
+def test_prescreen_keyframes_error_after_samples_routes_to_suspicious():
+    """当 PyAV 关键帧初筛在读出部分帧后遭遇数据损坏异常时，安全降级为 SUSPICIOUS。"""
+    class MockStream:
+        duration = 1000
+        time_base = 1 / 1000
+        codec_context = MagicMock()
+
+    class MockContainer:
+        def __init__(self):
+            self.streams = MagicMock()
+            self.streams.video = [MockStream()]
+            self.streams.audio = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def decode(self, stream):
+            for i in range(2):
+                frame = MagicMock()
+                frame.pts = i * 100
+                frame.type = "video"
+                yield frame
+            import av
+            raise av.error.InvalidDataError(1094995529, "Invalid data found")
+
+    mock_io = MagicMock()
+    with patch("av.open", return_value=MockContainer()), \
+         patch("src.hardware.scheduler.get_disk_semaphore", return_value=mock_io), \
+         patch("src.stages.prescreen.video_frame_to_gray", return_value=np.zeros((180, 320), dtype=np.uint8)), \
+         patch("src.stages.prescreen.acquire_with_retry", return_value=True):
+        res = _prescreen_keyframes("corrupted_tail.mp4", duration=100.0, max_keyframes=10, threshold=8.0)
+
+    assert res["status"] == "SUSPICIOUS"
+    meta = json.loads(res["result_json"])
+    assert meta.get("truncated") is True
+    assert "stream_error" in meta.get("reason", "")

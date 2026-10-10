@@ -321,3 +321,43 @@ def test_render_interrupt_propagates_to_run_and_preserves_batches(tmp_path, poli
         db.close()
         FFmpegProcessRegistry.reset_interrupted()
 
+
+def test_batch_render_suppresses_semaphore_timeout_warning_when_interrupted(tmp_path, caplog):
+    """验证当渲染 Worker 在等待信号量期间感知到外部中断时，绝不输出误导性的 semaphore acquire timeout 告警。"""
+    segs = [
+        TimelineSegment(
+            filepath=str(tmp_path / "f1.mp4"),
+            input_index=0,
+            start_in_file=0.0,
+            end_in_file=5.0,
+            state="STATIC",
+            duration=5.0,
+        )
+    ]
+
+    def mock_acquire(*args, **kwargs):
+        FFmpegProcessRegistry.mark_interrupted()
+        return False
+
+    try:
+        with patch("src.stages.renderer.acquire_with_retry", side_effect=mock_acquire), \
+             caplog.at_level("WARNING"):
+            res = build_batch_render(
+                segs,
+                bi=0,
+                enc_for_batch="nv",
+                fps=20,
+                width=1920,
+                height=1080,
+                seg_cfg={},
+                out_cfg={},
+                audio_cfg={},
+                date="20260901",
+                cam_index=0,
+                rows=[],
+            )
+            assert res is None
+        assert not any("io semaphore acquire timeout" in record.message for record in caplog.records)
+    finally:
+        FFmpegProcessRegistry.reset_interrupted()
+
