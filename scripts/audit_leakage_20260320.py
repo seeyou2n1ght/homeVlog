@@ -554,7 +554,7 @@ class LeakageAuditor:
             json.dump(summary_data, f, indent=2, ensure_ascii=False)
         logger.info("审计结构化数据已落盘至: %s", summary_json_path)
 
-        report_md_path = PROJECT_ROOT / "docs" / "LEAKAGE_AUDIT_REPORT_20260320.md"
+        report_md_path = AUDIT_OUT_DIR / "LEAKAGE_AUDIT_REPORT_20260320.md"
         self._generate_markdown_report(summary_data, report_md_path)
         logger.info("漏检评估综合报告已生成至: %s", report_md_path)
 

@@ -678,7 +678,7 @@ Final Display Duration: 5.60h (Scenario A*) / 5.56h (Scenario B)
 
 ## Accuracy & Risk Assessment (质量与风险量化)
 
-利用 `docs/LEAKAGE_AUDIT_REPORT_20260320.md` 中针对 20260320 的分层全检与穿透抽检数据进行交叉验证：
+利用针对 20260320 生产素材的分层全检与穿透抽检实测基线数据进行交叉验证：
 
 | 评估指标 | 模拟评估结果 | 行业评级 | 判定依据 |
 | :--- | :---: | :---: | :--- |
