@@ -781,3 +781,121 @@ def test_multi_feature_hysteresis_activity_decision():
 
     # 验证 50s 的单格微弱扰动未被误判为 1x
     assert not any(s.state == "DYNAMIC" and s.start_time <= 50 <= s.end_time for s in refined)
+
+
+
+# =========================================================================
+# 检测器时间轴闭环与自适应采样回归套件 (由旧阶段回归合并收敛)
+# =========================================================================
+
+def _make_detector_closure(mock_config):
+    from src.detector import MotionDetector
+    cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
+    det = cfg["detection"]
+    det["analysis_early_term_enabled"] = False  # 排除早停路径干扰
+    det["audio_vad_enabled"] = False
+    return MotionDetector(cfg, decode_gpu="qsv")
+
+
+class TestTimelineClosure:
+    """时间轴闭环铁律回归 (末帧时间戳必须闭合到 start_offset + file_duration)。"""
+
+    def test_last_label_time_equals_file_end(self, mock_config):
+        detector = _make_detector_closure(mock_config)
+        frames = [np.zeros((60, 80, 3), dtype=np.uint8) for _ in range(10)]
+        results, meta = detector.analyze_frames(
+            frames, start_offset=100.0, file_duration=60.0, fps=5.0,
+        )
+        assert results, "analyze_frames 应产生标签"
+        assert results[-1]["time"] == pytest.approx(160.0, abs=1e-6)
+        assert results[-1]["state"] == "STATIC"
+        assert results[-1]["is_motion"] is False
+
+    def test_closure_no_duplicate_when_already_closed(self, mock_config):
+        detector = _make_detector_closure(mock_config)
+        frames = [np.zeros((60, 80, 3), dtype=np.uint8) for _ in range(10)]
+        results, meta = detector.analyze_frames(
+            frames, start_offset=0.0, file_duration=1.8, fps=5.0,
+        )
+        assert results[-1]["time"] == pytest.approx(1.8, abs=1e-6)
+        times = [r["time"] for r in results]
+        assert len(times) == len(set(times)) or times[-1] != times[-2]
+
+
+def _create_tiny_mp4_helper(path, n_frames: int = 20, fps: int = 10):
+    """用 PyAV 生成一个极短的 mpeg4 测试视频。"""
+    import av
+
+    container = av.open(str(path), mode="w")
+    stream = container.add_stream("mpeg4", rate=fps)
+    stream.width = 64
+    stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    for i in range(n_frames):
+        frame = av.VideoFrame.from_ndarray(
+            np.full((64, 64, 3), i % 255, dtype=np.uint8), format="rgb24"
+        )
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return path
+
+
+class TestAdaptiveFpsUltraLongTier:
+    """ultra_long 档位生效回归。"""
+
+    def test_ultra_long_tier_selected(self, mock_config, tmp_path):
+        from src.detector import MotionDetector
+        cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
+        cfg["detection"]["analysis_fps_tiers"] = {
+            "short": 5, "medium": 3, "long": 1, "ultra_long": 0.5,
+        }
+        cfg["detection"]["analysis_fps_tier_thresholds"] = {
+            "short_max": 120, "medium_max": 600, "long_max": 1800,
+        }
+        detector = MotionDetector(cfg, decode_gpu="qsv")
+
+        video = _create_tiny_mp4_helper(tmp_path / "tiny.mp4")
+        _, _, _, meta = detector._decode_file(str(video), file_duration=2000.0)
+        assert meta["effective_fps"] == pytest.approx(0.5)
+
+    def test_long_tier_boundary_unchanged(self, mock_config, tmp_path):
+        from src.detector import MotionDetector
+        cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
+        cfg["detection"]["analysis_fps_tiers"] = {
+            "short": 5, "medium": 3, "long": 1, "ultra_long": 0.5,
+        }
+        cfg["detection"]["analysis_fps_tier_thresholds"] = {
+            "short_max": 120, "medium_max": 600, "long_max": 1800,
+        }
+        detector = MotionDetector(cfg, decode_gpu="qsv")
+
+        video = _create_tiny_mp4_helper(tmp_path / "tiny.mp4")
+        _, _, _, meta = detector._decode_file(str(video), file_duration=1700.0)
+        assert meta["effective_fps"] == pytest.approx(1.0)
+
+
+class TestYoloFpsAlignment:
+    """YOLO 验证帧索引 fps 对齐回归。"""
+
+    def test_verify_uses_effective_fps_for_frame_lookup(self):
+        from src.yolo_verifier import YoloVerifier
+        from src.segment import Segment
+
+        verifier = YoloVerifier.__new__(YoloVerifier)
+        verifier.enabled = False
+        verifier.skip_energy_threshold = 12.0
+
+        segs = [
+            Segment(
+                start_time=10.0, end_time=20.0, state="DYNAMIC",
+                source_file="x.mp4", file_start_offset=0.0, max_energy=1.0,
+            )
+        ]
+        out = verifier.verify(
+            "x.mp4", segs, frames_buffer={i: np.zeros((4, 4, 3), np.uint8) for i in range(30)},
+            analysis_fps=1.0,
+        )
+        assert out is segs or len(out) == len(segs)

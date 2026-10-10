@@ -3,7 +3,7 @@
 
 全量监控素材识别质量自动化核查与深度审计 CLI 工具。
 对数据库中的全部切片、动静判定、YOLO 置信度及音频唤醒进行多维度量化分析，
-输出量化质量指标及详细审计报告 (docs/ACCURACY_AUDIT_REPORT.md)。
+输出量化质量指标及详细审计报告 (output/ACCURACY_AUDIT_REPORT.md)。
 """
 
 import argparse
@@ -263,7 +263,7 @@ def fix_database_fragmentation(db_path: Path) -> tuple[int, int]:
 def main():
     parser = argparse.ArgumentParser(description="Verify accuracy and audit detection quality")
     parser.add_argument("--db-path", type=str, default="data/vlog.db", help="Path to SQLite database")
-    parser.add_argument("--report-out", type=str, default="docs/ACCURACY_AUDIT_REPORT.md", help="Output Markdown report path")
+    parser.add_argument("--report-out", type=str, default="output/ACCURACY_AUDIT_REPORT.md", help="Output Markdown report path")
     parser.add_argument("--date", type=str, default=None, help="Optional filter by date (YYYYMMDD)")
     parser.add_argument("--cam-index", type=int, default=None, help="Optional filter by cam index")
     parser.add_argument("--fix-fragmentation", action="store_true", help="Atomically merge adjacent same-state fragments in database")
