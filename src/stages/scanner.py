@@ -4,25 +4,20 @@ import re
 import time
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from src.core.database import VlogDatabase
 from src.core.config import load_config
-from src.core.identity import ts_to_unix
-
-from pathlib import Path
-
-logger = logging.getLogger("homevlog")
-
 from src.core.identity import (
     FILENAME_RE,
     CAMERA_DIR_RE,
     camera_key,
     parse_camera_dir,
     parse_filename,
+    ts_to_unix,
 )
 
-
-
+logger = logging.getLogger("homevlog")
 
 
 def resolve_camera_identity(dir_path: str, cam_index: int = 0, config: dict | None = None) -> tuple[str, str]:
@@ -42,7 +37,11 @@ def resolve_camera_identity(dir_path: str, cam_index: int = 0, config: dict | No
 
     if mac:
         if mac in aliases:
-            alias = aliases[mac]
+            raw_alias = aliases[mac]
+            if isinstance(raw_alias, dict):
+                alias = raw_alias.get("alias") or raw_alias.get("name") or raw_alias.get("profile") or mac
+            else:
+                alias = str(raw_alias)
             return f"{alias} ({mac})", alias
         return f"{mac} (Cam {cam_index})", mac
 
@@ -64,9 +63,11 @@ def resolve_camera_ui_name(dir_path: str | Path | None = None, cam_index: int = 
     if not mac and dir_str:
         match = re.search(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{12}(?![A-Fa-f0-9])", Path(dir_str).name)
         mac = match.group().upper() if match else None
-    alias = (config.get("cameras", {}) or {}).get(mac) if mac else None
-    if alias:
-        return str(alias)
+    alias_raw = (config.get("cameras", {}) or {}).get(mac) if mac else None
+    if alias_raw:
+        if isinstance(alias_raw, dict):
+            return str(alias_raw.get("alias") or alias_raw.get("name") or alias_raw.get("profile") or mac)
+        return str(alias_raw)
     if info.get("cam_id") is not None:
         return f"摄像头 {info['cam_id']}"
     if mac:

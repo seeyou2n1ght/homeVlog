@@ -178,6 +178,28 @@ class TuningSimulator:
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+    def simulate_profile(
+        self,
+        profile_name: str,
+        sensitivity: float = 1.0,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """对指定场景 Profile 及灵敏度执行 What-If 离线推演。"""
+        from src.core.profiles import resolve_profile_config
+        sim_cfg = resolve_profile_config(self.config, profile_name=profile_name, sensitivity=sensitivity)
+        params: dict[str, Any] = {
+            "detection.min_motion_threshold": sim_cfg.get("detection", {}).get("min_motion_threshold", 2.5),
+            "segment.min_motion_duration": sim_cfg.get("segment", {}).get("min_motion_duration", 2.0),
+            "yolo.confidence": sim_cfg.get("yolo", {}).get("confidence", 0.3),
+            "presence.person_conf_threshold": sim_cfg.get("presence", {}).get("person_conf_threshold", 0.20),
+        }
+        if overrides:
+            params.update(overrides)
+        res = self.simulate(params)
+        res["profile"] = profile_name
+        res["sensitivity"] = sensitivity
+        return res
+
 
 def generate_config_diff(
     new_params: dict[str, Any],

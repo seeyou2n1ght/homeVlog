@@ -24,6 +24,22 @@ def clean_semaphores():
     FFmpegProcessRegistry.reset_interrupted()
 
 
+@pytest.fixture(autouse=True)
+def reset_global_config_state():
+    """Reset global config path and settings singleton before and after each test for test isolation."""
+    import src.core.config as core
+    import src.utils as legacy
+    core.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
+    core.SETTINGS = {}
+    legacy.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
+    legacy.SETTINGS = {}
+    yield
+    core.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
+    core.SETTINGS = {}
+    legacy.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
+    legacy.SETTINGS = {}
+
+
 @pytest.fixture
 def temp_test_dir(tmp_path):
     """Provide an isolated workspace directory with subfolders for output, temp, logs, data."""

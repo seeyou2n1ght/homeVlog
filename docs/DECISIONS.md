@@ -1628,3 +1628,43 @@ Accepted (2026-10-11)
 - 人工打标彻底从“单点纠偏”演进为系统的数据飞轮中枢；
 - 每次算法发版与重构受到 100 样本权威黄金真值门禁守卫，严防核心场景退化；
 - 参数寻优建立在量化仿真证据之上，配合自动备份与热重载，杜绝生产配置误伤。
+
+---
+
+# ADR 0039 — Hierarchical Configuration Governance and Empirical Scenario Profiles
+
+## Status
+
+Accepted (2026-10-11)
+
+## Context
+
+在 HomeVlog 生产部署中，`config/settings.yaml` 曾一度膨胀至近 60 个底层物理超参数（如 `fg_threshold`, `ambient_drift_suppress`, `day_energy_threshold`, `min_dbfs`, `night_speed_factor` 等）。这些平铺参数强制全机位共享，存在三大工程痛点：
+1. **真实机位物理环境耦合冲突**：真实生产双机位中，婴儿房（`B888805AA3CD`，红外微光/低能量翻身/啼哭）与客厅（`B888806BD537`，日光漫射/大面积光影漂移/成人走动/夜间空房熟睡）物理特性矛盾。全局参数顾此失彼：调高门限则婴儿微动漏检，调低门限则客厅光影误报严重。
+2. **魔法数字与配置认知负荷**：底层参数缺乏场景语义，运维人员难以判断 `min_dbfs: -32` 与 `day_energy_threshold: 16.0` 的协同物理意义，容易导致“拍脑袋定配置”。
+3. **缺乏机位专属自适应能力**：配置系统缺乏按摄像机硬件 MAC/目录动态注入不同预设和灵敏度的分层治理机制。
+
+## Decision
+
+确立并实施三层分层配置治理体系（Layered Configuration Governance），并依托 100 样本权威黄金真值基准集固化 3 类内置场景 Profile：
+
+1. **Layer 1: 内置场景预设矩阵 (`src.core.profiles.PROFILES`)**：
+   - `living_room`（客厅标准）：平衡动作捕捉与光影漫射抑制，启用有人驻留 4x 温和快进与夜间睡眠 16x 延时；
+   - `baby_room`（婴儿房高敏）：极低动作门限（1.8），红外微光不误抑微动，啼哭 VAD 高敏唤醒（-38 dBFS），较早入睡时间段；
+   - `outdoor_corridor`（室外与走廊）：高抗噪（门限 3.5），抗车灯/树影漂移，关闭室内驻留与夜间微动。
+2. **Layer 2: 宏观主旋钮与机位专属绑定 (`motion_sensitivity` & Camera Mapping)**：
+   - 主旋钮 `motion_sensitivity`（0.5~2.0，默认 1.0），建立反比动态缩放：$\text{Thresh}_{\text{eff}} = \text{Thresh}_{\text{base}} / \text{sensitivity}$，保证调高灵敏度降低门限、调低灵敏度提高抗干扰；
+   - 机位绑定：`cameras.<mac>` 支持绑定专属场景预设与独立灵敏度（例如 `B888805AA3CD: baby_room`，`B888806BD537: living_room`），在流水线运行时由 `resolve_camera_config` 精准注入对应机位处理流。
+3. **Layer 3: 向后兼容与专家级显式覆盖 (Expert Overrides)**：
+   - 用户在配置文件或机位字典中显式声明的参数拥有最高优先级，不被 Profile 默认值覆盖；
+   - `settings.yaml` 大幅精简瘦身，顶部展示机位场景映射与全局主旋钮，底部折叠/注释底层专家参数；
+   - `load_config` 在加载时无缝展开 Profile 默认值，保证下游所有子系统（VAD、Segmenter、Timeline、Renderer）契约完备且零改动向下兼容。
+4. **离线调优集成**：
+   - `TuningSimulator` 扩展 `simulate_profile(profile_name, sensitivity)`，支持对场景预设在黄金基准集上的 Precision、Recall、F1-Score 及分场景收益进行离线 What-If 量化推演。
+
+## Consequences
+
+- 生产双机位（婴儿房 vs 客厅）彻底解耦，各自运行在最佳经验参数矩阵下；
+- 杜绝代码与配置文件中的“魔法数字”，所有核心预设门限均有黄金真值数据集实证支撑；
+- 新增机位仅需选择 Profile 并微调主旋钮，大幅降低工程维护与部署成本；
+- 自动化测试与质量门禁扩充至 485 项全绿守卫（479 passed, 6 skipped）。

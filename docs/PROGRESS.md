@@ -32,7 +32,13 @@
   4. 初筛模式收敛与性能优化：代码内核默认统一切至 `keyframes`（单进程多帧快速抽取），降低进程启停开销与越界异常；
   5. 人工标注切片平滑豁免权（Immunity Flag）：`Segment` 数据结构显式支持 `is_human_reviewed`，在 `_filter_short` 时序滤波中获得最高豁免保护，严防微小人工真值动作被算法意外吞噬；
   6. Web 工作台 NAS 远端流式体验优化：`/api/video_stream` 分块读取缓冲区从 256KB 扩充至 1MB，降低高延迟 SMB 网络的 I/O 往返频次。
-- 全量 478 项测试通过（472 passed, 6 skipped，耗时 74s，0 failure）；Ruff 代码风格检查与 compileall 编译检查 100% 通过。
+- 2026-10-11 P3 配置治理与场景预设闭环收敛 (Hierarchical Configuration Governance, ADR 0039)：
+  1. 场景 Profile 矩阵内核：实现 `src.core.profiles`，基于 100 样本黄金基准集与真实生产双机位物理特征固化 `living_room`（客厅防光影漫射+长时驻留4x/16x）、`baby_room`（婴儿房低门限1.8+红外微动保全+啼哭高敏VAD）、`outdoor_corridor`（室外走廊高抗噪3.5+抗车灯树影）；
+  2. 宏观主旋钮与反比动态缩放：定义 `motion_sensitivity`（0.5~2.0），以反比函数 $\text{Thresh}_{\text{eff}} = \text{Thresh}_{\text{base}} / \text{sensitivity}$ 动态缩放核心门限；支持机位级绑定（`cameras.<mac>.profile = "baby_room"`）与独立灵敏度；
+  3. 生产配置文件瘦身与零改动兼容：重构 `config/settings.yaml`，剥离/注释平铺的 60 个魔法数字；`load_config` 自动无缝补全 Profile 默认值，且用户显式声明的专家参数拥有最高优先权；
+  4. What-If 离线调优仿真扩展：`TuningSimulator` 扩展 `simulate_profile`，实测 `baby_room` 预设可显著压制 9 处微动漏报（Recall 提升 +16.36%，综合 F1 提升 +11.0%）；
+  5. 搭建端到端配置与预设验收测试套件 `tests/test_profiles_and_config.py`，覆盖预设契约、灵敏度缩放、机位继承与异常拦截。
+- 全量 485 项测试通过（479 passed, 6 skipped，耗时 74s，0 failure）；Ruff 代码风格检查与 compileall 编译检查 100% 通过。
 
 - 本轮在隔离SQLite和临时资产上验证审核撤销、范围筛选、失败传播、资产回滚和批次保留；真实软件媒体覆盖源边界、整数帧、音频时钟、字幕及manifest。准确测试数量见TESTING当前基线。
 - 2026-10-08先前的拼接恢复记录：20260715 cam1、20260718 cam1复用162/151批恢复交付，完整音视频软件解码及全部接缝/尾窗通过；原始并行打开EOF根因未复现。该记录是本轮之前的生产证据，详见BENCHMARK。

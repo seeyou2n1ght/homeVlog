@@ -320,19 +320,19 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Endpoint not found")
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        post_data = self.rfile.read(min(length, 64 * 1024)) if length > 0 else b"{}"
         if not self._trusted_request(require_token=True):
             self._send_json({"error": "Untrusted request origin"}, status=403)
             return
         parsed = urlparse(self.path)
         path = parsed.path
-        length = int(self.headers.get("Content-Length", 0))
         if length > 64 * 1024:
             self._send_json({"error": "Request body too large"}, status=413)
             return
         if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
             self._send_json({"error": "Content-Type must be application/json"}, status=415)
             return
-        post_data = self.rfile.read(length) if length > 0 else b"{}"
 
         try:
             payload = json.loads(post_data.decode("utf-8"))

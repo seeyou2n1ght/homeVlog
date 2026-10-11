@@ -5,7 +5,6 @@ from pathlib import Path
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 TEMP_DIR = PROJECT_ROOT / "temp"
 TEMP_STAGING_DIR = TEMP_DIR / "staging"
@@ -13,6 +12,9 @@ TEMP_BATCHES_DIR = TEMP_DIR / "batches"
 TEMP_SCRIPTS_DIR = TEMP_DIR / "scripts"
 LOGS_DIR = PROJECT_ROOT / "logs"
 DB_PATH = PROJECT_ROOT / "data" / "vlog.db"
+
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
+CONFIG_PATH = DEFAULT_CONFIG_PATH
 
 SETTINGS: dict = {}
 _config_lock = threading.RLock()
@@ -31,6 +33,8 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
             raise FileNotFoundError(f"config not found: {CONFIG_PATH}")
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             candidate = yaml.safe_load(f) or {}
+        from src.core.profiles import resolve_profile_config
+        candidate = resolve_profile_config(candidate)
         validate_config(candidate)
         SETTINGS = candidate
 
@@ -38,7 +42,6 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
             d.mkdir(parents=True, exist_ok=True)
 
         return SETTINGS
-
 
 
 def validate_config(config):
@@ -49,7 +52,7 @@ def validate_config(config):
         raise ValueError("QSV ICQ uses global_quality; remove maxrate/bufsize to avoid CQP fallback")
     positive = {
         "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_qsv_analysis_concurrency", "max_qsv_render_concurrency", "max_io_concurrency"),
-        "detection": ("prescreen_parallel", "analysis_max_workers", "analysis_buffer_mb", "prescreen_segments", "analysis_fps", "prescreen_diff_threshold"),
+        "detection": ("prescreen_parallel", "analysis_max_workers", "analysis_buffer_mb", "prescreen_segments", "analysis_fps", "prescreen_diff_threshold", "motion_sensitivity"),
         "render": (
             "batch_max_files", "max_concurrency", "inactivity_timeout_s",
             "qsv_timeout_s", "static_sample_window_s", "dynamic_window_max_s",
@@ -70,6 +73,25 @@ def validate_config(config):
                 value = float(config[section][key])
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"{section}.{key} must be positive and finite")
+    from src.core.profiles import PROFILES
+    allowed_profiles = set(PROFILES.keys())
+    det_profile = config.get("detection", {}).get("profile")
+    if det_profile is not None and det_profile not in allowed_profiles:
+        raise ValueError(f"Unsupported detection.profile: {det_profile}")
+    cam_cfg = config.get("cameras", {})
+    if isinstance(cam_cfg, dict):
+        for cam_key, cam_val in cam_cfg.items():
+            if isinstance(cam_val, dict):
+                p = cam_val.get("profile")
+                if p is not None and p not in allowed_profiles:
+                    raise ValueError(f"cameras.{cam_key}.profile unsupported: {p}")
+                sens = cam_val.get("motion_sensitivity")
+                if sens is not None:
+                    sens_val = float(sens)
+                    if not math.isfinite(sens_val) or sens_val <= 0:
+                        raise ValueError(f"cameras.{cam_key}.motion_sensitivity must be positive")
+            elif isinstance(cam_val, str) and cam_val in allowed_profiles:
+                pass
     modes = {
         ("detection", "prescreen_mode"): {"keyframes", "auto", "stream_fps", "legacy_seek"},
         ("pipeline", "prescreen_gpu_policy"): {"qsv_only", "cuda_only", "alternating"},

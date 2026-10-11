@@ -1644,6 +1644,11 @@ def process_date_cam(
         return True
     if config is None:
         config = load_config()
+    all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
+    sample_filepath = all_tasks[0]["filepath"] if all_tasks else None
+    if config.get("cameras"):
+        from src.core.profiles import resolve_camera_config
+        config = resolve_camera_config(config, cam_index=cam_index, filepath=sample_filepath)
     monitor = get_monitor()
     t_start = time.monotonic()
     # 失败任务自愈：将历史 FAILED 预筛/分析重置为 PENDING（retry_count 上限防护），
