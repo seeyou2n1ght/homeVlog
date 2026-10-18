@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """scripts/tune_thresholds.py
 
-基于人工打标历史数据与预筛指标缓存的超参数网格搜索与自动化寻优工具。
-针对家庭监控场景（低照度微动与全屏光影突变）优化 Pass 1 预筛选阈值。
+历史预筛摘要的只读模拟诊断，不代表当前检测器、完整文件真值或独立准确率。
+正式参数比较使用生产重放与独立质量门禁；本工具拒绝配置写入。
 """
 
 import argparse
@@ -68,7 +68,7 @@ def load_labeled_samples(db_path: Path) -> list[PrescreenSample]:
         logger.warning("数据库文件不存在: %s", db_path)
         return []
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
     # 获取所有有复核记录的文件
@@ -108,7 +108,8 @@ def load_labeled_samples(db_path: Path) -> list[PrescreenSample]:
         if "VERIFIED_MOTION" in lbls or "MISSED_MOTION" in lbls:
             gt = "MOTION"
         elif "FALSE_ALARM" in lbls:
-            gt = "STATIC"
+            # A reviewed interval cannot establish absence over the whole file.
+            continue
         else:
             continue
 
@@ -239,7 +240,7 @@ def print_dataset_summary(db_path: Path) -> None:
         print(f"[-] 数据库未找到: {db_path}")
         return
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -264,46 +265,21 @@ def print_dataset_summary(db_path: Path) -> None:
 
 
 def apply_best_config(config_path: Path, best: TuningResult) -> bool:
-    """安全写回推荐的超参数至 settings.yaml（创建 .bak 备份）。"""
-    if not config_path.exists():
-        logger.error("配置文件不存在: %s", config_path)
-        return False
-
-    try:
-        import yaml
-    except ImportError:
-        logger.error("缺少 pyyaml 依赖，无法更新配置文件")
-        return False
-
-    backup_path = config_path.with_suffix(".yaml.bak")
-    try:
-        content = config_path.read_text(encoding="utf-8")
-        backup_path.write_text(content, encoding="utf-8")
-        logger.info("已创建配置文件备份: %s", backup_path)
-
-        data = yaml.safe_load(content)
-        if "detection" not in data:
-            data["detection"] = {}
-
-        data["detection"]["prescreen_diff_threshold"] = float(best.base_threshold)
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, sort_keys=False)
-
-        logger.info("[Success] 成功更新 %s: prescreen_diff_threshold = %.1f", config_path.name, best.base_threshold)
-        return True
-    except Exception as e:
-        logger.error("更新配置文件失败: %s", e)
-        return False
+    """Retained rejection for callers of the retired configuration writer."""
+    raise RuntimeError("Legacy threshold application is disabled; use measured production replay and independent quality gates")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HomeVlog 预筛自适应阈值网格调优工具")
+    parser = argparse.ArgumentParser(description="HomeVlog 历史预筛摘要诊断（不运行生产识别、不应用参数）")
     parser.add_argument("--db", type=Path, default=PROJECT_ROOT / "data" / "vlog.db", help="数据库路径")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "settings.yaml", help="配置文件路径")
-    parser.add_argument("--apply", action="store_true", help="自动将搜索得到的最优参数写回配置文件")
+    parser.add_argument("--apply", action="store_true", help="已停用：历史摘要不能用于生产参数推广")
     parser.add_argument("--dry-run", action="store_true", help="仅查看数据统计，不执行调参")
 
     args = parser.parse_args()
+
+    if args.apply:
+        parser.error("--apply is disabled; use measured production replay and independent quality gates")
 
     print_dataset_summary(args.db)
 
@@ -315,19 +291,19 @@ def main():
         print("[!] 数据库中未找到任何已复核的有效样本。")
         print("[i] 使用提示:")
         print("    1. 请先启动 Web 审核工作台: uv run python scripts/audit_tool/app.py")
-        print("    2. 在浏览器中标记若干疑难视频（标记为 动态确认、误报、漏检）")
-        print("    3. 再次运行本工具执行超参数调优。")
+        print("    2. 使用工作台实际重放和独立质量门禁进行正式参数比较")
+        print("    本工具仅保留历史摘要诊断，不推荐生产参数。")
         return
 
     pos_count = sum(1 for s in samples if s.ground_truth == "MOTION")
     neg_count = sum(1 for s in samples if s.ground_truth == "STATIC")
-    print(f"[*] 加载有效真值样本: 总计 {len(samples)} (真实动态: {pos_count}, 纯静止: {neg_count})")
+    print(f"[*] 加载历史诊断样本: 总计 {len(samples)} (真实动态: {pos_count}, 纯静止: {neg_count})")
 
-    print("[*] 开始执行多维网格寻优搜索...")
+    print("[*] 执行旧摘要模拟；不代表当前检测器准确率或独立验收...")
     results = run_grid_search(samples)
 
     print("\n" + "=" * 80)
-    print(" [Top 5] 前 5 名最优超参数组合排名")
+    print(" [Top 5] 前 5 名历史模拟组合（非生产推荐）")
     print("=" * 80)
     print(f"{'排名':<4} {'基础阈值':<8} {'暗光系数':<8} {'网格集中度':<10} {'召回率':<8} {'精确率':<8} {'F2-分':<8} {'漏检FN':<6} {'误报FP':<6}")
     print("-" * 80)
@@ -339,11 +315,7 @@ def main():
         )
     print("=" * 80 + "\n")
 
-    best = results[0]
-    print(f"[Recommendation] 推荐最佳配置: 基础阈值 = {best.base_threshold:.1f}, 暗光系数 = {best.night_factor:.2f}")
-
-    if args.apply:
-        apply_best_config(args.config, best)
+    print("历史诊断结束；没有生产参数推荐或配置写入。")
 
 
 if __name__ == "__main__":

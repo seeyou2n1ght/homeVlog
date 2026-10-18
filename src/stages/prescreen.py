@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Callable
 import json
 import logging
 import subprocess
@@ -9,7 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from src.hardware.ffmpeg import run_ffmpeg, get_duration, build_hw_decode_args, FFmpegProcessRegistry
+from src.hardware.ffmpeg import (
+    run_ffmpeg, get_duration, build_hw_decode_args, FFmpegProcessRegistry,
+    MediaTerminationUnconfirmed, MediaStartTerminationUnconfirmed,
+)
 from src.hardware.scheduler import acquire_with_retry, VideoLease
 from src.core.utils import parse_res
 from src.algorithms.filters import video_frame_to_gray
@@ -42,12 +46,7 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
     hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
     expected = width * height * 3
     for attempt in range(2):
-        if not acquire_with_retry(hardware):
-            return None
-        try:
-            result = run_ffmpeg(args, timeout=timeout)
-        finally:
-            hardware.release()
+        result = run_ffmpeg(args, timeout=timeout, io_lease=VideoLease(hardware))
         if result.returncode == 0 and len(result.stdout) >= expected:
             frame = np.frombuffer(result.stdout[:expected], dtype=np.uint8).reshape((height, width, 3))
             return frame
@@ -167,6 +166,7 @@ def _prescreen_keyframes(
     gpu: str = "qsv",
     is_prior_active: bool = False,
     width: int = 320, height: int = 180, timeout: float = 120.0,
+    collect_prior_result: bool = False,
 ) -> dict:
     """基于 PyAV 仅解码 I-Frame (Keyframe) 进行毫秒级粗筛，带自适应动态阈值与空间集中度早停机制。"""
     import av
@@ -174,6 +174,20 @@ def _prescreen_keyframes(
     diffs: list[float] = []
     sample_ts: list[float] = []
     has_audio = 0
+    prior_result = None
+    base_result = None
+
+    def motion_result(current_threshold, mean_luma, concentration):
+        return {
+            "status": "SUSPICIOUS", "has_audio": has_audio,
+            "media_duration": media_duration,
+            "result_json": json.dumps({
+                "mode": "keyframes", "sample_ts": sample_ts, "diffs": diffs,
+                "max_diff": max(diffs), "threshold": current_threshold,
+                "mean_luma": mean_luma, "concentration": round(concentration, 2),
+                "early_stop": True, "checked_pairs": len(diffs), "sem_wait": sem_wait,
+            }),
+        }
 
     from src.hardware.scheduler import get_disk_semaphore
     io_sem = get_disk_semaphore()
@@ -254,6 +268,16 @@ def _prescreen_keyframes(
                 concentration, max_cell_energy = _calc_spatial_metrics(active_map)
                 concentrations.append(concentration)
 
+                # Retain only the first sensitive positive, from this same decode.
+                # Resolve the predecessor after returning and releasing the I/O lease.
+                if collect_prior_result and prior_result is None:
+                    prior_threshold = _calc_dynamic_threshold(threshold, mean_luma, True)
+                    prior_decision = _evaluate_prescreen_motion(
+                        d, prior_threshold, mean_luma, concentration, max_cell_energy, True,
+                    )
+                    if prior_decision.is_motion:
+                        prior_result = motion_result(prior_threshold, mean_luma, concentration)
+
                 decision = _evaluate_prescreen_motion(
                     d=d,
                     current_threshold=current_threshold,
@@ -276,27 +300,19 @@ def _prescreen_keyframes(
                 is_motion = decision.is_motion
 
                 if is_motion:
-                    return {
-                        "status": "SUSPICIOUS",
-                        "has_audio": has_audio,
-                        "media_duration": media_duration,
-                        "result_json": json.dumps({
-                            "mode": "keyframes",
-                            "sample_ts": sample_ts,
-                            "diffs": diffs,
-                            "max_diff": max(diffs),
-                            "threshold": current_threshold,
-                            "mean_luma": mean_luma,
-                            "concentration": round(concentration, 2),
-                            "early_stop": True,
-                            "checked_pairs": len(diffs),
-                            "sem_wait": sem_wait,
-                        }),
-                    }
+                    if base_result is None:
+                        base_result = motion_result(current_threshold, mean_luma, concentration)
+                    if not collect_prior_result:
+                        return base_result
+                if collect_prior_result and base_result is not None and prior_result is not None:
+                    base_result['_prior_active_result'] = prior_result
+                    return base_result
 
                 prev_frame = curr_frame
                 k += 1
                 # A negative decision requires reaching EOF, never just the first N keyframes.
+    except MediaTerminationUnconfirmed:
+        raise
     except Exception as e:
         logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
         if first_frame is not None or sample_ts:
@@ -327,7 +343,7 @@ def _prescreen_keyframes(
 
     max_diff = max(diffs)
     # 所有检查帧均未满足局部动作条件（弥散光影已在循环中成功抑制），判定为静止
-    return {
+    result = {
         "status": "STATIC",
         "has_audio": has_audio,
         "media_duration": media_duration,
@@ -344,6 +360,15 @@ def _prescreen_keyframes(
             "sem_wait": sem_wait,
         }),
     }
+    if collect_prior_result:
+        if prior_result is None:
+            prior_result = dict(result)
+            details = json.loads(result['result_json'])
+            details['threshold'] = _calc_dynamic_threshold(threshold, mean_lumas[-1], True)
+            prior_result['result_json'] = json.dumps(details)
+        result = base_result or result
+        result['_prior_active_result'] = prior_result
+    return result
 
 
 def prescreen_file(
@@ -352,6 +377,7 @@ def prescreen_file(
     config: dict,
     gpu: str = "qsv",
     is_prior_active: bool = False,
+    prior_active_resolver: Callable[[], bool] | None = None,
 ) -> dict:
     """按需逐帧提取 + 即时早停 diff: 只要发现一次动静即终止提取，极速抛弃。"""
     det_cfg = config.get("detection", {})
@@ -375,11 +401,19 @@ def prescreen_file(
             width=width, height=height, timeout=det_cfg.get("prescreen_extract_timeout", 120.0),
             threshold=threshold,
             gpu=gpu,
-            is_prior_active=is_prior_active,
+            is_prior_active=False if prior_active_resolver is not None else is_prior_active,
+            collect_prior_result=prior_active_resolver is not None,
         )
         if kf_res.get("status") != "FALLBACK":
+            prior_result = kf_res.pop('_prior_active_result', None)
+            if prior_active_resolver is not None:
+                is_prior_active = prior_active_resolver()
+                if is_prior_active and prior_result is not None:
+                    kf_res = prior_result
             return kf_res
     elif mode == "stream_fps":
+        if prior_active_resolver is not None:
+            is_prior_active = prior_active_resolver()
         return _prescreen_stream_fps(
             filepath,
             duration,
@@ -391,6 +425,9 @@ def prescreen_file(
             timeout=det_cfg.get("prescreen_extract_timeout", 30.0),
             is_prior_active=is_prior_active,
         )
+    # Less common seek/fallback modes resolve first, before acquiring any lease.
+    if prior_active_resolver is not None:
+        is_prior_active = prior_active_resolver()
     ts_list = _calc_sample_timestamps(duration, segments, timestamp_margin)
 
     diffs: list[float] = []
@@ -521,6 +558,7 @@ def _prescreen_stream_fps(
     is_prior_active: bool = False,
 ) -> dict:
     """用单个低 FPS 解码流做预筛，避免每个采样点启动一次 seek 进程。"""
+    FFmpegProcessRegistry.reap_cleanups()
     frame_size = width * height * 3
     max_frames = max(2, segments + 1)
     sample_fps = max(1.0 / max(duration, 1.0), segments / max(duration, 1.0))
@@ -537,6 +575,9 @@ def _prescreen_stream_fps(
     diffs: list[float] = []
     sample_ts: list[float] = []
     proc: subprocess.Popen | None = None
+    stderr_thread = None
+    watchdog = None
+    expired = threading.Event()
     completed_read = False
     effective_threshold = threshold
 
@@ -546,8 +587,11 @@ def _prescreen_stream_fps(
         return {"status": "FAILED", "error": "io semaphore acquire timeout"}
     process_key = f"prescreen:{filepath}:{time.monotonic()}"
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        FFmpegProcessRegistry.register(process_key, proc)
+        try:
+            proc = FFmpegProcessRegistry.start(process_key,cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        except MediaStartTerminationUnconfirmed as error:
+            proc, process_key = error.process, error.process_key
+            raise
 
         def _read_stderr():
             if proc and proc.stderr:
@@ -559,11 +603,11 @@ def _prescreen_stream_fps(
         stream_timeout = max(timeout, min(duration * 0.5, 900.0), 60.0)
 
         def _kill_on_timeout():
+            expired.set()
             try:
-                if proc and proc.poll() is None:
-                    proc.kill()
-            except OSError:
-                pass
+                FFmpegProcessRegistry.terminate(process_key)
+            except OSError as error:
+                logger.error("prescreen watchdog stop failed for %s: %s", process_key, error)
 
         watchdog = threading.Timer(stream_timeout, _kill_on_timeout)
         watchdog.daemon = True
@@ -625,34 +669,43 @@ def _prescreen_stream_fps(
             completed_read = True
         finally:
             watchdog.cancel()
-            if proc and proc.poll() is None:
-                try:
-                    if completed_read:
-                        proc.wait(timeout=5)
-                    else:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    except OSError:
-                        pass
-            if proc and proc.stdout:
-                proc.stdout.close()
-            if proc and proc.stderr:
-                proc.stderr.close()
-            stderr_thread.join(timeout=2)
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         try:
-            if proc and proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=5)
-        finally:
-            FFmpegProcessRegistry.deregister(process_key)
-            io_sem.release()
+            if proc is not None:
+                if completed_read and not expired.is_set():
+                    try:
+                        FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                        FFmpegProcessRegistry.terminate(process_key)
+                    except subprocess.TimeoutExpired:
+                        expired.set()
+                        FFmpegProcessRegistry.terminate(process_key)
+                        FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                else:
+                    FFmpegProcessRegistry.terminate(process_key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                # Buffered pipe close can block behind an active read lock.
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=2)
+                    if stderr_thread.is_alive():
+                        raise RuntimeError("prescreen stderr reader termination unconfirmed")
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+            if proc is not None:
+                FFmpegProcessRegistry.deregister(process_key, proc)
+        except BaseException as error:
+            if proc is not None:
+                readers = () if stderr_thread is None else (stderr_thread,)
+                FFmpegProcessRegistry.defer_cleanup(process_key, proc, io_sem, readers)
+                raise MediaTerminationUnconfirmed(
+                    f"prescreen termination unconfirmed; retained original lease: {filepath}"
+                ) from error
+            raise
+        io_sem.release()
 
-    if proc and proc.returncode not in (0, None):
+    if expired.is_set() or (proc and proc.returncode not in (0, None)):
         err = "".join(stderr_lines[-5:])
         return {
             "status": "FAILED",

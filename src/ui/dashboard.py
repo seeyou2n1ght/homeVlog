@@ -155,6 +155,7 @@ def print_summary_card(
 
     # 尝试从伴随 .meta.json 中提取真实时长与指标（若未显式传入）
     meta_path = output_path.with_suffix(".meta.json")
+    by_state = {}
     if meta_path.exists() and vlog_dur is None:
         try:
             m_data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -162,6 +163,7 @@ def print_summary_card(
             vlog_dur = metrics.get("vlog_duration_s")
             dynamic_dur = metrics.get("dynamic_duration_s")
             static_dur = metrics.get("static_duration_s")
+            by_state = metrics.get("source_duration_by_state_s", {})
         except Exception:
             pass
 
@@ -188,12 +190,17 @@ def print_summary_card(
             f"[bold green]{condense_ratio:.1f}× 浓缩[/bold green] (成片时长: [cyan]{v_m:02d}分{v_s:02d}秒[/cyan])",
         )
 
-    if dynamic_dur is not None and static_dur is not None and (dynamic_dur + static_dur) > 0:
+    if by_state:
+        names = {"DYNAMIC": "动态", "DYNAMIC_AUDIO": "声音活动", "STATIC": "静态",
+                 "PRESENCE": "有人驻留", "NIGHT_STATIONARY": "夜间驻留", "MICRO_MOTION": "微动"}
+        metric_table.add_row("源时段分布", " | ".join(
+            f"{names.get(state, state)}: {duration:.1f}s" for state, duration in by_state.items()))
+    elif dynamic_dur is not None and static_dur is not None and (dynamic_dur + static_dur) > 0:
         total_content = dynamic_dur + static_dur
         dyn_pct = (dynamic_dur / total_content) * 100
         sta_pct = (static_dur / total_content) * 100
         metric_table.add_row(
-            "动态/静态分布",
+            "高光/静态子集分布",
             f"[yellow]高光动态: {dyn_pct:.1f}% ({dynamic_dur:.1f}s)[/] | [dim]静态快进: {sta_pct:.1f}% ({static_dur:.1f}s)[/dim]",
         )
 

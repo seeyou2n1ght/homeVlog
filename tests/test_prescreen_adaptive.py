@@ -23,6 +23,310 @@ from scripts.tune_thresholds import (
 )
 
 
+@pytest.mark.parametrize('failure', ['stop_timeout', 'cached_zero_live_stderr'])
+def test_stream_fps_native_unconfirmed_stop_retains_original_lease(monkeypatch, tmp_path, failure):
+    """Real Windows child, finite lifetime; injected stop failure is not kernel exit."""
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+    from pathlib import Path
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    from src.stages import prescreen
+
+    if os.name != 'nt':
+        pytest.skip('native Windows process handle verification')
+    import _winapi
+    disk = scheduler.FileBudget(1)
+    hardware = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
+    started = []
+    real_start = registry.start
+    report = {'scope': 'local Python/CPU only, injected stop no-op and wait timeout'}
+
+    def start(key, command, **kwargs):
+        # Close pipes before the injected failure, so the old close order cannot block.
+        close_stderr = 'os.close(2);' if failure == 'stop_timeout' else ''
+        child = f"import os,time; os.write(1,bytes([100]*12+[220]*12)); os.close(1); {close_stderr} time.sleep(15)"
+        proc = real_start(key, [sys.executable, '-c', child], **kwargs)
+        started.append((key, proc, proc.kill, proc.terminate, proc.wait, proc.owned_job.close))
+        monkeypatch.setattr(proc, 'kill', lambda: None)
+        monkeypatch.setattr(proc, 'terminate', lambda: None)
+        monkeypatch.setattr(proc.owned_job, 'close', lambda: None)
+        def wait(timeout=None):
+            if failure == 'cached_zero_live_stderr':
+                return 0
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        monkeypatch.setattr(proc, 'wait', wait)
+        if failure == 'cached_zero_live_stderr':
+            proc.returncode = 0  # Deliberately false cached status; same kernel stays live.
+        return proc
+
+    monkeypatch.setattr(registry, 'start', start)
+    began = time.monotonic()
+    try:
+        error = None
+        try:
+            result = prescreen._prescreen_stream_fps('local-controlled', 2, 1, 2, 2, 8.5, 'qsv', 1)
+        except BaseException as caught:
+            error, result = caught, None
+        key, proc, *_ = started[0]
+        kernel = _winapi.WaitForSingleObject(proc._handle, 0)
+        readmitted = hardware.acquire(blocking=False)
+        if readmitted:
+            hardware.release()
+        report['observation'] = dict(pid=proc.pid, handle=int(proc._handle), kernel_wait=kernel,
+            error=type(error).__name__ if error else None, result=result, wall_s=time.monotonic()-began,
+            registry_present=registry._processes.get(key) is proc, deferred=key in registry._deferred,
+            disk_available=disk.available, hardware_readmitted=readmitted, cached_returncode=proc.returncode,
+            reader_alive=[reader.is_alive() for reader in registry._deferred.get(key, {}).get('readers', [])])
+        assert kernel == _winapi.WAIT_TIMEOUT
+        assert isinstance(error, MediaTerminationUnconfirmed)
+        assert registry._processes[key] is proc
+        assert registry._deferred[key]['io_sem'].hardware is hardware
+        assert registry._deferred[key]['io_sem'].disk is disk
+        assert registry._deferred[key]['readers']
+        if failure == 'cached_zero_live_stderr':
+            assert registry._deferred[key]['readers'][0].is_alive()
+        assert disk.available == 0 and not readmitted
+        assert registry.reap_cleanups()['pending'] == [key]
+    finally:
+        for key, proc, kill, terminate, wait, close in started:
+            proc.kill, proc.terminate, proc.wait, proc.owned_job.close = kill, terminate, wait, close
+            if _winapi.WaitForSingleObject(proc._handle, 0) == _winapi.WAIT_TIMEOUT:
+                proc.returncode = None
+            if not registry.has_exited(proc):
+                kill()  # The vulnerable baseline may already have detached this key.
+            registry.terminate(key)
+            registry.wait_for_exit(proc, timeout=5)
+            close()
+            if key in registry._deferred:
+                for reader in registry._deferred[key]['readers']:
+                    reader.join(timeout=2)
+                registry.reap_cleanups()
+                assert registry.reap_cleanups()['recovered'] == []
+            elif key in registry._processes:
+                registry.deregister(key)
+            for stream in (proc.stdout, proc.stderr):
+                if stream:
+                    stream.close()
+            report['cleanup'] = dict(pid=proc.pid, kernel_wait=_winapi.WaitForSingleObject(proc._handle, 0),
+                returncode=proc.returncode, disk_available=disk.available,
+                registry_present=key in registry._processes, deferred=key in registry._deferred,
+                job_handle=int(proc.owned_job.handle or 0))
+            assert report['cleanup']['kernel_wait'] == _winapi.WAIT_OBJECT_0
+            assert disk.available == 1 and hardware.acquire(blocking=False)
+            hardware.release()
+        destination = Path(os.environ.get('HOMEVLOG_PRESCREEN_EVIDENCE', tmp_path))
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination/f'native_{failure}_receipt.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('early_positive', 'SUSPICIOUS'), ('negative', 'STATIC'),
+    ('ordinary_failure', 'FAILED'), ('first_frame_failure', 'FAILED'), ('cancelled', 'FAILED'),
+])
+def test_stream_fps_local_python_confirmed_exit_contracts(monkeypatch, case, expected):
+    import os
+    import sys
+    import threading
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    from src.stages import prescreen
+
+    disk, hardware = scheduler.FileBudget(1), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
+    started = []
+    real_start = registry.start
+    frames = [] if case in ('first_frame_failure', 'cancelled') else [100]*12 + [220 if case == 'early_positive' else 100]*12
+    code = 2 if case in ('ordinary_failure', 'first_frame_failure') else 0
+    pause = 'time.sleep(10);' if case in ('early_positive', 'cancelled') else ''
+
+    def start(key, command, **kwargs):
+        child = f"import os,time; os.write(1,bytes({frames!r})); os.write(2,b'controlled stderr\\n'); {pause} raise SystemExit({code})"
+        proc = real_start(key, [sys.executable, '-c', child], **kwargs)
+        started.append((key, proc))
+        if case == 'cancelled':
+            registry.kill_all()
+        return proc
+
+    monkeypatch.setattr(registry, 'start', start)
+    try:
+        result = prescreen._prescreen_stream_fps('local-controlled', 2, 1, 2, 2, 8.5, 'qsv', 1)
+        assert result['status'] == expected
+        key, proc = started[0]
+        assert registry.has_exited(proc)
+        assert key not in registry._processes and key not in registry._deferred
+        assert disk.available == 1 and hardware.acquire(blocking=False)
+        hardware.release()
+        assert proc.stdout.closed and proc.stderr.closed
+    finally:
+        for key, proc in started:
+            if not registry.has_exited(proc):
+                proc.kill()
+            registry.wait_for_exit(proc, timeout=5)
+            if key in registry._processes:
+                registry.terminate(key)
+                registry.deregister(key)
+            if os.name == 'nt':
+                proc.owned_job.close()
+        registry.reset_interrupted()
+
+
+def test_stream_fps_spawn_failure_releases_original_lease(monkeypatch):
+    import threading
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    from src.stages import prescreen
+
+    disk, hardware = scheduler.FileBudget(1), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
+    monkeypatch.setattr(registry, 'start', MagicMock(side_effect=OSError('controlled spawn failure')))
+    with pytest.raises(OSError, match='controlled spawn failure'):
+        prescreen._prescreen_stream_fps('local-controlled', 2, 1, 2, 2, 8.5, 'qsv', 1)
+    assert disk.available == 1 and hardware.acquire(blocking=False)
+    hardware.release()
+
+
+def test_keyframe_unconfirmed_media_stop_propagates_without_seek_fallback(monkeypatch):
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    from src.stages import prescreen
+    import av
+
+    opened = MagicMock(side_effect=MediaTerminationUnconfirmed('controlled unknown stop'))
+    monkeypatch.setattr(av, 'open', opened)
+    extract = MagicMock()
+    monkeypatch.setattr(prescreen, '_extract_frame', extract)
+    with pytest.raises(MediaTerminationUnconfirmed):
+        prescreen.prescreen_file('local-controlled', 2, {})
+    extract.assert_not_called()
+
+
+def test_extract_frame_native_unknown_stop_retains_coupled_lease(monkeypatch, tmp_path):
+    import os
+    import sys
+    import threading
+    import time
+    from pathlib import Path
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    from src.stages import prescreen
+
+    if os.name != 'nt':
+        pytest.skip('native Windows pipe readers and kernel handle verification')
+    import _winapi
+    disk, hardware = scheduler.FileBudget(1), threading.BoundedSemaphore(1)
+    acquire, release = MagicMock(wraps=disk.acquire), MagicMock(wraps=disk.release)
+    monkeypatch.setattr(disk, 'acquire', acquire)
+    monkeypatch.setattr(disk, 'release', release)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
+    started = []
+    real_start = registry.start
+    report = {'scope': '_extract_frame -> production run_ffmpeg; CPU finite local child, injected Job stop failure'}
+
+    def start(key, command, **kwargs):
+        child = "import os,time; os.write(1,bytes([100]*12)); os.write(2,b'controlled extract\\n'); time.sleep(15)"
+        proc = real_start(key, [sys.executable, '-c', child], **kwargs)
+        started.append((key, proc, proc.owned_job.close))
+        monkeypatch.setattr(proc.owned_job, 'close', MagicMock(side_effect=OSError('controlled Job stop failure')))
+        return proc
+
+    monkeypatch.setattr(registry, 'start', start)
+    began = time.monotonic()
+    try:
+        with pytest.raises(MediaTerminationUnconfirmed):
+            prescreen._extract_frame('local-controlled', 0, 2, 2, timeout=.2)
+        assert len(started) == 1  # An unknown stop cannot trigger the second seek attempt.
+        key, proc, _ = started[0]
+        item = registry._deferred[key]
+        readers = item['readers']
+        readmitted = hardware.acquire(blocking=False)
+        if readmitted:
+            hardware.release()
+        report['observation'] = dict(pid=proc.pid, kernel_wait=_winapi.WaitForSingleObject(proc._handle, 0),
+            wall_s=time.monotonic()-began, disk_available=disk.available, hardware_readmitted=readmitted,
+            reader_alive=[reader.is_alive() for reader in readers], acquire_calls=acquire.call_count,
+            release_calls=release.call_count, registry_present=registry._processes.get(key) is proc)
+        assert report['observation']['kernel_wait'] == _winapi.WAIT_TIMEOUT
+        assert isinstance(item['io_sem'], scheduler.VideoLease)
+        assert item['io_sem'].hardware is hardware and item['io_sem'].disk is disk
+        assert len(readers) == 2 and all(reader.is_alive() for reader in readers)
+        assert disk.available == 0 and not readmitted
+        acquire.assert_called_once()
+        release.assert_not_called()
+        assert key in registry.reap_cleanups()['pending']
+    finally:
+        for key, proc, close in started:
+            proc.owned_job.close = close
+            registry.terminate(key)
+            registry.wait_for_exit(proc, timeout=5)
+            if key in registry._deferred:
+                for reader in registry._deferred[key]['readers']:
+                    reader.join(timeout=2)
+                assert registry.reap_cleanups()['recovered'] == [key]
+                assert registry.reap_cleanups()['recovered'] == []
+                release.assert_called_once_with(weight=1)
+            else:
+                registry.deregister(key)
+            assert disk.available == 1 and hardware.acquire(blocking=False)
+            hardware.release()
+            report['cleanup'] = dict(pid=proc.pid, kernel_wait=_winapi.WaitForSingleObject(proc._handle, 0),
+                job_handle=int(proc.owned_job.handle or 0), disk_available=disk.available,
+                acquire_calls=acquire.call_count, release_calls=release.call_count,
+                registry_present=key in registry._processes, deferred=key in registry._deferred)
+        destination = Path(os.environ.get('HOMEVLOG_PRESCREEN_EVIDENCE', tmp_path))
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination/'native_extract_receipt.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+
+
+@pytest.mark.parametrize('case,calls', [('success', 1), ('nonzero', 2), ('short_frame', 2)])
+def test_extract_frame_local_confirmed_result_keeps_finite_retry(monkeypatch, case, calls):
+    import os
+    import sys
+    import threading
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    from src.stages import prescreen
+
+    disk, hardware = scheduler.FileBudget(1), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
+    real_start, started = registry.start, []
+    def start(key, command, **kwargs):
+        count, code = (1 if case == 'short_frame' else 12), (2 if case == 'nonzero' else 0)
+        child = f'import os; os.write(1,bytes([100]*{count})); raise SystemExit({code})'
+        proc = real_start(key, [sys.executable, '-c', child], **kwargs)
+        started.append((key, proc))
+        return proc
+    monkeypatch.setattr(registry, 'start', start)
+    try:
+        result = prescreen._extract_frame('local-controlled', 0, 2, 2, timeout=2)
+        assert len(started) == calls
+        if case == 'success':
+            assert np.array_equal(result, np.full((2, 2, 3), 100, dtype=np.uint8))
+        else:
+            assert result is None
+        assert disk.available == 1 and hardware.acquire(blocking=False)
+        hardware.release()
+        assert all(registry.has_exited(proc) and key not in registry._processes for key, proc in started)
+    finally:
+        for key, proc in started:
+            if not registry.has_exited(proc):
+                proc.kill()
+            registry.wait_for_exit(proc, timeout=5)
+            if key in registry._processes:
+                registry.terminate(key)
+                registry.deregister(key)
+            if os.name == 'nt':
+                proc.owned_job.close()
+
+
 def test_calc_dynamic_threshold():
     base_th = 8.0
 
@@ -52,6 +356,59 @@ def test_calc_dynamic_threshold():
     # 6. 先验保护下限保底 1.8
     th_prior_floor = _calc_dynamic_threshold(2.0, mean_luma=20.0, is_prior_active=True)
     assert th_prior_floor == 1.8
+
+
+@pytest.mark.parametrize('threshold,change,prior', [
+    (8.5, 13, True), (8.5, 13, False), (8.5, 20, True),
+    (8.5, 0, True), (1.0, 3, True), (1.0, 3, False),
+])
+def test_deferred_keyframe_prior_matches_serial_without_second_decode(threshold, change, prior):
+    import av
+    from fractions import Fraction
+    from src.stages import prescreen
+
+    images = [np.full((16, 16), 100, dtype=np.uint8) for _ in range(3)]
+    for image in images[1:]:
+        image[:, :8] += change
+
+    def container():
+        frames = [av.VideoFrame.from_ndarray(image, format='gray') for image in images]
+        for index, frame in enumerate(frames):
+            frame.pts = index
+        stream = MagicMock(duration=3, time_base=Fraction(1, 1))
+        result = MagicMock(duration=3_000_000)
+        result.streams.video = [stream]
+        result.streams.audio = []
+        result.decode.return_value = iter(frames)
+        return result
+
+    config = {'detection': {'prescreen_diff_threshold': threshold,
+                            'prescreen_resolution': '16x16', 'prescreen_segments': 10}}
+    semaphore = MagicMock()
+    serial = container()
+    deferred = container()
+    with patch('av.open') as opened, \
+         patch('src.hardware.scheduler.get_disk_semaphore', return_value=semaphore), \
+         patch.object(prescreen, 'acquire_with_retry', return_value=True):
+        opened.return_value.__enter__.return_value = serial
+        expected = prescreen_file('controlled.mp4', 3, config, is_prior_active=prior)
+        semaphore.reset_mock()
+        opened.reset_mock()
+        opened.return_value.__enter__.return_value = deferred
+
+        def resolve():
+            semaphore.release.assert_called_once()
+            return prior
+
+        actual = prescreen_file('controlled.mp4', 3, config, is_prior_active=not prior,
+                               prior_active_resolver=resolve)
+        opened.assert_called_once()
+        deferred.decode.assert_called_once()
+    assert actual['status'] == expected['status']
+    a, b = [json.loads(r['result_json']) for r in (actual, expected)]
+    for key in ('threshold', 'sample_ts', 'diffs', 'early_stop', 'checked_pairs'):
+        assert a[key] == b[key]
+    assert '_prior_active_result' not in actual
 
 
 def test_spatial_concentration_diffuse_vs_localized():
@@ -389,3 +746,34 @@ def test_prescreen_keyframes_error_after_samples_routes_to_suspicious():
     meta = json.loads(res["result_json"])
     assert meta.get("truncated") is True
     assert "stream_error" in meta.get("reason", "")
+
+
+def test_legacy_threshold_tool_rejects_application_before_io(tmp_path, monkeypatch):
+    from scripts import tune_thresholds as tool
+    config = tmp_path / "settings.yaml"
+    config.write_text("detection: {prescreen_diff_threshold: 8.5}\n")
+    original = config.read_bytes()
+    with pytest.raises(RuntimeError, match="disabled"):
+        tool.apply_best_config(config, None)
+    monkeypatch.setattr("sys.argv", ["tune_thresholds.py", "--apply"])
+    monkeypatch.setattr(tool, "print_dataset_summary", lambda *a: pytest.fail("database accessed"))
+    with pytest.raises(SystemExit) as stopped:
+        tool.main()
+    assert stopped.value.code == 2
+    assert config.read_bytes() == original
+    assert not config.with_suffix(".yaml.bak").exists()
+
+
+def test_legacy_threshold_partial_negative_is_not_file_truth(tmp_path):
+    import sqlite3
+    import json
+    from scripts.tune_thresholds import load_labeled_samples
+    db = tmp_path / "legacy.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript("CREATE TABLE file_tasks(id INTEGER,filepath TEXT,prescreen_result TEXT); "
+                           "CREATE TABLE segments(file_id INTEGER,manual_label TEXT);")
+        conn.execute("INSERT INTO file_tasks VALUES(1,?,?)", ("source.mp4", json.dumps({"max_diff": 5})))
+        conn.execute("INSERT INTO segments VALUES(1,'FALSE_ALARM')")
+    before = db.read_bytes()
+    assert load_labeled_samples(db) == []
+    assert db.read_bytes() == before

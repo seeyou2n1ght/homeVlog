@@ -54,14 +54,17 @@ class AuditHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_bytes(self, data: bytes, content_type: str, status: int = 200, set_token_cookie: bool = False):
+    def _send_bytes(self, data: bytes, content_type: str, status: int = 200, set_token_cookie: bool = False, no_store: bool = False):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
         if set_token_cookie:
             self.send_header(
                 "Set-Cookie",
@@ -70,24 +73,31 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file(self, file_path: Path, content_type: str, set_token_cookie: bool = False):
+    def _send_file(self, file_path: Path, content_type: str, set_token_cookie: bool = False, no_store: bool = False):
         if not file_path.exists():
             self.send_error(404, "File not found")
             return
         try:
             with open(file_path, "rb") as f:
                 content = f.read()
-            self._send_bytes(content, content_type, set_token_cookie=set_token_cookie)
+            self._send_bytes(content, content_type, set_token_cookie=set_token_cookie, no_store=no_store)
         except Exception as e:
             self.send_error(500, str(e))
 
-    def _send_video_stream(self, file_path: Path):
-        """支持 HTTP 206 Partial Content 的流式视频分发"""
-        if not file_path.exists() or not file_path.is_file():
+    def _send_video_stream(self, file_path: Path, *, expected_identity=None):
+        import os
+        try:
+            with open(file_path, "rb") as stream:
+                stat = os.fstat(stream.fileno())
+                if expected_identity and (stat.st_size != expected_identity["size"] or stat.st_mtime_ns != expected_identity["mtime_ns"]):
+                    self._send_json({"error": "Delivery changed before playback; refresh comparison"}, status=409)
+                    return
+                self._stream_open_video(stream, stat.st_size)
+        except FileNotFoundError:
             self.send_error(404, "Video file not found")
-            return
 
-        file_size = file_path.stat().st_size
+    def _stream_open_video(self, f, file_size):
+        """支持 HTTP 206 Partial Content 的流式视频分发"""
         range_header = self.headers.get("Range")
 
         if not range_header:
@@ -97,26 +107,38 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
             try:
-                with open(file_path, "rb") as f:
-                    while chunk := f.read(1024 * 1024):
-                        self.wfile.write(chunk)
+                while chunk := f.read(1024 * 1024):
+                    self.wfile.write(chunk)
             except (ConnectionResetError, BrokenPipeError):
                 pass
             return
 
+        # Only one byte range is supported. Reject malformed/empty ranges before
+        # sending headers, and clamp a satisfiable end to the representation size.
+        import re
+        match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", range_header.strip(), re.IGNORECASE)
         try:
-            range_val = range_header.strip().lower()
-            if not range_val.startswith("bytes="):
-                self.send_error(416, "Requested Range Not Satisfiable")
-                return
-            range_spec = range_val[6:].strip()
-            parts = range_spec.split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-            if start >= file_size or end >= file_size or start > end:
-                self.send_error(416, "Requested Range Not Satisfiable")
-                return
+            if match is None or file_size == 0:
+                raise ValueError("Invalid byte range")
+            first, last = match.groups()
+            if not first:
+                suffix = int(last)
+                if suffix <= 0:
+                    raise ValueError("Empty suffix")
+                start, end = max(0, file_size - suffix), file_size - 1
+            else:
+                start = int(first)
+                end = min(int(last), file_size - 1) if last else file_size - 1
+                if start >= file_size or start > end:
+                    raise ValueError("Unsatisfiable range")
+        except ValueError:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
+        try:
             chunk_len = end - start + 1
             self.send_response(206)
             self.send_header("Content-Type", "video/mp4")
@@ -125,16 +147,15 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
 
-            with open(file_path, "rb") as f:
-                f.seek(start)
-                remaining = chunk_len
-                while remaining > 0:
-                    read_bytes = min(remaining, 1024 * 1024)
-                    data = f.read(read_bytes)
-                    if not data:
-                        break
-                    self.wfile.write(data)
-                    remaining -= len(data)
+            f.seek(start)
+            remaining = chunk_len
+            while remaining > 0:
+                read_bytes = min(remaining, 1024 * 1024)
+                data = f.read(read_bytes)
+                if not data:
+                    break
+                self.wfile.write(data)
+                remaining -= len(data)
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as e:
@@ -206,6 +227,74 @@ class AuditHandler(BaseHTTPRequestHandler):
             cam_int = int(cam) if cam is not None else None
             self._send_json(service.get_anomalies(category=cat, date=dt, cam_index=cam_int, limit=limit, offset=offset))
             return
+        elif path == "/api/review_queue":
+            try:
+                def parameter(name, default=None):
+                    return params.get(name, [default])[0]
+                date = parameter("date")
+                if date:
+                    from datetime import datetime
+                    if len(date) != 8:
+                        raise ValueError("Date must be YYYYMMDD")
+                    datetime.strptime(date, "%Y%m%d")
+                camera = int(parameter("cam_index")) if parameter("cam_index") else None
+                if camera is not None and camera < 0:
+                    raise ValueError("Camera must be nonnegative")
+                self._send_json(service.get_review_queue(
+                    category=parameter("category", "gold_candidates"), date=date, cam_index=camera,
+                    state=parameter("state"), scenario=parameter("scenario"), search=parameter("search", ""),
+                    hide_reviewed=parameter("hide_reviewed", "0") == "1", limit=int(parameter("limit", "50")),
+                    offset=int(parameter("offset", "0")), seed=int(parameter("seed", "0")),
+                    reference_id=int(parameter("reference_id")) if parameter("reference_id") else None))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+        elif path in ("/api/agent_target_review", "/api/agent_target_image"):
+            try:
+                segment_id = int(params.get("segment_id", ["0"])[0])
+                if path == "/api/agent_target_review":
+                    self._send_json(service.get_agent_target_proposal(segment_id))
+                else:
+                    _, payload, snapshot, _ = service._agent_proposal_frame(segment_id)
+                    if params.get("snapshot", [""])[0] != snapshot:
+                        self._send_json({"error": "智能体建议已变化，请重新打开"}, status=409)
+                    else:
+                        self._send_bytes(payload, "image/jpeg", no_store=True)
+            except (ValueError, TypeError, KeyError, OSError) as error:
+                self._send_json({"error": str(error)}, status=409)
+            return
+        elif path in ("/api/target_review", "/api/target_image"):
+            try:
+                segment_id = int(params.get("segment_id", ["0"])[0])
+                context = service.get_target_review(segment_id)
+                if path == "/api/target_review":
+                    self._send_json(context)
+                else:
+                    _, payload, _, snapshot, _ = service._target_frame(segment_id)
+                    if params.get("snapshot", [""])[0] != snapshot:
+                        self._send_json({"error": "归档帧已变化，请重新打开"}, status=409)
+                    else:
+                        self._send_bytes(payload, "image/jpeg", no_store=True)
+            except (ValueError, TypeError, KeyError, OSError) as error:
+                self._send_json({"error": str(error)}, status=400)
+            return
+
+        elif path in ("/api/delivery_comparison", "/api/delivery_stream"):
+            try:
+                segment_id = int(params.get("segment_id", [""])[0])
+                comparison = service.get_delivery_comparison(segment_id)
+                if path == "/api/delivery_comparison":
+                    self._send_json(comparison)
+                else:
+                    version_id = params.get("version_id", [""])[0]
+                    version = next((item for item in comparison["versions"] if item["version_id"] == version_id), None)
+                    if not version:
+                        self._send_json({"error": "Delivery changed or unavailable; refresh comparison"}, status=409)
+                    else:
+                        self._send_video_stream(Path(version["filepath"]), expected_identity=version["media_identity"])
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         elif path == "/api/file_segments":
             fid = params.get("file_id", [None])[0]
             fp = params.get("filepath", [None])[0]
@@ -224,7 +313,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             out = service.extract_frame(fp, t, width=w)
             if out and out.exists():
-                self._send_file(out, "image/jpeg")
+                self._send_file(out, "image/jpeg", no_store=True)
             else:
                 self.send_error(404, "Frame extraction failed")
             return
@@ -240,7 +329,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             out = service.generate_preview_clip(fp, st, et)
             if out and out.exists():
-                self._send_file(out, "image/webp")
+                self._send_file(out, "image/webp", no_store=True)
             else:
                 self.send_error(404, "Clip generation failed")
             return
@@ -274,11 +363,30 @@ class AuditHandler(BaseHTTPRequestHandler):
         elif path == "/api/tuning_insights":
             self._send_json(service.get_tuning_insights())
             return
+        elif path == "/api/review_context":
+            try:
+                segment_id = int(params.get("segment_id", [0])[0])
+                self._send_json(service.get_review_context(segment_id))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         elif path == "/api/rerender_status":
             dt = params.get("date", [""])[0]
             cam = int(params.get("cam_index", [0])[0])
             st = rerender_mgr.get_status(dt, cam)
             self._send_json(st)
+            return
+        elif path == "/api/rerender_plan":
+            from scripts.audit_tool.rerender import inspect_review_render
+            dt = params.get("date", [""])[0]
+            cam = int(params.get("cam_index", [0])[0])
+            if len(dt) != 8 or not dt.isdigit() or cam < 0:
+                self.send_error(400, "Invalid date or camera")
+                return
+            try:
+                self._send_json(inspect_review_render(service.db, dt, cam))
+            except Exception as exc:
+                self._send_json({"status": "UNAVAILABLE", "error": str(exc)}, status=409)
             return
         elif path == "/api/archive_stats":
             self._send_json(service.get_archive_stats())
@@ -340,11 +448,31 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Invalid JSON"}, status=400)
             return
 
-        if path == "/api/review":
+        if path == "/api/index_visual_source":
+            try:
+                segment_id = int(payload.get("segment_id",0))
+                segment = service.db.get_segment_by_id(segment_id)
+                if not segment:
+                    raise ValueError("Unknown segment")
+                from src.core.visual_index import index_source
+                self._send_json({"success":True,**index_source(service.db,segment["filepath"])})
+            except (ValueError,TypeError) as exc:
+                self._send_json({"error":str(exc)},status=400)
+            except Exception as exc:
+                logger.exception("Visual source indexing failed")
+                self._send_json({"error":str(exc)},status=503)
+            return
+        elif path == "/api/review":
             seg_id = payload.get("segment_id")
             label = payload.get("manual_label")
             notes = payload.get("notes", "")
             scenario = payload.get("scenario", "")
+            if "review_basis" in payload:
+                from scripts.audit_tool.service import REVIEW_BASES
+                basis = payload["review_basis"]
+                if not isinstance(basis, str) or basis not in REVIEW_BASES or "scenario" not in payload or "notes" not in payload:
+                    self._send_json({"error": "review_basis requires a valid value and explicit scenario/notes"}, status=400)
+                    return
             if not seg_id or not label:
                 self._send_json({"error": "Missing segment_id or manual_label"}, status=400)
                 return
@@ -353,11 +481,16 @@ class AuditHandler(BaseHTTPRequestHandler):
                 str(label),
                 notes=str(notes),
                 scenario=str(scenario),
+                preserve_attribution="notes" not in payload and "scenario" not in payload,
+                review_basis=payload.get("review_basis"),
             )
             self._send_json({"success": ok})
             return
 
         elif path == "/api/batch_review":
+            if "review_basis" in payload:
+                self._send_json({"error": "Save review_basis individually; batch decisions preserve each existing basis"}, status=400)
+                return
             seg_ids = payload.get("segment_ids", [])
             label = payload.get("manual_label")
             notes = payload.get("notes", "")
@@ -370,6 +503,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 str(label),
                 notes=str(notes),
                 scenario=str(scenario),
+                preserve_attribution="notes" not in payload and "scenario" not in payload,
             )
             self._send_json({"success": count > 0, "count": count})
             return
@@ -398,11 +532,29 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_json(res)
             return
 
+        elif path in ("/api/save_target_review", "/api/prepare_target_frame"):
+            try:
+                segment_id = int(payload["segment_id"])
+                if path == "/api/prepare_target_frame":
+                    result = service.prepare_target_frame(segment_id)
+                else:
+                    result = service.save_target_review(
+                        segment_id, snapshot=payload.get("snapshot"), review_sha256=payload.get("review_sha256"),
+                        boxes=payload.get("boxes"), decision=payload.get("decision"),
+                        all_targets_reviewed=payload.get("all_targets_reviewed"))
+                self._send_json(result)
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+                self._send_json({"error": str(error)}, status=409)
+            return
+
         elif path == "/api/export_yolo_dataset":
-            val_ratio = float(payload.get("val_ratio", 0.2))
-            out_dir = payload.get("output_dir")
-            res = service.export_yolo_dataset(val_ratio=val_ratio, output_dir=out_dir)
-            self._send_json(res)
+            try:
+                val_ratio = float(payload.get("val_ratio", 0.2))
+                out_dir = payload.get("output_dir")
+                res = service.export_yolo_dataset(val_ratio=val_ratio, output_dir=out_dir)
+                self._send_json(res)
+            except (ValueError, TypeError, OSError) as error:
+                self._send_json({"error": str(error)}, status=400)
             return
 
         elif path == "/api/export_gold_benchmark":
@@ -415,7 +567,12 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/tuning_simulate":
             cand = payload.get("candidate_params", {})
-            res = service.simulate_tuning(cand)
+            from src.core.tuner import ConfigurationConflict
+            try:
+                res = service.simulate_tuning(cand, expected_sha256=payload.get("expected_sha256"))
+            except ConfigurationConflict as exc:
+                self._send_json({"verdict": "UNAVAILABLE", "error": str(exc)}, status=409)
+                return
             self._send_json(res)
             return
 
@@ -427,7 +584,19 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/tuning_apply":
             cand = payload.get("params", {})
-            res = service.apply_tuning(cand)
+            from src.core.tuner import ConfigurationConflict
+            try:
+                res = service.apply_tuning(cand, expected_sha256=payload.get("expected_sha256"))
+            except ConfigurationConflict as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            except (ValueError, TypeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except OSError as exc:
+                logger.exception("Configuration apply failed")
+                self._send_json({"error": str(exc)}, status=500)
+                return
             self._send_json(res)
             return
 
@@ -460,7 +629,12 @@ class AuditHandler(BaseHTTPRequestHandler):
             if not dt:
                 self._send_json({"error": "Missing date"}, status=400)
                 return
-            res = rerender_mgr.start_rerender(service.db, dt, cam, output_version=version)
+            snapshot = payload.get("expected_snapshot")
+            if snapshot is not None and (not isinstance(snapshot, str) or len(snapshot) != 64
+                                         or any(char not in "0123456789abcdef" for char in snapshot)):
+                self._send_json({"error": "Invalid review snapshot"}, status=400)
+                return
+            res = rerender_mgr.start_rerender(service.db, dt, cam, output_version=version, expected_snapshot=snapshot)
             self._send_json(res)
             return
 
@@ -483,7 +657,11 @@ class AuditHandler(BaseHTTPRequestHandler):
             if not fp or not service.is_registered_filepath(fp):
                 self._send_json({"error": "Invalid or unregistered filepath"}, status=400)
                 return
-            ok = service.exclude_file(fp, reason=reason)
+            try:
+                ok = service.exclude_file(fp, reason=reason)
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
             self._send_json({"success": ok})
             return
 

@@ -21,6 +21,121 @@ from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
 
 
+@pytest.mark.parametrize('stage',['prescreen','analysis','audio_gate'])
+@pytest.mark.parametrize('render_enabled',[False,True])
+@pytest.mark.parametrize('persist_failure',[False,True])
+def test_unconfirmed_source_reader_stops_day_before_next_source(delivery_workspace, monkeypatch, stage, render_enabled, persist_failure):
+    import sqlite3
+    from src.hardware.ffmpeg import FFmpegProcessRegistry,MediaTerminationUnconfirmed
+    from src.hardware.render_cache import processing_fingerprint
+    w=delivery_workspace
+    w.config.update(pipeline={'render_start_delay':0,'prescreen_gpu_policy':'qsv_only','analysis_gpu_policy':'qsv_only'},
+        detection={'prescreen_parallel':1,'analysis_max_workers':1},yolo={'enabled':False},
+        audio_vad={'prescreen_audio_gate':stage=='audio_gate'})
+    second=w.source.with_name('second.mp4');second.write_bytes(b'controlled second source')
+    w.db.add_file_task(str(second),0,'20260901','20260901000100','20260901000200',60)
+    for source in (w.source,second):
+        w.db.set_prescreen_result(str(source),'SUSPICIOUS' if stage=='analysis' else 'PENDING')
+        w.db.set_processing_fingerprint(str(source),processing_fingerprint(source,w.config))
+    objects=[];calls=[]
+    def factory(*args,**kwargs):
+        instance=StreamingOrchestrator(*args,**kwargs);objects.append(instance);return instance
+    def fail(*args,**kwargs):
+        calls.append(args[0]['filepath'] if stage=='analysis' else args[0])
+        raise MediaTerminationUnconfirmed('controlled source reader still alive')
+    monkeypatch.setattr(w.pipeline,'StreamingOrchestrator',factory)
+    if stage=='prescreen':
+        monkeypatch.setattr(w.pipeline,'prescreen_file',fail)
+    elif stage=='audio_gate':
+        monkeypatch.setattr(w.pipeline,'prescreen_file',lambda *a,**k:dict(status='STATIC',has_audio=1))
+        monkeypatch.setattr(w.pipeline,'detect_audio_activity',fail)
+    else:
+        monkeypatch.setattr(StreamingOrchestrator,'_execute_analysis_task',lambda self,*a,**k:fail(*a,**k))
+    if persist_failure:
+        setter='set_analysis_result' if stage=='analysis' else 'set_prescreen_result'
+        original=getattr(w.db,setter)
+        def cannot_persist(filepath,status,*args,**kwargs):
+            if status=='FAILED':
+                raise sqlite3.OperationalError('controlled FAILED persistence failure')
+            return original(filepath,status,*args,**kwargs)
+        monkeypatch.setattr(w.db,setter,cannot_persist)
+    concat=MagicMock(side_effect=AssertionError('Source with unknown stop reached delivery'))
+    monkeypatch.setattr(w.pipeline,'concat_output_files',concat)
+    with patch.object(FFmpegProcessRegistry,'mark_interrupted') as mark,patch.object(FFmpegProcessRegistry,'kill_all') as stop:
+        with pytest.raises(MediaTerminationUnconfirmed):
+            process_date_cam(w.db,'20260901',0,dashboard_enabled=False,skip_render=not render_enabled)
+        mark.assert_called_once()
+        stop.assert_called()
+    assert calls==[str(w.source)]
+    assert objects[0].abort_event.is_set() and objects[0].stop_event.is_set() and objects[0]._media_cleanup_failure
+    concat.assert_not_called()
+    if render_enabled:
+        assert w.db.conn.execute('SELECT status FROM render_tasks').fetchone()[0]=='FAILED'
+    status_key='analysis_status' if stage=='analysis' else 'prescreen_status'
+    if persist_failure:
+        assert any('FAILED persistence failed' in error for error in objects[0].errors)
+        assert w.db.get_file_task(str(w.source))[status_key]!='FAILED'
+    else:
+        assert w.db.get_file_task(str(w.source))[status_key]=='FAILED'
+    assert w.db.get_file_task(str(second))[status_key]=='PENDING'
+    assert {p:p.read_bytes() for p in w.original}==w.original
+
+
+@pytest.mark.parametrize('policy', ['nv_only', 'qsv_only', 'heterogeneous'])
+def test_unconfirmed_render_stop_aborts_without_hardware_retry(tmp_path, monkeypatch, policy):
+    from src.stages.renderer import RenderTerminationUnconfirmed
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    from src.hardware.scheduler import DualEndedBatchQueue
+    db=VlogDatabase(tmp_path/'unconfirmed.sqlite')
+    db.add_file_task('source.mp4',0,'20260901','20260901000000','20260901000100',60)
+    db.set_prescreen_result('source.mp4','STATIC')
+    config={'pipeline':{'render_start_delay':0,'render_gpu_policy':policy},
+            'render':{'batch_max_files':1,'max_concurrency':1,'local_staging_enabled':False}}
+    orch=StreamingOrchestrator(db,'20260901',0,config,dashboard_enabled=False)
+    completed=tmp_path/'completed.mp4';completed.write_bytes(b'previous completed batch')
+    orch.batch_paths=[(-1,str(completed))]
+    orch.render_batch_queue.put({'filepath':'source.mp4','status':'STATIC'})
+    orch.stop_event.set()
+    calls=[]
+    def render(*args,**kwargs):
+        calls.append(args[2])
+        raise RenderTerminationUnconfirmed('controlled unresolved render reader')
+    # Force the initial light batch to QSV under heterogeneous policy, then
+    # reject any attempted failover. This is an orchestrator contract test.
+    if policy=='heterogeneous':
+        monkeypatch.setattr(DualEndedBatchQueue,'pop_heaviest',lambda *args,**kwargs: None)
+    monkeypatch.setattr('src.pipeline.build_batch_render',render)
+    with patch.object(FFmpegProcessRegistry,'mark_interrupted') as mark, patch.object(FFmpegProcessRegistry,'kill_all') as stop:
+        worker=threading.Thread(target=orch._render_manager,daemon=True)
+        try:
+            worker.start();worker.join(5)
+            assert not worker.is_alive()
+            assert len(calls)==1
+            assert orch.abort_event.is_set() and orch.render_finished_event.is_set()
+            assert len(orch.errors)==1 and orch.errors[0].startswith('render batch 0 cleanup unconfirmed:')
+            assert orch._media_cleanup_failure
+            assert 'controlled unresolved render reader' in orch.errors[0]
+            assert orch._render_interruption_reason is None  # failure, not external cancellation
+            assert orch.batch_paths==[(-1,str(completed))]
+            assert completed.read_bytes()==b'previous completed batch'
+            mark.assert_called_once();stop.assert_called_once()
+            assert db.conn.execute('SELECT status FROM render_tasks').fetchone() is None
+        finally:
+            orch.abort_event.set();worker.join(5);db.close()
+
+
+def test_unconfirmed_stop_prevents_delivery_commit(delivery_workspace, monkeypatch):
+    w=delivery_workspace
+    w.orch.errors=['render batch 0 termination unconfirmed; retained resources']
+    concat=MagicMock(side_effect=AssertionError('Unconfirmed reader reached delivery'))
+    monkeypatch.setattr(w.pipeline,'concat_output_files',concat)
+    assert not process_date_cam(w.db,'20260901',0,dashboard_enabled=False)
+    assert w.db.conn.execute('SELECT status FROM render_tasks').fetchone()[0]=='FAILED'
+    concat.assert_not_called()
+    assert {p:p.read_bytes() for p in w.original}==w.original
+    assert all(p.read_bytes()==b'new media' for p in w.batches)
+
+
 @pytest.mark.parametrize("outcome", ["failed", "exception", "cancelled"])
 def test_final_concat_failure_and_cancellation_are_measured(tmp_path, outcome):
     from src.monitor import PerfCollector
@@ -121,6 +236,36 @@ def test_analysis_result_survives_queue_metrics(tmp_path, with_labels):
         db.close()
 
 
+@pytest.mark.parametrize("audio_fast_path", [False, True])
+def test_derived_visual_index_published_only_after_current_source_decode(tmp_path, audio_fast_path):
+    import numpy as np
+    from src.core.visual_index import source_identity, frame_signature
+    from src.monitor import PerfCollector
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"source")
+    filepath = str(source)
+    db = VlogDatabase(tmp_path / "visual.db")
+    try:
+        db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000010", 10)
+        orch = StreamingOrchestrator(db, "20260901", 0, {}, render_enabled=False, dashboard_enabled=False)
+        labels = [{"time": float(t), "state": "DYNAMIC", "energy": 8, "raw_energy": 8} for t in range(11)]
+        detector = SimpleNamespace(analyze=lambda *a, **k: (labels, {}), decode_gpu="cpu", last_perf={}, fps=1,
+                                   visual_source=source_identity(filepath),
+                                   visual_samples=[(5, frame_signature(np.zeros((16,16),np.uint8)))])
+        task = {"file_duration": 10}
+        if audio_fast_path:
+            task.update(is_audio_gated_static=True, audio_events=[(2, 8)])
+        orch._execute_analysis_task(task, filepath, 0, detector, None, "cpu", PerfCollector(), time.monotonic())
+        rows = db.conn.execute("SELECT * FROM visual_features").fetchall()
+        if audio_fast_path:
+            assert rows == []  # Reused detector must not leak its previous source samples.
+        else:
+            assert len(rows) == 1 and rows[0]["origin"] == "single_pass_analysis"
+            assert rows[0]["filepath"] == filepath
+    finally:
+        db.close()
+
+
 def test_cancelled_analysis_keeps_task_pending(tmp_path):
     from types import SimpleNamespace
     from src.monitor import PerfCollector
@@ -193,7 +338,8 @@ def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
         out = tmp_path / "day.mp4"
         out.write_bytes(b"placeholder")
         media_metrics = {}
-        with patch.object(db, "sync_timeline_segments") as sync, patch("src.stages.companion.get_duration", return_value=12.2501) as probe:
+        with patch.object(db, "sync_timeline_segments") as sync, patch("src.stages.companion.get_duration", return_value=12.2501) as probe, \
+             patch("src.stages.companion.bind_delivery_mapping", return_value={"status": "AVAILABLE"}):
             assert _save_vlog_companion_assets(
                 out, "20260901", 0, "camera", 1, 20, 1, db,
                 {"render": {"generate_subtitles": False, "speed_ramping_enabled": False}},
@@ -435,6 +581,7 @@ class TestProcessDateCamPipeline:
                  patch("src.pipeline._dump_perf"), \
                  patch("src.core.utils.cleanup_staging_files"), \
                  patch("src.stages.companion.get_duration", return_value=300.0) as probe, \
+                 patch("src.stages.companion.bind_delivery_mapping", return_value={"status": "AVAILABLE"}), \
                  patch("src.pipeline.print_startup_banner"), \
                  patch("src.pipeline.print_summary_card"):
                 ok = process_date_cam(db, "20260901", 0, skip_render=False, dashboard_enabled=False)
@@ -858,6 +1005,107 @@ def test_prescreen_audio_gate_disabled_by_default(tmp_path):
     db.close()
 
 
+@pytest.mark.parametrize('prior_status', ['SUSPICIOUS', 'STATIC', 'FAILED', 'exception'])
+@pytest.mark.parametrize('prior_slow', [False, True])
+def test_prescreen_prior_classification_independent_of_completion_order(tmp_path, prior_status, prior_slow):
+    db = VlogDatabase(tmp_path / 'ordered_prior.db')
+    for name, start in [('prior.mp4', '000000'), ('current.mp4', '000100')]:
+        db.add_file_task(name, 0, '20260901', '20260901' + start, '20260901000200', 60)
+    orch = StreamingOrchestrator(db, '20260901', 0,
+        {'detection': {'prescreen_parallel': 2}, 'audio_vad': {'prescreen_audio_gate': False}},
+        render_enabled=False, dashboard_enabled=False)
+    orch._prev_task_map['current.mp4'] = 'prior.mp4'
+    orch.stop_event.set()
+    current_sampled, release_prior = threading.Event(), threading.Event()
+    observed = []
+
+    def sample(filepath, *_args, prior_active_resolver, is_prior_active, **_kwargs):
+        if filepath == 'prior.mp4':
+            if prior_slow:
+                assert release_prior.wait(5)
+            if prior_status == 'exception':
+                raise OSError('controlled predecessor read failure')
+            return {'status': prior_status, 'result_json': '{}'}
+        current_sampled.set()
+        active = prior_active_resolver() if prior_active_resolver else is_prior_active
+        observed.append(active)
+        return {'status': 'SUSPICIOUS' if active else 'STATIC', 'result_json': '{}'}
+
+    threads = []
+    try:
+        with patch('src.pipeline.prescreen_file', side_effect=sample), \
+             patch('src.hardware.render_cache.processing_fingerprint', return_value='controlled'), \
+             patch('src.pipeline.FFmpegProcessRegistry.is_interrupted', return_value=False):
+            orch.prescreen_queue.put({'filepath': 'prior.mp4', 'file_duration': 60})
+            if prior_slow:
+                orch.prescreen_queue.put({'filepath': 'current.mp4', 'file_duration': 60})
+            first = threading.Thread(target=orch._prescreen_worker, args=('cpu',))
+            threads.append(first)
+            first.start()
+            if not prior_slow:
+                first.join(5)
+                assert not first.is_alive()
+                orch.prescreen_queue.put({'filepath': 'current.mp4', 'file_duration': 60})
+            second = threading.Thread(target=orch._prescreen_worker, args=('cpu',))
+            threads.append(second)
+            second.start()
+            assert current_sampled.wait(5)
+            if prior_slow:
+                assert not observed  # parallel sample completed before predecessor publication
+            release_prior.set()
+            for thread in threads:
+                thread.join(5)
+                assert not thread.is_alive()
+        assert observed == [prior_status == 'SUSPICIOUS']
+        assert db.get_file_task('current.mp4')['prescreen_status'] == (
+            'SUSPICIOUS' if prior_status == 'SUSPICIOUS' else 'STATIC')
+        assert orch.prescreen_queue.unfinished_tasks == 0
+    finally:
+        release_prior.set()
+        orch.abort_event.set()
+        for thread in threads:
+            thread.join(5)
+        db.close()
+
+
+def test_prescreen_prior_resume_and_cancellation(tmp_path):
+    db = VlogDatabase(tmp_path / 'prior_resume.db')
+    try:
+        orch = StreamingOrchestrator(db, '20260901', 0, {}, render_enabled=False, dashboard_enabled=False)
+        orch._prev_task_map['current.mp4'] = 'prior.mp4'
+        orch._prescreen_results['prior.mp4'] = 'SUSPICIOUS'
+        assert orch._await_prior_prescreen('current.mp4')
+        assert not orch._await_prior_prescreen('first.mp4')
+        del orch._prescreen_results['prior.mp4']
+        orch.abort_event.set()
+        with pytest.raises(InterruptedError, match='cancelled'):
+            orch._await_prior_prescreen('current.mp4')
+    finally:
+        db.close()
+
+
+def test_ordered_prescreen_cache_revision_invalidates_only_requested_day(tmp_path):
+    from src.hardware.render_cache import processing_fingerprint, render_fingerprint
+    db = VlogDatabase(tmp_path / 'prior_cache.db')
+    config = {'detection': {'prescreen_diff_threshold': 8.5}}
+    selected = {key: config.get(key, {}) for key in
+                ('detection', 'yolo', 'audio_vad', 'segment', 'presence', 'micro_motion')}
+    try:
+        for date in ('20260901', '20260902'):
+            source = str(tmp_path / (date + '.mp4'))
+            db.add_file_task(source, 0, date, date + '000000', date + '000100', 60)
+            db.set_prescreen_result(source, 'STATIC')
+            old = render_fingerprint([source], 'analysis-v4-window-evidence', 'analysis', 0, {}, {}, selected)
+            assert old != processing_fingerprint(source, config)
+            db.set_processing_fingerprint(source, old)
+        peer_before = db.get_all_file_tasks_for_date('20260902', 0)
+        assert db.invalidate_stale_results('20260901', 0, config) == 1
+        assert db.get_all_file_tasks_for_date('20260901', 0)[0]['prescreen_status'] == 'PENDING'
+        assert db.get_all_file_tasks_for_date('20260902', 0) == peer_before
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("events", [[], [(10.0, 15.0, -28.0)]])
 def test_prescreen_audio_gate_enabled_wakes_up_suspicious(tmp_path, events):
     """验证当启用 prescreen_audio_gate 时，画面静态但有声音事件的文件被成功唤醒为 SUSPICIOUS。"""
@@ -935,6 +1183,38 @@ def test_cached_active_states_keep_fresh_queue_weight(tmp_path, state):
         db.close()
 
 
+@pytest.mark.parametrize('subtitles', [False, True])
+def test_unavailable_delivery_mapping_preserves_companions_and_metrics(tmp_path, subtitles):
+    from src.stages.companion import save_vlog_companion_assets
+    out = tmp_path / 'day.mp4'
+    out.write_bytes(b'controlled invalid clock')
+    original = {out.with_suffix('.meta.json'): b'old metadata', out.with_suffix('.srt'): b'old subtitles'}
+    for path, content in original.items():
+        path.write_bytes(content)
+    metrics = {}
+    with patch('src.stages.companion.build_timeline_from_rows', return_value=[]), \
+         patch('src.stages.companion.bind_delivery_mapping', return_value={'status': 'UNAVAILABLE', 'reason': 'PTS jump'}), \
+         patch('src.stages.companion.save_timecode_subtitles') as save_subtitles:
+        assert not save_vlog_companion_assets(out, '20260901', 0, 'camera', 1, 20, 1,
+                                              MagicMock(), {'render': {'generate_subtitles': subtitles}}, rows=[],
+                                              media_metrics=metrics)
+    assert metrics == {}
+    save_subtitles.assert_not_called()
+    assert {path: path.read_bytes() for path in original} == original
+    assert not list(tmp_path.glob('*.tmp'))
+
+
+def test_invalid_mapping_blocks_pipeline_completion_and_retains_batches(delivery_workspace, monkeypatch):
+    w = delivery_workspace
+    monkeypatch.setattr('src.stages.companion.bind_delivery_mapping',
+                        lambda *args: {'status': 'UNAVAILABLE', 'reason': 'PTS jump'})
+    assert not w.pipeline.process_date_cam(w.db, '20260901', 0, dashboard_enabled=False)
+    assert not w.db.is_render_completed('20260901', 0)
+    assert {path: path.read_bytes() for path in w.original} == w.original
+    assert all(batch.exists() for batch in w.batches)
+    assert not list(w.output.parent.glob('*.pending.*'))
+
+
 @pytest.mark.parametrize("failure", ["probe", "commit"])
 def test_companion_failure_does_not_publish_reusable_media_metrics(tmp_path, failure):
     from src.stages.companion import save_vlog_companion_assets
@@ -943,6 +1223,7 @@ def test_companion_failure_does_not_publish_reusable_media_metrics(tmp_path, fai
     media_metrics = {}
     with patch("src.stages.companion.get_duration", return_value=0 if failure == "probe" else 12.2501), \
          patch("src.stages.companion.build_timeline_from_rows", return_value=[]), \
+         patch("src.stages.companion.bind_delivery_mapping", return_value={"status": "AVAILABLE"}), \
          patch("pathlib.Path.replace", side_effect=OSError("commit failed")):
         assert not save_vlog_companion_assets(
             out, "20260901", 0, "camera", 1, 20, 1, MagicMock(),
@@ -960,6 +1241,70 @@ def test_headline_standalone_probe_and_failure_behavior(tmp_path):
         probe.assert_called_once()
     with patch("src.stages.companion.get_duration", side_effect=OSError("probe failed")):
         assert "output_dur_s" not in build_headline(out, 20, 1)
+
+
+@pytest.mark.parametrize("calibrated_duration", [20.0, 0.0])
+def test_delivery_metrics_use_duration_calibrated_during_analysis(delivery_workspace, calibrated_duration, monkeypatch):
+    w = delivery_workspace
+    measured={}
+    save_assets=w.pipeline._save_vlog_companion_assets
+    def capture_assets(**kwargs):
+        measured['elapsed']=kwargs['elapsed_wall']
+        return save_assets(**kwargs)
+    monkeypatch.setattr(w.pipeline,'_save_vlog_companion_assets',capture_assets)
+    def finish_analysis():
+        w.db.set_file_metadata(str(w.source), has_audio=0, duration=calibrated_duration)
+        return w.batches
+    w.orch.run.side_effect = finish_analysis
+    assert w.pipeline.process_date_cam(w.db, "20260901", 0, dashboard_enabled=False)
+    import json
+    meta = json.loads(w.output.with_suffix(".meta.json").read_text(encoding="utf-8"))
+    assert meta["metrics"]["raw_duration_s"] == calibrated_duration
+    assert meta['performance']['wall_clock_s']==round(measured['elapsed'],2)
+    assert meta["performance"]["speedup_x"] == round(
+        calibrated_duration / max(measured['elapsed'], 0.1), 2)
+
+
+@pytest.mark.parametrize('shared',['database','batches','delivery'])
+def test_real_process_day_ownership_and_force_kill_release(tmp_path,external_day_owner,shared):
+    from src.core.process_lock import day_task_lease
+    database=tmp_path/'a'/'state.sqlite';temporary=tmp_path/'temp_a';output=tmp_path/'out_a'/'day.mp4'
+    owner=external_day_owner(database,temporary,output)
+    other_database=database if shared=='database' else tmp_path/'b'/'state.sqlite'
+    other_temporary=temporary if shared=='batches' else tmp_path/'temp_b'
+    other_output=output if shared=='delivery' else tmp_path/'out_b'/'day.mp4'
+    date='20260902' if shared in ('delivery','batches') else '20260901'
+    with pytest.raises(RuntimeError,match='already owned'):
+        with day_task_lease(other_database,other_temporary,other_output,date,0):
+            pytest.fail('second process must not enter shared work')
+    if shared=='delivery':
+        # A later-resource conflict must release resources already acquired.
+        with day_task_lease(other_database,other_temporary,tmp_path/'out_c'/'day.mp4',date,0):pass
+    owner.kill();owner.communicate(timeout=5)
+    with day_task_lease(other_database,other_temporary,other_output,date,0):pass
+    assert list(tmp_path.rglob('*.lock'))  # Stale names do not block recovery.
+
+
+def test_main_day_conflict_precedes_persistent_mutation(delivery_workspace,external_day_owner,monkeypatch):
+    from src.stages import renderer
+    w=delivery_workspace
+    external_day_owner(w.db.db_path,renderer.TEMP_DIR,w.output)
+    monkeypatch.setattr(w.db,'invalidate_stale_results',lambda *args:pytest.fail('must acquire before invalidation'))
+    monkeypatch.setattr(w.db,'reset_failed_tasks',lambda *args:pytest.fail('must acquire before retry state mutation'))
+    with pytest.raises(RuntimeError,match='already owned'):
+        w.pipeline.process_date_cam(w.db,'20260901',0,dashboard_enabled=False)
+    w.orch.run.assert_not_called()
+    for path,content in w.original.items():assert path.read_bytes()==content
+
+
+def test_cleanup_cannot_delete_an_owned_workspace(delivery_workspace,external_day_owner):
+    from src.core import utils
+    w=delivery_workspace
+    external_day_owner(w.db.db_path,utils.TEMP_DIR,w.output)
+    batch=utils.TEMP_DIR/'_batch_active.mp4';batch.write_bytes(b'preserve live batch')
+    with pytest.raises(RuntimeError,match='already owned'):
+        utils.cleanup_temp_artifacts(clean_batches=True)
+    assert batch.read_bytes()==b'preserve live batch'
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -1045,6 +1390,170 @@ def test_delivery_rollback_failure_retains_previous_files_and_recovery_map(deliv
     for index, path in enumerate(w.original):
         assert recovery[str(index)] == str(path.resolve())
         assert (backups[0] / str(index)).read_bytes() == w.original[path]
+
+
+@pytest.mark.parametrize('phase', ['prepared', 'saved', 'promoted', 'committed'])
+def test_metadata_only_delivery_transaction_preserves_other_assets(delivery_workspace, phase):
+    from src.core.delivery_recovery import prepare_transaction, commit_transaction, recover_transaction, recover_output
+    from src.hardware.render_cache import _manifest_path
+    w = delivery_workspace
+    metadata = w.output.with_suffix('.meta.json')
+    candidate = w.output.parent / 'mapping-candidate.json'
+    candidate.write_bytes(b'{"delivery_mapping":{"status":"AVAILABLE"}}')
+    replacement = candidate.read_bytes()
+    targets = [w.output, metadata, w.output.with_suffix('.srt'), _manifest_path(w.output)]
+    backup = w.output.parent / '.delivery_backup_metadata_only'
+    backup.mkdir()
+    journal = prepare_transaction(backup, w.output, [(candidate, metadata)], targets,
+                                  context={'role': 'pipeline', 'date': '20260901', 'cam_index': 0},
+                                  keep_previous=False)
+    if phase != 'prepared':
+        metadata.replace(backup / '1')
+    if phase in ('promoted', 'committed'):
+        candidate.replace(metadata)
+    if phase == 'committed':
+        commit_transaction(backup, journal)
+    assert recover_transaction(backup) == ('COMMITTED' if phase == 'committed' else 'RECOVERED')
+    assert metadata.read_bytes() == (replacement if phase == 'committed' else w.original[metadata])
+    for target in targets:
+        if target != metadata:
+            assert target.read_bytes() == w.original[target]
+    assert not (backup / '0').exists()
+    assert not (backup / '2').exists()
+    assert not (backup / '3').exists()
+    if phase == 'promoted':
+        assert (backup / 'interrupted' / '1').read_bytes() == replacement
+    assert recover_output(w.output) == 0
+    assert not (backup / 'review_history.json').exists()
+
+
+@pytest.mark.parametrize('phase',[1,2,3,4,5,6,'database','committed'])
+def test_actual_process_asset_interrupt_recovers_or_retains_committed(delivery_workspace,interrupted_delivery_owner,phase):
+    from src.core.delivery_recovery import recover_transaction,pending_transactions
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,phase)
+    backup=next(w.output.parent.glob('.delivery_backup_*'))
+    if phase=='committed':
+        assert not pending_transactions(w.output.parent,output=w.output)
+        assert recover_transaction(backup)=='COMMITTED'
+        assert w.output.read_bytes()==b'candidate video'
+        assert w.db.is_render_completed('20260901',0)
+        return
+    if phase=='database':assert w.db.is_render_completed('20260901',0)
+    mark=lambda:w.db.set_render_status('20260901',0,'PENDING')
+    assert recover_transaction(backup,mark_pending=mark)=='RECOVERED'
+    assert not w.db.is_render_completed('20260901',0)
+    for path,content in w.original.items():assert path.read_bytes()==content
+    assert recover_transaction(backup,mark_pending=mark)=='RECOVERED'
+    if phase in (5,6,'database'):assert (backup/'interrupted'/'0').read_bytes()==b'candidate video'
+
+
+def test_recovery_preflight_preserves_external_changes(delivery_workspace,interrupted_delivery_owner):
+    from src.core.delivery_recovery import recover_transaction,DeliveryRecoveryError
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,6)
+    w.output.with_suffix('.meta.json').write_text('external edit')
+    before={path:path.read_bytes() if path.exists() else None for path in w.original}
+    with pytest.raises(DeliveryRecoveryError,match='Unrecognized current asset'):
+        recover_transaction(next(w.output.parent.glob('.delivery_backup_*')))
+    assert before=={path:path.read_bytes() if path.exists() else None for path in w.original}
+
+
+def test_asset_recovery_resumes_after_partial_restore_and_db_failure(delivery_workspace,interrupted_delivery_owner,monkeypatch):
+    from src.core import delivery_recovery
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,'database')
+    backup=next(w.output.parent.glob('.delivery_backup_*'))
+    copy=delivery_recovery._copy_durable
+    def fail_after_video(source,target,**kwargs):
+        copy(source,target,**kwargs)
+        if target==w.output:raise OSError('recovery interrupted')
+    with monkeypatch.context() as patcher:
+        patcher.setattr(delivery_recovery,'_copy_durable',fail_after_video)
+        with pytest.raises(OSError,match='recovery interrupted'):
+            delivery_recovery.recover_transaction(backup)
+    def db_failure():raise OSError('status unavailable')
+    with pytest.raises(OSError,match='status unavailable'):
+        delivery_recovery.recover_transaction(backup,mark_pending=db_failure)
+    assert delivery_recovery.pending_transactions(w.output.parent,output=w.output)==[backup]
+    assert delivery_recovery.recover_transaction(backup,mark_pending=lambda:w.db.set_render_status('20260901',0,'PENDING'))=='RECOVERED'
+    for path,content in w.original.items():assert path.read_bytes()==content
+
+
+def test_completed_record_cannot_bypass_interrupted_package(delivery_workspace,interrupted_delivery_owner,monkeypatch):
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,'database')
+    def inspect_then_stop(*args,**kwargs):
+        assert not w.db.is_render_completed('20260901',0)
+        for path,content in w.original.items():assert path.read_bytes()==content
+        return False
+    monkeypatch.setattr(w.pipeline,'_process_date_cam_owned',inspect_then_stop)
+    assert w.pipeline.process_date_cam(w.db,'20260901',0) is False
+
+
+def test_real_av_package_restores_after_process_death(delivery_workspace,interrupted_delivery_owner):
+    from src.hardware.ffmpeg import run_ffmpeg
+    from src.hardware.render_cache import save_manifest
+    from src.core.delivery_recovery import recover_transaction
+    from src.core.replay_evidence import content_sha256
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    for target,seconds in ((w.output,1),(candidate,2)):
+        result=run_ffmpeg(['-f','lavfi','-i','testsrc2=size=128x128:rate=20','-f','lavfi','-i',
+                          'sine=frequency=440:sample_rate=48000','-t',str(seconds),'-c:v','libx264',
+                          '-preset','ultrafast','-c:a','aac',str(target)],timeout=20)
+        assert result.returncode==0
+    candidate.with_suffix('.meta.json').write_text('{}')
+    save_manifest(w.output,'previous')
+    previous={path:content_sha256(path) for path in w.original}
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,'database')
+    assert recover_transaction(next(w.output.parent.glob('.delivery_backup_*')),
+                               mark_pending=lambda:w.db.set_render_status('20260901',0,'PENDING'))=='RECOVERED'
+    assert previous=={path:content_sha256(path) for path in w.original}
+    result=run_ffmpeg(['-v','error','-xerror','-i',str(w.output),'-f','null','-'],timeout=20)
+    assert result.returncode==0 and not result.stderr
+    import av
+    with av.open(str(w.output)) as video:
+        assert video.streams.audio and sum(1 for frame in video.decode(video=0))==20
+
+
+def test_committed_review_history_finalizes_after_process_death(delivery_workspace,interrupted_delivery_owner):
+    from src.core.delivery_recovery import recover_output
+    import json
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,'committed',keep_previous=True)
+    backup=next(w.output.parent.glob('.delivery_backup_*'))
+    assert not (backup/'review_history.json').exists()
+    assert recover_output(w.output)==1
+    history=json.loads((backup/'review_history.json').read_text())
+    for path,content in w.original.items():
+        assert (backup/history['assets'][path.name]).read_bytes()==content
+    assert w.output.read_bytes()==b'candidate video' and w.db.is_render_completed('20260901',0)
+    assert recover_output(w.output)==0
+
+
+def test_changed_previous_asset_blocks_recovery_before_writes(delivery_workspace,interrupted_delivery_owner):
+    from src.core.delivery_recovery import recover_transaction,DeliveryRecoveryError
+    w=delivery_workspace
+    candidate=w.output.with_name(w.output.stem+'.pending.mp4')
+    candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
+    interrupted_delivery_owner(candidate,w.output,w.db.db_path,'database')
+    backup=next(w.output.parent.glob('.delivery_backup_*'))
+    (backup/'0').write_bytes(b'changed backup')
+    before={path:path.read_bytes() if path.exists() else None for path in w.original}
+    with pytest.raises(DeliveryRecoveryError,match='Previous asset changed'):
+        recover_transaction(backup)
+    assert before=={path:path.read_bytes() if path.exists() else None for path in w.original}
 
 
 @pytest.mark.parametrize("status", ["STATIC", "FAILED", "PENDING", "SUSPICIOUS"])
@@ -1143,3 +1652,379 @@ def test_real_software_delivery_commits_media_subtitles_and_manifest(tmp_path, m
         assert all(batch.exists() for batch in batches)
     finally:
         db.close()
+
+
+
+def test_review_history_is_published_only_after_success(delivery_workspace):
+    from src.stages.companion import promote_vlog_assets
+    w = delivery_workspace
+    candidate = w.output.with_name(w.output.stem + ".pending.mp4")
+    candidate.write_bytes(b"new media")
+    candidate.with_suffix(".meta.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="commit rejected"):
+        with promote_vlog_assets(candidate,w.output,w.config,keep_previous=True):
+            raise RuntimeError("commit rejected")
+    assert not list(w.output.parent.glob(".delivery_backup_*/review_history.json"))
+    assert all(path.read_bytes() == content for path,content in w.original.items())
+
+
+@pytest.fixture
+def pending_pipeline_reader(monkeypatch, request):
+    """An actual old Windows owner holds one of two local I/O slots."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from src.core.visual_index import reader_process_state
+    from src.hardware import scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    if os.name != 'nt':
+        pytest.skip('Windows native deferred pipeline reader')
+    import _winapi
+    for name in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, name, {})
+    monkeypatch.setattr(registry, '_interrupted', False)
+    releases, observations = [], []
+    class Budget(scheduler.FileBudget):
+        def release(self, weight=1):
+            super().release(weight)
+            releases.append(weight)
+    disk = Budget(2)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    assert disk.acquire(timeout=1)
+    key = 'old-date-unconfirmed-reader'
+    child = registry.start(key, [sys.executable, '-c', 'import time;time.sleep(30)'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    registry.defer_cleanup(key, child, disk)
+    registry.mark_interrupted()
+    def observe(stage):
+        observations.append(dict(stage=stage, **reader_process_state(child.pid, handle=child._handle),
+                                 handle=int(child._handle), disk_available=disk.available,
+                                 interrupted=registry.is_interrupted(), releases=list(releases)))
+    def stop():
+        registry.terminate(key)
+        assert _winapi.WaitForSingleObject(child._handle, 5000) == _winapi.WAIT_OBJECT_0
+        registry.wait_for_exit(child, timeout=5)
+    observe('pending_native_owner')
+    try:
+        yield SimpleNamespace(registry=registry, child=child, key=key, disk=disk, releases=releases,
+                              stop=stop, observe=observe)
+    finally:
+        if _winapi.WaitForSingleObject(child._handle, 0) != _winapi.WAIT_OBJECT_0:
+            stop()
+        assert _winapi.WaitForSingleObject(child._handle, 5000) == _winapi.WAIT_OBJECT_0
+        registry.reap_cleanups()
+        observe('finally_native_ended')
+        assert disk.available == 2 and releases == [1]
+        assert not registry._processes and not registry._jobs and not registry._deferred
+        registry.reset_interrupted()
+        request.node.user_properties.append(('native_pipeline_admission', json.dumps(observations, sort_keys=True)))
+
+
+@pytest.mark.parametrize('skip_render', [False, True])
+def test_pending_pipeline_api_rejects_before_other_date_business_changes(
+        delivery_workspace, pending_pipeline_reader, monkeypatch, skip_render):
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    w, pending = delivery_workspace, pending_pipeline_reader
+    w.db.add_file_task('unread-next-date', 0, '20260902', '20260902000000', '20260902000100', 60)
+    w.db.set_prescreen_result('unread-next-date', 'FAILED', error_msg='previous failure')
+    before = tuple(w.db.conn.iterdump())
+    owned = MagicMock(side_effect=AssertionError('Pending reader reached day mutation boundary'))
+    monkeypatch.setattr(w.pipeline, '_process_date_cam_owned', owned)
+    with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+        w.pipeline.process_date_cam(w.db, '20260902', 0, config=w.config,
+                                    skip_render=skip_render, dashboard_enabled=False)
+    assert tuple(w.db.conn.iterdump()) == before
+    assert {path: path.read_bytes() for path in w.original} == w.original
+    assert pending.disk.available == 1 and not pending.releases and pending.registry.is_interrupted()
+    owned.assert_not_called()
+    w.pipeline.StreamingOrchestrator.assert_not_called()
+    pending.observe('api_rejected_unchanged_business')
+
+
+def test_pending_pipeline_constructor_rejects_before_scheduler_then_recovers_once(
+        pending_pipeline_reader, tmp_path, monkeypatch):
+    from src import pipeline
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    pending = pending_pipeline_reader
+    db = VlogDatabase(tmp_path/'constructor-admission.sqlite')
+    manager = MagicMock(wraps=pipeline.WorkStealingManager)
+    monkeypatch.setattr(pipeline, 'WorkStealingManager', manager)
+    config = {'hardware': {'device': 'cpu', 'max_io_concurrency': 2}, 'render': {'batch_max_files': 1}}
+    before = tuple(db.conn.iterdump())
+    try:
+        with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+            StreamingOrchestrator(db, '20260902', 0, config, render_enabled=False, dashboard_enabled=False)
+        manager.assert_not_called()
+        assert tuple(db.conn.iterdump()) == before and pending.registry.is_interrupted()
+        pending.stop()
+        assert pending.disk.available == 1 and not pending.releases
+        instance = StreamingOrchestrator(db, '20260902', 0, config,
+                                         render_enabled=False, dashboard_enabled=False)
+        assert instance.date == '20260902' and manager.call_count == 1
+        assert pending.disk.available == 2 and pending.releases == [1]
+        assert not pending.registry.is_interrupted()
+        assert pending.registry.require_cleanups() == {'recovered': [], 'pending': []}
+        assert pending.releases == [1] and tuple(db.conn.iterdump()) == before
+        pending.observe('constructor_admitted_after_confirmed_recovery')
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize('force_render', [False, True])
+def test_pending_pipeline_preserves_readonly_completed_skip_but_blocks_force(
+        delivery_workspace, pending_pipeline_reader, force_render):
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    w, pending = delivery_workspace, pending_pipeline_reader
+    w.db.set_render_status('20260901', 0, 'COMPLETED', output_file='offline-delivery.mp4')
+    before = tuple(w.db.conn.iterdump())
+    if force_render:
+        with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+            w.pipeline.process_date_cam(w.db, '20260901', 0, config=w.config,
+                                        force_render=True, dashboard_enabled=False)
+    else:
+        assert w.pipeline.process_date_cam(w.db, '20260901', 0, config=w.config,
+                                           dashboard_enabled=False)
+    assert tuple(w.db.conn.iterdump()) == before
+    assert {path: path.read_bytes() for path in w.original} == w.original
+    w.pipeline.StreamingOrchestrator.assert_not_called()
+    assert pending.registry.is_interrupted() and pending.disk.available == 1 and not pending.releases
+
+
+def test_pending_pipeline_start_claim_blocks_constructor_before_scheduler(monkeypatch):
+    from src import pipeline
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    for name in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, name, {})
+    manager = MagicMock(side_effect=AssertionError('Scheduler constructed during pending startup'))
+    monkeypatch.setattr(pipeline, 'WorkStealingManager', manager)
+    registry._starting['unreturned-child'] = {'proc': None}
+    try:
+        with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+            StreamingOrchestrator(MagicMock(), '20260902', 0, {}, dashboard_enabled=False)
+        manager.assert_not_called()
+        assert registry.is_interrupted()
+    finally:
+        registry._starting.clear()
+        registry.reset_interrupted()
+
+
+@pytest.mark.parametrize('outcome', ['typed_fatal', 'false_pending', 'ordinary_false'])
+def test_cross_date_pipeline_stops_only_for_unconfirmed_media_and_reports_remaining(tmp_path, monkeypatch, outcome):
+    from src import pipeline
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    for name in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, name, {})
+    monkeypatch.setattr(registry, '_interrupted', False)
+    db = VlogDatabase(tmp_path/'cross-date.sqlite')
+    for date in ('20260901', '20260902'):
+        db.add_file_task(date+'-unread', 0, date, date+'000000', date+'000100', 60)
+    before, calls = tuple(db.conn.iterdump()), []
+    asset = tmp_path/'retained-delivery.txt'
+    asset.write_bytes(b'retained prior delivery')
+    original_close = db.close
+    monkeypatch.setattr(db, 'close', lambda: None)
+    monkeypatch.setattr(pipeline, 'VlogDatabase', lambda: db)
+    monkeypatch.setattr(pipeline, 'scan_directory', MagicMock())
+    monkeypatch.setattr(pipeline, 'get_monitor', MagicMock())
+    monkeypatch.setattr(pipeline, 'OUTPUT_DIR', tmp_path)
+    monkeypatch.setattr(pipeline, 'check_disk_space', lambda *a: True)
+    monkeypatch.setattr(pipeline, 'cleanup_resources', lambda: None)
+    monkeypatch.setattr('src.core.utils.cleanup_temp_artifacts', lambda: None)
+    monkeypatch.setattr(pipeline, 'print_batch_startup_banner', MagicMock())
+    monkeypatch.setattr('src.ui.print_batch_summary_table', MagicMock())
+    monkeypatch.setattr(pipeline, 'build_batch_summary_item', lambda *a, **k: {'status': a[6]})
+    def process(database, date, camera, **kwargs):
+        calls.append(date)
+        if len(calls) == 1:
+            if outcome == 'typed_fatal':
+                raise MediaTerminationUnconfirmed('controlled old reader remains')
+            if outcome == 'false_pending':
+                registry.defer_cleanup('controlled-pending', SimpleNamespace(poll=lambda: None), MagicMock())
+                registry.mark_interrupted()
+            return False
+        return True
+    monkeypatch.setattr(pipeline, 'process_date_cam', process)
+    try:
+        result = pipeline.run_pipeline(dashboard_enabled=False, config={'hardware': {'device': 'cpu'}})
+        stopped = outcome != 'ordinary_false'
+        assert calls == (['20260901'] if stopped else ['20260901', '20260902'])
+        assert result == {'total': 2, 'ok': 0 if stopped else 1, 'failed': 1, 'skipped': 0,
+                          'remaining': 1 if stopped else 0,
+                          'stopped_reason': 'MEDIA_TERMINATION_UNCONFIRMED' if stopped else None}
+        assert tuple(db.conn.iterdump()) == before
+        assert asset.read_bytes() == b'retained prior delivery'
+    finally:
+        registry._deferred.clear()
+        registry.reset_interrupted()
+        original_close()
+
+
+def test_pending_pipeline_run_entry_rejects_before_cleanup_scan_or_database(monkeypatch):
+    from src import pipeline
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    for name in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, name, {})
+    registry.defer_cleanup('controlled-pending', SimpleNamespace(poll=lambda: None), MagicMock())
+    database, scan, cleanup = MagicMock(), MagicMock(), MagicMock()
+    monkeypatch.setattr(pipeline, 'VlogDatabase', database)
+    monkeypatch.setattr(pipeline, 'scan_directory', scan)
+    monkeypatch.setattr('src.core.utils.cleanup_temp_artifacts', cleanup)
+    try:
+        with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+            pipeline.run_pipeline(dashboard_enabled=False)
+        database.assert_not_called()
+        scan.assert_not_called()
+        cleanup.assert_not_called()
+        assert registry.is_interrupted()
+    finally:
+        registry._deferred.clear()
+        registry.reset_interrupted()
+
+
+@pytest.mark.parametrize('stage', ['streaming', 'concat', 'companion'])
+def test_public_media_failure_stays_fatal_across_dates_after_cleanup_is_empty(
+        delivery_workspace, monkeypatch, stage):
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    w = delivery_workspace
+    second = w.source.with_name('next-date-unread.mp4')
+    second.write_bytes(b'untouched following date')
+    w.db.add_file_task(str(second), 0, '20260902', '20260902000000', '20260902000100', 60)
+    second_before = w.db.get_file_task(str(second))
+    assert not registry._deferred and not registry._starting
+    failure = MediaTerminationUnconfirmed('old reader has ended but this day failed fatally')
+    if stage == 'streaming':
+        w.orch.run.side_effect = failure
+    elif stage == 'concat':
+        monkeypatch.setattr(w.pipeline, 'concat_output_files', MagicMock(side_effect=failure))
+    else:
+        monkeypatch.setattr('src.stages.companion.get_duration', MagicMock(side_effect=failure))
+    original_close = w.db.close
+    monkeypatch.setattr(w.db, 'close', lambda: None)
+    monkeypatch.setattr(w.pipeline, 'VlogDatabase', lambda: w.db)
+    monkeypatch.setattr(w.pipeline, 'scan_directory', MagicMock())
+    monkeypatch.setattr(w.pipeline, 'check_disk_space', lambda *a: True)
+    monkeypatch.setattr(w.pipeline, 'cleanup_resources', lambda: None)
+    monkeypatch.setattr('src.core.utils.cleanup_temp_artifacts', lambda: None)
+    monkeypatch.setattr(w.pipeline, 'print_batch_startup_banner', MagicMock())
+    monkeypatch.setattr('src.ui.print_batch_summary_table', MagicMock())
+    try:
+        # The real public process_date_cam and its owned implementation run.
+        # Only the stage that failed is replaced; no public-API throw shortcut.
+        result = w.pipeline.run_pipeline(dashboard_enabled=False, config=w.config)
+        assert result == {'total': 2, 'ok': 0, 'failed': 1, 'skipped': 0, 'remaining': 1,
+                          'stopped_reason': 'MEDIA_TERMINATION_UNCONFIRMED'}
+        w.orch.run.assert_called_once()
+        assert w.pipeline.StreamingOrchestrator.call_count == 1
+        assert w.pipeline.StreamingOrchestrator.call_args.args[1] == '20260901'
+        assert not registry._deferred and not registry._starting
+        assert w.db.get_file_task(str(second)) == second_before
+        assert not w.db.is_render_completed('20260901', 0)
+        assert w.db.conn.execute("SELECT status FROM render_tasks WHERE date='20260901'").fetchone()[0] == 'FAILED'
+        assert {path: path.read_bytes() for path in w.original} == w.original
+        assert all(path.read_bytes() == b'new media' for path in w.batches)
+    finally:
+        original_close()
+
+
+def test_companion_media_probe_failure_is_typed_instead_of_false(delivery_workspace, monkeypatch, tmp_path):
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    from src.stages.companion import save_vlog_companion_assets
+    candidate = tmp_path/'probe-pending.mp4'
+    candidate.write_bytes(b'controlled pending candidate')
+    metadata = candidate.with_suffix('.meta.json')
+    metadata.write_bytes(b'previous candidate metadata')
+    metrics = {}
+    monkeypatch.setattr('src.stages.companion.get_duration',
+                        MagicMock(side_effect=MediaTerminationUnconfirmed('probe cleanup unconfirmed')))
+    with pytest.raises(MediaTerminationUnconfirmed, match='probe cleanup unconfirmed'):
+        save_vlog_companion_assets(candidate, '20260901', 0, 'camera', 0, 0, 1,
+                                   delivery_workspace.db, {'render': {'generate_subtitles': False}},
+                                   rows=[], media_metrics=metrics)
+    assert metrics == {} and metadata.read_bytes() == b'previous candidate metadata'
+
+
+@pytest.mark.parametrize("kind", ["matching", "unrelated", "history", "corrupt", "missing_output"])
+def test_completed_delivery_checks_legacy_packages_without_mutation(delivery_workspace, monkeypatch, kind):
+    import json
+    from src.core.delivery_recovery import DeliveryRecoveryError
+    w = delivery_workspace
+    w.db.set_render_status("20260901", 0, "COMPLETED", output_file="" if kind == "missing_output" else str(w.output))
+    backup = w.output.parent / ".delivery_backup_legacy"
+    backup.mkdir()
+    mapping = {"0": str(w.output if kind != "unrelated" else w.output.parent / "other.mp4")}
+    (backup / "recovery.json").write_text("{" if kind == "corrupt" else json.dumps(mapping))
+    if kind == "history":
+        (backup / "review_history.json").write_text("{}")
+    before_db = tuple(w.db.conn.iterdump())
+    before_files = {p: p.read_bytes() for p in w.output.parent.rglob("*") if p.is_file()}
+    monkeypatch.setattr(w.db, "invalidate_stale_results", lambda *a: pytest.fail("invalidation before recovery"))
+    # Config naming changes must not hide a package for the recorded old output.
+    config = {"output": {"naming": "renamed_{date}.mp4"}}
+    if kind in ("matching", "corrupt", "missing_output"):
+        with pytest.raises(DeliveryRecoveryError, match="[Ll]egacy"):
+            w.pipeline.process_date_cam(w.db, "20260901", 0, config=config)
+    else:
+        assert w.pipeline.process_date_cam(w.db, "20260901", 0, config=config)
+    assert tuple(w.db.conn.iterdump()) == before_db
+    assert {p: p.read_bytes() for p in w.output.parent.rglob("*") if p.is_file()} == before_files
+    w.pipeline.StreamingOrchestrator.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['hash', 'rename'])
+def test_delivery_preparation_failure_does_not_create_recovery_blocker(delivery_workspace, monkeypatch, failure):
+    from src.core import delivery_recovery
+    from src.stages.companion import promote_vlog_assets
+    w = delivery_workspace
+    candidate = w.output.with_name('candidate.mp4')
+    candidate.write_bytes(b'new media')
+    candidate.with_suffix('.meta.json').write_text('{}')
+    def fail(*args, **kwargs):
+        raise OSError('controlled preparation failure')
+    with monkeypatch.context() as patch:
+        if failure == 'hash':
+            patch.setattr(delivery_recovery, '_identity', fail)
+        else:
+            patch.setattr(Path, 'rename', fail)
+        with pytest.raises(OSError, match='controlled preparation failure'):
+            with promote_vlog_assets(candidate, w.output, w.config):
+                pytest.fail('must not yield')
+    for path, content in w.original.items():
+        assert path.read_bytes() == content
+    assert candidate.read_bytes() == b'new media'
+    assert not list(w.output.parent.glob('.delivery_backup_*'))
+    assert not list(w.output.parent.glob('.delivery_preparing_*'))
+    assert delivery_recovery.recover_output(w.output) == 0
+    with promote_vlog_assets(candidate, w.output, w.config):
+        pass
+    assert w.output.read_bytes() == b'new media'
+
+
+def test_actual_process_exit_during_delivery_preparation_preserves_output(delivery_workspace):
+    import subprocess
+    import sys
+    from src.core.delivery_recovery import recover_output
+    from src.stages.companion import promote_vlog_assets
+    w = delivery_workspace
+    candidate = w.output.with_name('preparation-crash.mp4')
+    candidate.write_bytes(b'new media')
+    candidate.with_suffix('.meta.json').write_text('{}')
+    code = '''
+import os, sys
+from pathlib import Path
+from src.core import delivery_recovery
+from src.stages.companion import promote_vlog_assets
+delivery_recovery._identity = lambda path: os._exit(37)
+with promote_vlog_assets(Path(sys.argv[1]), Path(sys.argv[2]), {'render': {'generate_subtitles': False}}):
+    raise AssertionError('unexpected promotion')
+'''
+    result = subprocess.run([sys.executable, '-c', code, str(candidate), str(w.output)], capture_output=True, timeout=30)
+    assert result.returncode == 37, result.stderr
+    assert len(list(w.output.parent.glob('.delivery_preparing_*'))) == 1
+    assert not list(w.output.parent.glob('.delivery_backup_*'))
+    for path, content in w.original.items():
+        assert path.read_bytes() == content
+    assert recover_output(w.output) == 0
+    with promote_vlog_assets(candidate, w.output, w.config):
+        pass
+    assert w.output.read_bytes() == b'new media'

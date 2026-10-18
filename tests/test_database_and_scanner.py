@@ -535,3 +535,55 @@ class TestSegmentsTableLifecycle:
         assert not any(c["anomaly_type"] == "high_energy_no_target" for c in next_candidates)
 
         db.close()
+
+
+def test_legacy_audio_inspection_never_changes_rows_or_batches(tmp_path, monkeypatch):
+    import sqlite3
+    from scripts.repair_audio_metadata import repair_metadata
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "legacy.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript("CREATE TABLE file_tasks(prescreen_status TEXT,has_audio INTEGER,date TEXT); "
+                           "INSERT INTO file_tasks VALUES('SUSPICIOUS',0,'20260101');")
+    batch = tmp_path / "temp" / "_batch0_20260101_cam0.mp4"
+    batch.parent.mkdir()
+    batch.write_bytes(b"preserve batch")
+    before = db.read_bytes()
+    assert repair_metadata(str(db), date="20260101") == 1
+    assert repair_metadata(str(db), date="20260102") == 0
+    with pytest.raises(ValueError, match="disabled"):
+        repair_metadata(str(db), clean_batches=True)
+    assert db.read_bytes() == before
+    assert batch.read_bytes() == b"preserve batch"
+    missing = tmp_path / "missing.db"
+    with pytest.raises(sqlite3.OperationalError):
+        repair_metadata(str(missing))
+    assert not missing.exists()
+
+
+def test_exclusion_claim_and_late_worker_results_preserve_human_terminal_state(tmp_path):
+    from src.core.process_lock import database_day_lease
+    from src.stages.timeline import build_timeline_from_rows
+    path = tmp_path / 'tasks.db'
+    worker, reviewer = VlogDatabase(path), VlogDatabase(path)
+    try:
+        fp = str(tmp_path / 'source.mp4')
+        worker.add_file_task(fp, 0, '20260901', '20260901100000', '20260901100100', 60)
+        worker.set_analysis_result(fp, segments=[{'start_time': 0, 'end_time': 60, 'state': 'DYNAMIC'}])
+        with database_day_lease(path, '20260901', 0):
+            with pytest.raises(RuntimeError, match='already owned'):
+                reviewer.exclude_file_task(fp)
+        assert reviewer.exclude_file_task(fp, 'human reason')
+        for audio in (None, 1):
+            worker.set_prescreen_result(fp, 'SUSPICIOUS', has_audio=audio)
+        worker.set_analysis_result(fp, segments=[{'start_time': 1, 'end_time': 2, 'state': 'STATIC'}])
+        row = worker.get_all_file_tasks_for_date('20260901', 0)[0]
+        assert row['prescreen_status'] == row['analysis_status'] == 'SKIPPED_EXCLUDED'
+        assert row['error_msg'] == 'human reason'
+        assert row['segments'][0]['end_time'] == 60
+        assert build_timeline_from_rows([row], '20260901', config={}, resolve_presence=False) == []
+        assert not reviewer.exclude_file_task('unknown')
+
+    finally:
+        worker.close()
+        reviewer.close()

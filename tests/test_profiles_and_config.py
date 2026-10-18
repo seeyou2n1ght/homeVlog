@@ -123,6 +123,26 @@ def test_resolve_profile_config_layering():
     assert resolved["presence"]["night_hours"] == [21, 8]
 
 
+def test_camera_resolution_preserves_explicit_global_values_after_expansion():
+    raw = {"detection": {"profile": "living_room", "fg_threshold": 19.0},
+           "segment": {"min_motion_duration": 4.2},
+           "cameras": {"CAM": {"profile": "baby_room", "motion_sensitivity": 1.5}}}
+    global_cfg = resolve_profile_config(raw)
+    global_cfg.setdefault("recovery", {})["skip_corrupt"] = True
+    cam = resolve_camera_config(global_cfg, camera_id="CAM")
+    assert cam["detection"]["fg_threshold"] == 19.0
+    assert cam["segment"]["min_motion_duration"] == 4.2
+    assert cam["detection"]["min_motion_threshold"] == 1.2
+    assert cam["recovery"]["skip_corrupt"] is True
+    assert resolve_camera_config(copy.deepcopy(global_cfg), camera_id="CAM") == cam
+    assert resolve_camera_config(cam, camera_id="CAM") == cam
+    # Selecting a different profile rebuilds implicit defaults while retaining experts.
+    switched = resolve_profile_config(global_cfg, profile_name="baby_room", sensitivity=2)
+    assert switched["detection"]["profile"] == "baby_room"
+    assert switched["detection"]["min_motion_threshold"] == 0.9
+    assert switched["detection"]["fg_threshold"] == 19.0
+
+
 def test_camera_profile_resolution_and_hierarchy():
     """验证机位级绑定与配置解析的精准度。"""
     config = {
@@ -213,10 +233,39 @@ def test_what_if_tuning_simulation_with_profiles():
 
     # 仿真婴儿房高敏预设 (极低动作门限 1.8)
     res = sim.simulate_profile("baby_room", sensitivity=1.0)
-    assert res["verdict"] in ("IMPROVED", "FAVORABLE_TRADEOFF", "NEUTRAL")
+    assert res["verdict"] == "UNAVAILABLE"
     assert res["profile"] == "baby_room"
-    assert "deltas" in res
-    assert res["deltas"]["fn_increase"] <= 0  # 婴儿房低门限必然大幅挽救漏报 (FN 减少)
+    assert "deltas" not in res
+    assert res["reviewed_samples"] == 0
+
+
+def test_profile_simulation_passes_full_effective_profile_to_replay():
+    observed = []
+    sample = {"scenario": "ADULT_MOTION", "reference_active": True,
+              "review_status": "independent_visual", "review_evidence": "fixture"}
+    def replay(config, samples):
+        observed.append(config)
+        return [True]
+    sim = TuningSimulator([sample], {}, replay=replay)
+    sim.simulate_profile("baby_room", sensitivity=2.)
+    assert len(observed) == 2
+    assert observed[-1]["detection"]["profile"] == "baby_room"
+    assert observed[-1]["detection"]["motion_sensitivity"] == 2.
+    assert observed[-1]["detection"]["fg_threshold"] == 4.
+    assert observed[-1]["detection"]["ambient_drift_suppress"] is False
+
+
+def test_equal_global_values_do_not_skip_changed_camera_inheritance():
+    from src.core.profiles import resolve_camera_config
+    sample = {"filepath": "XiaomiCamera_01_B888805AA3CD/source.mp4", "cam_index": 1,
+              "reference_active": True, "review_status": "independent_visual", "review_evidence": "fixture"}
+    calls = []
+    def replay(config, samples):
+        calls.append(resolve_camera_config(config, filepath=sample["filepath"], cam_index=1)["detection"]["min_motion_threshold"])
+        return [True]
+    simulator = TuningSimulator([sample], {"cameras": {"B888805AA3CD": "baby_room"}}, replay=replay)
+    simulator.simulate({"detection.min_motion_threshold": 2.5})
+    assert calls == [1.8, 2.5]
 
 
 def test_scanner_camera_identity_compatibility():

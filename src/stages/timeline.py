@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.core.database import VlogDatabase
+from src.core.database import VlogDatabase, is_skipped_source
 from src.algorithms.segment import (
     ACTIVE_STATES,
     Segment,
@@ -423,6 +423,7 @@ def generate_timecode_subtitles(
     base_date: str = "20260901",
     step_s: float = 1.0,
     format_type: str = "srt",
+    config: dict | None = None,
 ) -> str:
     """
     Generate an SRT/ASS subtitle string mapping presentation timestamps
@@ -436,7 +437,7 @@ def generate_timecode_subtitles(
     day_start_unix = ts_to_unix(base_date + "000000")
 
     # 展示时长计划与渲染滤镜图严格同源，含 speed ramping 非线性映射
-    plans = compute_display_plans(timeline, **display_plan_options(load_config()))
+    plans = compute_display_plans(timeline, **display_plan_options(load_config() if config is None else config))
 
     is_ass = format_type.lower() in ("ass", "ssa")
     entries = []
@@ -506,6 +507,7 @@ def save_timecode_subtitles(
     base_date: str = "20260901",
     step_s: float = 1.0,
     format_type: str = "srt",
+    config: dict | None = None,
 ) -> Path:
     """Save generated real-world timecode subtitles to a file."""
     out_p = Path(output_path)
@@ -514,7 +516,7 @@ def save_timecode_subtitles(
         content = timeline
     else:
         content = generate_timecode_subtitles(
-            timeline=timeline, rows=rows, base_date=base_date, step_s=step_s, format_type=format_type
+            timeline=timeline, rows=rows, base_date=base_date, step_s=step_s, format_type=format_type, config=config,
         )
     out_p.write_text(content, encoding="utf-8")
     return out_p
@@ -644,8 +646,7 @@ def build_timeline_from_rows(
     """
     rows = [
         row for row in rows
-        if row.get("prescreen_status") not in ("SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
-        and row.get("analysis_status") not in ("SKIPPED_EXCLUDED", "SKIPPED_CORRUPT")
+        if not is_skipped_source(row)
     ]
     if config is None:
         config = load_config()
@@ -824,6 +825,78 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
 
 
 
+def _single_pass_dense_video(timeline, source_timeline, display_plans, scale_parts,
+                             output_fps, planned_frames, *, scale_mode, preselected_static,
+                             timecode_osd):
+    """Retiming on one dense frame clock avoids one video branch per segment.
+
+    Keep the existing spatial filter and audio chains. The balanced lookup
+    reproduces trim's nearest-tick boundaries, segment-local integer PTS and
+    the shared plan's exact frame slots. Unsupported slices retain the legacy
+    graph, including sparse inputs, ramps, OSD and overlapping/sub-frame cuts.
+    """
+    if (len(timeline) < 2 or preselected_static or timecode_osd
+            or scale_mode not in ("cpu", "cuda_passthrough")
+            or len({seg.input_index for seg in timeline}) != 1
+            or len({seg.filepath for seg in timeline}) != 1
+            or any(seg.state not in ACTIVE_STATES for seg in timeline)
+            or any(ramp is not None for _, ramp in display_plans)
+            or not any(seg.state not in ("DYNAMIC", "DYNAMIC_AUDIO") for seg in timeline)):
+        return None
+    rules, cursor, previous_end = [], 0, None
+    for seg, source, (duration, _) in zip(timeline, source_timeline, display_plans):
+        if (seg.start_in_file != source.start_in_file or seg.end_in_file != source.end_in_file
+                or seg.end_in_file - seg.start_in_file < 1 / output_fps):
+            return None
+        start_tick = math.floor(float(f"{seg.start_in_file:.3f}") * output_fps + .5)
+        end_tick = math.floor(float(f"{seg.end_in_file:.3f}") * output_fps + .5)
+        if end_tick <= start_tick or (previous_end is not None and start_tick < previous_end):
+            return None
+        frames = round(duration * output_fps)
+        speed = ("1.0000" if seg.state in ("DYNAMIC", "DYNAMIC_AUDIO")
+                 else f"{(source.end_in_file-source.start_in_file)/duration:.4f}")
+        select = (f"gte(pts,{start_tick})*lt(pts,{end_tick})*"
+                  f"lt((pts-max({start_tick},start_t*{output_fps}))/{speed},{frames})")
+        pts = f"{cursor}+(PTS-max({start_tick},STARTPTS))/{speed}"
+        rules.append((end_tick, select, pts))
+        cursor += frames
+        previous_end = end_tick
+    if cursor != planned_frames:
+        return None
+
+    def lookup(items, field, variable):
+        if len(items) == 1:
+            return items[0][field]
+        middle = len(items) // 2
+        return (f"if(lt({variable},{items[middle-1][0]}),"
+                f"{lookup(items[:middle], field, variable)},"
+                f"{lookup(items[middle:], field, variable)})")
+
+    idx = timeline[0].input_index
+    video = (f"[padded_{idx}]select='{lookup(rules, 1, 'pts')}',"
+             f"setpts='{lookup(rules, 2, 'PTS')}',fps={output_fps},"
+             f"tpad=stop_mode=clone:stop_duration={planned_frames/output_fps:.3f},"
+             f"trim=end_frame={planned_frames},setpts=PTS-STARTPTS[v]")
+    return scale_parts[:2] + [video]
+
+
+@dataclass(frozen=True)
+class GroupedAudioPlan:
+    """Original per-segment DSP, bounded groups, and one terminal sample clock."""
+    video_filter: str
+    groups: tuple[tuple[str, int], ...]
+    final_filter: str
+    sample_rate: int
+    samples: int
+
+
+# Deliberately narrower than a general break-even rule: only the high-complexity
+# cohort, with a hard mono PCM ceiling. Smaller graphs keep the ordinary path.
+GROUPED_AUDIO_MIN_SEGMENTS = 384
+GROUPED_AUDIO_SEGMENTS = 48
+GROUPED_AUDIO_MAX_BYTES = 256 * 1024**2
+
+
 def build_concat_filter(
     timeline: list[TimelineSegment],
     rows: list[dict],
@@ -851,6 +924,8 @@ def build_concat_filter(
     static_sample_window_s: float = 0.25,
     audio_input_offset: int = 0,
     source_timeline: list[TimelineSegment] | None = None,
+    config: dict | None = None,
+    audio_groups_out: list[GroupedAudioPlan] | None = None,
 ) -> str:
     """
     Build a complex FFmpeg filtergraph string for the entire timeline.
@@ -861,11 +936,12 @@ def build_concat_filter(
     """
     kf_interval = max(static_keyframe_interval, 1.0)
 
-    tmp_cfg = {}
-    try:
-        tmp_cfg = load_config()
-    except Exception:
-        pass
+    tmp_cfg = config
+    if tmp_cfg is None:
+        try:
+            tmp_cfg = load_config()
+        except Exception:
+            tmp_cfg = {}
 
     render_cfg = tmp_cfg.get("render", {})
     seg_cfg = tmp_cfg.get("segment", {})
@@ -910,7 +986,8 @@ def build_concat_filter(
             audio = (
                 f"[0:a]atrim=start={seg.start_in_file:.3f}:end={seg.end_in_file:.3f},"
                 f"asetpts=PTS-STARTPTS,aformat=sample_rates={audio_sample_rate},"
-                f"apad,atrim=end_sample={round(dur*audio_sample_rate)},asetpts=N/SR/TB[a]"
+                f"apad,atrim=end_sample={round(dur*audio_sample_rate)},"
+                f"asettb=1/{audio_sample_rate},asetpts=N[a]"
             )
         else:
             audio = f"anullsrc=r={audio_sample_rate}:cl=mono:d={dur:.9f}[a]"
@@ -1177,12 +1254,44 @@ def build_concat_filter(
     all_parts = scale_parts + parts_v + parts_a
     planned_frames = sum(round(duration * output_fps) for duration, _ in display_plans)
     planned_samples = round(planned_frames * audio_sample_rate / output_fps)
+    single_pass = _single_pass_dense_video(
+        timeline, source_timeline, display_plans, scale_parts, output_fps, planned_frames,
+        scale_mode=scale_mode, preselected_static=preselected_static, timecode_osd=timecode_osd)
+    if single_pass is not None:
+        audio_labels = "".join(f"[a{i}]" for i in range(seg_count))
+        final_audio = (
+            f"aresample={audio_sample_rate}:async=1000:first_pts=0,"
+            f"apad,atrim=end_sample={planned_samples},asettb=1/{audio_sample_rate},asetpts=N[a]"
+        )
+        if (audio_groups_out is not None and seg_count >= GROUPED_AUDIO_MIN_SEGMENTS
+                and audio_input_offset == 0 and input_has_audio.get(0, False)
+                and timeline[0].input_index == 0 and audio_sample_rate == 48000
+                and output_fps > 0 and int(output_fps) == output_fps
+                and audio_sample_rate % int(output_fps) == 0
+                and planned_samples * 4 <= GROUPED_AUDIO_MAX_BYTES):
+            groups = []
+            for first in range(0, seg_count, GROUPED_AUDIO_SEGMENTS):
+                last = min(seg_count, first + GROUPED_AUDIO_SEGMENTS)
+                group_labels = "".join(f"[a{i}]" for i in range(first, last))
+                group_filter = ";".join(parts_a[first:last] + [
+                    f"{group_labels}concat=n={last-first}:v=0:a=1[chunk]"])
+                samples = sum(round(duration * audio_sample_rate)
+                              for duration, _ in display_plans[first:last])
+                groups.append((group_filter, samples))
+            assert sum(samples for _, samples in groups) == planned_samples
+            audio_groups_out.append(GroupedAudioPlan(
+                ";".join(single_pass), tuple(groups), "[1:a]" + final_audio,
+                audio_sample_rate, planned_samples))
+        return ";".join(single_pass + parts_a + [
+            f"{audio_labels}concat=n={seg_count}:v=0:a=1[a_tmp]",
+            "[a_tmp]" + final_audio,
+        ])
     concat = (
         f"{';'.join(all_parts)};{labels}concat=n={seg_count}:v=1:a=1[v_tmp][a_tmp];"
         f"[v_tmp]tpad=stop_mode=clone:stop_duration={planned_frames/output_fps:.3f},"
         f"fps={output_fps},trim=end_frame={planned_frames},setpts=PTS-STARTPTS[v];"
         f"[a_tmp]aresample={audio_sample_rate}:async=1000:first_pts=0,"
-        f"apad,atrim=end_sample={planned_samples},asetpts=N/SR/TB[a]"
+        f"apad,atrim=end_sample={planned_samples},asettb=1/{audio_sample_rate},asetpts=N[a]"
     )
 
     return concat

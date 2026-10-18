@@ -40,7 +40,7 @@ uv run python main.py --clean-temp
 uv run python main.py --help
 ```
 
-`recovery.skip_today` 可跳过尚未备份完整的当天素材。周末批处理可使用无 TUI 命令运行；不要同时启动多个处理相同日期/机位的主程序进程，当前硬件预算和进程注册表为进程内共享。
+`recovery.skip_today` 可跳过尚未备份完整的当天素材。周末批处理可使用无 TUI 命令运行；主流程与审核重渲通过数据库日期/机位、共享临时工作区及交付路径的内核认领拒绝冲突；同临时工作区也不支持跨进程并行不同日期。硬件预算和进程注册表仍是进程内共享。
 
 `--cam` 可单独选择该机位的所有日期；预览、重析和实际处理使用相同范围。`--stage` 支持 `all`、`analyze`，后者与 `--no-render` 相同，执行预筛和精析。仅分析遇到失败或未完成素材也返回非零退出码。
 
@@ -67,7 +67,7 @@ uv run python main.py --help
 - 批次与最终成片都有指纹清单。未交付日期会校验素材大小/mtime、配置、模型和时间轴；检测配置或素材变化会使旧分析失效。
 - `render_tasks.COMPLETED` 保存历史交付记录，普通运行不因配置变化、产物移走或新增素材自动重做。备份产物时须保留并备份 `data/vlog.db`；显式 `--force-render` 才重新处理。
 - 成片先写 `.pending.mp4` 并生成字幕/元数据，manifest 和完成记录提交成功后才清理本次批次。默认保留有效批次，可设置 `render.cleanup_batches_on_success: true` 在成功后清理。
-- 普通提交异常或取消会恢复上一份资产；恢复本身失败时，旧文件保留在输出目录 `.delivery_backup_*/`，`recovery.json` 记录原路径。发现这类目录时先保留并核对日志与数据库状态，不直接删除。文件分别原子替换，不承诺断电时整个资产包同时提交。
+- 普通提交异常或取消会恢复上一份资产；恢复本身失败时，旧文件保留在输出目录 `.delivery_backup_*/`，`recovery.json` 记录原路径。新事务包由下次持有认领的入口核对并恢复；旧仅含 `recovery.json` 的包会阻止对应历史完成记录被直接跳过，须人工检查，不直接删除。文件分别原子替换，不承诺断电时整个资产包同时提交。
 - 解码不完整、取消或 DB 写入失败不再伪装为分析成功。坏文件按重试策略降级跳过；渲染批次失败阻止合并，保留已成功批次。
 - 人工标签独立存于 `human_reviews`，按原始素材和时间范围覆盖算法结果；撤销当前区间同步撤销持久标签，区间外的审核和已归档图片保留。短区间保持真实源边界，输出最小帧数由展示计划决定。
 - 所有直接启动的 FFmpeg 子进程纳入注册表；取消会终止进程，资源等待也会响应中断。
@@ -77,7 +77,7 @@ uv run python main.py --help
 ```powershell
 uv run python scripts/audit_tool/app.py
 uv run python scripts/inspect_detection.py "path/to/sample.mp4" --csv
-uv run python scripts/verify_accuracy.py --report-out docs/latest_quality.md
+uv run python scripts/verify_accuracy.py --report-out reports/latest_quality.md
 
 # 按日期、机位、预筛状态分层抽取原始时间窗，包含预筛静态区域
 uv run python scripts/sample_accuracy.py --count 100 --output data/review_windows.csv
@@ -89,15 +89,19 @@ uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epoc
 
 审核快捷键与界面操作以当前工作台为准，TP/FP/FN/TN 短码和完整标签统一归一化。`FrameArchiver` 将反馈帧保存到 `data/feedback_archive/images/` 并追加 `manifest.jsonl`；原片不可达时尝试近期内存帧及已有审核缓存，失败记录 Warning。
 
-TN/FP 导出空标注，正样本缺少可信框时排除并记录，不能当作背景训练。注意“静态”不等于“没有人”：静坐人物仍需要 person 框，标注负样本前必须确认没有目标。已人工校正的同名 `.txt` 框文件优先于伪标签。类别沿用 COCO 的 person=0、cat=15、dog=16，避免自定义类别与基础模型错位。
+训练只接受绑定图片 SHA 和来源身份、完成全部目标复核的 `.targets.json`。事件误报/静止、旧 `.txt`、草稿及模型预测都不能充当目标框真值；只有明确复核无目标才允许空框。类别沿用 COCO person=0、cat=15、dog=16。
 
-训练/验证按源视频隔离并记录 provenance。导出的伪标签验证集不能证明真实准确率。训练强制 `freeze=10`；要自动应用新模型，必须另提供与训练素材不重叠、人工校正的 holdout，并通过召回与精度不退化检查：
+导出按来源/日期分为训练、调优和独立测试组，默认约60/20/20；不足三个合格组时拒绝导出。训练固定 `freeze=10`，每次生成独立候选与训练收据，不覆盖已有候选。可先使用 `--dry-run` 检查数据和基底：
 
 ```powershell
-uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --epochs 15 --apply --validation-data data/datasets/holdout/data.yaml
+uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --dry-run
+# 对已有候选评估独立 test 分组，不训练或写生产配置
+uv run python scripts/train_yolo.py --data data/datasets/my_cam/data.yaml --base-model models/yolo11n.pt --evaluate-model models/my_candidate.pt --validation-data data/datasets/my_cam/data.yaml
 ```
 
-`--apply` 写配置，并非运行中热切换。新任务加载所选权重。无人工标注时审核指标显示 N/A；自动疑似 FP/FN 仅为待审线索。
+`--apply` 已停用。图片指标通过仍需独立原片识别和动作验收；完整复核、来源分组与候选评估操作见[工作台说明](scripts/audit_tool/README.md)。无合格人工参考时指标为不可用，自动疑似 FP/FN 仅为待审线索。
+
+旧 `tune_thresholds.py` 只保留历史摘要诊断，不推荐或写入生产阈值；参数比较使用工作台实际重放。`repair_audio_metadata.py` 只读统计疑似记录，不推断音轨存在、不修改数据库，旧 `--clean-batches` 已停用。
 
 ## 开发验证与性能评估
 

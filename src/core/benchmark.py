@@ -5,8 +5,14 @@
 """
 
 import json
+import hashlib
 import logging
-import shutil
+import math
+import os
+import re
+import tempfile
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +23,95 @@ DEFAULT_BENCHMARK_FILE = (
     Path(__file__).resolve().parents[2] / "tests" / "benchmark_data" / "gold_ground_truth.json"
 )
 VERSIONS_DIR = DEFAULT_BENCHMARK_FILE.parent / "versions"
+_dataset_lock = threading.RLock()
+
+
+def assess_replay_quality(samples: list[dict], predictions: list[bool], *, min_per_scenario: int = 10) -> dict:
+    """Gate current predictions, refusing historical or unreviewed references.
+
+    Explicit holdout references only; tuning evidence remains diagnostic.
+    Recall >=90% for adult and infant activity; specificity >=95% for empty
+    rooms and light/shadow negatives. Count and score independent event groups
+    conservatively; absent event metadata uses one group per source file.
+    This is sample-level acceptance, not full-day temporal recall.
+    """
+    if min_per_scenario < 1:
+        raise ValueError("min_per_scenario must be positive")
+    if len(samples) != len(predictions) or any(type(p) is not bool for p in predictions):
+        raise ValueError("One current prediction is required per sample")
+    admitted = {}
+    conflicts = set()
+    excluded = {"unreviewed": 0, "not_holdout": 0, "used_for_tuning": 0,
+                "missing_source": 0, "invalid_interval": 0, "duplicates": 0, "conflicts": 0}
+    for sample, prediction in zip(samples, predictions):
+        if (sample.get("review_status") not in ("independent_human", "independent_visual")
+                or not isinstance(sample.get("reference_active"), bool) or not sample.get("review_evidence")):
+            excluded["unreviewed"] += 1
+            continue
+        if sample.get("split") != "holdout":
+            excluded["not_holdout"] += 1
+            continue
+        if sample.get("used_for_tuning") not in (None, False):
+            excluded["used_for_tuning"] += 1
+            continue
+        filepath = sample.get("filepath")
+        if not isinstance(filepath, str) or not filepath.strip():
+            excluded["missing_source"] += 1
+            continue
+        source = os.path.normcase(os.path.normpath(filepath))
+        declared = sample.get("independence_group")
+        group = ("declared", declared.strip()) if isinstance(declared, str) and declared.strip() else ("source", source)
+        start, end = sample.get("start_time"), sample.get("end_time")
+        if (start is not None or end is not None) and (
+                any(type(v) not in (int, float) or not math.isfinite(v) for v in (start, end))
+                or end <= start):
+            excluded["invalid_interval"] += 1
+            continue
+        key = (source, start, end)
+        signature = (sample.get("scenario"), sample["reference_active"], prediction, group)
+        if key in admitted:
+            excluded["duplicates"] += 1
+            if admitted[key][0] != signature:
+                conflicts.add(key)
+            continue
+        admitted[key] = (signature, dict(sample, replay_active=prediction, quality_independence_group=group,
+            gold_label="CONFIRMED_MOTION" if sample["reference_active"] else "CONFIRMED_STATIC"))
+    excluded["conflicts"] = len(conflicts)
+    verified = [value[1] for key, value in admitted.items() if key not in conflicts]
+    metrics = evaluate_stratified_metrics(verified, group_key="scenario",
+                                          is_active_decision_fn=lambda sample: sample["replay_active"])
+    groups = {}
+    for sample in verified:
+        group_key = (sample.get("scenario"), sample["quality_independence_group"], sample["reference_active"])
+        groups.setdefault(group_key, []).append(sample)
+    independent = []
+    for (scenario, _, active), members in groups.items():
+        # A long, repeatedly sampled easy event cannot hide missed hard events.
+        decision = all(s["replay_active"] for s in members) if active else any(s["replay_active"] for s in members)
+        independent.append(dict(scenario=scenario, replay_active=decision,
+            gold_label="CONFIRMED_MOTION" if active else "CONFIRMED_STATIC"))
+    independent_metrics = evaluate_stratified_metrics(independent, group_key="scenario",
+        is_active_decision_fn=lambda sample: sample["replay_active"])
+    failures, missing, independent_counts = [], [], {}
+    for scenario in ("ADULT_MOTION", "INFANT_MOTION", "EMPTY_ROOM", "LIGHT_SHADOW"):
+        result = independent_metrics.get(scenario, {})
+        positive = scenario in ("ADULT_MOTION", "INFANT_MOTION")
+        denominator = (result.get("tp", 0) + result.get("fn", 0) if positive
+                       else result.get("tn", 0) + result.get("fp", 0))
+        independent_counts[scenario] = len({s["quality_independence_group"] for s in verified
+            if s.get("scenario") == scenario and s["reference_active"] is positive})
+        if independent_counts[scenario] < min_per_scenario:
+            missing.append(scenario)
+        elif positive:
+            if result["recall"] < 90:
+                failures.append(scenario)
+        elif 100 * result["tn"] / denominator < 95:
+            failures.append(scenario)
+    return {"verdict": "FAIL" if failures else ("UNAVAILABLE" if missing else "PASS"),
+            "failed_scenarios": failures, "insufficient_scenarios": missing,
+            "verified_samples": len(verified), "total_samples": len(samples), "metrics": metrics,
+            "independent_counts": independent_counts, "independent_metrics": independent_metrics,
+            "excluded_samples": excluded, "required_independent_groups": min_per_scenario}
 
 
 def normalize_benchmark_label(label: str | None) -> str:
@@ -45,8 +140,14 @@ def load_benchmark_dataset(file_path: Path | str | None = None) -> tuple[list[di
     if not path.exists():
         raise FileNotFoundError(f"基准数据集文件不存在: {path}")
 
-    with open(path, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
+    with _dataset_lock:
+        data_bytes = path.read_bytes()
+        raw_data = json.loads(data_bytes)
+        sidecar = path.with_name(path.stem + ".meta.json")
+        stored_meta = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else None
+        if stored_meta and stored_meta.get("samples_sha256"):
+            if hashlib.sha256(data_bytes).hexdigest() != stored_meta["samples_sha256"]:
+                raise ValueError(f"Benchmark data/metadata mismatch: {path}")
 
     if isinstance(raw_data, list):
         samples = raw_data
@@ -56,6 +157,8 @@ def load_benchmark_dataset(file_path: Path | str | None = None) -> tuple[list[di
             "total_samples": len(samples),
             "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
         }
+        if stored_meta:
+            metadata.update(stored_meta)
     elif isinstance(raw_data, dict):
         samples = raw_data.get("samples", [])
         metadata = raw_data.get("metadata", {})
@@ -88,6 +191,8 @@ def save_benchmark_dataset(
     extra_metadata: dict[str, Any] | None = None,
 ) -> Path:
     """持久化基准数据集，支持元数据记录与历史版本快照归档。"""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", version):
+        raise ValueError("Benchmark version must contain only letters, digits, dot, underscore or hyphen")
     target_path = Path(output_path) if output_path else DEFAULT_BENCHMARK_FILE
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -116,29 +221,50 @@ def save_benchmark_dataset(
         key=lambda x: (x.get("date", ""), x.get("cam_index", 0), x.get("start_time", 0.0))
     )
 
-    # 写入主基准文件（保持直接为列表或带 metadata 的列表对象以兼顾既有代码）
-    # 为保证所有历史测试用例直接 json.load() 即是 list，在 list 首项或直接保存为标准 list 格式：
-    # 既有代码 tests/test_accuracy_baseline.py 期望直接得到 list，因此写入标准的 samples 列表
-    # 但每个 sample 包含标准字段，并在同一目录保存伴随元数据 .meta.json
-    with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(sorted_samples, f, ensure_ascii=False, indent=2)
-
+    payload = json.dumps(sorted_samples, ensure_ascii=False, indent=2).encode("utf-8")
+    meta["samples_sha256"] = hashlib.sha256(payload).hexdigest()
+    meta["snapshot_id"] = uuid.uuid4().hex
+    metadata_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
     meta_file = target_path.with_name(target_path.stem + ".meta.json")
-    with open(meta_file, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    # 历史版本快照归档
-    if archive_version_copy:
-        VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        v_stem = f"gold_ground_truth_v{version}"
-        v_file = VERSIONS_DIR / f"{v_stem}.json"
-        shutil.copy2(target_path, v_file)
-        v_meta = VERSIONS_DIR / f"{v_stem}.meta.json"
-        shutil.copy2(meta_file, v_meta)
-        logger.info("基准版本已归档至: %s", v_file)
+    with _dataset_lock:
+        # Immutable snapshots are the recovery source, even if publishing fails.
+        if archive_version_copy:
+            VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            v_stem = f"gold_ground_truth_v{version}_{meta['snapshot_id']}"
+            for suffix, content in ((".json", payload), (".meta.json", metadata_bytes)):
+                with (VERSIONS_DIR / (v_stem + suffix)).open("xb") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+        previous = [(p, p.read_bytes() if p.exists() else None) for p in (target_path, meta_file)]
+        try:
+            _atomic_write(target_path, payload)
+            # Hash-bearing metadata is the commit marker for external readers.
+            _atomic_write(meta_file, metadata_bytes)
+        except BaseException:
+            for path, old in previous:
+                if old is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write(path, old)
+            raise
 
     logger.info("基准数据集成功保存: %s (样本数: %d)", target_path, len(samples))
     return target_path
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as f:
+            temp = Path(f.name)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        temp.replace(path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 def merge_benchmark_samples(

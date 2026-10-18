@@ -11,7 +11,35 @@ import copy
 from pathlib import Path
 from typing import Any
 
-# Built-in scenario profiles calibrated on real dual-camera footage & gold benchmark
+
+class ResolvedConfig(dict):
+    """Dictionary-compatible effective config with original explicit provenance."""
+    def __init__(self, values: dict, explicit: dict):
+        super().__init__(values)
+        self.explicit = copy.deepcopy(explicit)
+        self.expanded = copy.deepcopy(values)
+
+
+def _explicit_config(config: dict) -> dict:
+    if not isinstance(config, ResolvedConfig):
+        return copy.deepcopy(config)
+    explicit = copy.deepcopy(config.explicit)
+    # Preserve runtime overrides made after expansion, including CLI settings.
+    for section, value in config.items():
+        old = config.expanded.get(section)
+        if isinstance(value, dict) and isinstance(old, dict):
+            for key, item in value.items():
+                if key not in old or item != old[key]:
+                    explicit.setdefault(section, {})[key] = copy.deepcopy(item)
+            for key in old.keys() - value.keys():
+                explicit.get(section, {}).pop(key, None)
+        elif section not in config.expanded or value != old:
+            explicit[section] = copy.deepcopy(value)
+    for section in config.expanded.keys() - config.keys():
+        explicit.pop(section, None)
+    return explicit
+
+# Empirical defaults; independent recognition-quality acceptance is pending.
 PROFILES: dict[str, dict[str, Any]] = {
     "living_room": {
         "name": "living_room",
@@ -248,7 +276,8 @@ def resolve_profile_config(
     2. Layer 2: 宏观主旋钮 sensitivity 缩放后的参数
     3. Layer 3: base_config 中显式配置的参数（专家级最高优先级）
     """
-    result = copy.deepcopy(base_config)
+    explicit = _explicit_config(base_config)
+    result = copy.deepcopy(explicit)
 
     # 提取 Profile 名称
     if not profile_name:
@@ -286,10 +315,10 @@ def resolve_profile_config(
 
     # 确保宏观元信息回填
     det_sec = result.setdefault("detection", {})
-    det_sec.setdefault("profile", profile_name)
-    det_sec.setdefault("motion_sensitivity", sensitivity)
+    det_sec["profile"] = profile_name
+    det_sec["motion_sensitivity"] = sensitivity
 
-    return result
+    return ResolvedConfig(result, explicit)
 
 
 def resolve_camera_config(
@@ -299,7 +328,7 @@ def resolve_camera_config(
     cam_index: int | None = None,
 ) -> dict[str, Any]:
     """为特定机位解析专有配置，支持机位映射、场景绑定与独立覆盖。"""
-    cam_cfg = copy.deepcopy(config)
+    cam_cfg = _explicit_config(config)
     cameras_map = cam_cfg.get("cameras", {}) or {}
 
     # 识别 MAC 地址或机位 Key
@@ -356,19 +385,9 @@ def resolve_camera_config(
     if cam_sensitivity is None:
         cam_sensitivity = cam_cfg.get("detection", {}).get("motion_sensitivity", 1.0)
 
-    # 如果机位绑定了明确的 Profile，将该 Profile 的参数应用到机位配置中
-    if profile_name in PROFILES:
-        scaled_profile = apply_motion_sensitivity(PROFILES[profile_name], cam_sensitivity)
-        for sec_name, sec_dict in scaled_profile.items():
-            if sec_name in ("name", "description") or not isinstance(sec_dict, dict):
-                continue
-            if sec_name not in cam_cfg:
-                cam_cfg[sec_name] = copy.deepcopy(sec_dict)
-            else:
-                cam_cfg[sec_name].update(copy.deepcopy(sec_dict))
-
-    cam_cfg.setdefault("detection", {})["profile"] = profile_name
-    cam_cfg["detection"]["motion_sensitivity"] = cam_sensitivity
+    # Defaults are reconstructed from explicit input, never reverse-inferred
+    # from the expanded global dictionary.
+    cam_cfg = resolve_profile_config(cam_cfg, profile_name=profile_name, sensitivity=cam_sensitivity)
 
     # 应用机位特有的 overrides (最高优先级)
     for sec_name, sec_dict in cam_overrides.items():

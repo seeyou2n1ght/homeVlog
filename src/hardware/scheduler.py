@@ -56,16 +56,24 @@ class FileBudget:
         with self.condition:
             ticket = object()
             self.waiters.append(ticket)
-            try:
-                deadline = time.monotonic() + timeout
-                while self.waiters[0] is not ticket or self.available < weight:
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                # Deferred cleanup holds Registry while releasing this budget.
+                # Query cancellation before acquiring its condition, never in
+                # the opposite order, so cancellation and recovery can finish.
+                if _interrupted():
+                    return False
+                with self.condition:
+                    if self.waiters[0] is ticket and self.available >= weight:
+                        self.available -= weight
+                        return True
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or _interrupted():
+                    if remaining <= 0:
                         return False
                     self.condition.wait(timeout=min(.5, remaining))
-                self.available -= weight
-                return True
-            finally:
+        finally:
+            with self.condition:
                 self.waiters.remove(ticket)
                 self.condition.notify_all()
 

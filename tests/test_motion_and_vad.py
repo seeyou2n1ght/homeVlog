@@ -12,6 +12,25 @@ import math
 import numpy as np
 import pytest
 
+
+def test_increasing_sensitivity_does_not_raise_adaptive_noise_threshold():
+    from array import array
+    from src.core.profiles import resolve_profile_config
+    from src.algorithms.motion_trace import MotionTrace
+    energies = [0.0] * 10 + [1.0] * 30 + [3.0] * 60
+    active = []
+    for sensitivity in (1.0, 2.0):
+        cfg = resolve_profile_config({"detection": {"motion_sensitivity": sensitivity,
+            "median_filter_window": 1, "min_motion_frames": 1, "min_static_frames": 1,
+            "noise_suppress_frames": 1}, "audio_vad": {"enabled": False}})
+        detector = MotionDetector(cfg)
+        trace = MotionTrace(detector, 5)
+        trace.energies = array("d", energies)
+        trace.confidences = array("d", [0.0] * len(energies))
+        labels, _ = detector.analyze_frames(trace, file_duration=20, fps=5)
+        active.append(sum(item["is_motion"] for item in labels))
+    assert active == [60, 60]
+
 from src.detector import (
     SpatialGridMotionFilter,
     EmaBackgroundModel,
@@ -263,6 +282,19 @@ class TestTruncatedMediaAndDegradation:
         assert detector.file_duration_detected == 6.0  # 30 帧 / 5.0 fps = 6.0s
         assert labels[-1]["time"] <= 6.0
 
+    def test_reanalysis_keeps_original_declared_extent(self):
+        from unittest.mock import patch
+        detector = MotionDetector({"detection": {"analysis_fps": 5}})
+        frames = [np.zeros((180, 320), dtype=np.uint8) for _ in range(30)]
+        meta = {"has_audio": 0, "effective_fps": 5., "complete": True, "truncated": True,
+                "decode_time": .1, "frames": 30, "completion_reason": "TRUNCATED_EOF"}
+        with patch.object(detector, "_decode_file", return_value=(frames, {}, np.array([], dtype=np.float32), meta)) as decode:
+            detector.analyze("truncated.mp4", file_duration=6., has_audio=0,
+                             duration_verified=True, declared_duration=300.)
+        decode.assert_called_once_with("truncated.mp4", 300.)
+        assert detector.decode_completion["declared_duration_s"] == 300.
+        assert detector.decode_completion["available_duration_s"] == 6.
+
     def test_detector_audio_decode_failure_degrades_to_silent_video(self):
         """当音频管道解码抛出异常时，_decode_file 应安全降级为静音视频，禁止清空视频帧。"""
         from unittest.mock import patch
@@ -284,3 +316,62 @@ class TestTruncatedMediaAndDegradation:
         assert len(frames) == 10
         assert meta["complete"] is True
         assert full_audio.size == 0  # 降级为静音
+
+
+
+def test_visual_features_reuse_one_decode_and_clear_after_incomplete_source(tmp_path,monkeypatch,mock_config):
+    from src.stages.detector import MotionDetector
+    path=tmp_path/"source.mp4";path.write_bytes(b"controlled source")
+    detector=MotionDetector(mock_config,decode_gpu="cpu")
+    frames=[np.zeros((32,32),np.uint8)]*2500
+    meta={"has_audio":0,"effective_fps":1250,"decode_time":0,"frames":2500,"complete":True}
+    calls=[]
+    monkeypatch.setattr(detector,"_decode_file",lambda *args:(calls.append(args) or (frames,{},np.array([],np.float32),meta)))
+    labels=[{"time":0,"is_motion":False,"state":"STATIC"}]
+    monkeypatch.setattr(detector,"analyze_frames",lambda *args,**kwargs:(labels,{}))
+    actual,_=detector.analyze(str(path),file_duration=2,has_audio=0,duration_verified=True)
+    assert actual==labels and len(calls)==1
+    assert len(detector.visual_samples)==2048
+    assert detector.visual_source[1]==len(b"controlled source")
+    assert detector.last_perf["visual_index_s"]>=0
+    meta["complete"]=False
+    actual,_=detector.analyze(str(path),file_duration=2,has_audio=0,duration_verified=True)
+    assert actual==[] and detector.visual_samples==[] and detector.visual_source is None
+    assert len(calls)==2
+
+
+def test_visual_features_collect_in_real_streaming_trace(tmp_path, monkeypatch, mock_config):
+    from src.algorithms.motion_trace import MotionTrace
+    from src.core.visual_index import frame_signature
+    path = tmp_path / "stream.mp4"
+    path.write_bytes(b"controlled source")
+    detector = MotionDetector(mock_config, decode_gpu="cpu")
+    plain = MotionTrace(detector, 5)
+    traced = MotionTrace(detector, 5, visual_sample_stride=2)
+    frame = np.zeros((detector.height, detector.width), np.uint8)
+    for i in range(12):
+        frame[:, i:i + 1] = 255
+        plain.append(frame)
+        traced.append(frame)
+    assert list(traced.energies) == list(plain.energies)
+    assert list(traced.confidences) == list(plain.confidences)
+    assert [value[0] for value in traced.visual_samples] == pytest.approx([i / 5 for i in range(0, 12, 2)])
+    assert traced.visual_samples[0][1] != frame_signature(frame)
+    meta = {"has_audio": 0, "effective_fps": 5, "frames": 12, "complete": True, "decode_time": 0}
+    monkeypatch.setattr(detector, "_decode_file", lambda *args: (traced, {}, np.array([], np.float32), meta))
+    detector.analyze(str(path), file_duration=2.4, has_audio=0, duration_verified=True)
+    assert detector.visual_samples == traced.visual_samples
+    assert detector.visual_source is not None
+    meta["complete"] = False
+    detector.analyze(str(path), file_duration=2.4, has_audio=0, duration_verified=True)
+    assert detector.visual_samples == [] and detector.visual_source is None
+
+
+def test_streaming_visual_features_have_fixed_memory_cap(mock_config):
+    from src.algorithms.motion_trace import MotionTrace
+    detector = MotionDetector(mock_config)
+    detector.width = detector.height = 16
+    trace = MotionTrace(detector, 5, visual_sample_stride=1)
+    for _ in range(2050):
+        trace.append(np.zeros((16, 16), np.uint8))
+    assert len(trace) == 2050 and len(trace.visual_samples) == 2048

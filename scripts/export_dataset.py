@@ -2,15 +2,17 @@
 """scripts/export_dataset.py
 
 从真实反馈归档库 (data/feedback_archive/) 与数据库人工打标记录中，
-抽取专属机位难样本（误报 Hard Negatives 与漏报 Hard Positives），
-构建符合 Ultralytics YOLO 标准格式的微调训练数据集。
+仅导出绑定图像和捕获来源的完整人工目标复核；事件标签、旧txt和
+自动预测不能证明目标框或无人。构建COCO80类别空间的YOLO训练数据。
 """
 
 import argparse
+import hashlib
+import math
+import os
 import json
 import logging
 import random
-import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -56,8 +58,7 @@ def load_archive_items(archive_dir: Path) -> list[DatasetItem]:
         logger.info("未在 %s 找到 manifest.jsonl", archive_dir)
         return []
 
-    items: list[DatasetItem] = []
-    seen_images: set[str] = set()
+    latest_items: dict[str, DatasetItem] = {}
 
     with open(manifest_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -66,7 +67,9 @@ def load_archive_items(archive_dir: Path) -> list[DatasetItem]:
                 continue
             try:
                 rec = json.loads(line)
-            except Exception:
+                if not isinstance(rec, dict):
+                    continue
+            except (ValueError, TypeError):
                 continue
 
             rel_img = rec.get("archived_image_path", "")
@@ -75,26 +78,20 @@ def load_archive_items(archive_dir: Path) -> list[DatasetItem]:
 
             img_p = PROJECT_ROOT / rel_img if not Path(rel_img).is_absolute() else Path(rel_img)
             if not img_p.exists() or img_p.stat().st_size == 0:
-                # 尝试直接在 images_dir 查找同名文件
-                img_p = images_dir / Path(rel_img).name
-                if not img_p.exists() or img_p.stat().st_size == 0:
-                    continue
+                continue  # Basename alone cannot identify the captured source image.
 
-            if str(img_p) in seen_images:
-                continue
-            seen_images.add(str(img_p))
-
-            items.append(
-                DatasetItem(
+            try:
+                latest_items[os.path.normcase(str(img_p.resolve()))] = DatasetItem(
                     image_path=img_p,
                     manual_label=rec.get("manual_label", "UNKNOWN"),
                     segment_id=int(rec.get("segment_id", 0)),
                     source_video=rec.get("filepath", ""),
                     timestamp=float(rec.get("frame_timestamp", 0.0)),
                 )
-            )
+            except (ValueError, TypeError):
+                continue
 
-    return items
+    return [latest_items[key] for key in sorted(latest_items)]
 
 
 def load_db_fallback_items(db_path: Path) -> list[DatasetItem]:
@@ -102,7 +99,7 @@ def load_db_fallback_items(db_path: Path) -> list[DatasetItem]:
     if not db_path.exists():
         return []
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """
@@ -133,77 +130,86 @@ def load_db_fallback_items(db_path: Path) -> list[DatasetItem]:
     return items
 
 
-def generate_yolo_labels_for_item(
-    item: DatasetItem,
-    target_txt_path: Path,
-    yolo_model: Any = None,
-) -> int:
-    """为单张图片生成 YOLO 标准格式标注文件 (.txt)。
-    
-    规则:
-    1. FALSE_ALARM (困难负样本):
-       生成空的 .txt 文件。告知模型当前机位背景无需产生任何检测框，强力抑制窗帘/树影/扫地机误检！
-    2. CONFIRMED_MOTION / VERIFIED_MOTION / MISSED_MOTION (正样本):
-       若有 yolo_model，运行推理获取目标的边界框并保存。
+def verified_target_annotation(item: DatasetItem):
+    """Read one immutable human target review; event labels/legacy txt are not truth.
+
+    Source identity is the captured provenance of the reviewed image, not a
+    promise that the NAS is currently online. The image content itself must
+    still match exactly. Automatic model predictions never enter this path.
     """
-    from src.feedback import normalize_label, NEGATIVE_LABELS
-    lbl = normalize_label(item.manual_label)
+    review_path = item.image_path.with_suffix(".targets.json")
+    if not review_path.is_file():
+        return None
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    if not isinstance(review, dict):
+        raise ValueError("Target review must be an object")
+    image = item.image_path.read_bytes()
+    if (review.get("schema") != 1 or review.get("label_source") != "human_target_review"
+            or review.get("all_targets_reviewed") is not True
+            or not isinstance(review.get("reviewed_at"), str) or not review["reviewed_at"].strip()
+            or review.get("image_sha256") != hashlib.sha256(image).hexdigest()):
+        raise ValueError("Target review missing human completeness or current image identity")
+    canonical = lambda value: os.path.normcase(str(Path(value).resolve()))
+    identity = review.get("source_identity")
+    if (not item.source_video or canonical(review.get("source_video", "")) != canonical(item.source_video)
+            or not isinstance(identity, list) or len(identity) != 3
+            or canonical(identity[0]) != canonical(item.source_video)
+            or type(identity[1]) is not int or identity[1] <= 0
+            or type(identity[2]) is not int or identity[2] <= 0
+            or not math.isfinite(float(review.get("frame_timestamp", float("nan"))))
+            or float(review["frame_timestamp"]) != float(item.timestamp)):
+        raise ValueError("Target review source/frame identity does not match archive item")
+    import cv2
+    import numpy as np
+    decoded_image = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+    if decoded_image is None:
+        raise ValueError("Reviewed image cannot be decoded")
+    boxes = review.get("boxes")
+    if (not isinstance(boxes, list) or type(review.get("no_targets")) is not bool
+            or review["no_targets"] != (len(boxes) == 0)):
+        raise ValueError("Empty target labels require explicit human confirmation")
+    lines = validate_target_boxes(boxes, decoded_image.shape[1], decoded_image.shape[0])
+    return lines, image, review
 
-    # 1. 困难负样本：必须写入空文本文件（0 目标）
-    if lbl in NEGATIVE_LABELS:
-        target_txt_path.write_text("", encoding="utf-8")
-        return 0
 
-    # Prefer manually reviewed box sidecars over pseudo-labels.
-    sidecar = item.image_path.with_suffix(".txt")
-    if sidecar.exists():
-        content = sidecar.read_text(encoding="utf-8").strip()
-        lines = content.splitlines()
-        for line in lines:
-            fields = line.split()
-            if (len(fields) != 5 or fields[0] not in {"0", "15", "16"} or
-                    any(not 0 <= float(v) <= 1 for v in fields[1:]) or
-                    float(fields[3]) <= 0 or float(fields[4]) <= 0):
-                raise ValueError(f"Invalid reviewed box: {sidecar}")
-        if lines:
-            target_txt_path.write_text(content + "\n", encoding="utf-8")
-            return len(lines)
-    # 2. 正样本：检测并生成目标框 (class_id x y w h)
-    box_lines: list[str] = []
-    if yolo_model is not None:
-        try:
-            import cv2
-            img = cv2.imread(str(item.image_path))
-            if img is not None:
-                h_img, w_img = img.shape[:2]
-                # 对困难漏报样本使用较低阈值 0.15 捕获微弱轮廓；对确认样本使用 0.25
-                conf_th = 0.15 if lbl == "MISSED_MOTION" else 0.25
-                results = yolo_model(img, conf=conf_th, verbose=False)
-                r = results[0]
-                if r.boxes is not None and len(r.boxes) > 0:
-                    for box in r.boxes:
-                        cls_id = int(box.cls[0].item())
-                        # COCO: 0=person, 15=cat, 16=dog
-                        if cls_id == 0:
-                            target_cls = 0  # person
-                        elif cls_id in (15, 16):
-                            target_cls = cls_id  # preserve COCO cat/dog IDs
-                        else:
-                            continue
+def validate_target_boxes(boxes, image_width, image_height):
+    """Shared strict validation for human review writes and dataset consumption."""
+    if not isinstance(boxes, list):
+        raise ValueError("Target boxes must be a list")
+    lines = []
+    for box in boxes:
+        cls = box["class_id"]
+        values = [float(box[key]) for key in ("x_center", "y_center", "width", "height")]
+        xc, yc, width, height = values
+        if (type(cls) is not int or cls not in (0, 15, 16)
+                or any(not math.isfinite(value) for value in values)
+                or width * image_width < 1 or height * image_height < 1
+                or not (0 <= xc-width/2 < xc+width/2 <= 1)
+                or not (0 <= yc-height/2 < yc+height/2 <= 1)):
+            raise ValueError("Reviewed box has invalid class, finite coordinates or image bounds")
+        lines.append(f"{cls} {xc:.6f} {yc:.6f} {width:.6f} {height:.6f}")
+    return lines
 
-                        # 转换为归一化 xywh
-                        xywh = box.xywhn[0].cpu().numpy()
-                        box_lines.append(f"{target_cls} {xywh[0]:.6f} {xywh[1]:.6f} {xywh[2]:.6f} {xywh[3]:.6f}")
-        except Exception as e:
-            logger.debug("YOLO 预测生成标签异常: %s", e)
 
-    if not box_lines:
-        logger.warning("Positive sample needs box annotation; excluded: %s", item.image_path)
+def generate_yolo_labels_for_item(item: DatasetItem, target_txt_path: Path, yolo_model: Any = None) -> int:
+    """Export verified human boxes/explicit no-target review only; never infer truth."""
+    try:
+        annotation = verified_target_annotation(item)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        logger.warning("Target annotation excluded for %s: %s", item.image_path, error)
         return -1
-    # 写入标签文件
-    content = "\n".join(box_lines)
-    target_txt_path.write_text(content, encoding="utf-8")
-    return len(box_lines)
+    if annotation is None:
+        logger.warning("Target annotation required; event label/legacy txt excluded: %s", item.image_path)
+        return -1
+    lines, _, _ = annotation
+    target_txt_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return len(lines)
+
+
+def target_source_key(source_video):
+    from src.core.identity import parse_filename
+    parsed = parse_filename(Path(source_video).name)
+    return "date:" + parsed["date"] if parsed else "source:" + os.path.normcase(str(Path(source_video).resolve()))
 
 
 def build_yolo_dataset(
@@ -211,64 +217,111 @@ def build_yolo_dataset(
     output_dir: Path,
     val_ratio: float = 0.2,
     yolo_model_path: Path | None = None,
+    test_ratio: float = 0.2,
+    seed: int = 42,
 ) -> dict[str, Any]:
-    """将归档图片划分为 train/val 并输出完整 YOLO 数据集结构。"""
+    """Freeze reviewed targets into disjoint train/val/test source groups."""
     # 初始化输出目录
     img_train_dir = output_dir / "images" / "train"
     img_val_dir = output_dir / "images" / "val"
     lbl_train_dir = output_dir / "labels" / "train"
     lbl_val_dir = output_dir / "labels" / "val"
+    img_test_dir = output_dir / "images" / "test"
+    lbl_test_dir = output_dir / "labels" / "test"
 
-    for d in (img_train_dir, img_val_dir, lbl_train_dir, lbl_val_dir):
+    directories = (img_train_dir, img_val_dir, img_test_dir, lbl_train_dir, lbl_val_dir, lbl_test_dir)
+    if not (0 < val_ratio < 1 and 0 < test_ratio < 1 and val_ratio + test_ratio < 1):
+        raise ValueError("val_ratio and test_ratio must be positive and sum to less than 1")
+    if type(seed) is not int or seed < 0:
+        raise ValueError("Split seed must be a nonnegative integer")
+    for d in directories:
         d.mkdir(parents=True, exist_ok=True)
 
-    # 加载推理模型（用于生成正样本伪标签）
-    yolo_model = None
-    if yolo_model_path and yolo_model_path.exists():
-        try:
-            from ultralytics import YOLO
-            import torch
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            yolo_model = YOLO(str(yolo_model_path))
-            yolo_model.to(device)
-            logger.info("已加载 YOLO 模型生成正样本标注: %s (device: %s)", yolo_model_path.name, device)
-        except Exception as e:
-            logger.warning("未能加载 YOLO 预测模型，将生成默认标签: %s", e)
-
-    from src.feedback import normalize_label, NEGATIVE_LABELS, POSITIVE_LABELS
-    import hashlib
-    if not 0 < val_ratio < 1:
-        raise ValueError("val_ratio must be between 0 and 1")
-    if any(any(d.iterdir()) for d in (img_train_dir, img_val_dir, lbl_train_dir, lbl_val_dir)):
+    # Keep the old model argument for callers, but never run automatic labeling.
+    if yolo_model_path is not None:
+        logger.info("Model argument ignored: export requires explicit human target annotations")
+    from src.feedback import normalize_label
+    if any(any(d.iterdir()) for d in directories):
         raise ValueError("Use a new empty dataset directory to avoid stale labels")
-    groups = sorted({it.source_video for it in items})
-    random.Random(42).shuffle(groups)
-    n_val = max(1, round(len(groups) * val_ratio)) if len(groups) > 1 else 0
-    val_groups = set(groups[:n_val])
-    stats = {"train_images": 0, "val_images": 0, "train_boxes": 0, "val_boxes": 0,
-             "negatives": 0, "positives": 0, "excluded": 0}
-    manifest = []
-    for it in items:
-        label = normalize_label(it.manual_label)
-        if label not in NEGATIVE_LABELS | POSITIVE_LABELS:
+    stats = {**{split + "_" + metric: 0 for split in ("train", "val", "test") for metric in ("images", "boxes")},
+             "negatives": 0, "positives": 0, "excluded": 0, "duplicates": 0, "conflicts": 0}
+    accepted, excluded = [], []
+    for it in sorted(items, key=lambda item: (str(item.image_path.resolve()), item.source_video, item.timestamp)):
+        try:
+            annotation = verified_target_annotation(it)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.warning("Target annotation excluded for %s: %s", it.image_path, error)
+            annotation = None
+        if annotation is None:
             stats["excluded"] += 1
+            excluded.append({"segment_id": it.segment_id, "reason": "unverified_target_review"})
             continue
-        split = "val" if it.source_video in val_groups else "train"
+        accepted.append((it, annotation))
+    # Source dates keep adjacent files and simultaneous camera views together.
+    # Exact duplicate images link groups and are never counted twice. Conflicting
+    # target labels for identical bytes are quarantined instead of choosing one.
+    from src.core.replay_journal import digest
+    def group_for(item):
+        return target_source_key(item.source_video)
+    parent = {group_for(item): group_for(item) for item, _ in accepted}
+    def root(group):
+        while parent[group] != group:
+            parent[group] = parent[parent[group]]
+            group = parent[group]
+        return group
+    by_image = {}
+    for entry in accepted:
+        by_image.setdefault(entry[1][2]["image_sha256"], []).append(entry)
+    unique = []
+    for entries in by_image.values():
+        if len({tuple(sorted(annotation[0])) for _, annotation in entries}) != 1:
+            stats["conflicts"] += len(entries)
+            stats["excluded"] += len(entries)
+            excluded.extend({"segment_id": item.segment_id, "reason": "conflicting_identical_image_targets"} for item, _ in entries)
+            continue
+        groups = [group_for(item) for item, _ in entries]
+        for group in groups[1:]:
+            parent[root(group)] = root(groups[0])
+        unique.append(entries[0])
+        stats["duplicates"] += len(entries)-1
+        stats["excluded"] += len(entries)-1
+        excluded.extend({"segment_id": item.segment_id, "reason": "identical_image_duplicate"} for item, _ in entries[1:])
+    members = {}
+    for group in parent:
+        members.setdefault(root(group), []).append(group)
+    group_ids = {group: digest(sorted(members[root(group)])) for group in parent}
+    group_members = {digest(sorted(values)): sorted(values) for values in members.values()}
+    groups = sorted({group_ids[group_for(item)] for item, _ in unique})
+    random.Random(seed).shuffle(groups)
+    n_test = min(max(1, round(len(groups)*test_ratio)), len(groups)-2) if len(groups) >= 3 else 0
+    n_val = min(max(1, round(len(groups)*val_ratio)), len(groups)-n_test-1) if len(groups) >= 2 else 0
+    assignments = {group: ("test" if index < n_test else "val" if index < n_test+n_val else "train") for index, group in enumerate(groups)}
+    manifest = []
+    for it, (lines, image_bytes, review) in unique:
+        label = normalize_label(it.manual_label)
+        source_group = group_ids[group_for(it)]
+        split = assignments[source_group]
         suffix = hashlib.sha256(str(it.image_path.resolve()).encode()).hexdigest()[:12]
         name = it.image_path.stem + "_" + suffix
         dest_lbl = output_dir / "labels" / split / (name + ".txt")
-        n_boxes = generate_yolo_labels_for_item(it, dest_lbl, yolo_model)
-        if n_boxes < 0:
-            stats["excluded"] += 1
-            continue
+        n_boxes = len(lines)
+        dest_lbl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         dest_img = output_dir / "images" / split / (name + it.image_path.suffix)
-        shutil.copy2(it.image_path, dest_img)
+        dest_img.write_bytes(image_bytes)
         stats[split + "_images"] += 1
         stats[split + "_boxes"] += n_boxes
-        stats["negatives" if label in NEGATIVE_LABELS else "positives"] += 1
+        stats["negatives" if n_boxes == 0 else "positives"] += 1
         manifest.append({"image": str(dest_img.relative_to(output_dir)), "source_video": it.source_video,
-                         "label": label, "split": split, "label_source": "human_negative" if label in NEGATIVE_LABELS else "human_boxes" if it.image_path.with_suffix(".txt").exists() else "pseudo"})
+                         "label": label, "split": split, "source_group": source_group,
+                         "label_source": "human_target_review", "image_sha256": review["image_sha256"],
+                         "label_file": str(dest_lbl.relative_to(output_dir)), "label_sha256": hashlib.sha256(dest_lbl.read_bytes()).hexdigest(),
+                         "source_identity": review["source_identity"], "frame_timestamp": review["frame_timestamp"],
+                         "all_targets_reviewed": True, "no_targets": review["no_targets"]})
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "excluded_items.json").write_text(json.dumps(excluded, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "dataset_split.json").write_text(json.dumps({"schema": 1, "seed": seed, "val_ratio": val_ratio,
+        "test_ratio": test_ratio, "grouping": "source_date_else_canonical_path_linked_by_identical_images",
+        "groups": [{"id": group, "split": assignments[group], "members": group_members[group]} for group in sorted(groups)]}, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 生成 data.yaml
     data_yaml_path = output_dir / "data.yaml"
@@ -277,11 +330,14 @@ def build_yolo_dataset(
     import ultralytics
     coco = yaml.safe_load((Path(ultralytics.__file__).parent / "cfg" / "datasets" / "coco.yaml").read_text(encoding="utf-8"))
     yaml_content = yaml.safe_dump({"path": str(output_dir.resolve()).replace("\\", "/"),
-                                   "train": "images/train", "val": "images/val", "names": coco["names"]},
+                                   "train": "images/train", "val": "images/val", "test": "images/test", "names": coco["names"]},
                                   allow_unicode=True, sort_keys=False)
     data_yaml_path.write_text(yaml_content, encoding="utf-8")
     logger.info("已生成数据集配置文件: %s", data_yaml_path)
 
+    stats["target_review_required"] = True
+    stats["source_groups"] = len(groups)
+    stats["usable"] = all(stats[split+"_images"] > 0 for split in ("train", "val", "test"))
     return stats
 
 
@@ -291,7 +347,9 @@ def main():
     parser.add_argument("--db", type=Path, default=PROJECT_ROOT / "data" / "vlog.db", help="数据库路径")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "yolo_dataset", help="YOLO 数据集导出目录")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集切分比例 (默认 0.2)")
-    parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models" / "yolo11n.pt", help="基础 YOLO 模型路径")
+    parser.add_argument("--test-ratio", type=float, default=0.2, help="独立留出比例 (默认0.2，按日期/原片分组)")
+    parser.add_argument("--seed", type=int, default=42, help="固定划分种子")
+    parser.add_argument("--model", type=Path, default=PROJECT_ROOT / "models" / "yolo11n.pt", help="已弃用：自动预测不作为人工目标真值导出")
     parser.add_argument("--camera", help="Camera MAC or configured alias")
     parser.add_argument("--dry-run", action="store_true", help="仅预览可用样本数，不执行文件生成")
 
@@ -338,16 +396,21 @@ def main():
         output_dir=args.output_dir,
         val_ratio=args.val_ratio,
         yolo_model_path=args.model,
+        test_ratio=args.test_ratio,
+        seed=args.seed,
     )
 
     print("\n" + "=" * 65)
-    print(" ✅ YOLO 数据集导出完成！")
+    print(" YOLO 人工目标复核导出完成" if stats["usable"] else " 尚无可用训练/验证集：需要独立人工目标框或明确无目标复核")
     print("=" * 65)
     print(f" 训练集: {stats['train_images']} 张图片 | {stats['train_boxes']} 个目标标注")
     print(f" 验证集: {stats['val_images']} 张图片 | {stats['val_boxes']} 个目标标注")
+    print(f" 留出集: {stats['test_images']} 张图片 | {stats['test_boxes']} 个目标标注")
     print(f" 困难负样本 (抑制误报): {stats['negatives']} 张 (空 txt 标注)")
     print(f" 配置文件位置: {args.output_dir / 'data.yaml'}")
     print("=" * 65 + "\n")
+    if not stats["usable"]:
+        return
     print("💡 下一步操作: 运行本地微调训练脚本:")
     print(f"    uv run python scripts/train_yolo.py --data {args.output_dir / 'data.yaml'}")
 

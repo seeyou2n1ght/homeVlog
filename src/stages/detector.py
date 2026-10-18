@@ -4,6 +4,7 @@ import os
 import subprocess
 import threading
 import time
+import math
 from pathlib import Path
 
 import av
@@ -12,7 +13,10 @@ import numpy as np
 
 from src.core.utils import parse_res
 from src.hardware.scheduler import acquire_with_retry, VideoLease
-from src.hardware.ffmpeg import run_ffmpeg, FFmpegProcessRegistry
+from src.hardware.ffmpeg import (
+    run_ffmpeg, FFmpegProcessRegistry, MediaTerminationUnconfirmed,
+    MediaStartTerminationUnconfirmed,
+)
 
 # 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.algorithms.filters 提供（单一实现，防漂移）。
 # 此处 re-export 以保持 `from src.detector import ...` 的历史导入路径兼容。
@@ -53,7 +57,7 @@ def evaluate_stream_completion(
     is_interrupted: bool = False,
     returncode: int | None = 0,
     has_tail_error: bool = False,
-    min_expected_ratio: float = 0.85,
+    timed_out: bool = False,
 ) -> DecodeStreamDecision:
     """统一评估管道流 (Pipe) 与内存解码 (PyAV) 的流完整性与截断判定策略。
 
@@ -62,23 +66,21 @@ def evaluate_stream_completion(
     if is_aborted or is_interrupted:
         return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="INTERRUPTED")
 
+    if timed_out:
+        return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="TIMEOUT")
+
     if total_frames < 2:
         return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="INSUFFICIENT_FRAMES")
 
-    min_expected_frames = max(1, int(file_duration * effective_fps * min_expected_ratio))
-    full_expected_frames = max(1, file_duration * effective_fps - 2)
-
-    is_complete = bool(
-        (returncode == 0)
-        or (total_frames >= min_expected_frames)
-        or (total_frames >= full_expected_frames)
-        or has_tail_error
-    )
+    # Frame coverage cannot prove successful termination (device, I/O and
+    # watchdog errors may arrive after most frames have already been decoded).
+    is_complete = returncode == 0 or has_tail_error
 
     if not is_complete:
         return DecodeStreamDecision(complete=False, truncated=False, corrupted_tail=False, reason="PROCESS_ERROR")
 
-    is_truncated = bool(total_frames < min_expected_frames)
+    # Permit sample rounding, not a percentage of a long recording.
+    is_truncated = total_frames + 2 < file_duration * effective_fps
     reason = "CORRUPTED_TAIL" if has_tail_error else ("TRUNCATED_EOF" if is_truncated else "NORMAL_COMPLETION")
     return DecodeStreamDecision(
         complete=True,
@@ -112,7 +114,7 @@ class MotionDetector:
         self.config = config
         self.width, self.height = parse_res(det.get("analysis_resolution", "640x360"))
         self.fps = det.get("analysis_fps", 5)
-        self.sensitivity = det.get("motion_sensitivity", 4.0)
+        self.sensitivity = float(det.get("motion_sensitivity", 1.0))
         self.min_motion_threshold = float(det.get("min_motion_threshold", 2.5))
         self.roi = det.get("roi_crop", [0.1, 0.12, 0.8, 0.85])
         self.min_motion_frames = det.get("min_motion_frames", 3)
@@ -222,7 +224,7 @@ class MotionDetector:
             cooldown_half_life=self.cooldown_half_life,
             min_connected_cells=self.min_connected_cells,
             cell_noise_alpha=self.cell_noise_alpha,
-            sens_multiplier=max(1.0, self.sensitivity * 0.5),
+            sens_multiplier=1.0 / max(0.001, self.sensitivity),
             base_noise_thresh=self.base_noise_thresh,
             cluster_boost=self.cluster_boost,
             ambient_drift_suppress=self.ambient_drift_suppress,
@@ -293,7 +295,7 @@ class MotionDetector:
         p5 = float(np.percentile(energies_arr, 5))
         p20 = float(np.percentile(energies_arr, 20))
         noise_spread = (p20 - p5) * 2.5
-        threshold = max(self.min_motion_threshold, p5 + self.sensitivity * noise_spread)
+        threshold = max(self.min_motion_threshold, p5 + noise_spread / max(0.001, self.sensitivity))
 
         raw_labels = [bool(e > threshold) for e in energies]
 
@@ -429,6 +431,8 @@ class MotionDetector:
             if frames and meta.get("complete", False):
                 try:
                     full_audio = self._decode_audio_pipe(filepath, file_duration)
+                except MediaTerminationUnconfirmed:
+                    raise
                 except Exception as exc:
                     logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, exc)
                     from src.algorithms.audio_features import AudioFeatures
@@ -446,7 +450,7 @@ class MotionDetector:
                 "pipe decode incomplete or yielded 0 frames for %s, falling back to PyAV",
                 Path(filepath).name,
             )
-        except MemoryError:
+        except (MemoryError, MediaTerminationUnconfirmed):
             # A second full decode has the same storage bound and cannot recover.
             raise
         except Exception as e:
@@ -465,9 +469,10 @@ class MotionDetector:
         本路径解码侧在 GPU 完成 fps 过滤与缩放，仅 ~660 个 416x234 小帧经管道回传，
         实测可将单文件解码耗时从 ~240s 降至 ~15-30s。
         """
+        FFmpegProcessRegistry.reap_cleanups()
         from src.hardware.frame_pool import FramePool
         from src.algorithms.motion_trace import MotionTrace
-        decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0))) if getattr(self, "_stream_motion", False)
+        decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)), visual_sample_stride=max(1, math.ceil(file_duration * effective_fps / 2048))) if getattr(self, "_stream_motion", False)
                           else FramePool(self.buffer_limit // 2))
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
@@ -517,26 +522,31 @@ class MotionDetector:
         total_frames = 0
         proc: subprocess.Popen | None = None
         watchdog_timer: threading.Timer | None = None
+        timed_out = threading.Event()
         from src.core.utils import TEMP_DIR
         pipe_key = f"pipe_decode_{Path(filepath).name}_{time.monotonic()}"
         safe_stem = Path(filepath).stem.replace(" ", "_")
         err_log = TEMP_DIR / f".pipe_decode_{safe_stem}_{os.getpid()}_{threading.get_ident()}.log"
         try:
             with open(err_log, "wb") as f_err:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=f_err)
-                FFmpegProcessRegistry.register(pipe_key, proc)
+                try:
+                    proc = FFmpegProcessRegistry.start(pipe_key,cmd,stdout=subprocess.PIPE,stderr=f_err)
+                except MediaStartTerminationUnconfirmed as error:
+                    proc, pipe_key = error.process, error.process_key
+                    raise
                 assert proc.stdout is not None
 
                 def _kill_on_timeout():
                     try:
-                        if proc and proc.poll() is None:
+                        if proc and not FFmpegProcessRegistry.has_exited(proc):
+                            timed_out.set()
                             logger.warning(
                                 "pipe decode watchdog timeout (%.1fs) for %s, terminating process",
                                 watchdog_timeout, Path(filepath).name,
                             )
-                            proc.kill()
-                    except Exception:
-                        pass
+                            FFmpegProcessRegistry.terminate(pipe_key)
+                    except Exception as error:
+                        logger.error("Decode watchdog stop failed for %s: %s", pipe_key, error)
 
                 watchdog_timer = threading.Timer(watchdog_timeout, _kill_on_timeout)
                 watchdog_timer.daemon = True
@@ -562,22 +572,34 @@ class MotionDetector:
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+                timed_out.set()
+                FFmpegProcessRegistry.terminate(pipe_key)
+                FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
             except BaseException:
                 if proc:
                     try:
-                        proc.kill()
+                        FFmpegProcessRegistry.terminate(pipe_key)
                     except Exception:
                         pass
                 raise
         finally:
-            if proc and proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=5)
             if watchdog_timer:
                 watchdog_timer.cancel()
-            FFmpegProcessRegistry.deregister(pipe_key)
+            try:
+                if proc is not None:
+                    FFmpegProcessRegistry.terminate(pipe_key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                if watchdog_timer is not None:
+                    watchdog_timer.join(timeout=2)
+                    if watchdog_timer.is_alive():
+                        raise RuntimeError("Decode watchdog termination unconfirmed")
+            except BaseException as error:
+                readers = [watchdog_timer] if watchdog_timer is not None else []
+                FFmpegProcessRegistry.defer_cleanup(pipe_key, proc, io_sem, readers)
+                logger.error("Decode cleanup unconfirmed; retained process, original lease and stderr: %s", pipe_key)
+                raise MediaTerminationUnconfirmed(f"Decode cleanup unconfirmed: {pipe_key}") from error
+            if proc is not None:
+                FFmpegProcessRegistry.deregister(pipe_key, proc)
             if proc and proc.stdout:
                 try:
                     proc.stdout.close()
@@ -606,6 +628,7 @@ class MotionDetector:
                 is_interrupted=FFmpegProcessRegistry.is_interrupted(),
                 returncode=proc.returncode if proc else -1,
                 has_tail_error=False,
+                timed_out=timed_out.is_set(),
             )
             is_complete = decision.complete
             is_truncated = decision.truncated
@@ -624,6 +647,8 @@ class MotionDetector:
             "aborted": is_aborted,
             "complete": is_complete,
             "truncated": is_truncated,
+            "completion_reason": decision.reason,
+            "completion_error": err_tail if not decision.complete else "",
         }
         return decoded_frames, yolo_buffer, meta
 
@@ -694,6 +719,8 @@ class MotionDetector:
         video_frame_count = 0
         decode_complete = False
         meta_corrupted_tail = False
+        timed_out = False
+        completion_error = ""
 
         try:
             from av.audio.resampler import AudioResampler
@@ -755,7 +782,7 @@ class MotionDetector:
                 effective_fps = video_fps / frame_step
                 if getattr(self, "_stream_motion", False):
                     from src.algorithms.motion_trace import MotionTrace
-                    decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)))
+                    decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)), visual_sample_stride=max(1, math.ceil(file_duration * effective_fps / 2048)))
 
                 # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
                 # 保证 yolo_buffer 帧键与分析阶段时间轴严格对齐
@@ -836,6 +863,7 @@ class MotionDetector:
                     decoded_frames.append(gray)
 
                     if time.monotonic() - t_decode_start > watchdog_timeout:
+                        timed_out = True
                         logger.warning(
                             "PyAV decode timeout for %s (dur=%.1f, elapsed=%.1f)",
                             Path(filepath).name, file_duration,
@@ -859,8 +887,10 @@ class MotionDetector:
                         pass
 
         except Exception as e:
+            completion_error = f"{type(e).__name__}: {e}"
             logger.warning("PyAV decode error for %s: %s", Path(filepath).name, e)
-            if not FFmpegProcessRegistry.is_interrupted() and total_frames >= 2:
+            if (isinstance(e, (av.error.InvalidDataError, av.error.EOFError))
+                    and not FFmpegProcessRegistry.is_interrupted() and total_frames >= 2):
                 decode_complete = True
                 meta_corrupted_tail = True
                 logger.info(
@@ -882,6 +912,7 @@ class MotionDetector:
             is_interrupted=FFmpegProcessRegistry.is_interrupted(),
             returncode=0 if decode_complete else -1,
             has_tail_error=meta_corrupted_tail,
+            timed_out=timed_out,
         )
         decode_complete = decision.complete
         meta_truncated = decision.truncated
@@ -894,12 +925,15 @@ class MotionDetector:
             "sem_wait": sem_wait,
             "truncated": meta_truncated,
             "corrupted_tail": meta_corrupted_tail,
+            "completion_reason": decision.reason,
+            "completion_error": completion_error if not decision.complete else "",
         }
         return decoded_frames, yolo_buffer, full_audio, meta
 
     def analyze(
         self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0,
         has_audio: int | None = None, duration_verified: bool = False,
+        declared_duration: float | None = None,
     ) -> tuple[list[dict], dict[int, np.ndarray]]:
         """
         全文件分析入口。
@@ -910,7 +944,16 @@ class MotionDetector:
         - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
         - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
+        self.visual_samples = []
+        self.visual_source = None
+        try:
+            from src.core.visual_index import source_identity
+            visual_source_before = source_identity(filepath)
+        except OSError:
+            visual_source_before = None
         self._analysis_start_offset = start_offset
+        if declared_duration is not None and duration_verified:
+            file_duration = max(file_duration, declared_duration)
         # Filename spans are day-relative placement metadata, not media duration.
         # Analysis is the lazy metadata boundary; probe only if metadata was not already resolved.
         if file_duration <= 0 or has_audio is None or not duration_verified:
@@ -943,6 +986,14 @@ class MotionDetector:
         has_audio = decode_meta["has_audio"]
         effective_fps = decode_meta["effective_fps"]
         t_decode_end = time.monotonic()
+        self.decode_completion = {
+            "reason": decode_meta.get("completion_reason", "UNKNOWN"),
+            "complete": bool(decode_meta.get("complete", True)),
+            "declared_duration_s": file_duration,
+            "available_duration_s": min(file_duration, len(decoded_frames) / max(.001, effective_fps)),
+            "sample_period_s": 1 / max(.001, effective_fps),
+            "error": decode_meta.get("completion_error", ""),
+        }
 
         if decode_meta.get("aborted") or not decode_meta.get("complete", True):
             decoded_frames = []
@@ -956,13 +1007,30 @@ class MotionDetector:
                 "has_audio": has_audio,
                 "audio_events": 0,
                 "sem_wait": decode_meta.get("sem_wait", 0.0),
+                "completion_reason": self.decode_completion["reason"],
             }
             return [], yolo_buffer
 
         actual_dur = round(len(decoded_frames) / max(0.001, effective_fps), 3)
-        if actual_dur < file_duration or decode_meta.get("truncated"):
+        if actual_dur + 2 / max(.001, effective_fps) < file_duration or decode_meta.get("truncated"):
             file_duration = actual_dur
             self.file_duration_detected = actual_dur
+
+        visual_started = time.monotonic()
+        try:
+            from src.core.visual_index import frame_signature
+            if visual_source_before and source_identity(filepath) == visual_source_before:
+                # Additional memory is bounded; never retain a second full frame pool.
+                from src.algorithms.motion_trace import MotionTrace
+                if isinstance(decoded_frames, MotionTrace):
+                    self.visual_samples = decoded_frames.visual_samples
+                else:
+                    indices = np.linspace(0,len(decoded_frames)-1,min(2048,len(decoded_frames)),dtype=int)
+                    self.visual_samples = [(int(i)/effective_fps,frame_signature(decoded_frames[i])) for i in indices]
+                self.visual_source = visual_source_before
+        except Exception as exc:
+            logger.warning("Visual samples unavailable for %s: %s", filepath, exc)
+        visual_time = time.monotonic()-visual_started + getattr(decoded_frames, "visual_index_s", 0.0)
 
         # One continuous background model per file; the outer worker pool bounds CPU concurrency.
         results, frames_meta = self.analyze_frames(
@@ -983,10 +1051,13 @@ class MotionDetector:
             "motion_ratio": round(motion_count / len(results), 3) if results else 0,
             "early_term": early_term_any,
             "effective_fps": effective_fps,
+            "visual_index_s": round(visual_time,6),
+            "visual_samples": len(self.visual_samples),
             "has_audio": has_audio,
             "audio_events": len(audio_events),
             "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
             "sem_wait": decode_meta.get("sem_wait", 0.0),
+            "completion_reason": self.decode_completion["reason"],
         }
         return results, yolo_buffer
 

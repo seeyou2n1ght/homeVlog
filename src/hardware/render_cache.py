@@ -35,7 +35,7 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
 
 def processing_fingerprint(filepath, config):
     selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")}
-    return render_fingerprint([filepath], "analysis-v4-window-evidence", "analysis", 0, {}, {}, selected)
+    return render_fingerprint([filepath], "analysis-v5-ordered-prescreen-prior", "analysis", 0, {}, {}, selected)
 
 
 def _window_is_continuous(container, stream, boundary: float, duration: float) -> bool:

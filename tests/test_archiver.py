@@ -151,3 +151,28 @@ def test_audit_service_submit_review_archive_hook(tmp_path):
             assert mock_extract.called
     finally:
         db.close()
+
+
+
+def test_archive_never_uses_legacy_basename_cache_or_out_of_interval_memory(tmp_path,monkeypatch):
+    from src.stages import archiver
+    db=VlogDatabase(db_path=tmp_path/"identity.sqlite")
+    try:
+        source=str(tmp_path/"cam1"/"same.mp4")
+        db.add_file_task(source,1,"20261012","20261012000000","20261012000004",4)
+        db.set_analysis_result(source,"ANALYZED",[Segment(start_time=2,end_time=4,state="STATIC",source_file=source)])
+        segment=db.get_segments_for_file(source)[0]["id"]
+        db.update_segment_review(segment,"CONFIRMED_STATIC")
+        cache=tmp_path/"cache";cache.mkdir();(cache/"same_wrong.jpg").write_bytes(b"wrong camera or time")
+        monkeypatch.setattr(archiver,"CACHE_DIR",cache)
+        archiver.FrameArchiver.remember(source,1,b"before this interval")
+        assert archiver.extract_and_archive_frame(db,segment,tmp_path/"archive") is None
+        archiver.FrameArchiver.remember(source,3.25,b"controlled decoded JPEG")
+        image=archiver.extract_and_archive_frame(db,segment,tmp_path/"archive")
+        assert image.read_bytes()==b"controlled decoded JPEG"
+        record=json.loads((tmp_path/"archive"/"manifest.jsonl").read_text())
+        assert record["frame_timestamp"]==3.25 and record["observed_timestamp_in_file"]==3.25
+        assert record["frame_origin"]=="decoded_memory" and record["source_identity"] is None
+        assert record["provenance_version"]==2
+    finally:
+        db.close()

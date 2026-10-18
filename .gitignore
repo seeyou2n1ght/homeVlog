@@ -62,6 +62,8 @@ inspect_out*/
 *.sqlite
 *.sqlite3
 *.prof
+# Persistent kernel-lock inode; never delete while a writer may own it.
+.*.writer.lock
 
 # ==========================================
 # Large Binary Models & Weights

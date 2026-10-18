@@ -423,13 +423,13 @@ def test_worker_failure_signals_abort(tmp_path):
 
 
 @pytest.mark.parametrize("label", ["FP", "TN", "FALSE_ALARM", "CONFIRMED_STATIC"])
-def test_all_negative_labels_are_empty(tmp_path, label):
+def test_event_negative_labels_are_not_object_negatives(tmp_path, label):
     from scripts.export_dataset import DatasetItem, generate_yolo_labels_for_item
     target = tmp_path / "label.txt"
     model = MagicMock()
     item = DatasetItem(tmp_path/"image.jpg", label, 1, "x", 0)
-    assert generate_yolo_labels_for_item(item,target,model) == 0
-    assert target.read_bytes() == b""
+    assert generate_yolo_labels_for_item(item,target,model) == -1
+    assert not target.exists()
     model.assert_not_called()
 
 

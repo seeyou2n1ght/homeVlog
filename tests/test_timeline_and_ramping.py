@@ -64,6 +64,7 @@ def test_render_subtitles_and_metadata_share_custom_display_clock(tmp_path, monk
     out.write_bytes(b"placeholder")
     monkeypatch.setattr(companion, "build_timeline_from_rows", lambda *a, **k: segments)
     monkeypatch.setattr(companion, "get_duration", lambda path: expected)
+    monkeypatch.setattr(companion, "bind_delivery_mapping", lambda *args: {"status": "AVAILABLE"})
     assert companion.save_vlog_companion_assets(out, "20260901", 0, "camera", 1,
                                                 duration * 6, 1, MagicMock(), config, rows=[])
     metadata = json.loads(out.with_suffix(".meta.json").read_text(encoding="utf-8"))

@@ -27,6 +27,33 @@ from src.utils import (
 from src.monitor import get_monitor, get_perf, PerfRecord
 
 
+def test_io_wait_checks_cancellation_without_blocking_budget_release(monkeypatch):
+    from src.hardware import scheduler
+    budget = scheduler.FileBudget(1)
+    assert budget.acquire(timeout=0)
+    probe_finished = threading.Event()
+    checks, probes = [], []
+    def probe_release_lock():
+        with budget.condition:
+            probe_finished.set()
+    def interrupted():
+        probe = threading.Thread(target=probe_release_lock)
+        probes.append(probe)
+        probe.start()
+        checks.append(probe_finished.wait(timeout=1))
+        return True
+    monkeypatch.setattr(scheduler, '_interrupted', interrupted)
+    try:
+        assert not budget.acquire(timeout=2)
+    finally:
+        for probe in probes:
+            probe.join(timeout=2)
+            assert not probe.is_alive()
+        budget.release()
+    assert checks == [True], 'Cancellation check held the lock needed by deferred permit release'
+    assert budget.available == 1 and not budget.waiters
+
+
 class TestWorkStealingScheduler:
     """测试异构算力动态工作窃取调度器。"""
 
@@ -59,6 +86,7 @@ class TestWorkStealingScheduler:
         mgr = WorkStealingManager(config=cfg)
 
         # 渲染启动
+        mgr.set_vram_probe_fn(lambda: 3000)
         mgr.register_render_start()
         assert mgr.is_render_active
         # 即便队列严重积压，也必须强制让步 QSV

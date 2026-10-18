@@ -3,14 +3,17 @@
 
 HomeVlog 专属机位小样本迁移学习与轻量微调训练流。
 基于 Ultralytics YOLO (如 YOLO11n / YOLO11s)，采用骨干网络冻结 (Backbone Freezing) 策略，
-仅针对 Neck 与 Detect Head 进行梯度更新，既能抑制机位专属背景误报并提升微弱动作召回，
-又能防止样本量较少时发生过拟合与对通用人形的灾难性遗忘。
+仅针对 Neck 与 Detect Head 进行梯度更新；是否改善识别及遗忘风险须独立验收。
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import shutil
 import sys
+import os
+import uuid
 from pathlib import Path
 
 # 确保项目根目录在 sys.path
@@ -46,30 +49,84 @@ def check_dataset_health(data_yaml_path: Path) -> bool:
         logger.error("训练集图片为空: %s", train_images_dir)
         return False
 
+    # Older exports inferred empty object labels from event negatives or mixed
+    # automatic predictions with reviewed targets. Preserve them as history,
+    # but do not train on that unverified labeling contract.
+    try:
+        import yaml
+        config = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8"))
+        names = config.get("names", {})
+        if (Path(config.get("path", "")).resolve() != dataset_root.resolve()
+                or config.get("train") != "images/train" or config.get("val") != "images/val"
+                or config.get("test") != "images/test"
+                or "download" in config or len(names) != 80
+                or [names[index] for index in (0, 15, 16)] != ["person", "cat", "dog"]):
+            raise ValueError("Dataset paths or target class namespace differ from verified export")
+        records = json.loads((dataset_root / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(records, list) or not records:
+            raise ValueError("Missing human target export manifest")
+        from scripts.export_dataset import target_source_key
+        from src.core.replay_journal import digest
+        protocol = json.loads((dataset_root / "dataset_split.json").read_text(encoding="utf-8"))
+        if protocol.get("schema") != 1:
+            raise ValueError("Missing frozen source split protocol")
+        groups = {}
+        member_groups = {}
+        for group in protocol["groups"]:
+            if group["id"] != digest(sorted(group["members"])) or group["split"] not in {"train", "val", "test"}:
+                raise ValueError("Invalid source split group")
+            groups[group["id"]] = group
+            for member in group["members"]:
+                if member in member_groups:
+                    raise ValueError("Source/date crosses dataset groups")
+                member_groups[member] = group["id"]
+        listed_images, listed_labels, image_hashes = set(), set(), set()
+        counts = {split: 0 for split in ("train", "val", "test")}
+        for record in records:
+            if (record.get("label_source") != "human_target_review"
+                    or record.get("all_targets_reviewed") is not True
+                    or type(record.get("no_targets")) is not bool):
+                raise ValueError("Unverified target labels or automatic predictions")
+            image = (dataset_root / record["image"]).resolve()
+            label = (dataset_root / record["label_file"]).resolve()
+            root = dataset_root.resolve()
+            if not image.is_relative_to(root) or not label.is_relative_to(root):
+                raise ValueError("Manifest path outside dataset")
+            split = record["split"]
+            group_id = member_groups.get(target_source_key(record["source_video"]))
+            if (group_id != record.get("source_group") or groups.get(group_id, {}).get("split") != split
+                    or image.parent != root / "images" / split or label.parent != root / "labels" / split
+                    or image in listed_images or label in listed_labels or record["image_sha256"] in image_hashes):
+                raise ValueError("Source/date, image or label crosses frozen dataset split")
+            if (hashlib.sha256(image.read_bytes()).hexdigest() != record["image_sha256"]
+                    or hashlib.sha256(label.read_bytes()).hexdigest() != record["label_sha256"]
+                    or record["no_targets"] != (not label.read_text(encoding="utf-8").strip())):
+                raise ValueError("Exported image/label identity changed")
+            listed_images.add(image)
+            listed_labels.add(label)
+            image_hashes.add(record["image_sha256"])
+            counts[split] += 1
+        actual_images = {p.resolve() for p in (dataset_root / "images").rglob("*") if p.is_file()}
+        actual_labels = {p.resolve() for p in (dataset_root / "labels").rglob("*.txt")}
+        if listed_images != actual_images or listed_labels != actual_labels:
+            raise ValueError("Dataset contains unlisted or missing image/label files")
+        if not all(counts.values()):
+            raise ValueError("Training, tuning and independent test groups are all required")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as error:
+        logger.error("目标复核数据集未通过来源/内容检查: %s", error)
+        return False
+
     return True
 
 
 def apply_custom_model_to_config(config_path: Path, model_path: Path) -> bool:
     """安全热替换 config/settings.yaml 中的 YOLO 模型配置（创建 .bak 备份）。"""
-    if not config_path.exists():
-        logger.error("配置文件不存在: %s", config_path)
+    if not config_path.exists() or not model_path.is_file() or model_path.stat().st_size == 0:
+        logger.error("配置或候选权重不存在/为空，未更新配置")
         return False
 
     try:
-        import yaml
-    except ImportError:
-        logger.error("缺少 pyyaml 模块，无法写回配置文件")
-        return False
-
-    backup_path = config_path.with_suffix(".yaml.bak")
-    try:
-        content = config_path.read_text(encoding="utf-8")
-        backup_path.write_text(content, encoding="utf-8")
-        logger.info("已创建配置文件备份: %s", backup_path)
-
-        data = yaml.safe_load(content)
-        if "yolo" not in data:
-            data["yolo"] = {}
+        content = config_path.read_bytes()
 
         # 相对路径格式
         try:
@@ -77,12 +134,10 @@ def apply_custom_model_to_config(config_path: Path, model_path: Path) -> bool:
         except ValueError:
             rel_model = str(model_path).replace("\\", "/")
 
-        data["yolo"]["enabled"] = True
-        data["yolo"]["model_path"] = rel_model
-
-        temporary = config_path.with_suffix(".yaml.tmp")
-        temporary.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        temporary.replace(config_path)
+        from src.core.tuner import apply_config_safe
+        result = apply_config_safe({"yolo.enabled": True, "yolo.model_path": rel_model},
+                                   config_path=config_path, expected_sha256=hashlib.sha256(content).hexdigest())
+        logger.info("配置备份: %s", result["backup_path"])
 
         logger.info("[Success] 成功更新 %s: yolo.model_path = %s", config_path.name, rel_model)
         return True
@@ -102,6 +157,12 @@ def run_training(
     device: str = "0",
 ) -> Path | None:
     """执行 YOLO 迁移微调训练。"""
+    if not check_dataset_health(data_yaml):
+        return None
+    if (output_model.exists() or output_model.with_suffix(".training.json").exists()
+            or not base_model.is_file() or base_model.stat().st_size == 0):
+        logger.error("输出模型已存在或基底权重缺失；请选择新输出路径和有效本地基底")
+        return None
     try:
         from ultralytics import YOLO
         import torch
@@ -114,70 +175,150 @@ def run_training(
         logger.warning("CUDA 不可用，自动回退到 CPU 训练模式")
         device = "cpu"
 
-    logger.info("正在加载基底权重: %s", base_model)
-    model = YOLO(str(base_model))
-
-    project_dir = PROJECT_ROOT / "runs" / "train"
-    project_dir.mkdir(parents=True, exist_ok=True)
-    exp_name = "homevlog_custom"
+    from src.core.replay_journal import atomic_json, digest
+    def dataset_identity():
+        return digest({name: hashlib.sha256((data_yaml.parent/name).read_bytes()).hexdigest()
+                       for name in (data_yaml.name, "manifest.json", "dataset_split.json")})
+    before = dataset_identity()
+    base_sha = hashlib.sha256(base_model.read_bytes()).hexdigest()
+    project_dir = PROJECT_ROOT / "runs" / "train" / uuid.uuid4().hex
+    project_dir.mkdir(parents=True, exist_ok=False)
+    exp_name = "fit"
+    receipt_path = project_dir / "training_receipt.json"
+    receipt = {"status": "RUNNING", "base_model_sha256": base_sha, "dataset_identity": before,
+               "data_yaml": str(data_yaml.resolve()), "output_model": str(output_model.resolve()),
+               "parameters": {"epochs": epochs, "batch": batch, "imgsz": imgsz, "freeze": freeze, "device": device},
+               "quality_gate": "UNAVAILABLE"}
+    atomic_json(receipt_path, receipt)
 
     logger.info("🚀 开始微调训练 (epochs=%d, batch=%d, freeze=%d, device=%s)...", epochs, batch, freeze, device)
 
     try:
-        train_res = model.train(
+        logger.info("正在加载基底权重: %s", base_model)
+        model = YOLO(str(base_model))
+        model.train(
             data=str(data_yaml.resolve()),
             epochs=epochs,
             batch=batch,
             imgsz=imgsz,
-            freeze=10,
+            freeze=freeze,
             device=device,
             amp=True,
             workers=2,
             project=str(project_dir),
             name=exp_name,
-            exist_ok=True,
+            exist_ok=False,
             verbose=True,
             save=True,
             plots=True,
         )
-    except Exception as e:
-        logger.error("YOLO 训练过程出现异常: %s", e)
-        return None
-
-    # 定位 best.pt
-    best_weight = project_dir / exp_name / "weights" / "best.pt"
-    if not best_weight.exists():
-        last_weight = project_dir / exp_name / "weights" / "last.pt"
-        best_weight = last_weight if last_weight.exists() else None
-
-    if best_weight and best_weight.exists():
+        # Only this unique attempt may produce the candidate. A stale best/last
+        # from another run must never make an incomplete training look complete.
+        best_weight = project_dir / exp_name / "weights" / "best.pt"
+        if not best_weight.is_file() or best_weight.stat().st_size == 0:
+            raise ValueError("Current training attempt produced no complete best.pt")
+        if (not check_dataset_health(data_yaml) or dataset_identity() != before
+                or hashlib.sha256(base_model.read_bytes()).hexdigest() != base_sha):
+            raise ValueError("Training dataset or base model changed during the attempt")
         output_model.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(best_weight), str(output_model))
+        temporary = output_model.with_name(output_model.name + "." + uuid.uuid4().hex + ".pending")
+        try:
+            shutil.copyfile(best_weight, temporary)
+            with temporary.open("rb+") as stream:
+                os.fsync(stream.fileno())
+            # Same-directory hard-link publication is exclusive and atomic;
+            # unsupported filesystems fail without overwriting an existing model.
+            os.link(temporary, output_model)
+        finally:
+            temporary.unlink(missing_ok=True)
+        receipt.update(status="CANDIDATE_EXPORTED_PENDING_QUALITY", model_sha256=hashlib.sha256(output_model.read_bytes()).hexdigest(),
+                       best_weight=str(best_weight), training_receipt=str(receipt_path))
+        atomic_json(output_model.with_suffix(".training.json"), receipt)
         logger.info("🎉 最优微调权重已成功导出并落盘: %s (%d KB)", output_model, output_model.stat().st_size // 1024)
         return output_model
-    else:
-        logger.error("未能找到导出的权重文件 best.pt")
+    except Exception as error:
+        receipt.update(status="FAILED", error_type=type(error).__name__, error=str(error))
+        logger.exception("YOLO训练或候选发布失败；保留本次产物: %s", project_dir)
         return None
+    except BaseException as error:
+        receipt.update(status="INTERRUPTED", error_type=type(error).__name__)
+        raise
+    finally:
+        atomic_json(receipt_path, receipt)
 
 
 def evaluate_candidate(base_model: Path, candidate: Path, validation_data: Path, training_data: Path | None = None) -> bool:
-    """A separately reviewed holdout is required before updating production config."""
-    import json
+    """Compare targets on source-isolated test images; never authorize deployment."""
+    from src.core.replay_journal import atomic_json, digest
     from ultralytics import YOLO
+    if training_data is None or not check_dataset_health(training_data) or not check_dataset_health(validation_data):
+        raise ValueError("Current verified train/val/test provenance is required")
+    receipt = json.loads(candidate.with_suffix(".training.json").read_text(encoding="utf-8"))
+    candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    base_sha = hashlib.sha256(base_model.read_bytes()).hexdigest()
+    training_identity = digest({name: hashlib.sha256((training_data.parent/name).read_bytes()).hexdigest()
+                                for name in (training_data.name, "manifest.json", "dataset_split.json")})
+    if (receipt.get("status") != "CANDIDATE_EXPORTED_PENDING_QUALITY" or receipt.get("model_sha256") != candidate_sha
+            or receipt.get("base_model_sha256") != base_sha or receipt.get("dataset_identity") != training_identity):
+        raise ValueError("Candidate differs from its training attempt or supplied training/base inputs")
     manifest = json.loads((validation_data.parent / "manifest.json").read_text(encoding="utf-8"))
-    validation = [r for r in manifest if r.get("split") == "val"]
-    if not validation or any(r.get("label_source") not in {"human_boxes", "human_negative"} for r in validation):
-        raise ValueError("Holdout requires human-reviewed boxes/negatives and provenance")
-    if training_data is None:
-        raise ValueError("Training provenance is required for an independent holdout")
-    training = json.loads((training_data.parent / "manifest.json").read_text(encoding="utf-8"))
-    if {r["source_video"] for r in training} & {r["source_video"] for r in validation}:
-        raise ValueError("Holdout source videos overlap with training data")
-    baseline = YOLO(str(base_model)).val(data=str(validation_data), split="val", verbose=False)
-    updated = YOLO(str(candidate)).val(data=str(validation_data), split="val", verbose=False)
-    passed = updated.box.mr >= baseline.box.mr and updated.box.mp >= baseline.box.mp
-    logger.info("Holdout recall %.4f -> %.4f, precision %.4f -> %.4f; accepted=%s",
-                baseline.box.mr, updated.box.mr, baseline.box.mp, updated.box.mp, passed)
+    validation = [r for r in manifest if r["split"] == "test"]
+    training = [r for r in json.loads((training_data.parent / "manifest.json").read_text(encoding="utf-8")) if r["split"] != "test"]
+    def source_members(path, splits):
+        protocol = json.loads((path.parent / "dataset_split.json").read_text(encoding="utf-8"))
+        return {member for group in protocol["groups"] if group["split"] in splits for member in group["members"]}
+    if (source_members(training_data, {"train", "val"}) & source_members(validation_data, {"test"})
+            or {r["image_sha256"] for r in training} & {r["image_sha256"] for r in validation}):
+        raise ValueError("Test sources/dates/images overlap training or tuning")
+    target_classes = set()
+    for record in validation:
+        for line in (validation_data.parent / record["label_file"]).read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                target_classes.add(int(line.split()[0]))
+    if 0 not in target_classes:
+        raise ValueError("Test set has no reviewed person targets; person quality is unavailable")
+    def identity(path):
+        return digest({name: hashlib.sha256((path.parent/name).read_bytes()).hexdigest()
+                       for name in (path.name, "manifest.json", "dataset_split.json")})
+    validation_identity = identity(validation_data)
+    before = hashlib.sha256((validation_data.parent / "manifest.json").read_bytes()).hexdigest()
+    evaluation_dir = candidate.parent / (candidate.name + ".evaluations") / uuid.uuid4().hex
+    evaluation_dir.mkdir(parents=True, exist_ok=False)
+    baseline = YOLO(str(base_model)).val(data=str(validation_data), split="test", verbose=False,
+                                       project=str(evaluation_dir), name="baseline", exist_ok=False)
+    updated = YOLO(str(candidate)).val(data=str(validation_data), split="test", verbose=False,
+                                     project=str(evaluation_dir), name="candidate", exist_ok=False)
+    def metrics(result):
+        import math
+        values = {}
+        for index, class_id in enumerate(result.box.ap_class_index):
+            if int(class_id) in target_classes:
+                score = tuple(float(value) for value in result.box.class_result(index))
+                if len(score) != 4 or not all(math.isfinite(value) for value in score):
+                    raise ValueError("Test metrics unavailable or nonfinite")
+                values[int(class_id)] = score
+        if set(values) != target_classes:
+            raise ValueError("Missing per-class test metrics")
+        return values
+    old, new = metrics(baseline), metrics(updated)
+    passed = all(all(current >= previous for current, previous in zip(new[class_id], old[class_id])) for class_id in target_classes)
+    if (not check_dataset_health(validation_data) or not check_dataset_health(training_data)
+            or identity(training_data) != training_identity or identity(validation_data) != validation_identity
+            or hashlib.sha256((validation_data.parent / "manifest.json").read_bytes()).hexdigest() != before
+            or hashlib.sha256(candidate.read_bytes()).hexdigest() != candidate_sha
+            or hashlib.sha256(base_model.read_bytes()).hexdigest() != base_sha):
+        raise ValueError("Evaluation inputs changed")
+    report = {"status": "TARGET_TEST_PASSED_PENDING_VIDEO_ACCEPTANCE" if passed else "TARGET_TEST_FAILED",
+              "model_sha256": candidate_sha, "base_model_sha256": base_sha, "test_manifest_sha256": before,
+              "test_images": len(validation), "explicit_empty_images": sum(record["no_targets"] for record in validation),
+              "per_class_before": old, "per_class_after": new, "metrics": ["precision", "recall", "mAP50", "mAP50_95"],
+              "quality_gate": "UNAVAILABLE", "deployment_authorized": False,
+              "scope": "Selected target images only; metrics use the validator confidence sweep, not fixed production event thresholds or full-video action/infant/audio acceptance"}
+    evidence = evaluation_dir / "evaluation.json"
+    report["evidence_path"] = str(evidence.resolve())
+    atomic_json(evidence, report)
+    atomic_json(candidate.with_suffix(".evaluation.json"), report)
+    logger.info("Independent target test passed=%s; full-video acceptance still required", passed)
     return passed
 
 
@@ -191,13 +332,20 @@ def main():
     parser.add_argument("--freeze", type=int, choices=[10], default=10, help="冻结主干特征层数 (强制 10)")
     parser.add_argument("--device", type=str, default="0", help="训练设备 (0 或 cpu)")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "settings.yaml", help="配置文件路径")
-    parser.add_argument("--validation-data", type=Path, help="Independent human-reviewed holdout data.yaml required by --apply")
-    parser.add_argument("--apply", action="store_true", help="训练完成后自动热替换配置文件中的 yolo.model_path")
-    parser.add_argument("--dry-run", action="store_true", help="仅验证环境与数据集，不实际启动训练")
+    parser.add_argument("--validation-data", type=Path, help="--evaluate-model所需的已核验test数据集")
+    parser.add_argument("--apply", action="store_true", help="已停用：候选模型须另做独立原片验收后再推广")
+    parser.add_argument("--evaluate-model", type=Path, help="仅评估已生成的候选模型，使用独立test分组，不训练或写生产配置")
+    parser.add_argument("--dry-run", action="store_true", help="仅检查数据集与基底文件，不加载模型或启动训练")
 
     args = parser.parse_args()
-    if args.apply and not args.validation_data:
-        parser.error("--apply requires --validation-data (independent reviewed holdout)")
+    if args.apply:
+        parser.error("--apply is disabled: target-image metrics do not establish full-video acceptance; keep production config unchanged")
+    if args.evaluate_model:
+        if not args.validation_data:
+            parser.error("--evaluate-model requires --validation-data")
+        if not evaluate_candidate(args.base_model, args.evaluate_model, args.validation_data, args.data):
+            raise SystemExit(1)
+        return
 
     print("\n" + "=" * 65)
     print(" [YOLO Fine-Tuning] HomeVlog 本地小样本迁移学习微调工具")
@@ -213,14 +361,14 @@ def main():
         print("[i] 请先执行数据导出脚本:")
         print("    uv run python scripts/export_dataset.py")
         print("=" * 65 + "\n")
-        return
+        raise SystemExit(1)
 
-    if not args.base_model.exists():
+    if not args.base_model.is_file() or args.base_model.stat().st_size == 0:
         print(f"[!] 找不到预训练基底权重: {args.base_model}")
-        print("[i] Ultralytics 将在启动时尝试自动下载官方权重，或可手动放置于 models/ 目录。")
+        raise SystemExit(1)
 
     if args.dry_run:
-        print("[*] Dry-run 模式：环境与数据集校验通过，未执行实际训练。")
+        print("[*] Dry-run 模式：数据集与本地基底文件检查通过，未加载模型或执行训练。")
         return
 
     best_model_path = run_training(
@@ -240,10 +388,9 @@ def main():
         print(f" 模型路径: {best_model_path}")
         print("=" * 65 + "\n")
 
-        if args.apply and evaluate_candidate(args.base_model, best_model_path, args.validation_data, args.data):
-            apply_custom_model_to_config(args.config, best_model_path)
     else:
         print("\n[!] 训练未完成或未生成有效权重。\n")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

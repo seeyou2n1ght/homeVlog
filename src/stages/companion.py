@@ -9,10 +9,10 @@ import time
 from typing import Any
 
 from src.core.config import LOGS_DIR
-from src.core.database import VlogDatabase
+from src.core.database import VlogDatabase, is_skipped_source
 from src.core.identity import camera_key
 from src.core.utils import size_metrics
-from src.hardware.ffmpeg import get_duration
+from src.hardware.ffmpeg import get_duration, MediaTerminationUnconfirmed
 from src.stages.timeline import (
     build_timeline_from_rows,
     compute_display_plans,
@@ -23,8 +23,32 @@ from src.stages.timeline import (
 logger = logging.getLogger("homevlog")
 
 
+def unavailable_source_ranges(rows: list[dict]) -> list[dict]:
+    """Disclose decoded prefixes missing a tail; retain the declared extent."""
+    missing = []
+    for row in rows:
+        completion = row.get("decode_completion")
+        if not completion:
+            continue
+        completion = json.loads(completion) if isinstance(completion, str) else completion
+        declared = float(completion["declared_duration_s"])
+        available = float(completion["available_duration_s"])
+        if not completion.get("complete") or declared - available <= 2 * completion["sample_period_s"]:
+            continue
+        missing.append({
+            "source_file": Path(row["filepath"]).name,
+            "source_start": row["file_start_time"],
+            "missing_start_offset_s": available,
+            "missing_end_offset_s": declared,
+            "missing_duration_s": round(declared - available, 3),
+            "reason": completion["reason"],
+            "extent_basis": "declared_media_duration",
+        })
+    return missing
+
+
 @contextmanager
-def promote_vlog_assets(candidate: Path, output: Path, config: dict):
+def promote_vlog_assets(candidate: Path, output: Path, config: dict, *, keep_previous=False, fingerprint=None, context=None):
     """Keep the previous delivery until the caller commits its manifest/status.
 
     Filesystem replacement is atomic per file. Ordinary failures and cancellation
@@ -38,10 +62,25 @@ def promote_vlog_assets(candidate: Path, output: Path, config: dict):
         if not source.is_file():
             raise FileNotFoundError(f"required delivery asset missing: {source}")
     targets = [output, output.with_suffix(".meta.json"), output.with_suffix(".srt"), _manifest_path(output)]
-    backup_dir = Path(tempfile.mkdtemp(prefix=".delivery_backup_", dir=output.parent))
-    (backup_dir / "recovery.json").write_text(json.dumps(
-        {str(index): str(target.resolve()) for index, target in enumerate(targets)}, indent=2
-    ), encoding="utf-8")
+    # No delivered asset moves until the complete journal is durably prepared.
+    # A crash during hashing leaves only an inert preparation directory.
+    preparing = Path(tempfile.mkdtemp(prefix=".delivery_preparing_", dir=output.parent))
+    backup_dir = preparing.with_name(preparing.name.replace(".delivery_preparing_", ".delivery_backup_", 1))
+    from src.core.delivery_recovery import prepare_transaction, commit_transaction
+    try:
+        journal = prepare_transaction(preparing, output, sources, targets,
+            fingerprint=fingerprint, context=context, keep_previous=keep_previous)
+        (preparing / "recovery.json").write_text(json.dumps(
+            {str(index): str(target.resolve()) for index, target in enumerate(targets)}, indent=2
+        ), encoding="utf-8")
+        preparing.rename(backup_dir)
+    except BaseException:
+        try:
+            if preparing.exists():
+                shutil.rmtree(preparing)
+        except OSError:
+            logger.exception("Could not remove inert delivery preparation directory %s", preparing)
+        raise
     backups = []
     promoted = []
     committing = False
@@ -56,6 +95,7 @@ def promote_vlog_assets(candidate: Path, output: Path, config: dict):
             promoted.append(target)
         committing = True
         yield
+        commit_transaction(backup_dir,journal)
     except BaseException:
         try:
             for target in promoted:
@@ -71,10 +111,101 @@ def promote_vlog_assets(candidate: Path, output: Path, config: dict):
             shutil.rmtree(backup_dir)
         raise
     else:
+        if keep_previous and backups:
+            # Only successfully committed review deliveries become selectable history.
+            # Ordinary rollback still restores the old bundle and removes its backup.
+            try:
+                marker = backup_dir / "review_history.json"
+                temporary = marker.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"version": 1, "output": str(output.resolve()),
+                    "committed_at": time.time(), "assets": {target.name: backup.name for backup, target in backups}}, indent=2), encoding="utf-8")
+                temporary.replace(marker)
+            except OSError:
+                logger.exception("Review delivery committed; history index unavailable, previous assets retained at %s", backup_dir)
+            return
         try:
             shutil.rmtree(backup_dir)
         except OSError:
             logger.warning("Delivery committed; could not remove backup directory %s", backup_dir)
+
+
+def build_delivery_mapping(timeline, config):
+    """Frame ranges of complete rendered segments on the shared batch clock."""
+    from copy import deepcopy
+    from src.stages.timeline import partition_timeline_by_batches, normalize_file_timeline
+    fps = float(config.get("output", {}).get("fps", 20))
+    cursor, entries = 0, []
+    batches = partition_timeline_by_batches(deepcopy(timeline), batch_max_files=config.get("render", {}).get("batch_max_files", 1))
+    for batch_index, batch in enumerate(batches):
+        normalized = normalize_file_timeline(batch)
+        plans = compute_display_plans(normalized, **display_plan_options(config))
+        for segment, (duration, _) in zip(normalized, plans):
+            frames = round(duration * fps)
+            if frames <= 0:
+                continue
+            entries.append({"source_file": str(Path(segment.filepath).resolve()),
+                "source_start_s": segment.start_in_file, "source_end_s": segment.end_in_file,
+                "output_start_frame": cursor, "output_end_frame": cursor + frames,
+                "state": segment.state, "batch_index": batch_index})
+            cursor += frames
+    return {"version": 1, "fps": fps, "planned_frames": cursor, "segments": entries,
+            "scope": "complete overlapping rendered segments, including context; not an exact source-window crop"}
+
+
+def bind_delivery_mapping(output_path, timeline, config):
+    """Do not offer inferred timestamps for old, mismatched or unprobeable media."""
+    from fractions import Fraction
+    import math
+    import av
+    from src.hardware.scheduler import acquire_with_retry, get_disk_semaphore
+    mapping = build_delivery_mapping(timeline, config)
+    try:
+        fps = mapping["fps"]
+        if not math.isfinite(fps) or fps <= 0 or mapping["planned_frames"] <= 0:
+            raise ValueError("Invalid planned frame clock")
+        output_path = Path(output_path)
+        before = output_path.stat()
+        disk = get_disk_semaphore()
+        if not acquire_with_retry(disk, timeout=5, retries=1):
+            raise TimeoutError("Delivery frame clock I/O admission unavailable")
+        try:
+            with av.open(str(output_path), timeout=60.0) as container:
+                stream = container.streams.video[0]
+                frames = stream.frames
+                if frames != mapping["planned_frames"] or not stream.time_base or stream.time_base <= 0:
+                    raise ValueError("Media frame count/time base differs from delivery mapping")
+                time_base = stream.time_base
+                step = Fraction(1, 1) / Fraction(str(fps)) / time_base
+                timestamps = []
+                for packet in container.demux(stream):
+                    if not packet.size:
+                        continue
+                    if packet.pts is None:
+                        raise ValueError("Media frame timestamp missing")
+                    timestamps.append(packet.pts)
+                    if len(timestamps) > frames:
+                        raise ValueError("Media access-unit count exceeds planned frames")
+                timestamps.sort()  # B-frames are demuxed in decode order.
+                if len(timestamps) != frames:
+                    raise ValueError("Media access-unit count differs from planned frames")
+                origin = timestamps[0]
+                if not 0 <= origin <= step:
+                    raise ValueError("Media frame clock origin exceeds one frame")
+                if any(abs(pts - (origin + index * step)) > 1 for index, pts in enumerate(timestamps)):
+                    raise ValueError("Media frame timestamps differ from planned clock")
+        finally:
+            disk.release()
+        stat = output_path.stat()
+        if (before.st_size, before.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns):
+            raise ValueError("Media identity changed during frame clock verification")
+        mapping["clock_validation"] = {"method": "packet_pts", "packets": frames,
+                                       "origin_s": float(origin * time_base), "max_error_ticks": 1}
+        mapping.update(status="AVAILABLE", media_identity={"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                                                          "frames": frames, "fps": fps})
+    except Exception as exc:
+        logger.warning("Delivery segment mapping unavailable for %s: %s", output_path, exc)
+        mapping = {"version": 1, "status": "UNAVAILABLE", "reason": str(exc)}
+    return mapping
 
 
 def cleanup_delivery_candidate(candidate: Path) -> None:
@@ -200,6 +331,11 @@ def save_vlog_companion_assets(
     try:
         rows = rows if rows is not None else db.get_all_file_tasks_for_date(date, cam_index)
         full_timeline = build_timeline_from_rows(rows, date, config=config, resolve_presence=False)
+        delivery_mapping = bind_delivery_mapping(output_path, full_timeline, config)
+        if delivery_mapping.get("status") != "AVAILABLE":
+            logger.warning("Delivery frame clock validation failed for %s: %s", output_path,
+                           delivery_mapping.get("reason", "mapping unavailable"))
+            return False
 
         # 1. 生成伴随 .srt 字幕（默认开启，可在配置中显式关闭）
         srt_path = output_path.with_suffix(".srt")
@@ -211,6 +347,7 @@ def save_vlog_companion_assets(
                     srt_tmp,
                     rows=rows,
                     base_date=date,
+                    config=config,
                 )
                 srt_tmp.replace(srt_path)
             except Exception as e:
@@ -229,6 +366,9 @@ def save_vlog_companion_assets(
 
         dyn_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO"))
         sta_dur = sum(s.duration for s in full_timeline if getattr(s, "state", "") == "STATIC")
+        by_state = {}
+        for segment in full_timeline:
+            by_state[segment.state] = by_state.get(segment.state, 0.) + segment.duration
 
         # 提取动态高光片段（用于下游相册/Web 秒级定位）
         highlights = []
@@ -254,15 +394,15 @@ def save_vlog_companion_assets(
 
         manifest_data = {
             "version": "1.0",
+            "unavailable_source_ranges": unavailable_source_ranges(rows),
             "skipped_sources": [
                 {"source_file": Path(row["filepath"]).name,
                  "reason": "empty_file" if row.get("prescreen_status") == "SKIPPED_EMPTY" else (row.get("error_msg") or "excluded_source"),
-                 "size_bytes": 0,
+                 "size_bytes": 0 if row.get("prescreen_status") == "SKIPPED_EMPTY" else None,
                  "source_start": row["file_start_time"], "source_end": row["file_end_time"],
                  "nominal_duration_s": row.get("file_duration")}
                 for row in rows
-                if row.get("prescreen_status") in ("SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
-                or row.get("analysis_status") in ("SKIPPED_EXCLUDED", "SKIPPED_CORRUPT")
+                if is_skipped_source(row)
             ],
             "date": date,
             "camera": {
@@ -276,10 +416,12 @@ def save_vlog_companion_assets(
                 "condensation_ratio": round(total_input_dur / max(vlog_dur, 0.1), 2),
                 "dynamic_duration_s": round(dyn_dur, 2),
                 "static_duration_s": round(sta_dur, 2),
+                "source_duration_by_state_s": {state: round(duration, 3) for state, duration in by_state.items()},
                 "total_source_files": total_files,
                 **size_metrics(vlog_size),
             },
             "timeline_highlights": highlights,
+            "delivery_mapping": delivery_mapping,
             "performance": {
                 "wall_clock_s": round(elapsed_wall, 2),
                 "speedup_x": round(total_input_dur / max(elapsed_wall, 0.1), 2),
@@ -295,6 +437,8 @@ def save_vlog_companion_assets(
             p.name for p in (srt_path, meta_path) if p.exists()
         ))
         return True
+    except MediaTerminationUnconfirmed:
+        raise
     except Exception as e:
         logger.warning("Failed to save vlog companion assets for %s: %s", output_path.name, e)
         return False

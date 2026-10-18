@@ -8,15 +8,152 @@ const state = {
   filteredItems: [],
   selectedIndex: -1,
   counts: { gold_candidates: 0, all: 0, reviewed: 0 },
+  offset: 0, pageSize: 50, totalItems: 0, seed: 0, requestSerial: 0, loading: false,
+  scope: {}, visualReference: null, previewPinnedId: null,
   fourKeysMode: false,
 };
 
+let queueSearchTimer;
 const prefetchSet = new Set();
 const frameCache = new Map();
+
+async function exportTargetDataset() {
+  const button=document.getElementById('btn-create-target-export'),status=document.getElementById('target-export-result');
+  if(button.disabled)return;button.disabled=true;status.textContent='正在核对人工目标记录并导出…';
+  try {
+    const response=await fetch('/api/export_yolo_dataset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const result=await response.json();if(!response.ok||result.error)throw new Error(result.error||'导出失败');
+    const stats=result.stats||{};
+    status.textContent=`${result.message}\n训练 ${stats.train_images||0} 张 · 调优 ${stats.val_images||0} 张 · 留出 ${stats.test_images||0} 张\n排除 ${stats.excluded||0} 张 · 重复 ${stats.duplicates||0} 张 · 冲突 ${stats.conflicts||0} 张\n${result.output_dir||''}${result.train_cmd?`\n训练命令：${result.train_cmd}`:''}`;
+  }catch(error){status.textContent=error.message;}
+  finally{button.disabled=false;}
+}
+
+const targetEditor = { id:null, serial:0, context:null, image:null, boxes:[], selected:-1, drag:null, busy:false };
+function closeTargetReview() {
+  targetEditor.serial++;
+  targetEditor.drag = null;
+  document.getElementById('modal-target-review').classList.add('hidden');
+}
+function targetControls() {
+  const enabled = !!targetEditor.context && !!targetEditor.image && !targetEditor.busy;
+  document.querySelectorAll('#target-save-actions button, #target-delete, #target-clear').forEach(button => { button.disabled = !enabled; });
+  document.getElementById('target-prepare').disabled = targetEditor.busy;
+}
+function drawTargets() {
+  const canvas = document.getElementById('target-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (!targetEditor.image) return;
+  ctx.drawImage(targetEditor.image,0,0,canvas.width,canvas.height);
+  const names = {0:'人物',15:'猫',16:'狗'};
+  targetEditor.boxes.forEach((box,index) => {
+    const x=(box.x_center-box.width/2)*canvas.width,y=(box.y_center-box.height/2)*canvas.height;
+    ctx.strokeStyle=index===targetEditor.selected?'#ffcc44':'#4be3a0';ctx.lineWidth=Math.max(2,canvas.width/350);
+    ctx.strokeRect(x,y,box.width*canvas.width,box.height*canvas.height);
+    ctx.font=`${Math.max(16,canvas.width/70)}px sans-serif`;ctx.fillStyle=ctx.strokeStyle;
+    ctx.fillText(`${index+1} ${names[box.class_id]}`,x,Math.max(24,y));
+  });
+  if(targetEditor.drag){const d=targetEditor.drag;ctx.strokeStyle='#8ac6ff';ctx.strokeRect(d.x*canvas.width,d.y*canvas.height,(d.endX-d.x)*canvas.width,(d.endY-d.y)*canvas.height);}
+  document.getElementById('target-box-count').textContent=`${targetEditor.boxes.length} 个目标框${targetEditor.selected>=0?` · 选中 ${targetEditor.selected+1}`:''}`;
+}
+async function loadTargetContext(prepare=false) {
+  const serial=++targetEditor.serial,id=targetEditor.id;
+  targetEditor.busy=true;targetEditor.drag=null;targetEditor.context=null;targetEditor.image=null;targetEditor.boxes=[];targetEditor.selected=-1;
+  document.getElementById('target-complete').checked=false;drawTargets();targetControls();
+  const status=document.getElementById('target-review-status');status.textContent=prepare?'正在从原片生成固定归档帧…':'正在核对归档来源…';
+  try {
+    const response=await fetch(prepare?'/api/prepare_target_frame':`/api/target_review?segment_id=${id}`,prepare?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segment_id:id})}:{});
+    const context=await response.json();if(!response.ok||context.error)throw new Error(context.error||'归档不可用');
+    const image=new Image();image.src=context.image_url;await image.decode();
+    if(serial!==targetEditor.serial)return;
+    targetEditor.context=context;targetEditor.image=image;targetEditor.boxes=structuredClone(context.review?.boxes||[]);
+    const canvas=document.getElementById('target-canvas');canvas.width=context.width;canvas.height=context.height;
+    const decisions={objects:'全部目标已复核',no_targets:'已确认无目标',uncertain:'不能确定',draft:'草稿'};
+    status.textContent=`片段 #${id} · 截帧位置 ${context.frame_timestamp.toFixed(3)}s · ${decisions[context.review?.decision]||'尚未目标复核'}。只核对当前固定图片。`;
+    drawTargets();
+  } catch(error) { if(serial===targetEditor.serial)status.textContent=error.message; }
+  finally { if(serial===targetEditor.serial){targetEditor.busy=false;targetControls();} }
+}
+async function saveTargets(decision) {
+  if(!targetEditor.context||targetEditor.busy)return;
+  const serial=targetEditor.serial;targetEditor.busy=true;targetControls();
+  try {
+    const context=targetEditor.context;
+    const response=await fetch('/api/save_target_review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segment_id:targetEditor.id,snapshot:context.snapshot,review_sha256:context.review_sha256,boxes:targetEditor.boxes,decision,all_targets_reviewed:document.getElementById('target-complete').checked})});
+    const result=await response.json();if(!response.ok||!result.success)throw new Error(result.error||'保存失败');
+    if(serial!==targetEditor.serial)return;
+    targetEditor.context=result.context;document.getElementById('target-complete').checked=false;
+    document.getElementById('target-review-status').textContent=result.training_eligible?'完整目标复核已保存，可参与数据集导出。':'已保存；草稿或不能确定不参与训练。';
+    showToast('目标记录已保存','success');
+  } catch(error){if(serial===targetEditor.serial)document.getElementById('target-review-status').textContent=error.message;}
+  finally{if(serial===targetEditor.serial){targetEditor.busy=false;targetControls();}}
+}
+let agentReviewSerial=0;
+function closeAgentTargetReview(){agentReviewSerial++;document.getElementById('modal-agent-target-review').classList.add('hidden');}
+async function openAgentTargetReview(id){
+  const serial=++agentReviewSerial,modal=document.getElementById('modal-agent-target-review');
+  const status=document.getElementById('agent-target-status'),notes=document.getElementById('agent-target-notes');
+  const canvas=document.getElementById('agent-target-canvas'),ctx=canvas.getContext('2d');
+  modal.classList.remove('hidden');status.textContent='正在核对智能体复核建议…';notes.textContent='';ctx.clearRect(0,0,canvas.width,canvas.height);
+  try{
+    const response=await fetch(`/api/agent_target_review?segment_id=${id}`),context=await response.json();
+    if(!response.ok||context.error)throw new Error(context.error||'尚无智能体目标复核建议');
+    const image=new Image();image.src=context.image_url;await image.decode();
+    if(serial!==agentReviewSerial)return;
+    canvas.width=context.width;canvas.height=context.height;ctx.drawImage(image,0,0);
+    const names={0:'人',15:'猫',16:'狗'};ctx.strokeStyle='#ff4343';ctx.fillStyle='#ff4343';ctx.lineWidth=Math.max(2,canvas.width/600);ctx.font=`${Math.max(18,canvas.width/65)}px sans-serif`;
+    for(const [i,box] of context.review.boxes.entries()){
+      const x=(box.x_center-box.width/2)*canvas.width,y=(box.y_center-box.height/2)*canvas.height;
+      ctx.strokeRect(x,y,box.width*canvas.width,box.height*canvas.height);ctx.fillText(`${i+1} ${names[box.class_id]}`,x,Math.max(canvas.width/65,y));
+    }
+    const decisions={objects:'有可见目标',no_targets:'无可见目标',uncertain:'不能确定'};
+    status.textContent=`片段 #${id} · 来源：智能体视觉复核 · ${decisions[context.review.decision]} · ${context.review.boxes.length} 个近似框${context.human_review_has_priority?' · 已有人工裁决优先':''}`;
+    notes.textContent=context.review.notes||'';
+  }catch(error){if(serial===agentReviewSerial)status.textContent=error.message;}
+}
+function initTargetReview() {
+  document.getElementById('btn-agent-target-review')?.addEventListener('click',()=>{
+    const item=state.filteredItems[state.selectedIndex];if(!item)return showToast('先选择片段','error');openAgentTargetReview(item.id);
+  });
+  document.getElementById('btn-close-agent-target-review')?.addEventListener('click',closeAgentTargetReview);
+  document.getElementById('modal-agent-target-review')?.addEventListener('click',event=>{if(event.target.id==='modal-agent-target-review')closeAgentTargetReview();});
+  document.getElementById('btn-target-review')?.addEventListener('click',()=>{
+    const item=state.filteredItems[state.selectedIndex];if(!item)return showToast('先选择片段','error');
+    targetEditor.id=item.id;document.getElementById('modal-target-review').classList.remove('hidden');loadTargetContext();
+  });
+  document.getElementById('btn-close-target-review')?.addEventListener('click',closeTargetReview);
+  document.getElementById('target-prepare')?.addEventListener('click',()=>loadTargetContext(true));
+  for(const [id,decision] of [['objects','objects'],['empty','no_targets'],['uncertain','uncertain'],['draft','draft']])document.getElementById(`target-save-${id}`)?.addEventListener('click',()=>saveTargets(decision));
+  document.getElementById('target-delete')?.addEventListener('click',()=>{if(targetEditor.selected>=0)targetEditor.boxes.splice(targetEditor.selected,1);targetEditor.selected=-1;document.getElementById('target-complete').checked=false;drawTargets();});
+  document.getElementById('target-clear')?.addEventListener('click',()=>{targetEditor.boxes=[];targetEditor.selected=-1;document.getElementById('target-complete').checked=false;drawTargets();});
+  const canvas=document.getElementById('target-canvas');
+  if (!canvas) return;
+  const point=event=>{
+    const r=canvas.getBoundingClientRect(),style=getComputedStyle(canvas);
+    const px=name=>parseFloat(style[name])||0;
+    const left=px('borderLeftWidth')+px('paddingLeft'),right=px('borderRightWidth')+px('paddingRight');
+    const top=px('borderTopWidth')+px('paddingTop'),bottom=px('borderBottomWidth')+px('paddingBottom');
+    return {x:Math.max(0,Math.min(1,(event.clientX-r.left-left)/(r.width-left-right))),y:Math.max(0,Math.min(1,(event.clientY-r.top-top)/(r.height-top-bottom)))};
+  };
+  canvas.addEventListener('pointerdown',event=>{if(!targetEditor.image||targetEditor.busy||targetEditor.drag||event.button!==0)return;const p=point(event);targetEditor.drag={...p,endX:p.x,endY:p.y,pointerId:event.pointerId,serial:targetEditor.serial};canvas.setPointerCapture(event.pointerId);});
+  canvas.addEventListener('pointermove',event=>{const d=targetEditor.drag;if(!d||event.pointerId!==d.pointerId)return;if(targetEditor.busy||d.serial!==targetEditor.serial){targetEditor.drag=null;drawTargets();return;}const p=point(event);d.endX=p.x;d.endY=p.y;drawTargets();});
+  canvas.addEventListener('pointerup',event=>{
+    if(!targetEditor.drag||event.pointerId!==targetEditor.drag.pointerId)return;const d=targetEditor.drag;targetEditor.drag=null;
+    if(targetEditor.busy||d.serial!==targetEditor.serial||!targetEditor.image){drawTargets();return;}const p=point(event);
+    const width=Math.abs(p.x-d.x),height=Math.abs(p.y-d.y);
+    if(width*canvas.width>=1&&height*canvas.height>=1){targetEditor.boxes.push({class_id:Number(document.getElementById('target-class').value),x_center:(p.x+d.x)/2,y_center:(p.y+d.y)/2,width,height});targetEditor.selected=targetEditor.boxes.length-1;document.getElementById('target-complete').checked=false;}
+    else{targetEditor.selected=targetEditor.boxes.findLastIndex(box=>Math.abs(p.x-box.x_center)<=box.width/2&&Math.abs(p.y-box.y_center)<=box.height/2);}
+    drawTargets();
+  });
+  canvas.addEventListener('pointercancel',event=>{if(targetEditor.drag&&event.pointerId===targetEditor.drag.pointerId){targetEditor.drag=null;drawTargets();}});
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
   loadQueue();
+  const agentId=new URLSearchParams(window.location.search).get('agent_segment_id');
+  if(agentId&&/^\d+$/.test(agentId)&&Number.isSafeInteger(Number(agentId))&&Number(agentId)>0)openAgentTargetReview(Number(agentId));
 });
 
 // ================== 1. 事件监听与键盘绑定 ==================
@@ -34,7 +171,8 @@ function initEventListeners() {
   if (searchInput) {
     searchInput.addEventListener('input', (e) => {
       state.searchQuery = e.target.value.toLowerCase().trim();
-      applyFilterAndRender();
+      clearTimeout(queueSearchTimer);
+      queueSearchTimer = setTimeout(() => { state.offset = 0; loadQueue(); }, 300);
     });
   }
 
@@ -43,9 +181,33 @@ function initEventListeners() {
   if (toggleHide) {
     toggleHide.addEventListener('change', (e) => {
       state.hideReviewed = e.target.checked;
-      applyFilterAndRender();
+      state.offset = 0; loadQueue();
     });
   }
+
+  document.getElementById('queue-apply-scope')?.addEventListener('click', () => {
+    const seed = Number(document.getElementById('queue-seed').value);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 2147483647) return showToast('种子须为0–2147483647整数', 'error');
+    state.seed = seed;
+    state.scope = Object.fromEntries(['date','camera','state','scenario'].map(key => [key, document.getElementById(`queue-${key}`).value.trim()]));
+    state.offset = 0; loadQueue();
+  });
+  document.getElementById('queue-seed')?.addEventListener('change', e => {
+    const seed = Number(e.target.value);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 2147483647) return showToast('种子须为0–2147483647整数', 'error');
+    state.seed = seed; state.offset = 0; loadQueue();
+  });
+  document.getElementById('queue-resample')?.addEventListener('click', () => {
+    state.seed = (state.seed + 1) % 2147483648;
+    document.getElementById('queue-seed').value = state.seed;
+    state.offset = 0; loadQueue();
+  });
+  document.getElementById('queue-page-prev')?.addEventListener('click', () => {
+    if (!state.loading && state.offset > 0) { state.offset = Math.max(0, state.offset - state.pageSize); loadQueue(); }
+  });
+  document.getElementById('queue-page-next')?.addEventListener('click', () => {
+    if (!state.loading && state.offset + state.pageSize < state.totalItems) { state.offset += state.pageSize; loadQueue(); }
+  });
 
   // 底部两键打标
   const btnKeep = document.getElementById('btn-action-keep');
@@ -112,8 +274,18 @@ function initEventListeners() {
   const modalWhatif = document.getElementById('modal-whatif');
   const btnCloseWhatif = document.getElementById('btn-close-whatif');
   if (btnOpenWhatif && modalWhatif) {
-    btnOpenWhatif.addEventListener('click', () => modalWhatif.classList.remove('hidden'));
+    btnOpenWhatif.addEventListener('click', openTuningPanel);
   }
+  document.getElementById('btn-index-visual-source')?.addEventListener('click', indexCurrentVisualSource);
+  document.getElementById('btn-delivery-comparison')?.addEventListener('click', openDeliveryComparison);
+  document.getElementById('btn-close-delivery-comparison')?.addEventListener('click', () => document.getElementById('modal-delivery-comparison').classList.add('hidden'));
+  document.getElementById('btn-review-context')?.addEventListener('click', openReviewContext);
+  document.getElementById('btn-close-context')?.addEventListener('click', () => document.getElementById('modal-context').classList.add('hidden'));
+  document.getElementById('btn-save-review-context')?.addEventListener('click', saveReviewContext);
+  initTargetReview();
+  document.getElementById('btn-open-yolo')?.addEventListener('click',()=>document.getElementById('modal-target-export').classList.remove('hidden'));
+  document.getElementById('btn-close-target-export')?.addEventListener('click',()=>document.getElementById('modal-target-export').classList.add('hidden'));
+  document.getElementById('btn-create-target-export')?.addEventListener('click',exportTargetDataset);
   if (btnCloseWhatif && modalWhatif) {
     btnCloseWhatif.addEventListener('click', () => modalWhatif.classList.add('hidden'));
   }
@@ -146,11 +318,21 @@ function initEventListeners() {
   const modalPlayer = document.getElementById('modal-player');
   const videoEl = document.getElementById('vlog-video-el');
   if (btnClosePlayer && modalPlayer) {
-    btnClosePlayer.addEventListener('click', () => {
-      modalPlayer.classList.add('hidden');
-      if (videoEl) videoEl.pause();
-    });
+    btnClosePlayer.addEventListener('click', closeVideoPlayer);
   }
+  document.getElementById('btn-open-source')?.addEventListener('click', () => {
+    const item = state.filteredItems[state.selectedIndex];
+    if (!item) return showToast('请先选择审核片段', 'info');
+    openVideoPlayer(item.filepath, `原片 #${item.id} · ${item.wall_start_str}–${item.wall_end_str}`, {
+      start: Number(item.in_file_start), end: Number(item.in_file_end)
+    });
+  });
+  document.getElementById('btn-replay-interval')?.addEventListener('click', () => {
+    if (videoEl && playerInterval) {
+      videoEl.currentTime = playerInterval.start;
+      videoEl.play().catch(() => {});
+    }
+  });
 
   // 模态框遮罩点击关闭 (惯性交互)
   [modalWhatif, modalPlayer].forEach(modal => {
@@ -158,9 +340,7 @@ function initEventListeners() {
       modal.addEventListener('click', (e) => {
         if (e.target === modal) {
           modal.classList.add('hidden');
-          if (modal === modalPlayer && videoEl) {
-            videoEl.pause();
-          }
+          if (modal === modalPlayer) closeVideoPlayer();
         }
       });
     }
@@ -177,8 +357,34 @@ function initEventListeners() {
 }
 
 function handleKeydown(e) {
+  const agentModal=document.getElementById('modal-agent-target-review');
+  if(agentModal&&!agentModal.classList.contains('hidden')){
+    if(e.key==='Escape'){closeAgentTargetReview();e.preventDefault();}
+    return;
+  }
+  const exportModal=document.getElementById('modal-target-export');
+  if(exportModal&&!exportModal.classList.contains('hidden')){
+    if(e.key==='Escape'){exportModal.classList.add('hidden');e.preventDefault();}return;
+  }
+  const targetModal = document.getElementById('modal-target-review');
+  if (targetModal && !targetModal.classList.contains('hidden')) {
+    if (e.key === 'Escape') { closeTargetReview(); e.preventDefault(); }
+    return;
+  }
   // ESC 键优先关闭打开的模态框
   if (e.key === 'Escape') {
+    const contextModal = document.getElementById('modal-context');
+    if (contextModal && !contextModal.classList.contains('hidden')) {
+      e.preventDefault();
+      contextModal.classList.add('hidden');
+      return;
+    }
+    const renderModal = document.getElementById('modal-rerender');
+    if (renderModal && !renderModal.classList.contains('hidden')) {
+      e.preventDefault();
+      renderModal.classList.add('hidden');
+      return;
+    }
     const modalWhatif = document.getElementById('modal-whatif');
     if (modalWhatif && !modalWhatif.classList.contains('hidden')) {
       e.preventDefault();
@@ -188,15 +394,25 @@ function handleKeydown(e) {
     const modalPlayer = document.getElementById('modal-player');
     if (modalPlayer && !modalPlayer.classList.contains('hidden')) {
       e.preventDefault();
-      modalPlayer.classList.add('hidden');
-      const videoEl = document.getElementById('vlog-video-el');
-      if (videoEl) videoEl.pause();
+      closeVideoPlayer();
       return;
     }
+    const comparison = document.getElementById('modal-delivery-comparison');
+    if (comparison && !comparison.classList.contains('hidden')) { comparison.classList.add('hidden'); e.preventDefault(); return; }
   }
 
   // 如果在输入框内打字，不拦截按键
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+  const whatifModal = document.getElementById('modal-whatif');
+  if (whatifModal && !whatifModal.classList.contains('hidden')) return;
+  const contextModal = document.getElementById('modal-context');
+  if (contextModal && !contextModal.classList.contains('hidden')) return;
+  const renderModal = document.getElementById('modal-rerender');
+  if (renderModal && !renderModal.classList.contains('hidden')) return;
+  const comparison = document.getElementById('modal-delivery-comparison');
+  if (comparison && !comparison.classList.contains('hidden')) return;
+  const playerOpen = !document.getElementById('modal-player')?.classList.contains('hidden');
+  if (playerOpen && !['j', 'J', 'k', 'K', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
 
   const isShift = e.shiftKey;
 
@@ -233,37 +449,59 @@ function handleKeydown(e) {
 }
 
 // ================== 2. 数据拉取与队列渲染 ==================
-async function loadQueue() {
+async function loadQueue(preferredId = null) {
+  if (queueSearchTimer) clearTimeout(queueSearchTimer);
+  queueSearchTimer = null;
+  const serial = ++state.requestSerial;
+  state.loading = true;
+  state.items = []; state.filteredItems = []; showEmptyPlaceholder();
   const container = document.getElementById('queue-list-container');
-  if (container) {
-    container.innerHTML = '<div style="padding: 20px; text-align: center; color: #64748b; font-size: 12px;">⏳ 正在调取高争议切片...</div>';
-  }
-
+  if (container) container.innerText = '正在读取当前范围...';
+  updateQueuePage();
+  const query = new URLSearchParams({category:state.currentCategory,limit:state.pageSize,offset:state.offset,
+    seed:state.seed,search:state.searchQuery,hide_reviewed:state.hideReviewed ? '1' : '0'});
+  if (state.currentCategory === 'visual') query.set('reference_id',state.visualReference);
+  for (const [key,value] of Object.entries(state.scope)) if (value !== '') query.set(key === 'camera' ? 'cam_index' : key, value);
   try {
-    const res = await fetch(`/api/anomalies?category=${state.currentCategory}&limit=100`);
-    const data = await res.json();
-    state.items = Array.isArray(data) ? data : [];
-
-    updateCategoryBadges();
-    applyFilterAndRender();
-
-    // 默认定位到第一个未复核的切片
-    if (state.filteredItems.length > 0) {
-      const firstUnreviewed = state.filteredItems.findIndex(it => !it.manual_label);
-      selectItem(firstUnreviewed >= 0 ? firstUnreviewed : 0);
-    } else {
-      showEmptyPlaceholder();
+    const response = await fetch(`/api/review_queue?${query}`);
+    const data = await response.json();
+    if (serial !== state.requestSerial) return;
+    if (!response.ok || data.error || !Array.isArray(data.items)) throw Error(data.error || '队列响应无效');
+    state.counts = data.counts; state.totalItems = data.total_items;
+    if (state.totalItems && state.offset >= state.totalItems) {
+      state.offset = Math.floor((state.totalItems - 1) / state.pageSize) * state.pageSize;
+      return loadQueue(preferredId);
     }
-  } catch (err) {
-    console.error('Load queue failed:', err);
-    if (container) {
-      container.innerHTML = '<div style="padding: 20px; text-align: center; color: #f43f5e; font-size: 12px;">⚠️ 加载切片队列失败</div>';
-    }
-    showEmptyPlaceholder();
+    state.items = data.items; prefetchSet.clear();
+    state.filteredItems = [...state.items]; state.selectedIndex = -1;
+    renderQueueList(); updateCategoryBadges();
+    const preferred = state.filteredItems.findIndex(item => item.id === preferredId);
+    if (state.filteredItems.length) selectItem(preferred >= 0 ? preferred : 0);
+    setElementText('queue-scope-status', `当前范围：${data.counts.all}条，未审${data.counts.unreviewed}条。本队列${data.total_items}条/组。` +
+      (state.currentCategory === 'gold_candidates' ? '同源5分钟/状态/场景代表；非视觉相似，仅标当前项。' :
+       state.currentCategory === 'random' ? `种子${data.seed}；库存与范围不变时可复现，不能认证其余片段。` : '计数来自完整筛选范围。'));
+    if (state.currentCategory === 'visual') setElementText('queue-scope-status', `参考#${state.visualReference} · 范围${data.counts.all}条，已采集索引${data.captured_index_items}条，当前匹配${data.indexed_items}条，本页有效${data.items.length}条。${data.status === 'UNAVAILABLE' ? '参考图缺少可信索引或源已变化；可从全部队列选择片段，再为当前原片建立索引。' : data.visual_notice}`);
+    return true;
+  } catch (error) {
+    if (serial !== state.requestSerial) return;
+    if (container) container.innerText = `加载失败：${error.message}`;
+    setElementText('queue-scope-status', '库存读取失败；上次计数不能代表当前状态。');
+    return false;
+  } finally {
+    if (serial === state.requestSerial) { state.loading = false; updateQueuePage(); }
   }
 }
 
+function updateQueuePage() {
+  const pages = Math.max(1, Math.ceil(state.totalItems / state.pageSize));
+  setElementText('queue-page-info', `${Math.floor(state.offset / state.pageSize)+1} / ${pages}`);
+  const prev = document.getElementById('queue-page-prev'), next = document.getElementById('queue-page-next');
+  if (prev) prev.disabled = state.loading || state.offset === 0;
+  if (next) next.disabled = state.loading || state.offset + state.pageSize >= state.totalItems;
+}
+
 function showEmptyPlaceholder() {
+  closeVideoPlayer();
   state.selectedIndex = -1;
   const placeholder = document.getElementById('stage-empty-placeholder');
   if (placeholder) placeholder.classList.remove('hidden');
@@ -288,25 +526,24 @@ function showEmptyPlaceholder() {
 }
 
 function switchCategory(cat) {
-  state.currentCategory = cat;
+  if (cat === 'visual') {
+    const reference = state.filteredItems[state.selectedIndex];
+    if (reference) state.visualReference = reference.id;
+    if (!state.visualReference) return showToast('请先选择一个参考片段','info');
+  }
+  state.currentCategory = cat; state.offset = 0;
+  if (cat === 'reviewed') { state.hideReviewed = false; document.getElementById('toggle-hide-reviewed').checked = false; }
+  document.getElementById('queue-random-controls').classList.toggle('hidden', cat !== 'random');
   document.querySelectorAll('.filter-chip').forEach(c => {
-    c.classList.toggle('active', c.getAttribute('data-category')) === cat;
+    c.classList.toggle('active', c.getAttribute('data-category') === cat);
   });
   loadQueue();
 }
 
 function updateCategoryBadges() {
-  const reviewed = state.items.filter(i => !!i.manual_label).length;
-  const countGold = document.getElementById('count-gold');
-  const countAll = document.getElementById('count-all');
-  const countReviewed = document.getElementById('count-reviewed');
-
-  if (state.currentCategory === 'gold_candidates' && countGold) {
-    countGold.innerText = state.items.length;
-  }
-  if (countReviewed) {
-    countReviewed.innerText = reviewed;
-  }
+  setElementText('count-gold', state.counts.gold_candidates);
+  setElementText('count-all', state.counts.all);
+  setElementText('count-reviewed', state.counts.reviewed);
   updateBatchProgressBar();
 }
 
@@ -315,32 +552,10 @@ function updateBatchProgressBar() {
   const reviewed = state.filteredItems.filter(i => !!i.manual_label).length;
   const textEl = document.getElementById('batch-progress-text');
   const fillEl = document.getElementById('batch-progress-fill');
-  if (textEl) textEl.innerText = `${reviewed} / ${total}`;
+  if (textEl) textEl.innerText = `本页 ${reviewed} / ${total}`;
   if (fillEl) {
     const pct = total > 0 ? (reviewed / total) * 100 : 0;
     fillEl.style.width = `${pct}%`;
-  }
-}
-
-function applyFilterAndRender() {
-  let list = [...state.items];
-  if (state.hideReviewed) {
-    list = list.filter(it => !it.manual_label);
-  }
-  if (state.searchQuery) {
-    const q = state.searchQuery;
-    list = list.filter(it => {
-      const fn = (it.filepath || '').toLowerCase();
-      const r = (it.reason_desc || '').toLowerCase();
-      const s = (it.state || '').toLowerCase();
-      return fn.includes(q) || r.includes(q) || s.includes(q) || String(it.id).includes(q);
-    });
-  }
-  state.filteredItems = list;
-  renderQueueList();
-  updateBatchProgressBar();
-  if (state.filteredItems.length === 0) {
-    showEmptyPlaceholder();
   }
 }
 
@@ -350,7 +565,7 @@ function renderQueueList() {
   container.innerHTML = '';
 
   if (state.filteredItems.length === 0) {
-    container.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b; font-size: 12px;">队列已清空，全部复核完成 🎉</div>';
+    container.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b; font-size: 12px;">当前筛选无条目；不代表全部已复核</div>';
     return;
   }
 
@@ -371,18 +586,20 @@ function renderQueueList() {
       else if (['FALSE_ALARM', 'FP'].includes(m)) badgeHtml = '<span class="item-badge fp">FP</span>';
       else if (['MISSED_MOTION', 'FN'].includes(m)) badgeHtml = '<span class="item-badge fn">FN</span>';
       else if (['CONFIRMED_STATIC', 'TN'].includes(m)) badgeHtml = '<span class="item-badge tn">TN</span>';
+    } else if (item.represented_count > 1) {
+      badgeHtml = `<span class="item-badge cluster">代表${Number(item.represented_count)}</span>`;
     } else if (item.cluster_count && item.cluster_count > 1) {
       badgeHtml = `<span class="item-badge cluster">x${item.cluster_count}</span>`;
     }
 
     const dur = (item.duration || 0).toFixed(1);
-    const reason = item.reason_desc || item.state || '';
+    const reason = escapeHTML((Number.isFinite(item.visual_distance) ? `视觉距离 ${item.visual_distance.toFixed(3)} · ` : '') + (item.reason_desc || item.state || ''));
 
     el.innerHTML = `
       <div class="item-left">
         <span class="item-status-icon">${icon}</span>
         <div class="item-meta">
-          <span class="item-id">#${item.id} <small style="color:#64748b;">${item.state}</small></span>
+          <span class="item-id">#${item.id} <small style="color:#64748b;">${escapeHTML(item.state)}</small></span>
           <span class="item-reason" title="${reason}">${reason}</span>
         </div>
       </div>
@@ -400,7 +617,9 @@ function renderQueueList() {
 // ================== 3. 切片选择与微动播放 ==================
 function selectItem(index) {
   if (index < 0 || index >= state.filteredItems.length) return;
+  closeVideoPlayer();
   state.selectedIndex = index;
+  state.previewPinnedId = null;
   const item = state.filteredItems[index];
 
   // 更新左侧高亮
@@ -460,50 +679,57 @@ function loadVisualsForSegment(item) {
   const fp = item.filepath;
   const st = item.start_time;
   const et = item.end_time;
-  const mid = (st + et) / 2.0;
+  const indexedFrame = Number.isFinite(item.visual_frame_time) ? item.visual_frame_time + Number(item.file_start_offset || 0) : null;
+  const mid = indexedFrame ?? (st + et) / 2.0;
+  setElementText('thumb-mid-label', indexedFrame == null ? '中点代表帧' : '索引代表帧');
 
   const playerImg = document.getElementById('main-player-img');
   const spinner = document.getElementById('player-spinner');
   const heroBadge = document.getElementById('hero-badge');
 
   if (heroBadge) {
-    heroBadge.innerText = 'PEAK FRAME';
+    heroBadge.innerText = indexedFrame == null ? 'MIDPOINT FRAME · 代表图不等于整段' : '索引代表帧 · 相似画面不认证同一事件';
     heroBadge.classList.remove('hidden');
   }
 
-  // 1. 优先加载峰值静态帧，确保 0ms 瞬间有画面
-  const peakUrl = `/api/frame?filepath=${encodeURIComponent(fp)}&t=${mid.toFixed(3)}&w=800`;
+  // 先显示代表帧，再加载短动图；用户选择帧后不被迟到动图替换。
+  const representativeUrl = `/api/frame?filepath=${encodeURIComponent(fp)}&t=${mid.toFixed(3)}&w=800`;
   if (playerImg) {
-    playerImg.src = peakUrl;
+    playerImg.onerror = () => {
+      if (state.filteredItems[state.selectedIndex]?.id === item.id && heroBadge) {
+        heroBadge.innerText = '画面提取失败 · 请检查原片';
+      }
+    };
+    playerImg.src = representativeUrl;
     playerImg.classList.remove('hidden');
   }
 
-  // 2. 加载底部三联小卡片 (起点、峰值、终点)
+  // 底部三联帧：起点、代表帧、终点。
   loadThumbImage('start', fp, st);
   loadThumbImage('mid', fp, mid);
   loadThumbImage('end', fp, Math.max(st, et - 0.1));
 
   // 3. 异步尝试载入 WebP 循环短微视频
   if (spinner) spinner.classList.remove('hidden');
-  const clipUrl = `/api/clip?filepath=${encodeURIComponent(fp)}&start=${st.toFixed(2)}&end=${et.toFixed(2)}`;
+  const clipUrl = `/api/clip?filepath=${encodeURIComponent(fp)}&start=${st.toFixed(2)}&end=${Math.min(et,st+6).toFixed(2)}`;
 
   const clipLoader = new Image();
   clipLoader.onload = () => {
     // 仅在当前选中的切片依然是此切片时才替换
     if (state.selectedIndex >= 0 && state.filteredItems[state.selectedIndex]?.id === item.id) {
-      if (playerImg) {
+      if (playerImg && state.previewPinnedId !== item.id) {
         playerImg.src = clipUrl;
         playerImg.classList.remove('hidden');
       }
       if (spinner) spinner.classList.add('hidden');
-      if (heroBadge) {
-        heroBadge.innerText = 'DYNAMIC LOOP (10fps)';
+      if (heroBadge && state.previewPinnedId !== item.id) {
+        heroBadge.innerText = '短预览 ≤6s · 10fps · 无声；完整复核请查看原片';
         heroBadge.classList.remove('hidden');
       }
     }
   };
   clipLoader.onerror = () => {
-    if (spinner) spinner.classList.add('hidden');
+    if (spinner && state.filteredItems[state.selectedIndex]?.id === item.id) spinner.classList.add('hidden');
   };
   clipLoader.src = clipUrl;
 }
@@ -518,12 +744,16 @@ function loadThumbImage(pos, filepath, timestamp) {
 
   // 鼠标悬停到小卡片时，主视窗立刻切换为该帧，提供精确视察
   if (card) {
+    const displayedId = state.filteredItems[state.selectedIndex]?.id;
     card.onmouseenter = () => {
+      if (state.filteredItems[state.selectedIndex]?.id !== displayedId) return;
+      state.previewPinnedId = displayedId;
       const playerImg = document.getElementById('main-player-img');
       const heroBadge = document.getElementById('hero-badge');
-      if (playerImg) playerImg.src = url;
-      if (heroBadge) heroBadge.innerText = `${pos.toUpperCase()} FRAME`;
+      if (playerImg) playerImg.src = url.replace('&w=240','&w=800');
+      if (heroBadge) heroBadge.innerText = pos === 'mid' && Number.isFinite(state.filteredItems[state.selectedIndex]?.visual_frame_time) ? '索引代表帧 · 画面相似不认证同一事件' : `${pos.toUpperCase()} FRAME`;
     };
+    card.onclick = card.onmouseenter;
   }
 }
 
@@ -560,72 +790,166 @@ function handleDecision(action, isBatch = false) {
   submitReviewDirect(manualLabel, isBatch);
 }
 
-async function submitReviewDirect(manualLabel, isBatch = false) {
-  if (state.selectedIndex < 0) return;
-  const item = state.filteredItems[state.selectedIndex];
-  const doBatch = isBatch && Array.isArray(item.cluster_ids) && item.cluster_ids.length > 1;
+const pendingReviewIds = new Set();
 
-  // 1. 乐观更新当前内存状态
-  item.manual_label = manualLabel;
-  if (doBatch) {
-    const idSet = new Set(item.cluster_ids);
-    state.items.forEach(it => {
-      if (idSet.has(it.id)) it.manual_label = manualLabel;
-    });
+async function commitReview(ids, manualLabel, attribution = null) {
+  if (ids.some(id => pendingReviewIds.has(id))) {
+    showToast('该片段正在提交，请等待确认', 'info'); return false;
   }
-
-  // 2. 局部刷新 UI (0ms 瞬时响应)
-  updateCategoryBadges();
-  renderQueueList();
-
-  // 3. 自动步进到下一个未复核切片
-  selectNext(1);
-
-  // 4. 后台静默发送请求
-  const endpoint = doBatch ? '/api/batch_review' : '/api/review';
-  const payload = doBatch
-    ? { segment_ids: item.cluster_ids, manual_label: manualLabel }
-    : { segment_id: item.id, manual_label: manualLabel };
-
+  ids.forEach(id => pendingReviewIds.add(id));
+  const batch = ids.length > 1;
+  const payload = batch ? {segment_ids:ids, manual_label:manualLabel} : {segment_id:ids[0], manual_label:manualLabel};
+  if (attribution) Object.assign(payload, attribution);
   try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+    const response = await fetch(batch ? '/api/batch_review' : '/api/review', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
     });
-    const data = await res.json();
-    if (data.success) {
-      const hint = doBatch ? `已批量处理 ${data.count} 处切片` : `已标记 #${item.id}`;
-      showToast(`${hint} ➔ ${manualLabel}`, 'success');
+    const data = await response.json();
+    if (!response.ok || !data.success || (batch && data.count !== ids.length)) {
+      showToast(`提交未完整确认：${data.error || '请刷新队列核对持久状态'}`, 'error');
+      return false;
     }
+    const targets = new Set(ids);
+    state.items.forEach(item => { if (targets.has(item.id)) {
+      item.manual_label = manualLabel;
+      if (attribution) { item.scenario = attribution.scenario; item.user_notes = attribution.notes;
+        if ('review_basis' in attribution) item.review_basis = attribution.review_basis; }
+    } });
+    updateCategoryBadges(); renderQueueList();
+    showToast(`已确认保存${ids.length}条复核`, 'success');
+    return true;
   } catch (err) {
-    console.error('Submit review error:', err);
-    showToast('网络提交异常，请检查本地后台', 'error');
-  }
+    showToast(`提交结果未知：${err.message}；请刷新队列核对，未将界面标为成功。`, 'error');
+    return false;
+  } finally { ids.forEach(id => pendingReviewIds.delete(id)); }
+}
+
+async function submitReviewDirect(manualLabel, isBatch = false) {
+  const item = state.filteredItems[state.selectedIndex];
+  if (!item) return;
+  const ids = isBatch && item.cluster_ids?.length > 1 ? item.cluster_ids : [item.id];
+  const nextId = state.filteredItems[state.selectedIndex + 1]?.id;
+  if (await commitReview(ids, manualLabel)) await loadQueue(nextId ?? item.id);
 }
 
 async function clearCurrentReview() {
-  if (state.selectedIndex < 0) return;
   const item = state.filteredItems[state.selectedIndex];
-  if (!item.manual_label) {
-    showToast('当前切片未打标，无需撤销', 'info');
-    return;
-  }
-
-  item.manual_label = null;
-  updateCategoryBadges();
-  renderQueueList();
-
+  if (!item?.manual_label) return showToast('当前片段未打标', 'info');
+  if (pendingReviewIds.has(item.id)) return;
+  pendingReviewIds.add(item.id);
   try {
-    await fetch('/api/clear_review', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ segment_id: item.id })
+    const response = await fetch('/api/clear_review', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({segment_id:item.id})});
+    const result = await response.json();
+    if (!response.ok || !result.success) throw Error(result.error || '撤销未确认');
+    item.manual_label = null; item.scenario = ''; item.user_notes = ''; item.review_basis = 'unknown';
+    updateCategoryBadges(); renderQueueList();
+    showToast(`已撤销 #${item.id}`, 'info');
+    await loadQueue(item.id);
+  } catch (err) { showToast(`撤销结果未知：${err.message}；请刷新核对。`, 'error'); }
+  finally { pendingReviewIds.delete(item.id); }
+}
+
+let activeReviewContext = null;
+let tuningContextHash = null;
+let tuningContextValues = {};
+
+function qualityGateSummary(gate) {
+  if (!gate || !gate.independent_counts) return '独立验收资料暂不可用；全部参考的 F1 仅用于诊断比较。';
+  const count = value => Number.isInteger(value) && value >= 0 ? String(value) : '未知';
+  const names = {ADULT_MOTION:'成人活动', INFANT_MOTION:'婴幼儿活动', EMPTY_ROOM:'空镜', LIGHT_SHADOW:'光影'};
+  const required = count(gate.required_independent_groups);
+  const groups = Object.entries(names).map(([key,name]) => `${name} ${count(gate.independent_counts[key])}/${required}组`).join('；');
+  const excluded = gate.excluded_samples || {};
+  const missing = (gate.insufficient_scenarios || []).map(key => names[key] || '未知场景').join('、');
+  const failed = (gate.failed_scenarios || []).map(key => names[key] || '未知场景').join('、');
+  return [`独立验收：准入留出参考 ${count(gate.verified_samples)}条。${groups}。`,
+    `未用于验收：非留出 ${count(excluded.not_holdout)}条，已用于调优 ${count(excluded.used_for_tuning)}条，未核验 ${count(excluded.unreviewed)}条；来源缺失 ${count(excluded.missing_source)}条，无效区间 ${count(excluded.invalid_interval)}条，重复 ${count(excluded.duplicates)}条，冲突 ${count(excluded.conflicts)}个区间。`,
+    `${missing ? '待补齐：'+missing+'。' : ''}${failed ? '未达标：'+failed+'。' : ''}上方全部参考的 F1 仅用于诊断比较；质量门禁按独立事件组评估。`].join('\n');
+}
+
+async function fetchReviewContext(id) {
+  const response = await fetch(`/api/review_context?segment_id=${id}`);
+  const result = await response.json();
+  if (!response.ok || result.error) throw Error(result.error || '配置/审核上下文不可用');
+  return result;
+}
+
+function appendTableRow(body, values) {
+  const row = document.createElement('tr');
+  values.forEach(value => { const cell = document.createElement('td'); cell.innerText = value == null ? '—' : String(value); row.appendChild(cell); });
+  body.appendChild(row);
+}
+
+async function openReviewContext() {
+  const item = state.filteredItems[state.selectedIndex];
+  if (!item) return showToast('请先选择审核片段', 'info');
+  document.getElementById('modal-context').classList.remove('hidden');
+  activeReviewContext = null;
+  document.getElementById('btn-save-review-context').disabled = true;
+  document.getElementById('review-context-parameters').replaceChildren();
+  setElementText('review-context-status', '正在读取当前配置与审核计划...');
+  try {
+    const context = await fetchReviewContext(item.id);
+    if (state.filteredItems[state.selectedIndex]?.id !== item.id) return;
+    activeReviewContext = context;
+    setElementText('review-context-title', `#${item.id} · 机位${context.segment.cam_index} · 配置与归因`);
+    setElementText('review-context-status', context.notice);
+    const label = document.getElementById('review-context-label');
+    const normalized = {TP:'CONFIRMED_MOTION',VERIFIED_MOTION:'CONFIRMED_MOTION',FP:'FALSE_ALARM',FN:'MISSED_MOTION',TN:'CONFIRMED_STATIC'};
+    label.value = normalized[context.segment.manual_label] || context.segment.manual_label || '';
+    const scenario = document.getElementById('review-context-scenario');
+    if (context.scenario && !Array.from(scenario.options).some(option => option.value === context.scenario)) {
+      const option = document.createElement('option'); option.value = context.scenario; option.innerText = context.scenario; scenario.appendChild(option);
+    }
+    scenario.value = context.scenario || '';
+    document.getElementById('review-context-notes').value = context.user_notes || '';
+    document.getElementById('review-context-basis').value = context.review_basis || 'unknown';
+    const analysis = context.comparison.analysis, reviewed = context.comparison.reviewed;
+    const states = details => [...new Set(details.portions.map(portion => portion.state))].join(', ') || '无覆盖';
+    setElementText('review-context-comparison', `保存的分析 → 人工覆盖计划：${states(analysis)} → ${states(reviewed)}；本区间展示贡献 ${analysis.display_s.toFixed(3)}s → ${reviewed.display_s.toFixed(3)}s。这是计划对比，成片效果需另行验证。`);
+    const body = document.getElementById('review-context-parameters');
+    context.parameters.forEach(parameter => appendTableRow(body, [parameter.param, parameter.global, parameter.camera, parameter.explicit_global ? '有显式值' : '预设/默认填充']));
+    document.getElementById('btn-save-review-context').disabled = false;
+  } catch (err) { setElementText('review-context-status', err.message); }
+}
+
+async function saveReviewContext() {
+  if (!activeReviewContext) return;
+  const context = activeReviewContext;
+  const label = document.getElementById('review-context-label').value;
+  if (!label) return showToast('待确认片段不提交裁决；确认后再保存。', 'info');
+  const attribution = {scenario:document.getElementById('review-context-scenario').value,
+    notes:document.getElementById('review-context-notes').value, review_basis:document.getElementById('review-context-basis').value};
+  const button = document.getElementById('btn-save-review-context'); button.disabled = true;
+  if (await commitReview([context.segment.id], label, attribution)) {
+    const refreshed = await loadQueue(context.segment.id);
+    setElementText('review-context-status', refreshed ? '保存已确认；队列库存已刷新。当前归因面板仍对应原片段。' : '保存已确认，但库存刷新失败，请手动刷新核对。');
+    button.disabled = false;
+  } else { button.disabled = false; }
+}
+
+async function openTuningPanel() {
+  document.getElementById('modal-whatif').classList.remove('hidden');
+  document.getElementById('btn-run-simulation').disabled = true;
+  document.getElementById('sim-report-box').classList.add('hidden');
+  document.getElementById('btn-apply-tuning-config').classList.add('hidden');
+  tuningContextHash = null;
+  tuningContextValues = {};
+  const item = state.filteredItems[state.selectedIndex];
+  if (!item) return setElementText('sim-context-hint', '请先选择机位片段。');
+  try {
+    const context = await fetchReviewContext(item.id);
+    if (state.filteredItems[state.selectedIndex]?.id !== item.id) throw Error('选中片段已改变，请重新打开参数对照。');
+    tuningContextHash = context.config_sha256;
+    [['energy','detection.min_motion_threshold'],['dur','segment.min_motion_duration'],['yolo','yolo.confidence']].forEach(([field,key]) => {
+      const parameter = context.parameters.find(entry => entry.param === key);
+      tuningContextValues[key] = parameter?.global;
+      document.getElementById(`sim-input-${field}`).value = parameter?.global ?? '';
+      setElementText(`sim-hint-${field}`, `全局解析值 ${parameter?.global ?? '未提供'}；机位${context.segment.cam_index}解析值 ${parameter?.camera ?? '未提供'}`);
     });
-    showToast(`已撤销 #${item.id} 的复核标记`, 'info');
-  } catch (err) {
-    console.error('Clear review failed:', err);
-  }
+    setElementText('sim-context-hint', `读取当前配置；选中 #${item.id} / 机位${context.segment.cam_index}。候选作用域为全局，初始值没有建议含义。`);
+    document.getElementById('btn-run-simulation').disabled = false;
+  } catch (err) { setElementText('sim-context-hint', err.message); }
 }
 
 // ================== 5. 工具功能与导出 ==================
@@ -639,7 +963,7 @@ async function exportGoldBenchmark() {
     });
     const data = await res.json();
     if (data.success) {
-      showToast(`🏆 成功导出 ${data.count} 条黄金基准至 tests/benchmark_data/`, 'success');
+      showToast(`已导出 ${data.count} 条审核记录；独立参考核验需另行完成`, 'success');
     } else {
       showToast('导出基准失败: ' + (data.error || '未知原因'), 'error');
     }
@@ -649,31 +973,47 @@ async function exportGoldBenchmark() {
 }
 
 let lastSimulationParams = null;
+let lastSimulationConfigHash = null;
 
 async function runTuningSimulation() {
-  const energyVal = parseFloat(document.getElementById('sim-input-energy').value) || 2.5;
-  const durVal = parseFloat(document.getElementById('sim-input-dur').value) || 2.0;
-  const yoloVal = parseFloat(document.getElementById('sim-input-yolo').value) || 0.3;
+  const energyVal = parseFloat(document.getElementById('sim-input-energy').value);
+  const durVal = parseFloat(document.getElementById('sim-input-dur').value);
+  const yoloVal = parseFloat(document.getElementById('sim-input-yolo').value);
+  if (!tuningContextHash || ![energyVal, durVal, yoloVal].every(Number.isFinite) || energyVal <= 0 || durVal <= 0 || yoloVal <= 0 || yoloVal > 1) {
+    return showToast('请读取当前配置并输入有效正数；置信度须不大于1。', 'error');
+  }
 
-  const candidateParams = {
+  const enteredParams = {
     'detection.min_motion_threshold': energyVal,
     'segment.min_motion_duration': durVal,
     'yolo.confidence': yoloVal,
   };
-  lastSimulationParams = candidateParams;
+  const candidateParams = Object.fromEntries(Object.entries(enteredParams).filter(([key,value]) => value !== tuningContextValues[key]));
+  lastSimulationParams = null;
+  lastSimulationConfigHash = null;
 
-  showToast('⚡ 正在对 100 样本黄金基准执行 What-If 推演...', 'info');
+  document.getElementById('sim-report-box').classList.add('hidden');
+  document.getElementById('sim-sample-changes').replaceChildren();
+  setElementText('sim-quality-details', '');
+  document.getElementById('btn-apply-tuning-config').classList.add('hidden');
+  showToast('正在检查独立参考标签与生产算法重放证据...', 'info');
   try {
     const res = await fetch('/api/tuning_simulate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ candidate_params: candidateParams })
+      body: JSON.stringify({ candidate_params: candidateParams, expected_sha256: tuningContextHash })
     });
     const data = await res.json();
     if (data.error) {
-      showToast('仿真失败: ' + data.error, 'error');
+      document.getElementById('sim-report-box').classList.remove('hidden');
+      setElementText('sim-verdict-tag', 'UNAVAILABLE');
+      setElementText('sim-quality-details', qualityGateSummary(null));
+      setElementText('sim-verdict-reason', `${data.error}；有效参考 ${data.reviewed_samples ?? '未知'}/${data.total_samples ?? '未知'}，未显示收益。`);
+      ['stat-base-f1','stat-sim-f1','stat-delta-f1','stat-fp-red','stat-fn-inc'].forEach(id => setElementText(id, '—'));
       return;
     }
+    lastSimulationParams = candidateParams;
+    lastSimulationConfigHash = data.config_sha256;
 
     // 渲染报告
     const box = document.getElementById('sim-report-box');
@@ -682,7 +1022,8 @@ async function runTuningSimulation() {
     const vTag = document.getElementById('sim-verdict-tag');
     const vReason = document.getElementById('sim-verdict-reason');
     vTag.innerText = data.verdict;
-    vReason.innerText = data.rationale;
+    vReason.innerText = `${data.rationale}；有效参考 ${data.reviewed_samples}/${data.total_samples}`;
+    setElementText('sim-quality-details', qualityGateSummary(data.quality_gate));
 
     if (data.verdict === 'IMPROVED') {
       vTag.style.background = '#10b981';
@@ -698,14 +1039,26 @@ async function runTuningSimulation() {
     setElementText('stat-sim-f1', `${data.simulated.f1}%`);
     const deltaSign = data.deltas.f1 >= 0 ? '+' : '';
     setElementText('stat-delta-f1', `${deltaSign}${data.deltas.f1}%`);
-    setElementText('stat-fp-red', `-${data.deltas.fp_reduction}`);
-    setElementText('stat-fn-inc', `+${data.deltas.fn_increase}`);
+    setElementText('stat-fp-red', `${data.deltas.fp_reduction}`);
+    setElementText('stat-fn-inc', `${data.deltas.fn_increase}`);
+    const sampleBody = document.getElementById('sim-sample-changes');
+    const contribution = details => details?.status === 'MEASURED' ? `${details.display_s.toFixed(3)}s` : '未测';
+    const states = details => details?.status === 'MEASURED' ? [...new Set(details.portions.map(part => part.state))].join(',') : '未测';
+    (data.sample_changes || []).forEach(sample => appendTableRow(sampleBody, [
+      `#${sample.segment_id ?? '—'} / 机位${sample.cam_index ?? '—'}`, sample.scenario || 'UNKNOWN',
+      sample.reference_active ? '活动' : '静止', sample.baseline_retained ? '保留' : '静态压缩',
+      sample.candidate_retained ? '保留' : '静态压缩', `${states(sample.baseline_display)} → ${states(sample.candidate_display)}`, `${contribution(sample.baseline_display)} → ${contribution(sample.candidate_display)}`
+    ]));
 
     // 显示应用配置按钮
     const btnApply = document.getElementById('btn-apply-tuning-config');
-    btnApply.classList.remove('hidden');
+    if (data.quality_gate?.verdict === 'PASS') {
+      btnApply.classList.remove('hidden');
+    } else {
+      vReason.innerText += `；质量门禁 ${data.quality_gate?.verdict || 'UNAVAILABLE'}，不能据此自动应用参数`;
+    }
 
-    showToast(`推演完成: F1 预计变化 ${deltaSign}${data.deltas.f1}%`, 'success');
+    showToast(`重放完成: 参考子集 F1 变化 ${deltaSign}${data.deltas.f1}%`, 'success');
   } catch (err) {
     showToast('网络错误: ' + err.message, 'error');
   }
@@ -725,7 +1078,7 @@ async function applyTuningConfig() {
     const res = await fetch('/api/tuning_apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ params: lastSimulationParams })
+      body: JSON.stringify({ params: lastSimulationParams, expected_sha256: lastSimulationConfigHash })
     });
     const data = await res.json();
     if (data.success) {
@@ -740,67 +1093,208 @@ async function applyTuningConfig() {
   }
 }
 
-function openVideoPlayer(filepath, title = '') {
+let playerInterval = null;
+
+function closeVideoPlayer() {
+  const video = document.getElementById('vlog-video-el');
+  document.getElementById('modal-player')?.classList.add('hidden');
+  playerInterval = null;
+  if (!video) return;
+  video.onloadedmetadata = video.ontimeupdate = video.onerror = null;
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+}
+
+function openVideoPlayer(filepath, title = '', interval = null, deliveryUrl = null) {
   const modalPlayer = document.getElementById('modal-player');
   const videoEl = document.getElementById('vlog-video-el');
   const titleEl = document.getElementById('player-modal-title');
   if (!modalPlayer || !videoEl) return;
+  closeVideoPlayer();
+  const hint = document.getElementById('player-interval-hint');
+  const replay = document.getElementById('btn-replay-interval');
+  if (interval && (!Number.isFinite(interval.start) || !Number.isFinite(interval.end)
+      || interval.start < 0 || interval.end <= interval.start)) {
+    showToast('审核区间无效，不能定位原片', 'error');
+    return;
+  }
+  playerInterval = interval;
+  replay?.classList.toggle('hidden', !interval);
+  if (hint) hint.innerText = interval
+    ? `原片文件内 ${interval.start.toFixed(2)}–${interval.end.toFixed(2)} 秒；播放完整审核区间，含原声。短动图最多6秒。`
+    : '成片预览';
 
   if (title && titleEl) {
     titleEl.innerText = `▶ ${title}`;
   }
-  videoEl.src = `/api/video_stream?filepath=${encodeURIComponent(filepath)}`;
+  videoEl.src = deliveryUrl || `/api/video_stream?filepath=${encodeURIComponent(filepath)}`;
+  if (deliveryUrl && hint) hint.innerText = `实际成片 ${interval.start.toFixed(3)}–${interval.end.toFixed(3)}秒；完整展示分段，含上下文及成片音轨。`;
+  videoEl.onloadedmetadata = () => {
+    if (interval && (!Number.isFinite(videoEl.duration) || interval.end > videoEl.duration + 0.05)) {
+      videoEl.pause();
+      playerInterval = null;
+      replay?.classList.add('hidden');
+      if (hint) hint.innerText = deliveryUrl ? '成片时长与交付映射不符，请刷新对比并核对交付。' : '原片时长不足以覆盖审核区间，请核对源文件与元数据。';
+      return;
+    }
+    videoEl.currentTime = interval ? interval.start : 0;
+    videoEl.play().catch(() => {
+      if (hint) hint.innerText += ' 请点击播放。';
+    });
+  };
+  videoEl.ontimeupdate = () => {
+    if (playerInterval && videoEl.currentTime >= playerInterval.end) videoEl.pause();
+  };
+  videoEl.onerror = () => {
+    if (hint) hint.innerText = deliveryUrl ? '成片版本已变化、读取失败或格式不受支持，请刷新对比后重试。' : '视频读取或浏览器解码失败，请检查共享连接与视频格式。';
+  };
   modalPlayer.classList.remove('hidden');
-  videoEl.play().catch(e => console.log('Autoplay blocked:', e));
+  videoEl.load();
+}
+
+let reviewedRenderRequest = null;
+let reviewedRenderTimer = null;
+let reviewedRenderPolling = false;
+let reviewedRenderLoading = false;
+
+function showRenderBatchRows(reports, actual = false) {
+  const body = document.getElementById('rerender-batches');
+  body.replaceChildren();
+  reports.forEach((entry) => {
+    const report = actual ? entry.attempts?.at(-1) : entry;
+    const row = document.createElement('tr');
+    const values = [entry.batch_index + 1,
+      report?.source_files?.map(fp => fp.split(/[\\/]/).at(-1)).join(', ') || '—',
+      report?.expected_duration_s == null ? '—' : `${report.expected_duration_s.toFixed(2)}s`,
+      actual ? '启动时快照' : (entry.review_intervals?.length || 0),
+      actual ? `${entry.status} · ${entry.cache_hit == null ? '待判定' : (entry.cache_hit ? '已复用' : '重新渲染')}`
+        : (entry.cache_hit ? '已校验可复用' : '需渲染（无匹配有效缓存）')];
+    values.forEach(value => { const cell = document.createElement('td'); cell.innerText = value; row.appendChild(cell); });
+    body.appendChild(row);
+  });
 }
 
 async function triggerRerender() {
-  const currentItem = state.selectedIndex >= 0 ? state.filteredItems[state.selectedIndex] : (state.items[0] || null);
-  const defaultDate = currentItem?.date || new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const defaultCam = currentItem?.cam_index ?? 0;
+  if (reviewedRenderLoading || reviewedRenderTimer) {
+    document.getElementById('modal-rerender').classList.remove('hidden');
+    return;
+  }
+  const item = state.filteredItems[state.selectedIndex] || state.items[0];
+  const modal = document.getElementById('modal-rerender');
+  const dateInput = document.getElementById('rerender-date');
+  const cameraInput = document.getElementById('rerender-camera');
+  dateInput.value = item?.date || '';
+  cameraInput.value = item?.cam_index ?? 0;
+  modal.classList.remove('hidden');
+  document.getElementById('btn-close-rerender').onclick = () => modal.classList.add('hidden');
+  document.getElementById('btn-inspect-reviewed-render').onclick = inspectReviewedRender;
+  [dateInput, cameraInput].forEach(input => { input.oninput = () => {
+    reviewedRenderRequest = null;
+    document.getElementById('btn-start-reviewed-render').disabled = true;
+    setElementText('rerender-summary', '范围已改变，请刷新批次预览。');
+  }; });
+  await inspectReviewedRender();
+}
 
-  const inputDate = prompt('请输入需要基于当前复核重新浓缩的日期 (YYYYMMDD):', defaultDate);
-  if (!inputDate) return;
-
-  showToast(`🚀 正在为 ${inputDate} (机位${defaultCam}) 启动后台重渲染...`, 'info');
+async function inspectReviewedRender() {
+  if (reviewedRenderLoading || reviewedRenderTimer) return;
+  const date = document.getElementById('rerender-date').value.trim();
+  const camIndex = Number(document.getElementById('rerender-camera').value);
+  const modal = document.getElementById('modal-rerender');
+  if (!/^\d{8}$/.test(date) || !Number.isInteger(camIndex) || camIndex < 0) {
+    setElementText('rerender-summary', '请输入8位日期和非负整数机位。');
+    return;
+  }
+  reviewedRenderLoading = true;
+  const start = document.getElementById('btn-start-reviewed-render');
+  const cancel = document.getElementById('btn-cancel-reviewed-render');
+  modal.classList.remove('hidden');
+  start.disabled = true;
+  cancel.classList.add('hidden');
+  reviewedRenderRequest = null;
+  setElementText('rerender-summary', '正在读取审核快照与校验缓存；NAS读取可能需要时间。');
+  document.getElementById('rerender-batches').replaceChildren();
+  document.getElementById('btn-close-rerender').onclick = () => modal.classList.add('hidden');
   try {
-    const res = await fetch('/api/rerender', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ date: inputDate, cam_index: defaultCam, version: 'reviewed' })
-    });
-    const data = await res.json();
-    if (data.status === 'ALREADY_RUNNING' || data.status === 'CHECKING' || data.status === 'RENDERING') {
-      pollRerenderProgress(inputDate, defaultCam);
+    const response = await fetch(`/api/rerender_plan?date=${encodeURIComponent(date)}&cam_index=${camIndex}`);
+    const plan = await response.json();
+    if (date !== document.getElementById('rerender-date').value.trim() || camIndex !== Number(document.getElementById('rerender-camera').value)) return;
+    if (plan.status !== 'AVAILABLE') {
+      setElementText('rerender-summary', `预览不可用：${plan.error || ('不可访问素材 ' + (plan.missing_files?.length || 0))}`);
+      return;
+    }
+    reviewedRenderRequest = {date, cam_index: camIndex, expected_snapshot: plan.snapshot_sha256};
+    showRenderBatchRows(plan.batches);
+    setElementText('rerender-summary', `${date} 机位${camIndex} · 共${plan.total_batches}批；已校验可复用${plan.reusable_batches}批、需渲染${plan.total_batches - plan.reusable_batches}批。`);
+    start.disabled = false;
+    start.onclick = startReviewedRender;
+    cancel.onclick = async () => {
+      if (!reviewedRenderRequest) return;
+      try {
+        const response = await fetch('/api/rerender_cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(reviewedRenderRequest)});
+        const data = await response.json();
+        if (!data.success) showToast('任务已经结束或无法取消', 'info');
+      } catch (err) { showToast(`取消请求失败：${err.message}`, 'error'); }
+    };
+  } catch (err) { setElementText('rerender-summary', `预览失败：${err.message}`); }
+  finally { reviewedRenderLoading = false; }
+}
+
+async function startReviewedRender() {
+  if (!reviewedRenderRequest) return;
+  const request = {...reviewedRenderRequest};
+  document.getElementById('btn-start-reviewed-render').disabled = true;
+  setRenderRangeLocked(true);
+  try {
+    const response = await fetch('/api/rerender', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(request)});
+    const data = await response.json();
+    if (['ALREADY_RUNNING', 'CHECKING', 'RENDERING', 'CONCATING', 'CANCELLING'].includes(data.status)) {
+      document.getElementById('btn-cancel-reviewed-render').classList.remove('hidden');
+      pollRerenderProgress(request.date, request.cam_index);
     } else {
-      showToast('启动重渲染失败: ' + (data.message || data.error || '未知错误'), 'error');
+      setRenderRangeLocked(false);
+      setElementText('rerender-summary', `启动失败：${data.message || data.error || '未知错误'}`);
     }
   } catch (err) {
-    showToast('网络请求失败: ' + err.message, 'error');
+    // A lost response does not prove the worker never started.
+    pollRerenderProgress(request.date, request.cam_index);
+    setElementText('rerender-summary', `启动响应未取得：${err.message}；正在核实任务状态。`);
   }
 }
 
+function setRenderRangeLocked(locked) {
+  ['rerender-date', 'rerender-camera', 'btn-inspect-reviewed-render'].forEach(id => {
+    document.getElementById(id).disabled = locked;
+  });
+}
+
 function pollRerenderProgress(date, camIndex) {
-  const timer = setInterval(async () => {
+  if (reviewedRenderTimer) clearInterval(reviewedRenderTimer);
+  const poll = async () => {
+    if (reviewedRenderPolling) return;
+    reviewedRenderPolling = true;
     try {
-      const res = await fetch(`/api/rerender_status?date=${date}&cam_index=${camIndex}`);
-      const st = await res.json();
-      if (st.status === 'COMPLETED') {
-        clearInterval(timer);
-        showToast(`🎉 重渲染完成 (${st.file_size_mb} MB)，正在开启成片预览！`, 'success');
-        if (st.output_file) {
-          openVideoPlayer(st.output_file, `Daily Vlog 重渲染成片 (${date})`);
+      const response = await fetch(`/api/rerender_status?date=${date}&cam_index=${camIndex}`);
+      const status = await response.json();
+      showRenderBatchRows(status.batch_results || [], true);
+      setElementText('rerender-summary', `${status.status} · ${status.progress || 0}% · 批次 ${status.current_batch || 0}/${status.total_batches || 0} · ${status.error || ''}`);
+      if (['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'].includes(status.status)) {
+        clearInterval(reviewedRenderTimer);
+        reviewedRenderTimer = null;
+        setRenderRangeLocked(false);
+        document.getElementById('btn-cancel-reviewed-render').classList.add('hidden');
+        if (status.status === 'COMPLETED' && status.output_file) {
+          document.getElementById('modal-rerender').classList.add('hidden');
+          openVideoPlayer(status.output_file, `审核成片 (${date})`);
         }
-      } else if (st.status === 'FAILED') {
-        clearInterval(timer);
-        showToast(`❌ 重渲染失败: ${st.error || '未知错误'}`, 'error');
-      } else if (st.status === 'RENDERING' || st.status === 'CONCATING') {
-        showToast(`⏳ 正在重渲染 (${st.progress}%: Batch ${st.current_batch}/${st.total_batches})`, 'info');
       }
     } catch (err) {
-      clearInterval(timer);
-    }
-  }, 3000);
+      setElementText('rerender-summary', `状态读取失败：${err.message}；任务状态未知，继续查询。`);
+    } finally { reviewedRenderPolling = false; }
+  };
+  reviewedRenderTimer = setInterval(poll, 3000);
+  poll();
 }
 
 // 辅助函数
@@ -823,3 +1317,59 @@ function showToast(msg, type = 'info') {
 }
 
 
+
+function escapeHTML(value) { return String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char])); }
+
+
+async function openDeliveryComparison() {
+  const item = state.filteredItems[state.selectedIndex];
+  if (!item) return showToast('请先选择审核片段', 'info');
+  const modal = document.getElementById('modal-delivery-comparison');
+  modal.classList.remove('hidden');
+  setElementText('delivery-comparison-title', `#${item.id} · 已渲染成片版本`);
+  setElementText('delivery-comparison-status', '正在核对交付映射与媒体身份...');
+  const body = document.getElementById('delivery-comparison-versions'); body.replaceChildren();
+  try {
+    const response = await fetch(`/api/delivery_comparison?segment_id=${item.id}`);
+    const result = await response.json();
+    if (!response.ok || result.error) throw Error(result.error || '交付映射不可用');
+    if (state.filteredItems[state.selectedIndex]?.id !== item.id || modal.classList.contains('hidden')) return;
+    setElementText('delivery-comparison-status', `${result.status === 'AVAILABLE' ? '' : '当前无可定位交付。'}${result.notice} ${result.problems.join('；')}`);
+    for (const version of result.versions) {
+      const section = document.createElement('section');
+      const heading = document.createElement('p');
+      heading.innerText = `${version.role === 'current' ? '当前交付' : '先前交付'} · ${version.generated_at || '时间未记录'} · 版本${version.version_id.slice(0,12)}`;
+      section.appendChild(heading);
+      version.intervals.forEach((interval,index) => {
+        const button = document.createElement('button'); button.className = 'delivery-interval';
+        button.innerText = `播放${index+1} · ${interval.state} · 帧${interval.start_frame}–${interval.end_frame} · ${interval.start.toFixed(3)}–${interval.end.toFixed(3)}s`;
+        button.addEventListener('click', () => openVideoPlayer(version.filepath, `${heading.innerText} · #${item.id}`, interval,
+          `/api/delivery_stream?segment_id=${item.id}&version_id=${version.version_id}`));
+        section.appendChild(button);
+      });
+      body.appendChild(section);
+    }
+  } catch (error) { setElementText('delivery-comparison-status', error.message); }
+}
+
+
+async function indexCurrentVisualSource() {
+  const item = state.filteredItems[state.selectedIndex];
+  const id = item?.id || state.visualReference;
+  if (!id) return showToast('请先选择参考片段','info');
+  const button = document.getElementById('btn-index-visual-source');
+  if (button.disabled) return;
+  button.disabled = true;
+  showToast('正在为当前原片构建视觉索引，请等待；不修改人工标签。','info');
+  try {
+    const response = await fetch('/api/index_visual_source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segment_id:id})});
+    const result = await response.json();
+    if (!response.ok || !result.success) throw Error(result.error || '索引构建未确认');
+    showToast(`当前原片 ${result.indexed}/${result.segments} 条获得有效画面索引`,'success');
+    if (state.filteredItems[state.selectedIndex]?.id === id || (!state.filteredItems.length && state.visualReference === id)) {
+      state.visualReference = id;
+      switchCategory('visual');
+    }
+  } catch (error) { showToast(`视觉索引不可用：${error.message}`,'error'); }
+  finally { button.disabled = false; }
+}

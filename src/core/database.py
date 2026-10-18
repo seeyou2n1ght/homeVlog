@@ -1,4 +1,5 @@
 import math
+import json
 import sqlite3
 import threading
 import logging
@@ -11,6 +12,12 @@ from src.core.config import DB_PATH
 from src.core.identity import camera_key, ts_to_unix
 
 logger = logging.getLogger("homevlog")
+
+
+def is_skipped_source(row: dict) -> bool:
+    """Terminal source exclusions are recorded, but never rendered/probed again."""
+    return (row.get("prescreen_status") in ("SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
+            or row.get("analysis_status") in ("SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"))
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -37,7 +44,8 @@ CREATE TABLE IF NOT EXISTS file_tasks (
     updated_at TEXT DEFAULT (datetime('now', 'localtime')),
     has_audio INTEGER DEFAULT 0,
     duration_verified INTEGER DEFAULT 0,
-    processing_fingerprint TEXT
+    processing_fingerprint TEXT,
+    decode_completion TEXT
 );
 
 CREATE TABLE IF NOT EXISTS segments (
@@ -66,6 +74,20 @@ CREATE TABLE IF NOT EXISTS segments (
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
     UNIQUE(file_id, start_time, end_time)
 );
+
+-- Derived, rebuildable visual features, never manual labels or target boxes.
+CREATE TABLE IF NOT EXISTS visual_features (
+    segment_id INTEGER PRIMARY KEY,
+    filepath TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL NOT NULL,
+    file_start_offset REAL NOT NULL,
+    source_identity TEXT NOT NULL,
+    frame_time REAL NOT NULL,
+    signature TEXT NOT NULL,
+    origin TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_visual_features_path ON visual_features(filepath);
 
 CREATE TABLE IF NOT EXISTS render_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,12 +145,14 @@ class VlogDatabase:
     def _migrate(self):
         with self._lock:
             version_row = self.conn.execute("PRAGMA user_version").fetchone()
-            if version_row and version_row[0] >= 3:
+            if version_row and version_row[0] >= 4:
                 return
 
             self.conn.execute("BEGIN IMMEDIATE")
             cursor = self.conn.execute("PRAGMA table_info(file_tasks)")
             columns = [row["name"] for row in cursor.fetchall()]
+            if "decode_completion" not in columns:
+                self.conn.execute("ALTER TABLE file_tasks ADD COLUMN decode_completion TEXT")
             if "has_audio" not in columns:
                 self.conn.execute("ALTER TABLE file_tasks ADD COLUMN has_audio INTEGER DEFAULT 0")
             if "processing_fingerprint" not in columns:
@@ -158,7 +182,7 @@ class VlogDatabase:
                 if index != row["cam_index"]:
                     self.conn.execute("UPDATE segments SET cam_index=? WHERE file_id=?", (index,row["id"]))
                     self.conn.execute("UPDATE render_tasks SET status='PENDING' WHERE date=?", (row["date"],))
-            self.conn.execute("PRAGMA user_version = 3")
+            self.conn.execute("PRAGMA user_version = 4")
             self.conn.commit()
 
     def _camera_index(self, identity, preferred):
@@ -198,7 +222,8 @@ class VlogDatabase:
             raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         return self._conn
 
-    def set_file_metadata(self, filepath: str, has_audio: int, duration: float | None = None):
+    def set_file_metadata(self, filepath: str, has_audio: int, duration: float | None = None,
+                          *, decode_completion: dict | None = None):
         with self._lock:
             try:
                 new_end_time = None
@@ -220,9 +245,12 @@ class VlogDatabase:
                        SET has_audio=?,
                            file_duration=COALESCE(?, file_duration),
                            file_end_time=COALESCE(?, file_end_time),
+                           decode_completion=COALESCE(?, decode_completion),
                            duration_verified=CASE WHEN ? IS NULL THEN duration_verified ELSE 1 END
                        WHERE filepath=?""",
-                    (has_audio, duration, new_end_time, duration, str(filepath))
+                    (has_audio, duration, new_end_time,
+                     json.dumps(decode_completion) if decode_completion is not None else None,
+                     duration, str(filepath))
                 )
                 self.conn.commit()
             except Exception as e:
@@ -232,7 +260,14 @@ class VlogDatabase:
 
     def exclude_file_task(self, filepath: str, reason: str = "MANUAL_EXCLUDED") -> bool:
         """显式受控排除异常或损坏的原片，更新其为终态 SKIPPED_EXCLUDED，避免阻断全日交付。"""
+        from src.core.process_lock import database_day_lease
         with self._lock:
+            row = self.conn.execute(
+                "SELECT date, cam_index FROM file_tasks WHERE filepath=?", (str(filepath),)
+            ).fetchone()
+        if row is None:
+            return False
+        with database_day_lease(self.db_path, row["date"], row["cam_index"]), self._lock:
             try:
                 cur = self.conn.execute(
                     """UPDATE file_tasks
@@ -287,14 +322,14 @@ class VlogDatabase:
                     self.conn.execute(
                         """UPDATE file_tasks
                            SET prescreen_status=?, prescreen_result=?, has_audio=?, error_msg=?, updated_at=datetime('now', 'localtime')
-                           WHERE filepath=?""",
+                           WHERE filepath=? AND prescreen_status!='SKIPPED_EXCLUDED' AND analysis_status!='SKIPPED_EXCLUDED'""",
                         (status, result_json, has_audio, error_msg, str(filepath)),
                     )
                 else:
                     self.conn.execute(
                         """UPDATE file_tasks
                            SET prescreen_status=?, prescreen_result=?, error_msg=?, updated_at=datetime('now', 'localtime')
-                           WHERE filepath=?""",
+                           WHERE filepath=? AND prescreen_status!='SKIPPED_EXCLUDED' AND analysis_status!='SKIPPED_EXCLUDED'""",
                         (status, result_json, error_msg, str(filepath)),
                     )
                 self.conn.commit()
@@ -332,12 +367,16 @@ class VlogDatabase:
                         segments_json = ""
 
                 # 1. 更新 file_tasks 状态与兼容用 JSON
-                self.conn.execute(
+                updated = self.conn.execute(
                     """UPDATE file_tasks
                        SET analysis_status=?, analysis_segments=?, error_msg=?, updated_at=datetime('now', 'localtime')
-                       WHERE filepath=?""",
+                       WHERE filepath=? AND prescreen_status!='SKIPPED_EXCLUDED' AND analysis_status!='SKIPPED_EXCLUDED'""",
                     (status, segments_json, error_msg, str(filepath)),
                 )
+
+                if updated.rowcount == 0:
+                    self.conn.commit()
+                    return
 
                 # 2. 查询 file_task 元数据以供 segments 外键关联
                 row = self.conn.execute(
@@ -352,6 +391,7 @@ class VlogDatabase:
 
                     # ANALYZED replaces prior algorithm segments, including an
                     # explicitly empty result. Human reviews live separately.
+                    self.conn.execute("DELETE FROM visual_features WHERE segment_id IN (SELECT id FROM segments WHERE file_id=?)", (file_id,))
                     self.conn.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
 
                     records = []
@@ -452,31 +492,31 @@ class VlogDatabase:
                 self.conn.rollback()
 
 
-    def update_segment_review(self, segment_id: int, manual_label: str, notes: str = "", archived_frame_path: str | None = None) -> bool:
+    def update_segment_review(self, segment_id: int, manual_label: str, notes: str | None = "", archived_frame_path: str | None = None) -> bool:
         with self._lock:
             try:
                 if archived_frame_path:
-                    self.conn.execute(
+                    cursor = self.conn.execute(
                         """UPDATE segments
-                           SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime'), archived_frame_path=?
+                           SET manual_label=?, review_notes=COALESCE(?,review_notes), reviewed_at=datetime('now', 'localtime'), archived_frame_path=?
                            WHERE id=?""",
                         (manual_label, notes, archived_frame_path, segment_id),
                     )
                 else:
-                    self.conn.execute(
+                    cursor = self.conn.execute(
                         """UPDATE segments
-                           SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime')
+                           SET manual_label=?, review_notes=COALESCE(?,review_notes), reviewed_at=datetime('now', 'localtime')
                            WHERE id=?""",
                         (manual_label, notes, segment_id),
                     )
                 self.conn.commit()
-                return True
+                return cursor.rowcount > 0
             except Exception as e:
                 logger.error("DB error in update_segment_review: %s", e)
                 self.conn.rollback()
                 return False
 
-    def batch_update_segment_review(self, segment_ids: list[int], manual_label: str, notes: str = "") -> int:
+    def batch_update_segment_review(self, segment_ids: list[int], manual_label: str, notes: str | None = "") -> int:
         """批量更新一组切片的人工复核标签（用于聚类切片一键刷标）。"""
         if not segment_ids:
             return 0
@@ -485,7 +525,7 @@ class VlogDatabase:
                 placeholders = ",".join("?" for _ in segment_ids)
                 cur = self.conn.execute(
                     f"""UPDATE segments
-                        SET manual_label=?, review_notes=?, reviewed_at=datetime('now', 'localtime')
+                        SET manual_label=?, review_notes=COALESCE(?,review_notes), reviewed_at=datetime('now', 'localtime')
                         WHERE id IN ({placeholders})""",
                     [manual_label, notes, *segment_ids],
                 )

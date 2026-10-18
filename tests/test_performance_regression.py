@@ -159,8 +159,9 @@ def test_render_concurrency_controls_real_workers(tmp_path, workers):
     identities = set()
     lock = threading.Lock()
 
-    def render(segs, bi, gpu, *args):
+    def render(segs, bi, gpu, *args, **kwargs):
         assert gpu == "nv"
+        assert kwargs["config"] is cfg
         with lock:
             identities.add(threading.get_ident())
         barrier.wait()
@@ -177,6 +178,70 @@ def test_render_concurrency_controls_real_workers(tmp_path, workers):
         db.close()
 
 
+def test_profile_decode_cost_receipt_structure(tmp_path):
+    """Verify non-invasive decode profiler produces structured 6-stage diagnostic receipt."""
+    from scripts.profile_decode_cost import resolve_media_path, profile_pass15_analysis
+    from src.core.config import load_config
+    import json
+
+    raw_media = "scratch/complex_batch_diagnosis/e35443eff91f4b11a0ba328cadffdb19/00_20260328002805_20260328013503.mp4"
+    try:
+        media_path = resolve_media_path(raw_media)
+    except FileNotFoundError:
+        pytest.skip(f"Target media {raw_media} not available in current environment")
+
+    cfg = load_config()
+    out_json = tmp_path / "decode_breakdown.json"
+
+    # Profile 30 frames with CUDA or CPU
+    report = profile_pass15_analysis(
+        video_path=media_path,
+        config=cfg,
+        max_frames=30,
+        hwaccel_mode="cuda",
+        analysis_res="416x234",
+        analysis_fps=5.0,
+        enable_yolo=False,
+    )
+
+    out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    loaded = json.loads(out_json.read_text(encoding="utf-8"))
+
+    # 1. Structure contract validation
+    assert loaded["report_version"] == "1.0"
+    assert "input_media" in loaded
+    assert loaded["input_media"]["native_resolution"] == "3840x2160"
+    assert loaded["execution_summary"]["video_frames_demuxed"] == 30
+
+    # 2. 6-stage breakdown validation
+    stages = loaded["stages"]
+    assert len(stages) == 6
+    stage_keys = [s["key"] for s in stages]
+    assert stage_keys == [
+        "demux_and_video_decode",
+        "grayscale_and_resize",
+        "ema_motion_analysis",
+        "candidate_jpeg_encoding",
+        "audio_demux_and_vad",
+        "yolo_verification",
+    ]
+
+    # 3. Normalized per-10k frames timing
+    for s in stages[:5]:
+        assert s["total_ms"] > 0
+        assert s["time_per_10k_frames_s"] > 0
+        assert 0.0 <= s["pct_of_analyzed"] <= 100.0
+
+    total_pct = sum(s["pct_of_analyzed"] for s in stages)
+    assert abs(total_pct - 100.0) < 0.5
+
+    # 4. Hardware metrics validation
+    hw = loaded["hardware_utilization"]
+    assert "cpu_avg_pct" in hw
+    assert "ram_peak_mb" in hw
+    assert "gpu_name" in hw
+
+
 if __name__ == "__main__":
     image = np.random.default_rng(23).random((198, 332))
     for implementation in (ReferenceGrid, SpatialGridMotionFilter):
@@ -185,3 +250,52 @@ if __name__ == "__main__":
         for _ in range(5000):
             grid.extract_grid_energies(image)
         print(implementation.__name__, round(time.perf_counter() - start, 3), "seconds / 5000 frames")
+
+
+@pytest.mark.parametrize("mode", ["render_only", "full"])
+def test_day_benchmark_seeds_explicit_isolated_workload(tmp_path, mode):
+    from scripts.benchmark_day import seed_workload
+    from src.core.database import VlogDatabase
+    source = str(tmp_path / "00_20260829000000_20260829000020.mp4")
+    task = {"id": 7, "filepath": source, "date": "20260829", "cam_index": 0,
+            "camera_id": "camera", "file_start_time": "20260829000000", "file_end_time": "20260829000010",
+            "file_duration": 9.4, "prescreen_status": "SUSPICIOUS", "analysis_status": "ANALYZED",
+            "analysis_segments": "[]", "duration_verified": 1, "processing_fingerprint": "historical", "has_audio": 1}
+    segment = {"id": 19, "file_id": 7, "filepath": source, "date": "20260829", "cam_index": 0,
+               "start_time": 0, "end_time": 9.4, "duration": 9.4, "state": "DYNAMIC"}
+    review = {"filepath": source, "start_time": 2, "end_time": 3, "manual_label": "CONFIRMED_MOTION"}
+    workload = {"tasks": [task], "segments": [segment], "human_reviews": [review],
+                "camera_registry": [{"camera_id": "camera", "cam_index": 0}]}
+    db = VlogDatabase(tmp_path / "isolated.sqlite")
+    try:
+        seed_workload(db, workload, mode)
+        saved = dict(db.conn.execute("SELECT * FROM file_tasks").fetchone())
+        assert db.conn.execute("SELECT count(*) FROM human_reviews").fetchone()[0] == 1
+        if mode == "render_only":
+            assert saved["file_duration"] == 9.4 and saved["processing_fingerprint"] == "historical"
+            assert db.conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 1
+        else:
+            assert saved["file_duration"] == 20 and saved["file_end_time"] == "20260829000020"
+            assert saved["duration_verified"] == 0 and saved["processing_fingerprint"] is None
+            assert saved["prescreen_status"] == saved["analysis_status"] == "PENDING"
+            assert db.conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
+        assert task["file_duration"] == 9.4 and task["processing_fingerprint"] == "historical"
+        with pytest.raises(ValueError, match="empty database"):
+            seed_workload(db, workload, mode)
+    finally:
+        db.close()
+
+
+def test_day_benchmark_invalid_seed_is_transactional(tmp_path):
+    from scripts.benchmark_day import seed_workload
+    from src.core.database import VlogDatabase
+    db = VlogDatabase(tmp_path / "rollback.sqlite")
+    try:
+        workload = {"camera_registry": [{"camera_id": "camera", "cam_index": 0}],
+                    "tasks": [{"unknown_column": 1}], "human_reviews": [], "segments": []}
+        with pytest.raises(ValueError, match="Unknown workload columns"):
+            seed_workload(db, workload, "render_only")
+        assert db.conn.execute("SELECT count(*) FROM camera_registry").fetchone()[0] == 0
+        assert db.conn.execute("SELECT count(*) FROM file_tasks").fetchone()[0] == 0
+    finally:
+        db.close()

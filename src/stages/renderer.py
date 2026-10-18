@@ -5,12 +5,17 @@ import time
 import threading
 import hashlib
 import shutil
+import os
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from src.core.config import TEMP_DIR
 from src.hardware.scheduler import acquire_with_retry, VideoLease
-from src.hardware.ffmpeg import run_ffmpeg, get_duration, FFmpegProcessRegistry
+from src.hardware.ffmpeg import (
+    run_ffmpeg, run_ffprobe, get_duration, FFmpegProcessRegistry, MediaTerminationUnconfirmed,
+    MediaStartTerminationUnconfirmed,
+)
 from src.stages.timeline import build_concat_filter, compute_display_plans, display_plan_options, normalize_file_timeline as _normalize_file_timeline
 from src.hardware.monitor import get_perf, PerfRecord
 
@@ -21,6 +26,14 @@ logger = logging.getLogger("homevlog")
 
 class RenderInterrupted(InterruptedError):
     """A render subprocess received a conclusive external interruption."""
+
+
+class RenderTerminationUnconfirmed(MediaTerminationUnconfirmed):
+    """The batch still owns resources; fallback and retry must stop."""
+
+
+_batch_lock_guard = threading.Lock()
+_retained_batch_locks: dict[str, ExitStack] = {}
 
 _FFMPEG_PROGRESS_RE = re.compile(
 
@@ -65,10 +78,6 @@ def _startup_watchdog_timeout(
         steady_timeout,
         min(render_timeout, configured_timeout),
     )
-
-
-# Re-export from src.hardware.ffmpeg for backwards compatibility across tests and modules
-from src.hardware.ffmpeg import FFmpegProcessRegistry
 
 
 def _clean_ffmpeg_error(err_tail: str) -> str:
@@ -431,14 +440,15 @@ def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
             disk_sem.release()
 
 
-def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows):
+def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows, *, config=None, inspect_only=False, cache_observer=None):
     from copy import deepcopy
     from src.core.config import load_config
-    cfg = {}
-    try:
-        cfg = load_config()
-    except Exception:
-        pass
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
     render_cfg = cfg.get("render", {})
 
     batch_copy = deepcopy(batch_segs)
@@ -513,10 +523,10 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             dynamic_window_max_s=render_cfg.get("dynamic_window_max_s", 600.0),
         )
         descriptor_path = TEMP_DIR / f"_edl_batch{bi}_{date}_cam{cam_index}.ffconcat"
-        descriptor_path.parent.mkdir(parents=True, exist_ok=True)
 
         def _prepare_virtual_input():
             nonlocal staged_source
+            descriptor_path.parent.mkdir(parents=True, exist_ok=True)
             if render_cfg.get("local_staging_enabled", True):
                 staged_source = _stage_source_for_render(files[0])
             execution_plan = plan_builder(
@@ -553,8 +563,10 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     filter_timeline = list(plan.mapped_timeline) if plan and plan.mapped_timeline else batch_copy
     source_timeline = list(plan.source_timeline) if plan and plan.source_timeline else batch_copy
 
+    audio_plans = []
     fc = build_concat_filter(
         filter_timeline,
+        config=cfg,
         rows=rows,
         output_fps=fps, output_width=width, output_height=height,
         static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
@@ -576,6 +588,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         static_sample_window_s=render_cfg.get("static_sample_window_s", 0.25),
         audio_input_offset=1 if virtual_enabled and any(r.get("has_audio") for r in rows if r.get("filepath") in files) else 0,
         source_timeline=source_timeline,
+        audio_groups_out=audio_plans if enc_for_batch == "nv" and int(audio_cfg.get("channels", 1)) == 1 else None,
     )
 
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
@@ -599,12 +612,15 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         )
     if render_cfg.get("static_mode") == "continuous":
         pure_static_files = set()
+    retain_inputs = False
     try:
         result = _run_batch_render(
             files, fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,
-            date, cam_index, batch_idx=bi, pure_static_files=pure_static_files,
+            date, cam_index, config=cfg, batch_idx=bi, pure_static_files=pure_static_files,
             expected_duration=expected_duration, input_args=input_args,
             fingerprint_salt=plan.text if plan else "", prepare_input=prepare_input,
+            inspect_only=inspect_only, cache_observer=cache_observer,
+            audio_plan=audio_plans[0] if audio_plans else None,
         )
         if result is not None or not virtual_enabled or FFmpegProcessRegistry.is_interrupted():
             return result
@@ -616,6 +632,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         fallback_scale = "cuda_passthrough" if enc_for_batch == "nv" else ("qsv" if enc_for_batch == "qsv" else "cpu")
         fallback_fc = build_concat_filter(
             batch_copy,
+            config=cfg,
             rows=rows,
             output_fps=fps, output_width=width, output_height=height,
             static_keyframe_interval=seg_cfg.get("static_keyframe_interval", 30.0),
@@ -634,36 +651,154 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         )
         return _run_batch_render(
             files, fallback_fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,
-            date, cam_index, batch_idx=bi, pure_static_files=set(),
+            date, cam_index, config=cfg, batch_idx=bi, pure_static_files=set(),
             expected_duration=expected_duration,
             fingerprint_salt="virtual-fallback-v1",
+            cache_observer=cache_observer,
         )
+    except RenderTerminationUnconfirmed:
+        retain_inputs = True
+        raise
     finally:
-        if descriptor_path is not None:
+        if descriptor_path is not None and not inspect_only and not retain_inputs:
             descriptor_path.unlink(missing_ok=True)
-        if staged_source is not None:
+        if staged_source is not None and not retain_inputs:
             staged_source.unlink(missing_ok=True)
 
 
-def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0, pure_static_files=None, expected_duration=None, input_args=None, fingerprint_salt="", prepare_input=None) -> str | None:
+def _prepare_grouped_audio(input_file, plan, pcm_path, script_path):
+    """Stream bounded PCM through existing managed FFmpeg and disk admission."""
+    from src.stages.timeline import GROUPED_AUDIO_MAX_BYTES
+
+    expected_bytes = plan.samples * 4
+    if expected_bytes > GROUPED_AUDIO_MAX_BYTES:
+        return False
+    # The cap is per live NV worker. Low space preserves the original graph.
+    if shutil.disk_usage(pcm_path.parent).free < expected_bytes + GROUPED_AUDIO_MAX_BYTES:
+        logger.info("Grouped audio skipped: insufficient temporary disk headroom")
+        return False
+    # Plan is built only when audio stream is present; no blocking network probe
+    deadline = time.monotonic() + 900
+    with pcm_path.open("wb") as joined:
+        for group_index, (graph, samples) in enumerate(plan.groups):
+            if FFmpegProcessRegistry.is_interrupted():
+                raise RenderInterrupted("Grouped audio cancelled before next group")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Grouped audio preparation exceeded total execution budget")
+            script_path.write_text(graph, encoding="utf-8")
+            written = 0
+            def consume(block):
+                nonlocal written
+                if written + len(block) > samples * 4:
+                    raise RuntimeError("Grouped audio exceeded planned sample count")
+                joined.write(block)
+                written += len(block)
+            result = run_ffmpeg([
+                "-fflags", "+genpts", "-i", str(input_file), "-/filter_complex", str(script_path),
+                "-map", "[chunk]", "-c:a", "pcm_f32le", "-ar", str(plan.sample_rate),
+                "-ac", "1", "-f", "f32le", "-",
+            ], timeout=min(300, remaining), io_timeout=30, stdout_consumer=consume)
+            if FFmpegProcessRegistry.is_interrupted():
+                raise RenderInterrupted("Grouped audio cancelled during preparation")
+            if result.returncode != 0 or result.timed_out or written != samples * 4:
+                raise RuntimeError(
+                    f"Grouped audio {group_index} failed: code={result.returncode}, "
+                    f"timeout={result.timed_out}, bytes={written}/{samples*4}; {result.stderr_text[-2000:]}")
+    if pcm_path.stat().st_size != expected_bytes:
+        raise RuntimeError("Grouped audio final PCM length differs from display plan")
+    return True
+
+
+def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0, pure_static_files=None, expected_duration=None, input_args=None, fingerprint_salt="", prepare_input=None, config=None, inspect_only=False, cache_observer=None, audio_plan=None) -> str | None:
+    """Own the whole batch, including audio preparation and atomic publication."""
+    from src.core.process_lock import exclusive_file_lock
+
+    output = Path(output_path)
+    pcm = output.with_name(output.stem + ".audio.f32")
+    script = output.with_name(output.stem + ".audio.filter.txt")
+    identity = hashlib.sha256(os.path.normcase(str(output.resolve())).encode()).hexdigest()
+    retain = False
+    with ExitStack() as stack:
+        if not inspect_only:
+            try:
+                with _batch_lock_guard:
+                    previous = _retained_batch_locks.get(identity)
+                    if previous is not None:
+                        FFmpegProcessRegistry.reap_cleanups()
+                        tmp_key = str(output.with_name(f"{output.stem}.tmp.mp4"))
+                        if FFmpegProcessRegistry.is_owned(tmp_key):
+                            raise RenderTerminationUnconfirmed(f"Batch output already owned or cleanup pending: {tmp_key}")
+                        previous.close()
+                        del _retained_batch_locks[identity]
+                    stack.enter_context(exclusive_file_lock(
+                        output.parent / ".task_locks" / ("batch-" + identity + ".lock"),
+                        conflict=f"Batch output already owned: {output}"))
+            except RuntimeError as error:
+                raise RenderTerminationUnconfirmed(str(error)) from error
+        try:
+            if not inspect_only and (pcm.exists() or script.exists()):
+                # A prior unknown audio reader may still own these exact paths.
+                FFmpegProcessRegistry.reap_cleanups()
+                tmp_key = str(output.with_name(f"{output.stem}.tmp.mp4"))
+                if FFmpegProcessRegistry.is_owned(tmp_key):
+                    raise RenderTerminationUnconfirmed(f"Batch output already owned or cleanup pending: {tmp_key}")
+            return _run_batch_render_owned(
+                input_files, filter_complex, output, encoder, fps, out_cfg, audio_cfg,
+                date, cam_index, batch_idx=batch_idx, pure_static_files=pure_static_files,
+                expected_duration=expected_duration, input_args=input_args,
+                fingerprint_salt=fingerprint_salt, prepare_input=prepare_input, config=config,
+                inspect_only=inspect_only, cache_observer=cache_observer, audio_plan=audio_plan)
+        except MediaTerminationUnconfirmed as error:
+            retain = True
+            if not inspect_only:
+                with _batch_lock_guard:
+                    _retained_batch_locks[identity] = stack.pop_all()
+            if isinstance(error, RenderTerminationUnconfirmed):
+                raise
+            raise RenderTerminationUnconfirmed(f"Batch audio preparation cleanup unconfirmed: {output}") from error
+        finally:
+            if not inspect_only and not retain:
+                pcm.unlink(missing_ok=True)
+                script.unlink(missing_ok=True)
+
+
+def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, fps, out_cfg, audio_cfg, date, cam_index, batch_idx=0, pure_static_files=None, expected_duration=None, input_args=None, fingerprint_salt="", prepare_input=None, config=None, inspect_only=False, cache_observer=None, audio_plan=None) -> str | None:
     output_path = Path(output_path)
+    tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+    key = str(tmp_output_path)
+    FFmpegProcessRegistry.reap_cleanups()
+    if FFmpegProcessRegistry.is_owned(key):
+        raise RenderTerminationUnconfirmed(f"Batch output already owned or cleanup pending: {key}")
     if FFmpegProcessRegistry.is_interrupted():
         logger.info("batch-render cam%d batch%d cancelled before launch", cam_index, batch_idx)
         return None
 
     from src.core.config import load_config
-    cfg = {}
-    try:
-        cfg = load_config()
-    except Exception:
-        pass
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
     render_cfg = cfg.get("render", {})
     from src.hardware.render_cache import render_fingerprint, reusable, valid_video, save_manifest
     fingerprint = render_fingerprint(
-        input_files, filter_complex + fingerprint_salt,
+        input_files, filter_complex + fingerprint_salt + ("|grouped-audio-v1" if audio_plan else ""),
         encoder, fps, out_cfg, audio_cfg, cfg,
     )
-    if reusable(output_path, fingerprint, expected_duration, require_audio=True):
+    cache_hit = reusable(output_path, fingerprint, expected_duration, require_audio=True)
+    if cache_observer is not None:
+        cache_observer({"batch_index": batch_idx, "output_file": str(output_path),
+                        "fingerprint": fingerprint, "cache_hit": cache_hit,
+                        "encoder": encoder, "expected_duration_s": expected_duration,
+                        "source_files": list(map(str, input_files)),
+                        "path_kind": "fallback" if fingerprint_salt == "virtual-fallback-v1" else "primary"})
+    if inspect_only:
+        # Inspect the same graph and fingerprint without preparing/staging inputs
+        # or launching an encoder. A miss is not a completed render artifact.
+        return str(output_path)
+    if cache_hit:
         logger.info("Reusing verified batch %s", output_path.name)
         return str(output_path)
 
@@ -676,6 +811,26 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             logger.exception("batch-render cam%d batch%d input preparation failed", cam_index, batch_idx)
             return None
 
+    audio_prepare_s = 0.0
+    audio_prepare_fallback = False
+    grouped_audio = False
+    pcm_path = output_path.with_name(output_path.stem + ".audio.f32")
+    if audio_plan is not None and encoder == "nv" and input_args is None and len(input_files) == 1 and int(audio_cfg.get("channels", 1)) == 1:
+        started = time.monotonic()
+        try:
+            grouped_audio = _prepare_grouped_audio(
+                input_files[0], audio_plan, pcm_path,
+                output_path.with_name(output_path.stem + ".audio.filter.txt"))
+        except (MediaTerminationUnconfirmed, RenderInterrupted):
+            raise
+        except Exception:
+            logger.exception("batch-render cam%d batch%d grouped audio preparation failed; using original graph after confirmed cleanup", cam_index, batch_idx)
+            pcm_path.unlink(missing_ok=True)
+            output_path.with_name(output_path.stem + ".audio.filter.txt").unlink(missing_ok=True)
+            audio_prepare_fallback = True
+        audio_prepare_s = time.monotonic() - started
+        if grouped_audio:
+            filter_complex = audio_plan.video_filter + ";" + audio_plan.final_filter
 
     hwaccel_args = []
     if input_args is not None:
@@ -691,6 +846,9 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
             elif encoder == "qsv":
                 hwaccel_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
             hwaccel_args += ["-i", str(fp)]
+
+    if grouped_audio:
+        hwaccel_args += ["-f", "f32le", "-ar", str(audio_plan.sample_rate), "-ac", "1", "-i", str(pcm_path)]
 
     enc_args = _build_enc_args(encoder, out_cfg)
     audio_codec = audio_cfg.get("codec", "aac")
@@ -711,7 +869,6 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         cmd += ["-filter_hw_device", "gpu"]
     cmd += ["-/filter_complex", str(fc_script), "-map", "[v]", "-map", "[a]", "-r", str(fps)]
     cmd += enc_args
-    tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp.mp4")
     tmp_output_path.unlink(missing_ok=True)
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
     cmd += ["-tag:v", "hev1", "-movflags", "+faststart"]
@@ -722,7 +879,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         io_sem = VideoLease(get_qsv_render_semaphore(), 1 if input_args is not None else len(input_files))
     else:
         from src.hardware.scheduler import get_nvenc_semaphore
-        io_sem = VideoLease(get_nvenc_semaphore(), 1 if input_args is not None else len(input_files))
+        io_sem = VideoLease(get_nvenc_semaphore(), 1 if input_args is not None else len(input_files) + int(grouped_audio))
     err_log = TEMP_DIR / f"_stderr_batch{batch_idx}_{date}_cam{cam_index}.log"
 
     # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
@@ -743,11 +900,12 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
 
 
     proc: subprocess.Popen | None = None
+    retain_lease = False
+    completed_process = False
     t0 = time.monotonic()
     try:
         with open(err_log, "wb") as f_err:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=f_err)
-            FFmpegProcessRegistry.register(str(tmp_output_path), proc)
+            proc = FFmpegProcessRegistry.start(str(tmp_output_path),cmd,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=f_err)
             if encoder == "qsv":
                 base_timeout = max(render_cfg.get("qsv_timeout_s", 600), len(input_files) * 300)
                 dur_timeout = int((expected_duration or 0) * 2.5) + 60
@@ -776,6 +934,7 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
                 while True:
                     try:
                         proc.wait(timeout=2.0)
+                        completed_process = True
                         break
                     except subprocess.TimeoutExpired:
                         pass
@@ -827,34 +986,27 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
                             "encoding" if encoding_started else "startup",
                             now - last_active_time, last_frame_count,
                         )
-                        proc.kill()
-                        try:
-                            proc.wait(timeout=5)
-                        except Exception:
-                            pass
-                        tmp_output_path.unlink(missing_ok=True)
                         return None
             except subprocess.TimeoutExpired:
                 logger.warning("Render timeout expired on %s for %s, killing process", encoder, tmp_output_path)
-                proc.kill()
-                try:
-                    proc.wait(timeout=10)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-                tmp_output_path.unlink(missing_ok=True)
                 return None
-            except BaseException:
-                # 包含 KeyboardInterrupt 等中断异常，立即杀灭当前子进程并清理未完成的临时文件
-                if proc:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=5)
-                    except Exception:
-                        pass
-                tmp_output_path.unlink(missing_ok=True)
-                raise
             finally:
-                FFmpegProcessRegistry.deregister(str(tmp_output_path))
+                try:
+                    FFmpegProcessRegistry.terminate(key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                except BaseException as error:
+                    retain_lease = True
+                    FFmpegProcessRegistry.defer_cleanup(key, proc, io_sem)
+                    logger.error("Batch termination unconfirmed; retained process, lease and temporary assets: %s", key)
+                    raise RenderTerminationUnconfirmed(f"Batch termination unconfirmed; retained resources: {key}") from error
+                FFmpegProcessRegistry.deregister(key, proc)
+    except MediaStartTerminationUnconfirmed as error:
+        proc, key = error.process, error.process_key
+        retain_lease = True
+        FFmpegProcessRegistry.defer_cleanup(key, proc, io_sem)
+        raise RenderTerminationUnconfirmed(f"Batch startup termination unconfirmed: {key}") from error
+    except RenderTerminationUnconfirmed:
+        raise
     except KeyboardInterrupt:
         tmp_output_path.unlink(missing_ok=True)
         raise
@@ -864,8 +1016,11 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
         return None
     finally:
         # 信号量释放单次原则 + 超时/失败路径统一清理临时脚本
-        io_sem.release()
-        fc_script.unlink(missing_ok=True)
+        if not retain_lease:
+            io_sem.release()
+            fc_script.unlink(missing_ok=True)
+            if not completed_process or proc is None or proc.returncode != 0:
+                tmp_output_path.unlink(missing_ok=True)
 
     elapsed = time.monotonic() - t0
 
@@ -898,7 +1053,10 @@ def _run_batch_render(input_files, filter_complex, output_path, encoder, fps, ou
                 file=output_path.name,
                 gpu=encoder,
                 duration=round(elapsed, 3),
-                extra={**enc_stats, "size_mb": size_mb, "sem_wait": lease_wait},
+                extra={**enc_stats, "size_mb": size_mb, "sem_wait": lease_wait,
+                       "audio_prepare_s": round(audio_prepare_s, 3),
+                       "audio_prepare_fallback": audio_prepare_fallback,
+                       "audio_groups": len(audio_plan.groups) if grouped_audio else 0},
                 start_time=round(t0, 3),
                 end_time=round(time.monotonic(), 3),
             )
@@ -992,9 +1150,11 @@ def concat_output_files(
     report.update(status="failed", failure_stage="inputs")
     if not files:
         return False
+    FFmpegProcessRegistry.require_cleanups()
     concat_list = output.with_name(f".concat_{output.stem}.txt")
     temporary = output.with_name(output.stem + ".tmp.mp4")
     stderr = ""
+    retain_inputs = False
     started = time.monotonic()
     def _concat_path(path):
         return str(Path(path).resolve()).replace(chr(92), "/").replace("'", r"'\''")
@@ -1077,6 +1237,12 @@ def concat_output_files(
         report["promote_s"] = round(time.monotonic() - promote_started, 6)
         report.update(status="completed", failure_stage=None)
         return True
+    except MediaTerminationUnconfirmed as exc:
+        retain_inputs = True
+        report.update(status="termination_unconfirmed", error=f"{type(exc).__name__}: {exc}",
+                      retained_temporary=str(temporary), retained_concat_list=str(concat_list))
+        logger.error("Concat cleanup unconfirmed; preserving inputs in place: %s, %s", concat_list, temporary)
+        raise
     except (KeyboardInterrupt, SystemExit):
         report["status"] = "cancelled"
         raise
@@ -1087,10 +1253,11 @@ def concat_output_files(
         report["total_s"] = round(time.monotonic() - started, 6)
         if report["failure_stage"] == "probe" and "probe_s" not in report:
             report["probe_s"] = round(time.monotonic() - probe_started, 6)
-        if report["status"] != "completed":
+        if not retain_inputs and report["status"] != "completed":
             _preserve_concat_failure(output, temporary, concat_list, report, stderr)
-        concat_list.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
+        if not retain_inputs:
+            concat_list.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
 
 def _build_enc_args(encoder, out_cfg):
     if encoder == "qsv":

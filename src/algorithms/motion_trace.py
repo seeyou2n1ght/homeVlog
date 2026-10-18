@@ -1,12 +1,14 @@
 """Consume decoded frames immediately; retain only motion scalars and model state."""
 from array import array
+import logging
+import time
 
 import cv2
 import numpy as np
 
 
 class MotionTrace:
-    def __init__(self, detector, fps, is_night_mode=False):
+    def __init__(self, detector, fps, is_night_mode=False, visual_sample_stride=None):
         self.detector = detector
         self.dt = 1.0 / fps
         self.is_night_mode = bool(is_night_mode)
@@ -17,6 +19,9 @@ class MotionTrace:
         self.confidences = array("d")
         self.active_cells = array("I")
         self.max_cell_energies = array("d")
+        self.visual_sample_stride = visual_sample_stride
+        self.visual_samples = []
+        self.visual_index_s = 0.0
 
     def __len__(self):
         return len(self.energies)
@@ -32,6 +37,18 @@ class MotionTrace:
             gray = frame
         else:
             gray = cv2.resize(frame, (det.width, det.height), interpolation=cv2.INTER_NEAREST)
+        if (self.visual_sample_stride is not None and len(self.visual_samples) < 2048
+                and len(self) % self.visual_sample_stride == 0):
+            started = time.monotonic()
+            try:
+                from src.core.visual_index import frame_signature
+                self.visual_samples.append((len(self) * self.dt, frame_signature(gray)))
+            except Exception as error:
+                self.visual_samples.clear()
+                self.visual_sample_stride = None
+                logging.getLogger("homevlog").warning("Streaming visual samples unavailable: %s", error)
+            finally:
+                self.visual_index_s += time.monotonic() - started
         x, y = int(det.width * det.roi[0]), int(det.height * det.roi[1])
         w, h = int(det.width * det.roi[2]), int(det.height * det.roi[3])
         roi = gray[y:y + h, x:x + w]

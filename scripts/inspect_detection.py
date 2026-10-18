@@ -13,7 +13,7 @@ Outputs:
 import argparse
 import csv
 import os
-import subprocess
+import logging
 import sys
 from pathlib import Path
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.detector import MotionDetector
 from src.segment import build_segments
-from src.ffmpeg import get_duration
+from src.ffmpeg import get_duration, run_ffmpeg
 from src.utils import load_config
 
 
@@ -29,15 +29,18 @@ def extract_frame(filepath: str, timestamp: float, output: Path, width: int = 64
     """Extract a single frame at timestamp as PNG for visual inspection."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-loglevel", "error",
         "-ss", str(timestamp),
         "-i", str(filepath),
         "-vframes", "1",
         "-q:v", "2",
         str(output),
     ]
-    result = subprocess.run(cmd, capture_output=True)
-    return result.returncode == 0
+    result = run_ffmpeg(cmd, timeout=15, io_timeout=3)
+    if result.returncode != 0 or result.timed_out:
+        logging.getLogger("homevlog").warning("Diagnostic frame extraction failed: %s", result.stderr_text[-2000:])
+        return False
+    return output.is_file() and output.stat().st_size > 0
 
 
 def main():

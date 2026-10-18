@@ -14,6 +14,42 @@ from src.utils import reset_semaphores
 
 
 @pytest.fixture(autouse=True)
+def isolate_runtime_outputs(tmp_path, monkeypatch):
+    """Tests must not mix mock telemetry or assets into production directories."""
+    import sys
+    workspace = tmp_path / "runtime"
+    replacements = {
+        "OUTPUT_DIR": workspace / "output", "TEMP_DIR": workspace / "temp",
+        "TEMP_STAGING_DIR": workspace / "temp/staging", "TEMP_BATCHES_DIR": workspace / "temp/batches",
+        "TEMP_SCRIPTS_DIR": workspace / "temp/scripts", "LOGS_DIR": workspace / "logs",
+        "DB_PATH": workspace / "data/vlog.db", "CACHE_DIR": workspace / "temp/audit_cache",
+        "ARCHIVE_DIR": workspace / "data/feedback_archive", "DEFAULT_ARCHIVE_DIR": workspace / "data/feedback_archive",
+        "DEFAULT_IMAGES_DIR": workspace / "data/feedback_archive/images",
+        "DEFAULT_MANIFEST": workspace / "data/feedback_archive/manifest.jsonl",
+    }
+    for name, value in replacements.items():
+        (value.parent if name in ("DB_PATH", "DEFAULT_MANIFEST") else value).mkdir(parents=True, exist_ok=True)
+    # Compatibility facades and eager package imports retain path snapshots.
+    # Patch every already-loaded consumer; later imports inherit core paths.
+    for module_name, module in list(sys.modules.items()):
+        if module_name.startswith(("src.", "scripts.audit_tool.")):
+            for name, value in replacements.items():
+                if hasattr(module, name):
+                    monkeypatch.setattr(module, name, value)
+    import logging
+    logger = logging.getLogger("homevlog")
+    previous = list(logger.handlers)
+    for handler in previous:
+        logger.removeHandler(handler)
+    yield
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    for handler in previous:
+        logger.addHandler(handler)
+
+
+@pytest.fixture(autouse=True)
 def clean_semaphores():
     """Reset hardware semaphores and registry interruption before and after each test for test isolation."""
     from src.renderer import FFmpegProcessRegistry
@@ -208,6 +244,9 @@ def delivery_workspace(tmp_path, monkeypatch):
         return True
     monkeypatch.setattr(pipeline, "concat_output_files", concat)
     monkeypatch.setattr("src.stages.companion.get_duration", lambda _: 12.2501)
+    # Synthetic bytes exercise publication, not the real media clock validator.
+    monkeypatch.setattr("src.stages.companion.bind_delivery_mapping",
+                        lambda *args: {"status": "AVAILABLE"})
     monkeypatch.setattr("src.core.utils.cleanup_staging_files", lambda: None)
     try:
         yield SimpleNamespace(db=db, config=config, output=output, batches=batches,
@@ -254,3 +293,139 @@ def sample_segments():
             max_energy=0.8,
         ),
     ]
+
+
+@pytest.fixture
+def blocked_source_reader(tmp_path):
+    """Owned native pipe reads model metadata/decode stalls without changing NAS."""
+    import os
+    import subprocess
+    import sys
+    worker = tmp_path / 'blocked_reader.py'
+    worker.write_text('''import json, os, sys
+from pathlib import Path
+from src.core.visual_index import source_identity
+filepath=json.loads(sys.stdin.buffer.readline())
+if sys.argv[1]=='sampling':
+    print(json.dumps(['identity',source_identity(filepath)]),flush=True)
+    json.loads(sys.stdin.buffer.readline())
+Path(sys.argv[2]).write_text(str(os.getpid()))
+read_fd,write_fd=os.pipe()
+os.read(read_fd,1)
+''',encoding='utf-8')
+    owned=[]
+    def start(mode='metadata', ready=None):
+        environment=os.environ.copy()
+        environment['PYTHONPATH']=str(Path(__file__).resolve().parents[1])
+        executable=sys.executable
+        if os.name=='nt' and sys.prefix!=sys.base_prefix:
+            executable=sys._base_executable;environment['__PYVENV_LAUNCHER__']=sys.executable
+        process=subprocess.Popen([executable,str(worker),mode,str(ready or tmp_path/'reader.ready')],
+                                 env=environment,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        owned.append(process)
+        return process
+    start.worker=worker
+    start.ready=tmp_path/'reader.ready'
+    start.owned=owned
+    yield start
+    for process in owned:
+        if process.poll() is None:process.kill()
+        process.wait(timeout=5)
+        for stream in (process.stdin,process.stdout,process.stderr):
+            if stream:stream.close()
+
+
+@pytest.fixture
+def short_local_video(tmp_path):
+    """Real local 20fps media for PTS and independently launched reader checks."""
+    import av
+    import numpy as np
+    path=tmp_path/'short.mp4'
+    with av.open(str(path),'w') as output:
+        stream=output.add_stream('mpeg4',rate=20)
+        stream.width=stream.height=64;stream.pix_fmt='yuv420p'
+        for value in range(120):
+            frame=av.VideoFrame.from_ndarray(np.full((64,64),value,np.uint8),format='gray')
+            for packet in stream.encode(frame):output.mux(packet)
+        for packet in stream.encode():output.mux(packet)
+    return path
+
+
+@pytest.fixture
+def external_day_owner():
+    """A real second process holds the same production lease primitive."""
+    import os
+    import subprocess
+    import sys
+    owned=[]
+    def start(database,temporary,output,date='20260901',camera=0):
+        script="from src.core.process_lock import day_task_lease; import os,sys;\nwith day_task_lease(*sys.argv[1:5],int(sys.argv[5])): print(os.getpid(),flush=True); sys.stdin.read()"
+        environment=os.environ.copy();executable=sys.executable
+        if os.name=='nt' and sys.prefix!=sys.base_prefix:
+            executable=sys._base_executable;environment['__PYVENV_LAUNCHER__']=sys.executable
+        process=subprocess.Popen([executable,'-c',script,str(database),str(temporary),str(output),date,str(camera)],
+                                 cwd=str(Path(__file__).resolve().parents[1]),env=environment,
+                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        owned.append(process)
+        line=process.stdout.readline().strip()
+        assert line,str(process.communicate(timeout=5))
+        assert int(line)==process.pid
+        return process
+    yield start
+    for process in owned:
+        if process.poll() is None:process.kill()
+        process.communicate(timeout=5)
+
+
+@pytest.fixture
+def interrupted_delivery_owner(tmp_path):
+    """An actual process stops at selected replacement/DB/commit boundaries."""
+    import os
+    import subprocess
+    import sys
+    script=tmp_path/'interrupt_assets.py'
+    script.write_text('''import sys
+from pathlib import Path
+from src.stages.companion import promote_vlog_assets
+from src.core import delivery_recovery
+from src.hardware.render_cache import save_manifest
+from src.database import VlogDatabase
+candidate,output=map(Path,sys.argv[1:3]);phase=sys.argv[3]
+replace=Path.replace;counter=0
+def pause():
+    print('READY',flush=True);sys.stdin.read()
+def instrument(source,target):
+    global counter
+    result=replace(source,target)
+    if not source.name.endswith('.tmp'):
+        counter+=1
+        if phase==str(counter):pause()
+    return result
+Path.replace=instrument
+atomic=delivery_recovery.atomic_json
+def commit(path,value):
+    atomic(path,value)
+    if phase=='committed' and value['state']=='COMMITTED':pause()
+delivery_recovery.atomic_json=commit
+with promote_vlog_assets(candidate,output,{'render':{'generate_subtitles':False}},fingerprint='candidate',keep_previous=sys.argv[5]=='1',
+                         context={'role':'pipeline','date':'20260901','cam_index':0}):
+    save_manifest(output,'candidate')
+    db=VlogDatabase(db_path=sys.argv[4]);db.set_render_status('20260901',0,'COMPLETED',output_file=str(output));db.close()
+    if phase=='database':pause()
+''',encoding='utf-8')
+    owned=[]
+    def start(candidate,output,database,phase,keep_previous=False):
+        environment=os.environ.copy();environment['PYTHONPATH']=str(Path(__file__).resolve().parents[1])
+        executable=sys.executable
+        if os.name=='nt' and sys.prefix!=sys.base_prefix:
+            executable=sys._base_executable;environment['__PYVENV_LAUNCHER__']=sys.executable
+        process=subprocess.Popen([executable,str(script),str(candidate),str(output),str(phase),str(database),'1' if keep_previous else '0'],
+                                 env=environment,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        owned.append(process)
+        assert process.stdout.readline().strip()=='READY',process.communicate(timeout=5)
+        process.kill();process.communicate(timeout=5)
+        return process
+    yield start
+    for process in owned:
+        if process.poll() is None:process.kill()
+        process.communicate(timeout=5)

@@ -22,6 +22,7 @@ from src.stages.scanner import scan_directory, get_date_cam_groups
 from src.stages.prescreen import prescreen_file
 from src.stages.detector import MotionDetector, detect_audio_activity
 from src.stages.renderer import RenderInterrupted, build_batch_render, concat_output_files
+from src.hardware.ffmpeg import MediaTerminationUnconfirmed
 from src.stages.companion import (
     dump_perf as _dump_perf,
     build_headline as _build_headline,
@@ -156,6 +157,8 @@ class StreamingOrchestrator:
         dashboard_enabled: bool = True,
         cam_name: str | None = None,
     ):
+        # Admission precedes scheduler/UI construction and cancellation reset.
+        FFmpegProcessRegistry.reset_interrupted()
         self.db = db
         self.date = date
         self.cam_index = cam_index
@@ -206,11 +209,10 @@ class StreamingOrchestrator:
         self.render_delay = pipe_cfg.get("render_start_delay", 5)
 
         # 状态控制
-        from src.hardware.ffmpeg import FFmpegProcessRegistry
-        FFmpegProcessRegistry.reset_interrupted()
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
         self._render_interruption_reason: str | None = None
+        self._media_cleanup_failure: str | None = None
         self.render_finished_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
@@ -222,6 +224,7 @@ class StreamingOrchestrator:
         self._prev_task_map: dict[str, str] = {}
         self._prescreen_results: dict[str, str] = {}
         self._prescreen_results_lock = threading.Lock()
+        self._prescreen_results_condition = threading.Condition(self._prescreen_results_lock)
 
         # 冷启动预热保护：避免启动瞬间队列无积压导致 SJF 短作业优先失效
         self._analysis_warmup_event = threading.Event()
@@ -256,6 +259,17 @@ class StreamingOrchestrator:
             self.errors.append(message)
         if self.dashboard is not None:
             self.dashboard.add_alert(message)
+
+    def _stop_for_unconfirmed_media(self, context: str, error: MediaTerminationUnconfirmed):
+        """Stop producers before a quarantined reader can overlap a retry."""
+        from src.hardware.ffmpeg import FFmpegProcessRegistry
+        self._media_cleanup_failure = f"{context} cleanup unconfirmed: {error}"
+        self.abort_event.set()
+        self.stop_event.set()
+        self._add_error(self._media_cleanup_failure)
+        FFmpegProcessRegistry.mark_interrupted()
+        FFmpegProcessRegistry.kill_all()
+        logger.error("Stopping pipeline with unresolved media reader: %s", self._media_cleanup_failure)
 
     def _sync_queue_levels(self) -> None:
         """同步三阶段积压水位与调度器状态到仪表盘。"""
@@ -312,6 +326,18 @@ class StreamingOrchestrator:
             finally:
                 self._prefetch_queue.task_done()
 
+    def _await_prior_prescreen(self, filepath: str) -> bool:
+        """Resolve chronological prior state without holding media/hardware leases."""
+        prev_fp = self._prev_task_map.get(filepath)
+        if prev_fp is None:
+            return False
+        with self._prescreen_results_condition:
+            while prev_fp not in self._prescreen_results:
+                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                    raise InterruptedError("cancelled waiting for predecessor prescreen")
+                self._prescreen_results_condition.wait(timeout=0.1)
+            return self._prescreen_results[prev_fp] == "SUSPICIOUS"
+
     def _prescreen_worker(self, gpu: str = "qsv", worker_id: str = ""):
         """预筛 Worker：将扫描到的文件进行快速筛选。"""
         worker_name = worker_id or f"pre_{gpu}"
@@ -325,15 +351,17 @@ class StreamingOrchestrator:
             duration = task.get("file_duration") or 300.0
             t0 = time.monotonic()
 
-            # 时间邻域弹性保护：前置相邻素材若存在活动，本段门槛弹性下调以防漏切
-            prev_fp = self._prev_task_map.get(filepath)
-            is_prior_active = False
-            if prev_fp:
-                with self._prescreen_results_lock:
-                    is_prior_active = (self._prescreen_results.get(prev_fp) == "SUSPICIOUS")
-
             try:
-                res = prescreen_file(filepath, duration, self.config, gpu=gpu, is_prior_active=is_prior_active)
+                prev_fp = self._prev_task_map.get(filepath)
+                with self._prescreen_results_lock:
+                    prior_known = prev_fp is None or prev_fp in self._prescreen_results
+                    is_prior_active = self._prescreen_results.get(prev_fp) == "SUSPICIOUS"
+                res = prescreen_file(
+                    filepath, duration, self.config, gpu=gpu,
+                    is_prior_active=is_prior_active,
+                    prior_active_resolver=(None if prior_known else
+                                           lambda: self._await_prior_prescreen(filepath)),
+                )
                 if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                     continue
                 if (res["status"] == "STATIC" and res.get("has_audio") and
@@ -361,6 +389,8 @@ class StreamingOrchestrator:
                                 "audio_events": [],
                                 "vad_stats": audio_stats,
                             })
+                    except MediaTerminationUnconfirmed:
+                        raise
                     except Exception as exc:
                         if self.abort_event.is_set():
                             return
@@ -384,8 +414,9 @@ class StreamingOrchestrator:
                 if res["status"] in ("STATIC", "SUSPICIOUS"):
                     from src.hardware.render_cache import processing_fingerprint
                     self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
-                with self._prescreen_results_lock:
+                with self._prescreen_results_condition:
                     self._prescreen_results[filepath] = res["status"]
+                    self._prescreen_results_condition.notify_all()
 
                 extra = {"status": res["status"]}
                 try:
@@ -447,6 +478,14 @@ class StreamingOrchestrator:
                     )
                     self._sync_queue_levels()
 
+            except MediaTerminationUnconfirmed as exc:
+                self._stop_for_unconfirmed_media(f"prescreen {Path(filepath).name}", exc)
+                try:
+                    self.db.set_prescreen_result(filepath, "FAILED", "", error_msg=str(exc))
+                except Exception:
+                    logger.exception("Cannot persist FAILED after unconfirmed prescreen stop: %s", filepath)
+                    self._add_error(f"prescreen FAILED persistence failed: {Path(filepath).name}")
+                break
             except Exception as exc:
                 if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                     continue
@@ -471,6 +510,10 @@ class StreamingOrchestrator:
                     {"filepath": filepath, "status": "FAILED"}
                 )
             finally:
+                with self._prescreen_results_condition:
+                    # Exceptions/cancellation must also unblock successors.
+                    self._prescreen_results.setdefault(filepath, "FAILED")
+                    self._prescreen_results_condition.notify_all()
                 self.prescreen_queue.task_done()
         if not self._analysis_warmup_event.is_set():
             self._analysis_warmup_event.set()
@@ -581,12 +624,14 @@ class StreamingOrchestrator:
                 self._sync_queue_levels()
             return
 
+        previous_extent = json.loads(task["decode_completion"]) if task.get("decode_completion") else {}
         labels, yolo_buffer = detector.analyze(
             filepath,
             start_offset=file_start_offset,
             file_duration=float(task.get("file_duration") or 300.0),
             has_audio=task.get("has_audio"),
             duration_verified=bool(task.get("duration_verified")),
+            declared_duration=previous_extent.get("declared_duration_s"),
         )
         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
             return
@@ -594,7 +639,8 @@ class StreamingOrchestrator:
         gpu = getattr(detector, "decode_gpu", gpu)
         if hasattr(detector, 'has_audio_detected'):
             final_has_audio = max(int(task.get("has_audio") or 0), int(detector.has_audio_detected or 0))
-            self.db.set_file_metadata(filepath, final_has_audio, getattr(detector, "file_duration_detected", None))
+            self.db.set_file_metadata(filepath, final_has_audio, getattr(detector, "file_duration_detected", None),
+                                      decode_completion=getattr(detector, "decode_completion", None))
 
         if labels:
             seg_cfg = self.config.get("segment", {})
@@ -655,6 +701,12 @@ class StreamingOrchestrator:
                     FrameArchiver.remember(filepath, key / rate, payload)
             js = segments_to_json(segments)
             self.db.set_analysis_result(filepath, "ANALYZED", js)
+            if getattr(detector,"visual_source",None) and getattr(detector,"visual_samples",None):
+                try:
+                    from src.core.visual_index import store_samples
+                    store_samples(self.db,filepath,detector.visual_source,detector.visual_samples,origin="single_pass_analysis")
+                except Exception as exc:
+                    logger.warning("Derived visual index unavailable for %s: %s",filepath,exc)
             from src.hardware.render_cache import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
 
@@ -720,6 +772,9 @@ class StreamingOrchestrator:
                 if decode_frames < 2
                 else "analysis produced no labels"
             )
+            completion = getattr(detector, "decode_completion", {})
+            if not completion.get("complete", True):
+                err_msg = f"decode {completion.get('reason', 'FAILED')}: {completion.get('error', '')}"
             skip_corrupt = bool(self.config.get("recovery", {}).get("skip_corrupt", False))
             if skip_corrupt and decode_frames < 2:
                 logger.warning(
@@ -832,6 +887,14 @@ class StreamingOrchestrator:
                         task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id
                     )
 
+            except MediaTerminationUnconfirmed as exc:
+                self._stop_for_unconfirmed_media(f"analysis {Path(filepath).name}", exc)
+                try:
+                    self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
+                except Exception:
+                    logger.exception("Cannot persist FAILED after unconfirmed analysis stop: %s", filepath)
+                    self._add_error(f"analysis FAILED persistence failed: {Path(filepath).name}")
+                break
             except Exception as exc:
                 if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                     continue
@@ -1168,7 +1231,7 @@ class StreamingOrchestrator:
                         res_path = build_batch_render(
                             batch_segs, b_idx, gpu, fps, width, height,
                             seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
-                            all_rows
+                            all_rows, config=self.config,
                         )
                         r_dur = round(time.monotonic() - t_r0, 3)
                         busy_time += r_dur
@@ -1250,6 +1313,10 @@ class StreamingOrchestrator:
                                 terminal_batch_ids.add(b_idx)
                             if self.dashboard is not None:
                                 self.dashboard.render_batch_finished(len(files_to_batch))
+                    except MediaTerminationUnconfirmed as exc:
+                        self._stop_for_unconfirmed_media(f"render batch {b_idx}", exc)
+                        logger.error("Render cleanup unconfirmed; stopping without retries and preserving completed batches: %s", exc)
+                        break
                     except RenderInterrupted as exc:
                         with self.batch_lock:
                             self._render_interruption_reason = str(exc)
@@ -1590,6 +1657,8 @@ class StreamingOrchestrator:
 
         if self._render_interruption_reason is not None:
             raise KeyboardInterrupt(self._render_interruption_reason)
+        if self._media_cleanup_failure is not None:
+            raise MediaTerminationUnconfirmed(self._media_cleanup_failure)
 
         with self.batch_lock:
             self.batch_paths.sort(key=lambda x: x[0])
@@ -1631,6 +1700,42 @@ def process_date_cam(
     skip_render: bool = False, dashboard_enabled: bool = True,
     force_render: bool = False, config: dict | None = None,
 ) -> bool:
+    from src.core.delivery_recovery import pending_transactions,recover_output,reject_legacy_recovery
+    context={'role':'pipeline','date':date,'cam_index':cam_index}
+    if not force_render and db.is_render_completed(date,cam_index) and not pending_transactions(OUTPUT_DIR,context=context):
+        with db._lock:
+            completed = db.conn.execute(
+                'SELECT output_file FROM render_tasks WHERE date=? AND cam_index=?',
+                (date, cam_index),
+            ).fetchone()
+        reject_legacy_recovery(OUTPUT_DIR, completed['output_file'] or None)
+        return _process_date_cam_owned(db,date,cam_index,skip_render,dashboard_enabled,force_render,config)
+    FFmpegProcessRegistry.require_cleanups()
+    from src.core.process_lock import day_task_lease
+    from src.core.profiles import resolve_camera_config
+    from src.stages.scanner import resolve_output_filename
+    from src.stages import renderer
+    settings=load_config() if config is None else config
+    rows=db.get_all_file_tasks_for_date(date,cam_index)
+    sample=rows[0]['filepath'] if rows else None
+    effective=resolve_camera_config(settings,cam_index=cam_index,filepath=sample) if settings.get('cameras') else settings
+    filename=resolve_output_filename(effective.get('output',{}).get('naming','DailyVlog_{date}_{mac}.mp4'),
+                                     date,cam_index,sample_filepath=sample,config=effective)
+    with day_task_lease(db.db_path,renderer.TEMP_DIR,OUTPUT_DIR/filename,date,cam_index):
+        for backup in pending_transactions(OUTPUT_DIR,context=context):
+            journal=json.loads((backup/'transaction.json').read_text(encoding='utf-8'))
+            if Path(journal['output']).resolve()!=(OUTPUT_DIR/filename).resolve():
+                raise RuntimeError(f'Interrupted delivery destination differs; retained for inspection: {backup}')
+        recover_output(OUTPUT_DIR/filename,mark_pending=lambda:db.set_render_status(date,cam_index,'PENDING',
+                       error_msg='interrupted asset package recovered'))
+        return _process_date_cam_owned(db,date,cam_index,skip_render,dashboard_enabled,force_render,settings)
+
+
+def _process_date_cam_owned(
+    db: VlogDatabase, date: str, cam_index: int,
+    skip_render: bool = False, dashboard_enabled: bool = True,
+    force_render: bool = False, config: dict | None = None,
+) -> bool:
     # Completion records survive moving delivered assets to offline storage.
     # Check before fingerprint invalidation so configuration changes cannot
     # silently reopen an already delivered day.
@@ -1658,7 +1763,8 @@ def process_date_cam(
     db.reset_failed_tasks(date, cam_index)
     all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
     total_files = len(all_tasks)
-    total_input_dur = sum(float(t.get("file_duration") or 300.0) for t in all_tasks)
+    total_input_dur = sum(float(t["file_duration"]) if t.get("file_duration") is not None else 300.0
+                          for t in all_tasks)
     analysis_snapshot = [
         {key: row.get(key) for key in (
             "filepath", "file_duration", "duration_verified", "prescreen_status",
@@ -1732,6 +1838,12 @@ def process_date_cam(
                    run_context={**run_context, "status": "failed", "error": message})
         return False
 
+    def record_media_failure(context, error):
+        try:
+            fail(f"{context} media termination unconfirmed: {error}")
+        except Exception:
+            logger.exception("Could not record fatal media failure; batch must still stop")
+
     try:
         with monitor.stage(f"pipeline_{date}_cam{cam_index}"):
             batch_paths = orchestrator.run()
@@ -1739,6 +1851,11 @@ def process_date_cam(
         _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
                    worker_stats=orchestrator.render_worker_stats,
                    run_context={**run_context, "status": "cancelled"})
+        raise
+    except MediaTerminationUnconfirmed as exc:
+        record_media_failure("streaming", exc)
+        # The failure remains fatal for this batch even if later reaping can
+        # confirm termination. Only an explicit new execution may resume it.
         raise
     except Exception as exc:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
@@ -1749,6 +1866,12 @@ def process_date_cam(
     task_rows = db.get_all_file_tasks_for_date(date, cam_index)
     if all_tasks and not task_rows:
         return fail("source task reconciliation unavailable")
+    # Lazy probing/decoding can replace nominal durations during this run.
+    # Delivery metrics and the completion card must use the reconciled values,
+    # including a known zero, rather than the pre-analysis startup estimate.
+    total_input_dur = sum(float(row["file_duration"]) if row.get("file_duration") is not None else 300.0
+                          for row in task_rows)
+    total_files = len(task_rows)
     incomplete = [
         row for row in task_rows
         if row.get("prescreen_status") not in ("STATIC", "SUSPICIOUS", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
@@ -1825,6 +1948,9 @@ def process_date_cam(
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}),
                    run_context={**run_context, "status": "cancelled"})
         raise
+    except MediaTerminationUnconfirmed as exc:
+        record_media_failure("finalize render output", exc)
+        raise  # A pending reader/writer may still own the candidate.
     except Exception as exc:
         logger.exception("finalize render output failed")
         cleanup_delivery_candidate(candidate)
@@ -1838,6 +1964,7 @@ def process_date_cam(
 
     # 生成标准化成片伴随资产包：.srt 现实世界时间码字幕 + .meta.json 结构化清单
     media_metrics = {}
+    retain_candidate = False
     try:
         assets_ok = _save_vlog_companion_assets(
             output_path=candidate,
@@ -1854,7 +1981,8 @@ def process_date_cam(
         if not assets_ok:
             return fail("required companion assets failed")
         fingerprint = final_fingerprint()
-        with promote_vlog_assets(candidate, output_path, config):
+        with promote_vlog_assets(candidate, output_path, config,fingerprint=fingerprint,
+                                 context={'role':'pipeline','date':date,'cam_index':cam_index}):
             save_manifest(output_path, fingerprint)
             db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
             if not db.is_render_completed(date, cam_index):
@@ -1868,11 +1996,16 @@ def process_date_cam(
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}),
                    run_context={**run_context, "status": "cancelled"})
         raise
+    except MediaTerminationUnconfirmed as exc:
+        retain_candidate = True
+        record_media_failure("delivery commit", exc)
+        raise
     except Exception as exc:
         logger.exception("Delivery commit failed")
         return fail(f"delivery commit failed: {exc}")
     finally:
-        cleanup_delivery_candidate(candidate)
+        if not retain_candidate:
+            cleanup_delivery_candidate(candidate)
     # End-to-end means the final container, manifest, optional subtitles and DB
     # completion marker are all durable.  Previous reports stopped this clock
     # before concat and under-reported the user-observed runtime by ~20 seconds.
@@ -1908,6 +2041,7 @@ def process_date_cam(
 
 def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, dashboard_enabled: bool = True,
                  force_render: bool = False, config: dict | None = None) -> dict:
+    FFmpegProcessRegistry.require_cleanups()
     from src.core.utils import cleanup_temp_artifacts
     logger.info("准备临时工作目录和任务数据库…", extra={"startup_progress": True})
     cleanup_temp_artifacts()
@@ -1953,11 +2087,14 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 else:
                     failed += 1
             except KeyboardInterrupt:
-                from src.hardware.ffmpeg import FFmpegProcessRegistry
                 FFmpegProcessRegistry.mark_interrupted()
                 FFmpegProcessRegistry.kill_all()
                 logger.warning("run_pipeline interrupted. Halting batch pipeline.")
                 raise
+            except MediaTerminationUnconfirmed:
+                logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
+                failed += 1
+                stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
             except Exception:
                 logger.exception("pipeline crash")
                 failed += 1
@@ -1967,7 +2104,17 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 batch_summary_list.append(build_batch_summary_item(
                     db, date, cam_index, OUTPUT_DIR, load_config(), wall_s, status, skip_render=skip_render,
                 ))
+            # A day may return False after recording a fatal reader failure.
+            # Inspect before cleanup so successful later termination cannot
+            # silently turn that failure into permission to continue this batch.
+            try:
+                FFmpegProcessRegistry.require_cleanups()
+            except MediaTerminationUnconfirmed:
+                logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
+                stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
             cleanup_resources()
+            if stopped_reason:
+                break
 
         if len(groups) > 1:
             from src.ui import print_batch_summary_table

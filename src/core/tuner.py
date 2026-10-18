@@ -1,14 +1,17 @@
-"""HomeVlog 离线参数仿真器与配置安全拟合引擎 (What-If Tuning Simulator)
+"""Compare independent references using complete production replay receipts.
 
-基于黄金真值评测集 (Gold Benchmark)，离线仿真候选参数变更对
-混淆矩阵、Precision、Recall、F1-Score 及各场景误报/漏报的量化影响。
-提供参数 Diff 预览、原子备份回滚与安全配置落地保障。
+Report observed retention and display contributions, never infer accuracy from
+historical summary fields. Provide config previews, conflict checks and rollback.
 """
 
 import copy
+from contextlib import contextmanager
+import hashlib
 import logging
 import math
-import shutil
+import os
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +24,8 @@ from src.core.benchmark import (
     load_benchmark_dataset,
     normalize_benchmark_label,
 )
-from src.core.config import CONFIG_PATH, load_config, validate_config
+from src.core import config as core_config
+from src.core.config import load_config, validate_config
 
 logger = logging.getLogger("homevlog.tuner")
 
@@ -49,156 +53,123 @@ def _set_nested_param(d: dict[str, Any], key_path: str, value: Any) -> None:
 
 
 class TuningSimulator:
-    """What-If 离线参数灵敏度仿真引擎"""
+    """Compare current production replays against independently reviewed evidence.
 
-    def __init__(self, benchmark_samples: list[dict[str, Any]] | None = None, config: dict[str, Any] | None = None):
+    A replay callable receives (effective_config, samples) and returns one boolean
+    decision per sample, in order. Historical algo_state/energy/confidence are
+    never substituted for running the detector. UI without a replay provider
+    reports unavailable rather than invented quality gains.
+    """
+
+    def __init__(self, benchmark_samples=None, config=None, *, replay=None):
         if benchmark_samples is None:
             try:
                 self.samples, _ = load_benchmark_dataset()
-            except Exception as e:
-                logger.warning("未能自动加载基准数据集: %s", e)
+            except (OSError, ValueError) as error:
+                logger.warning("未能加载基准数据集: %s", error)
                 self.samples = []
         else:
             self.samples = benchmark_samples
+        self.config = config if config is not None else load_config()
+        self.replay = replay
 
-        self.config = config or load_config()
-
-    def simulate(self, candidate_params: dict[str, Any]) -> dict[str, Any]:
-        """对候选参数执行 What-If 离线推演并返回详尽的量化收益分析。
-
-        支持的仿真参数:
-            - detection.min_motion_threshold (float)
-            - segment.min_motion_duration (float)
-            - yolo.confidence (float)
-            - presence.person_conf_threshold (float)
-        """
-        if not self.samples:
-            return {
-                "error": "No benchmark samples available for simulation",
-                "verdict": "UNAVAILABLE",
-            }
-
-        # 1. 计算基准表现 (Baseline)
-        baseline_metrics = evaluate_confusion_matrix(self.samples)
-        baseline_stratified = evaluate_stratified_metrics(self.samples, group_key="scenario")
-
-        # 2. 提取当前生效参数与候选参数
-        cur_det_thresh = float(_get_nested_param(self.config, "detection.min_motion_threshold", 2.5))
-        cur_min_dur = float(_get_nested_param(self.config, "segment.min_motion_duration", 2.0))
-        cur_yolo_conf = float(_get_nested_param(self.config, "yolo.confidence", 0.3))
-        cur_person_conf = float(_get_nested_param(self.config, "presence.person_conf_threshold", 0.20))
-
-        sim_det_thresh = float(candidate_params.get("detection.min_motion_threshold", cur_det_thresh))
-        sim_min_dur = float(candidate_params.get("segment.min_motion_duration", cur_min_dur))
-        sim_yolo_conf = float(candidate_params.get("yolo.confidence", cur_yolo_conf))
-        sim_person_conf = float(candidate_params.get("presence.person_conf_threshold", cur_person_conf))
-
-        # 3. 逐样本推演新状态
-        def simulated_decision(s: dict[str, Any]) -> bool:
-            orig_state = s.get("algo_state", "STATIC")
-            is_originally_active = orig_state in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE")
-
-            energy = float(s.get("max_energy", 0.0) or 0.0)
-            conf = float(s.get("avg_confidence", 0.0) or 0.0)
-            dur = float(s.get("duration", 0.0) or 0.0)
-
-            # 规则 A: 目标置信度驱动
-            # 若置信度达到新 YOLO/驻留门限，强制认定为真实活动
-            has_strong_object = conf >= sim_yolo_conf or conf >= sim_person_conf
-            has_weak_object = conf > 0.0 and (conf >= min(sim_yolo_conf, sim_person_conf) * 0.8)
-
-            # 规则 B: 短碎片过滤 (时长惩罚)
-            if dur < sim_min_dur and not has_strong_object:
-                # 过于短暂的毛刺碎片被平滑为静态
-                return False
-
-            # 规则 C: 能量门限判断
-            if is_originally_active:
-                # 原为激活态: 如果没有高确信度物体，且动能跌破新门限，则被滤除
-                if not has_strong_object and energy < sim_det_thresh:
-                    return False
-                return True
-            else:
-                # 原为静态: 若动能超过了降低后的新门限，且达到微动或有弱目标，则被召回
-                if energy >= sim_det_thresh and (has_weak_object or energy >= sim_det_thresh * 1.2):
-                    return True
-                return False
-
-        sim_metrics = evaluate_confusion_matrix(self.samples, is_active_decision_fn=simulated_decision)
-        sim_stratified = evaluate_stratified_metrics(
-            self.samples, group_key="scenario", is_active_decision_fn=simulated_decision
+    def simulate(self, candidate_params):
+        from src.core.profiles import resolve_profile_config, resolve_camera_config, _explicit_config
+        reviewed = [s for s in self.samples
+                    if s.get("review_status") in ("independent_human", "independent_visual")
+                    and isinstance(s.get("reference_active"), bool)
+                    and s.get("review_evidence")]
+        if not reviewed or self.replay is None:
+            return {"verdict": "UNAVAILABLE", "applied_params": candidate_params,
+                    "error": "需要独立核验的参考标签与当前生产算法重放；历史状态和摘要不能预测调参收益",
+                    "reviewed_samples": len(reviewed), "total_samples": len(self.samples)}
+        baseline_cfg = resolve_profile_config(self.config)
+        raw_candidate = _explicit_config(self.config)
+        for key, value in candidate_params.items():
+            _set_nested_param(raw_candidate, key, value)
+        candidate_cfg = resolve_profile_config(raw_candidate)
+        same_effective = all(
+            resolve_camera_config(baseline_cfg, filepath=sample.get("filepath"), cam_index=sample.get("cam_index"))
+            == resolve_camera_config(candidate_cfg, filepath=sample.get("filepath"), cam_index=sample.get("cam_index"))
+            for sample in reviewed
         )
 
-        # 4. 指标差值计算
-        delta_f1 = round(sim_metrics["f1"] - baseline_metrics["f1"], 2)
-        delta_prec = round(sim_metrics["precision"] - baseline_metrics["precision"], 2)
-        delta_recall = round(sim_metrics["recall"] - baseline_metrics["recall"], 2)
-        fp_reduction = baseline_metrics["fp"] - sim_metrics["fp"]  # 正数表示误报减少
-        fn_increase = sim_metrics["fn"] - baseline_metrics["fn"]    # 正数表示漏报增加
+        def decisions(cfg):
+            measure = getattr(self.replay, "measure", None)
+            measured = measure(cfg, reviewed) if callable(measure) else None
+            result = measured["predictions"] if measured is not None else self.replay(cfg, reviewed)
+            if len(result) != len(reviewed) or any(type(v) is not bool for v in result):
+                raise ValueError("Replay must return a boolean for every reviewed sample")
+            return result, measured
 
-        # 5. 场景细分收益度量
-        scenario_deltas = {}
-        for sc in set(list(baseline_stratified.keys()) + list(sim_stratified.keys())):
-            b_sc = baseline_stratified.get(sc, {"fp": 0, "fn": 0, "f1": 0.0})
-            s_sc = sim_stratified.get(sc, {"fp": 0, "fn": 0, "f1": 0.0})
-            scenario_deltas[sc] = {
-                "fp_delta": s_sc.get("fp", 0) - b_sc.get("fp", 0),
-                "fn_delta": s_sc.get("fn", 0) - b_sc.get("fn", 0),
-                "f1_delta": round(s_sc.get("f1", 0.0) - b_sc.get("f1", 0.0), 2),
-            }
+        from src.core.replay_evidence import ReplayUnavailable
+        try:
+            baseline, base_measurement = decisions(baseline_cfg)
+            candidate, new_measurement = (baseline, base_measurement) if same_effective else decisions(candidate_cfg)
+            if base_measurement is not None and new_measurement is not None and base_measurement["identity"] != new_measurement["identity"]:
+                raise ReplayUnavailable("基线与候选的代码、模型、运行环境或源集合身份不一致，不能比较")
+        except ReplayUnavailable as error:
+            return {"verdict": "UNAVAILABLE", "error": str(error), "applied_params": candidate_params,
+                    "reviewed_samples": len(reviewed), "total_samples": len(self.samples)}
 
-        # 6. 决策评估与解释性结论
-        if delta_f1 > 0 and fn_increase <= 1:
-            verdict = "IMPROVED"
-            reason = f"综合 F1 提升 +{delta_f1}%，成功压制 {fp_reduction} 处误报且未显著破坏动作召回"
-        elif fp_reduction >= 3 and delta_f1 >= -0.5:
-            verdict = "FAVORABLE_TRADEOFF"
-            reason = f"显著压制 {fp_reduction} 处误报，虽略有 {fn_increase} 处漏报代价，但整体成片率大幅净化"
-        elif fn_increase >= 3 or delta_f1 < -1.0:
-            verdict = "REGRESSED"
-            reason = f"参数过于激进：增加 {fn_increase} 处漏报，F1 下降 {delta_f1}%，存在关键动态漏剪风险"
-        else:
-            verdict = "NEUTRAL"
-            reason = "指标变化微弱或正负效应相互抵消"
+        def metrics(predictions):
+            rows = [dict(s, gold_label="CONFIRMED_MOTION" if s["reference_active"] else "CONFIRMED_STATIC",
+                         replay_active=active) for s, active in zip(reviewed, predictions)]
+            decision = lambda s: s["replay_active"]
+            return (evaluate_confusion_matrix(rows, is_active_decision_fn=decision),
+                    evaluate_stratified_metrics(rows, group_key="scenario", is_active_decision_fn=decision))
 
-        return {
-            "baseline": baseline_metrics,
-            "simulated": sim_metrics,
-            "deltas": {
-                "f1": delta_f1,
-                "precision": delta_prec,
-                "recall": delta_recall,
-                "fp_reduction": fp_reduction,
-                "fn_increase": fn_increase,
-            },
-            "scenario_impacts": scenario_deltas,
-            "applied_params": candidate_params,
-            "verdict": verdict,
-            "rationale": reason,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        base_metrics, base_scenarios = metrics(baseline)
+        new_metrics, new_scenarios = metrics(candidate)
+        deltas = {k: round(new_metrics[k] - base_metrics[k], 2) for k in ("f1", "precision", "recall")}
+        deltas.update(fp_reduction=base_metrics["fp"] - new_metrics["fp"],
+                      fn_increase=new_metrics["fn"] - base_metrics["fn"])
+        impacts = {key: {"fp_delta": new_scenarios[key]["fp"] - value["fp"],
+                         "fn_delta": new_scenarios[key]["fn"] - value["fn"],
+                         "f1_delta": round(new_scenarios[key]["f1"] - value["f1"], 2)}
+                   for key, value in base_scenarios.items()}
+        # An observed metric change is not release acceptance: missing negative
+        # examples or unreviewed difficult scenarios leave quality unestablished.
+        from src.core.benchmark import assess_replay_quality
+        quality_gate = assess_replay_quality(reviewed, candidate)
+        rows = [{"segment_id": sample.get("segment_id", sample.get("id")),
+                 "filepath": sample.get("filepath"), "date": sample.get("date"),
+                 "cam_index": sample.get("cam_index"), "start_time": sample.get("start_time"),
+                 "end_time": sample.get("end_time"), "scenario": sample.get("scenario", "UNKNOWN"),
+                 "reference_active": sample["reference_active"],
+                 "baseline_retained": before, "candidate_retained": after,
+                 "retention_changed": before != after}
+                for sample, before, after in zip(reviewed, baseline, candidate)]
+        details = getattr(self.replay, "details", None)
+        if base_measurement is not None or callable(details):
+            try:
+                base_details = base_measurement["details"] if base_measurement is not None else details(baseline_cfg, reviewed)
+                new_details = new_measurement["details"] if new_measurement is not None else (base_details if same_effective else details(candidate_cfg, reviewed))
+                if len(base_details) != len(rows) or len(new_details) != len(rows):
+                    raise ValueError("Replay details must cover every reference")
+                for row, before, after in zip(rows, base_details, new_details):
+                    row.update(baseline_display=before, candidate_display=after)
+            except ReplayUnavailable as error:
+                # Do not keep a metric result if source/receipt identity changed
+                # between retention and detailed display-clock reads.
+                return {"verdict": "UNAVAILABLE", "error": str(error), "applied_params": candidate_params,
+                        "reviewed_samples": len(reviewed), "total_samples": len(self.samples)}
+        return {"baseline": base_metrics, "simulated": new_metrics, "deltas": deltas,
+                "scenario_impacts": impacts, "applied_params": candidate_params,
+                "verdict": "NEUTRAL" if baseline == candidate else "MEASURED_CHANGE",
+                "rationale": "当前生产算法重放对照；是否满足质量门禁需独立验收",
+                "reviewed_samples": len(reviewed), "total_samples": len(self.samples),
+                "quality_gate": quality_gate, "sample_changes": rows,
+                "baseline_receipt_sha256": base_measurement.get("receipt_sha256") if base_measurement else None,
+                "candidate_receipt_sha256": new_measurement.get("receipt_sha256") if new_measurement else None,
+                "evidence_basis": "production_replay", "timestamp": datetime.now().isoformat()}
 
-    def simulate_profile(
-        self,
-        profile_name: str,
-        sensitivity: float = 1.0,
-        overrides: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """对指定场景 Profile 及灵敏度执行 What-If 离线推演。"""
-        from src.core.profiles import resolve_profile_config
-        sim_cfg = resolve_profile_config(self.config, profile_name=profile_name, sensitivity=sensitivity)
-        params: dict[str, Any] = {
-            "detection.min_motion_threshold": sim_cfg.get("detection", {}).get("min_motion_threshold", 2.5),
-            "segment.min_motion_duration": sim_cfg.get("segment", {}).get("min_motion_duration", 2.0),
-            "yolo.confidence": sim_cfg.get("yolo", {}).get("confidence", 0.3),
-            "presence.person_conf_threshold": sim_cfg.get("presence", {}).get("person_conf_threshold", 0.20),
-        }
-        if overrides:
-            params.update(overrides)
-        res = self.simulate(params)
-        res["profile"] = profile_name
-        res["sensitivity"] = sensitivity
-        return res
+    def simulate_profile(self, profile_name, sensitivity=1.0, overrides=None):
+        params = {"detection.profile": profile_name, "detection.motion_sensitivity": sensitivity}
+        params.update(overrides or {})
+        result = self.simulate(params)
+        result.update(profile=profile_name, sensitivity=sensitivity)
+        return result
 
 
 def generate_config_diff(
@@ -206,12 +177,12 @@ def generate_config_diff(
     config_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """生成候选参数与当前 settings.yaml 的结构化 Diff 对比。"""
-    cfg_file = Path(config_path) if config_path else CONFIG_PATH
+    cfg_file = Path(config_path) if config_path else core_config.CONFIG_PATH
     if not cfg_file.exists():
         raise FileNotFoundError(f"配置文件未找到: {cfg_file}")
 
-    with open(cfg_file, "r", encoding="utf-8") as f:
-        current_cfg = yaml.safe_load(f) or {}
+    original = cfg_file.read_bytes()
+    current_cfg = yaml.safe_load(original) or {}
 
     diffs = []
     for k, new_v in new_params.items():
@@ -226,58 +197,94 @@ def generate_config_diff(
 
     return {
         "config_path": str(cfg_file),
+        "config_sha256": hashlib.sha256(original).hexdigest(),
         "total_changes": len(diffs),
         "diffs": diffs,
     }
+
+
+@contextmanager
+def _config_writer(path):
+    from src.core.process_lock import exclusive_file_lock
+    lock = path.with_name("." + path.name + ".writer.lock")
+    # Translate admission conflicts only; errors inside the transaction retain
+    # their original context and rollback semantics.
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive_file_lock(lock, conflict="Configuration writer already active"))
+        except RuntimeError as error:
+            raise ConfigurationConflict(str(error)) from error
+        yield
 
 
 def apply_config_safe(
     new_params: dict[str, Any],
     config_path: Path | str | None = None,
     create_backup: bool = True,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     """安全校验并原子写回新配置，自动创建带时间戳的备份文件。"""
-    cfg_file = Path(config_path) if config_path else CONFIG_PATH
-    if not cfg_file.exists():
-        raise FileNotFoundError(f"配置文件未找到: {cfg_file}")
+    with core_config._config_lock:
+        cfg_file = (Path(config_path) if config_path else core_config.CONFIG_PATH).resolve()
+        with _config_writer(cfg_file):
+            original = cfg_file.read_bytes()
+            if expected_sha256 is not None and hashlib.sha256(original).hexdigest() != expected_sha256:
+                raise ConfigurationConflict("Configuration changed since preview; refresh the diff before applying")
+            candidate_cfg = yaml.safe_load(original) or {}
+            for k, v in new_params.items():
+                _set_nested_param(candidate_cfg, k, v)
+            from src.core.profiles import resolve_profile_config
+            validate_config(resolve_profile_config(candidate_cfg))
+            proposed = yaml.safe_dump(candidate_cfg, allow_unicode=True, sort_keys=False).encode("utf-8")
+            backup_path = _commit_config(cfg_file, proposed, original, create_backup)
+            return {"success": True, "config_path": str(cfg_file), "applied_count": len(new_params),
+                    "backup_path": str(backup_path) if backup_path else None, "updated_params": new_params}
 
-    with open(cfg_file, "r", encoding="utf-8") as f:
-        raw_cfg = yaml.safe_load(f) or {}
 
-    # 1. 深度拷贝并在内存中应用新参数
-    candidate_cfg = copy.deepcopy(raw_cfg)
-    for k, v in new_params.items():
-        _set_nested_param(candidate_cfg, k, v)
+class ConfigurationConflict(ValueError):
+    """A writer owns the configuration or a preview refers to an older version."""
 
-    # 2. 强校验: 必须通过核心契约 validate_config
-    validate_config(candidate_cfg)
 
-    # 3. 创建安全备份
-    backup_path = None
+def _atomic_config_write(path: Path, payload: bytes) -> None:
+    """Replace a single file from a unique, flushed same-directory temporary."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as f:
+            temporary = Path(f.name)
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _commit_config(path: Path, proposed: bytes, original: bytes, create_backup: bool) -> Path | None:
+    """Caller owns the config lock across read, validation, commit and reload."""
+    backup = None
     if create_backup:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = cfg_file.with_name(f"{cfg_file.name}.bak_{ts}")
-        shutil.copy2(cfg_file, backup_path)
-        logger.info("已生成配置安全备份: %s", backup_path)
-
-    # 4. 原子安全写回
-    temp_target = cfg_file.with_name(f"{cfg_file.name}.tmp")
-    with open(temp_target, "w", encoding="utf-8") as f:
-        yaml.safe_dump(candidate_cfg, f, allow_unicode=True, sort_keys=False)
-
-    shutil.move(str(temp_target), str(cfg_file))
-
-    # 5. 触发配置缓存刷新
-    load_config(config_path=cfg_file, reload=True)
-
-    logger.info("配置已成功更新并热重载: %s (修改项: %d)", cfg_file, len(new_params))
-    return {
-        "success": True,
-        "config_path": str(cfg_file),
-        "applied_count": len(new_params),
-        "backup_path": str(backup_path) if backup_path else None,
-        "updated_params": new_params,
-    }
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup = path.with_name(f"{path.name}.bak_{stamp}_{uuid.uuid4().hex}")
+        with backup.open("xb") as f:
+            f.write(original)
+            f.flush()
+            os.fsync(f.fileno())
+    previous_path, previous_settings = core_config.CONFIG_PATH, core_config.SETTINGS
+    _atomic_config_write(path, proposed)
+    try:
+        load_config(config_path=path, reload=True)
+    except BaseException:
+        try:
+            _atomic_config_write(path, original)
+        except OSError:
+            logger.exception("Configuration rollback failed; preserve backup at %s", backup)
+            raise
+        finally:
+            core_config.CONFIG_PATH, core_config.SETTINGS = previous_path, previous_settings
+        raise
+    return backup
 
 
 def rollback_config(
@@ -285,24 +292,14 @@ def rollback_config(
     config_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """从备份文件安全回滚配置。"""
-    b_file = Path(backup_path)
-    if not b_file.exists():
-        raise FileNotFoundError(f"指定的备份文件不存在: {b_file}")
-
-    target_file = Path(config_path) if config_path else CONFIG_PATH
-
-    # 先验证备份文件的合法性
-    with open(b_file, "r", encoding="utf-8") as f:
-        candidate_cfg = yaml.safe_load(f) or {}
-    validate_config(candidate_cfg)
-
-    # 复制覆盖
-    shutil.copy2(b_file, target_file)
-    load_config(config_path=target_file, reload=True)
-
-    logger.info("配置已成功从备份回滚: %s -> %s", b_file, target_file)
-    return {
-        "success": True,
-        "restored_from": str(b_file),
-        "target_config": str(target_file),
-    }
+    with core_config._config_lock:
+        b_file = Path(backup_path).resolve()
+        target_file = (Path(config_path) if config_path else core_config.CONFIG_PATH).resolve()
+        with _config_writer(target_file):
+            proposed = b_file.read_bytes()
+            from src.core.profiles import resolve_profile_config
+            validate_config(resolve_profile_config(yaml.safe_load(proposed) or {}))
+            current = target_file.read_bytes()
+            backup = _commit_config(target_file, proposed, current, True)
+            return {"success": True, "restored_from": str(b_file), "target_config": str(target_file),
+                    "backup_path": str(backup)}

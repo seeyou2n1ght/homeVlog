@@ -17,7 +17,6 @@ from src.utils import (
     get_logger,
     register_dashboard,
     unregister_dashboard,
-    LOGS_DIR,
     size_metrics,
 )
 
@@ -40,6 +39,7 @@ def test_subsystem_adapter_and_contextual_formatter(tmp_path):
 def test_error_log_and_jsonl_separation(tmp_path):
     """验证主日志、独立错误日志及 JSONL 事件流的三路分离机制。"""
     setup_logging()
+    from src.core.utils import LOGS_DIR
 
     # 寻找最新的日志文件集合（支持子目录分区）
     main_logs = sorted(LOGS_DIR.rglob("homevlog_*.log"), key=lambda p: p.stat().st_mtime)
@@ -218,6 +218,21 @@ def test_ui_components_render(tmp_path, capsys):
     assert "Corrupt slice detected" in output and "QSV session timeout" in output
 
 
+def test_summary_discloses_presence_and_micro_motion_instead_of_false_dynamic_percentage(tmp_path, capsys):
+    output = tmp_path / "summary.mp4"
+    output.write_bytes(b"test media placeholder")
+    output.with_suffix(".meta.json").write_text(json.dumps({"metrics": {
+        "vlog_duration_s": 25., "dynamic_duration_s": 4., "static_duration_s": 0.,
+        "source_duration_by_state_s": {"DYNAMIC": 4., "PRESENCE": 80., "MICRO_MOTION": 16.},
+    }}), encoding="utf-8")
+    print_summary_card("20260610", 0, 1, 100., output, 10.)
+    displayed = capsys.readouterr().out
+    assert "源时段分布" in displayed
+    assert "有人驻留" in displayed and "80.0s" in displayed
+    assert "微动" in displayed and "16.0s" in displayed
+    assert "100.0%" not in displayed
+
+
 def test_pipeline_dashboard_lifecycle():
     """验证 PipelineDashboard 的更新逻辑、队列水位更新及生命周期开关。"""
     from rich.console import Console
@@ -299,15 +314,19 @@ def test_cli_parser_and_date_normalization():
     assert resolve_cli_dates(args2) == ["20260320", "20260321"]
 
 
-def test_system_doctor_and_report():
+def test_system_doctor_and_report(tmp_path, monkeypatch):
     """验证环境体检医生模块数据采集与报告面板呈现。"""
     from src.ui import run_system_doctor, print_doctor_report
+    # Routine regression must not depend on the availability of a production NAS.
+    input_dir=tmp_path/'doctor_input';input_dir.mkdir()
+    monkeypatch.setattr('src.core.utils.get_input_dirs',lambda config:[str(input_dir)])
     report = run_system_doctor()
     assert "python" in report
     assert "ffmpeg" in report
     assert "gpu" in report
     assert "storage" in report
     assert "model" in report
+    assert report['storage']['inputs'][0]['exists'] is True
 
     # 打印报告卡片不崩溃
     ok = print_doctor_report()
@@ -521,6 +540,18 @@ def test_cli_dry_run_does_not_reset_or_clean(cli_workspace, monkeypatch):
     w.cleanup.assert_not_called()
 
 
+def test_cli_reanalysis_cannot_reset_an_owned_day(cli_workspace,external_day_owner,monkeypatch,tmp_path):
+    from src.stages import renderer
+    w=cli_workspace
+    external_day_owner(w.db.db_path,renderer.TEMP_DIR,tmp_path/'out.mp4','20260901',1)
+    before=list(w.db.conn.iterdump())
+    monkeypatch.setattr('sys.argv',['main.py','--date','20260901','--cam','1','--reanalyze','--no-tui'])
+    with pytest.raises(RuntimeError,match='already owned'):
+        w.cli.main()
+    assert before==list(w.db.conn.iterdump())
+    w.processor.assert_not_called()
+
+
 @pytest.mark.parametrize("force", [False, True])
 def test_cli_reanalysis_requires_force_for_completed_groups(cli_workspace, monkeypatch, force):
     w = cli_workspace
@@ -546,3 +577,63 @@ def test_cli_rejects_unimplemented_options(flags):
     with pytest.raises(SystemExit) as caught:
         build_arg_parser().parse_args(flags)
     assert caught.value.code == 2
+
+
+@pytest.fixture
+def cli_pending_media(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    for field in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, field, {})
+    process, permit = MagicMock(), MagicMock()
+    process.poll.return_value = None
+    def defer():
+        registry.defer_cleanup('previous-day', process, permit)
+    return registry, permit, defer
+
+
+@pytest.mark.parametrize('flags', [[], ['--reanalyze'], ['--clean-temp'], ['--config', 'unused.yaml']])
+def test_cli_pending_media_rejects_before_mutation(cli_workspace, cli_pending_media, monkeypatch, capsys, flags):
+    w = cli_workspace
+    registry, permit, defer = cli_pending_media
+    before = list(w.db.conn.iterdump())
+    defer()
+    monkeypatch.setattr('sys.argv', ['main.py', '--date', '20260901', '--no-tui', *flags])
+    with pytest.raises(SystemExit) as stopped:
+        w.cli.main()
+    assert stopped.value.code == 1
+    assert list(w.db.conn.iterdump()) == before
+    w.processor.assert_not_called()
+    w.cleanup.assert_not_called()
+    permit.release.assert_not_called()
+    assert registry.is_interrupted()
+    assert 'MEDIA_TERMINATION_UNCONFIRMED' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('outcome', ['exception', 'pending_false', 'ordinary_false'])
+def test_cli_stops_cross_day_after_unconfirmed_media(cli_workspace, cli_pending_media, monkeypatch, capsys, outcome):
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    w = cli_workspace
+    registry, permit, defer = cli_pending_media
+    before = list(w.db.conn.iterdump())
+    def process(*args, **kwargs):
+        if w.processor.call_count == 1:
+            if outcome == 'exception':
+                raise MediaTerminationUnconfirmed('controlled previous reader')
+            if outcome == 'pending_false':
+                defer()
+            return False
+        return True
+    w.processor.side_effect = process
+    monkeypatch.setattr('sys.argv', ['main.py', '--cam', '1', '--no-tui'])
+    with pytest.raises(SystemExit) as stopped:
+        w.cli.main()
+    assert stopped.value.code == 1
+    assert list(w.db.conn.iterdump()) == before
+    assert w.processor.call_count == (2 if outcome == 'ordinary_false' else 1)
+    output = capsys.readouterr().out
+    if outcome != 'ordinary_false':
+        assert 'MEDIA_TERMINATION_UNCONFIRMED' in output and '未处理=1' in output
+    else:
+        assert 'MEDIA_TERMINATION_UNCONFIRMED' not in output
+    permit.release.assert_not_called()

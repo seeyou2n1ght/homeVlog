@@ -7,7 +7,8 @@
 
 import json
 import logging
-import shutil
+import hashlib
+import uuid
 import threading
 import time
 from pathlib import Path
@@ -110,53 +111,52 @@ def _extract_and_archive_frame(
     # 1. 尝试从原始视频高清抽取
     source_fp = Path(segment.get("filepath", ""))
     extracted = False
+    source_snapshot = None
+    frame_origin = "unavailable"
 
     try:
-        source_available = source_fp.exists() and source_fp.stat().st_size > 0
+        from src.core.visual_index import source_identity
+        source_snapshot = source_identity(source_fp)
+        source_available = True
     except OSError as exc:
         logger.warning("Source unavailable; trying cached frame: %s", exc)
         source_available = False
     if source_available:
+        temporary = target_img.with_name(target_img.stem+".pending_"+uuid.uuid4().hex+".jpg")
         cmd = [
             "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
             "-ss", f"{local_mid:.3f}",
             "-i", str(source_fp),
             "-vframes", "1",
             "-q:v", "2",
-            str(target_img),
+            str(temporary),
         ]
         try:
             from src.hardware.ffmpeg import run_ffmpeg
             res = run_ffmpeg(cmd[1:], capture_output=True, timeout=12)
-            if res.returncode == 0 and target_img.exists() and target_img.stat().st_size > 0:
+            if res.returncode == 0 and temporary.exists() and temporary.stat().st_size > 0 and source_identity(source_fp) == source_snapshot:
+                temporary.replace(target_img)
+                frame_origin = "ffmpeg_seek"
                 extracted = True
         except Exception as e:
             logger.debug("FFmpeg 直接抽取切片帧失败: %s", e)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    # 2. 次级兜底：若原始 NAS 视频离线，寻找缓存池已抽取的首帧或切片帧
-    if not extracted and CACHE_DIR.exists():
-        stem = source_fp.stem
-        # 寻找匹配的缓存文件
-        candidates = list(CACHE_DIR.glob(f"{stem}_*_{t_mid:.2f}_*.jpg"))
-        if not candidates:
-            candidates = list(CACHE_DIR.glob(f"{stem}_*.jpg"))
-
-        for c in candidates:
-            if c.exists() and c.stat().st_size > 0 and not c.name.startswith("_file_missing"):
-                try:
-                    shutil.copy2(str(c), str(target_img))
-                    extracted = True
-                    break
-                except Exception as e:
-                    logger.debug("从缓存复制归档帧失败: %s", e)
-
+    # Legacy basename-only disk caches have no reliable source/time identity.
+    # Only a timestamped decoded memory sample inside this interval may degrade.
+    observed_time = None
     if not extracted:
-        cached = FrameArchiver.cached(str(source_fp), local_mid)
-        if cached:
-            logger.warning("Source unavailable; archiving memory frame for segment %s", segment_id)
-            temporary = target_img.with_suffix(".jpg.tmp")
+        with FrameArchiver._lock:
+            choices = [(abs(t-local_mid),t,payload) for (fp,t),payload in FrameArchiver._cache.items()
+                       if fp == str(source_fp) and max(0,start_t-file_offset) <= t < end_t-file_offset]
+        if choices:
+            _, observed_time, cached = min(choices,key=lambda item:item[0])
+            logger.warning("Source extraction unavailable; archiving timestamped memory frame for segment %s",segment_id)
+            temporary = target_img.with_name(target_img.stem+".memory_pending.jpg")
             temporary.write_bytes(cached)
             temporary.replace(target_img)
+            frame_origin = "decoded_memory"
             extracted = True
     if not extracted or not target_img.exists():
         logger.warning(
@@ -182,7 +182,14 @@ def _extract_and_archive_frame(
         "predicted_state": segment.get("state"),
         "manual_label": manual_label,
         "review_notes": segment.get("review_notes") or "",
-        "frame_timestamp": t_mid,
+        "provenance_version": 2,
+        "frame_origin": frame_origin,
+        "timestamp_kind": "requested_seek" if frame_origin == "ffmpeg_seek" else "analysis_sample_clock",
+        "source_identity": source_snapshot if frame_origin == "ffmpeg_seek" else None,
+        "requested_timestamp_in_file": local_mid,
+        "observed_timestamp_in_file": observed_time,
+        "image_sha256": hashlib.sha256(target_img.read_bytes()).hexdigest(),
+        "frame_timestamp": t_mid if observed_time is None else observed_time+file_offset,
         "archived_image_path": rel_path,
         "archived_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }

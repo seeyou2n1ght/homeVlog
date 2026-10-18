@@ -1,6 +1,5 @@
-"""Repair corrupted has_audio metadata in file_tasks table and purge bad batch caches."""
+"""Inspect legacy audio-metadata suspects without changing media or database state."""
 import argparse
-import glob
 import logging
 import sqlite3
 from pathlib import Path
@@ -10,8 +9,8 @@ logger = logging.getLogger("repair_audio")
 
 
 def repair_metadata(db_path: str = "data/vlog.db", date: str | None = None, clean_batches: bool = False):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    if clean_batches:
+        raise ValueError("--clean-batches is disabled: batch removal requires verified delivery and workspace ownership")
 
     query = "SELECT COUNT(*) FROM file_tasks WHERE prescreen_status = 'SUSPICIOUS' AND has_audio = 0"
     params = []
@@ -19,39 +18,25 @@ def repair_metadata(db_path: str = "data/vlog.db", date: str | None = None, clea
         query += " AND date = ?"
         params.append(date)
 
-    cursor.execute(query, params)
-    count = cursor.fetchone()[0]
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        count = conn.execute(query, params).fetchone()[0]
+    finally:
+        conn.close()
     logger.info("Found %d records with prescreen_status='SUSPICIOUS' and has_audio=0", count)
 
-    if count > 0:
-        update_sql = "UPDATE file_tasks SET has_audio = 1, updated_at = datetime('now', 'localtime') WHERE prescreen_status = 'SUSPICIOUS' AND has_audio = 0"
-        if date:
-            update_sql += " AND date = ?"
-        cursor.execute(update_sql, params)
-        conn.commit()
-        logger.info("Successfully updated %d records to has_audio = 1", cursor.rowcount)
-    else:
-        logger.info("No records need repair.")
-
-    if clean_batches:
-        temp_dir = Path("temp")
-        pattern = f"_batch*_{date}_*.mp4*" if date else "_batch*.mp4*"
-        files = list(temp_dir.glob(pattern))
-        logger.info("Cleaning %d cached batch files matching %s", len(files), pattern)
-        for f in files:
-            try:
-                f.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning("Failed to delete %s: %s", f.name, exc)
-
-    conn.close()
+    logger.info("Inspection only: SUSPICIOUS does not establish an audio stream; no rows or batches changed")
+    return count
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Repair corrupted audio metadata in vlog.db")
+    parser = argparse.ArgumentParser(description="Inspect audio metadata suspects (read-only)")
     parser.add_argument("--db", default="data/vlog.db", help="Path to SQLite database")
     parser.add_argument("--date", default=None, help="Target date YYYYMMDD (optional, default all)")
-    parser.add_argument("--clean-batches", action="store_true", help="Clean affected temp batch mp4 and manifest files")
+    parser.add_argument("--clean-batches", action="store_true", help="Disabled legacy option; never removes batches")
     args = parser.parse_args()
+    if args.clean_batches:
+        parser.error("--clean-batches is disabled; this tool only inspects metadata")
 
     repair_metadata(db_path=args.db, date=args.date, clean_batches=args.clean_batches)

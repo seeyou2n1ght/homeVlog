@@ -1,9 +1,7 @@
-"""HomeVlog 权威黄金基准评测与精度回归测试套件 (Gold Benchmark Accuracy Suite)
+"""Historical dataset contracts, current replay gating, and review precedence.
 
-用途:
-    依托 tests/benchmark_data/gold_ground_truth.json 黄金真值数据集，
-    对算法识别准确率、混淆矩阵、Precision、Recall、F1-Score 进行量化评估，
-    并作为发版和算法迭代的自动化质量门禁 (Quality Gate)。
+The legacy 100 labels are unverified hypotheses, not release truth. Static
+algo_state statistics do not exercise today's detector.
 """
 
 import json
@@ -45,8 +43,8 @@ def test_gold_benchmark_schema_and_distribution():
     assert expected_categories.issubset(labels), f"基准分类覆盖不全: 缺少 {expected_categories - labels}"
 
 
-def test_confusion_matrix_and_accuracy_metrics():
-    """计算当前算法识别的混淆矩阵与核心指标，确立精度基线。"""
+def test_historical_confusion_matrix_arithmetic():
+    """仅验证历史记录的统计计算，不代表当前算法识别质量。"""
     assert BENCHMARK_FILE.exists()
 
     with open(BENCHMARK_FILE, "r", encoding="utf-8") as f:
@@ -104,8 +102,8 @@ def test_confusion_matrix_and_accuracy_metrics():
     assert tn + fp > 0, "负样本总数不能为 0"
 
 
-def test_stratified_scenario_quality_gates():
-    """验证分场景切片细分指标 (Stratified Scenario Quality Gates) 达到发版质量门禁标准。"""
+def test_historical_scenario_distribution():
+    """历史分层数据可以汇总，但未核验的标签不能通过质量门禁。"""
     from src.core.benchmark import load_benchmark_dataset, evaluate_stratified_metrics
 
     samples, meta = load_benchmark_dataset(BENCHMARK_FILE)
@@ -121,19 +119,101 @@ def test_stratified_scenario_quality_gates():
         print(f" [{sc:14s}] N={metrics['total']:2d} | TP={metrics['tp']:2d} FP={metrics['fp']:2d} FN={metrics['fn']:2d} TN={metrics['tn']:2d} | F1={metrics['f1']:5.1f}%")
     print("=" * 55)
 
-    # 1. 门禁 1: 核心成人活动场景 (ADULT_MOTION) 召回率严禁低于 90% (守卫日常精彩镜头)
-    if "ADULT_MOTION" in stratified:
-        adult_recall = stratified["ADULT_MOTION"]["recall"]
-        assert adult_recall >= 90.0, f"核心人物动态召回率劣化: {adult_recall}% < 90%"
-
-    # 2. 门禁 2: 纯静止背景空镜 (EMPTY_ROOM) 过滤准确率严禁低于 95% (守卫浓缩压缩率)
-    if "EMPTY_ROOM" in stratified:
-        empty_acc = stratified["EMPTY_ROOM"]["accuracy"]
-        assert empty_acc >= 95.0, f"空镜背景过滤率劣化: {empty_acc}% < 95%"
-
-    # 3. 门禁 3: 必须包含典型难例挑战集 (光影假阳性与婴儿微动假阴性)
     assert "LIGHT_SHADOW" in stratified, "基准集必须覆盖光影误报挑战集"
     assert "INFANT_MOTION" in stratified, "基准集必须覆盖微动漏报挑战集"
+    from src.core.benchmark import assess_replay_quality
+    gate = assess_replay_quality(samples, [True] * len(samples))
+    assert gate["verdict"] == "UNAVAILABLE"
+    assert gate["verified_samples"] == 0
+
+
+def test_current_predictions_enforce_all_four_quality_limits():
+    from src.core.benchmark import assess_replay_quality
+    samples = [{"scenario": scenario, "reference_active": active,
+                "review_status": "independent_visual", "review_evidence": "controlled reference",
+                "split": "holdout", "filepath": f"{scenario}.mp4"}
+               for scenario, active in (("ADULT_MOTION", True), ("INFANT_MOTION", True),
+                                         ("EMPTY_ROOM", False), ("LIGHT_SHADOW", False))]
+    assert assess_replay_quality(samples, [True, True, False, False], min_per_scenario=1)["verdict"] == "PASS"
+    for predictions, failed in (([False, False, False, False], ["ADULT_MOTION", "INFANT_MOTION"]),
+                                ([True, True, True, True], ["EMPTY_ROOM", "LIGHT_SHADOW"])):
+        gate = assess_replay_quality(samples, predictions, min_per_scenario=1)
+        assert gate["verdict"] == "FAIL"
+        assert gate["failed_scenarios"] == failed
+
+
+@pytest.mark.parametrize('variant', ['tuning', 'missing_split', 'used', 'same_source', 'same_event', 'duplicates'])
+def test_quality_gate_rejects_leaked_or_correlated_reference_counts(variant):
+    from src.core.benchmark import assess_replay_quality
+    samples, predictions = [], []
+    for scenario, active in [('ADULT_MOTION', True), ('INFANT_MOTION', True), ('EMPTY_ROOM', False), ('LIGHT_SHADOW', False)]:
+        for index in range(10):
+            row = dict(scenario=scenario, reference_active=active, review_status='independent_visual',
+                review_evidence='controlled fixture', split='holdout', filepath=f'{scenario}_{index}.mp4',
+                start_time=index*10, end_time=index*10+6)
+            if variant == 'tuning': row['split'] = 'tuning'
+            elif variant == 'missing_split': row.pop('split')
+            elif variant == 'used': row['used_for_tuning'] = True
+            elif variant == 'same_source': row['filepath'] = f'{scenario}.mp4'
+            elif variant == 'same_event': row['independence_group'] = 'one event'
+            elif variant == 'duplicates': row.update(filepath=f'{scenario}.mp4', start_time=0, end_time=6)
+            samples.append(row)
+            predictions.append(active)
+    gate = assess_replay_quality(samples, predictions)
+    assert gate['verdict'] == 'UNAVAILABLE'
+    assert len(gate['insufficient_scenarios']) == 4
+    assert all(value <= 1 for value in gate['independent_counts'].values())
+    if variant == 'duplicates':
+        assert gate['verified_samples'] == 4 and gate['excluded_samples']['duplicates'] == 36
+
+
+def test_quality_gate_accepts_distinct_holdout_sources_and_excludes_conflicts():
+    from src.core.benchmark import assess_replay_quality
+    samples, predictions = [], []
+    for scenario, active in [('ADULT_MOTION', True), ('INFANT_MOTION', True), ('EMPTY_ROOM', False), ('LIGHT_SHADOW', False)]:
+        for index in range(10):
+            samples.append(dict(scenario=scenario, reference_active=active, review_status='independent_human',
+                review_evidence='controlled fixture', split='holdout', filepath=f'{scenario}_{index}.mp4'))
+            predictions.append(active)
+    assert assess_replay_quality(samples, predictions)['verdict'] == 'PASS'
+    samples.append(dict(samples[0], reference_active=False))
+    predictions.append(False)
+    gate = assess_replay_quality(samples, predictions)
+    assert gate['verdict'] == 'UNAVAILABLE'
+    assert gate['independent_counts']['ADULT_MOTION'] == 9
+    assert gate['excluded_samples']['conflicts'] == 1
+
+
+@pytest.mark.parametrize('active', [True, False])
+def test_quality_gate_weights_events_instead_of_easy_window_count(active):
+    from src.core.benchmark import assess_replay_quality
+    samples, predictions = [], []
+    for scenario, truth in [('ADULT_MOTION', True), ('INFANT_MOTION', True), ('EMPTY_ROOM', False), ('LIGHT_SHADOW', False)]:
+        for index in range(10):
+            row = dict(scenario=scenario, reference_active=truth, review_status='independent_human',
+                review_evidence='controlled fixture', split='holdout', filepath=f'{scenario}_{index}.mp4',
+                start_time=0, end_time=6)
+            samples.append(row)
+            predictions.append(not truth if truth == active and index else truth)
+        if truth == active:
+            easy = dict(samples[-10])
+            for index in range(1, 301):
+                samples.append(dict(easy, start_time=index*10, end_time=index*10+6))
+                predictions.append(truth)
+    gate = assess_replay_quality(samples, predictions)
+    assert gate['verdict'] == 'FAIL'
+    for scenario in (['ADULT_MOTION', 'INFANT_MOTION'] if active else ['EMPTY_ROOM', 'LIGHT_SHADOW']):
+        assert gate['independent_counts'][scenario] == 10
+        assert scenario in gate['failed_scenarios']
+
+
+@pytest.mark.parametrize('interval', [(None, 6), (0, float('nan')), (False, 6), (6, 0), ([0], 6)])
+def test_quality_gate_excludes_invalid_interval_identity(interval):
+    from src.core.benchmark import assess_replay_quality
+    row = dict(scenario='ADULT_MOTION', reference_active=True, review_status='independent_visual',
+        review_evidence='fixture', split='holdout', filepath='source.mp4', start_time=interval[0], end_time=interval[1])
+    gate = assess_replay_quality([row], [True], min_per_scenario=1)
+    assert gate['verified_samples'] == 0 and gate['excluded_samples']['invalid_interval'] == 1
 
 
 def test_human_feedback_remedy_guarantee(tmp_path):

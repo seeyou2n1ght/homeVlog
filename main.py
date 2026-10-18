@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.utils import setup_logging, load_config, reset_semaphores, cleanup_resources, cleanup_temp_artifacts, get_input_dirs, check_disk_space
 from src.pipeline import run_pipeline, process_date_cam
+from src.hardware.ffmpeg import FFmpegProcessRegistry, MediaTerminationUnconfirmed
 from src.stages.companion import build_batch_summary_item
 from src.database import VlogDatabase
 from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name
@@ -51,6 +52,14 @@ logger = setup_logging()
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    # Dry-run still scans/persists tasks; --config can replace live budgets.
+    if args.config or not (args.doctor or args.status):
+        try:
+            FFmpegProcessRegistry.require_cleanups()
+        except MediaTerminationUnconfirmed as exc:
+            console.print(f"[red]流水线提前停止: MEDIA_TERMINATION_UNCONFIRMED: {exc}[/red]")
+            sys.exit(1)
 
     if args.debug:
         setup_logging(level_override=logging.DEBUG)
@@ -109,24 +118,31 @@ def main():
         db = VlogDatabase()
         try:
             groups = get_date_cam_groups(db, dates=target_dates, cam_index=args.cam)
-            with db._lock:
-                if not args.force_render and any(
-                    db.conn.execute("SELECT 1 FROM render_tasks WHERE date=? AND cam_index=? AND status='COMPLETED'", (d, c)).fetchone()
-                    for d, c in groups
-                ):
-                    parser.error("所选范围包含已交付日期；重析请同时使用 --force-render（尚未重置任何数据）")
-                try:
-                    for d, cam in groups:
-                        db.conn.execute(
-                            """UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL,
-                               analysis_status='PENDING', analysis_segments=NULL, processing_fingerprint=NULL,
-                               retry_count=0, error_msg=NULL WHERE date=? AND cam_index=?""", (d, cam),
-                        )
-                        db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, cam))
-                    db.conn.commit()
-                except BaseException:
-                    db.conn.rollback()
-                    raise
+            from contextlib import ExitStack
+            from src.core.process_lock import workspace_lease, database_day_lease
+            from src.stages import renderer
+            with ExitStack() as ownership:
+                ownership.enter_context(workspace_lease(renderer.TEMP_DIR))
+                for d,cam in sorted(groups):
+                    ownership.enter_context(database_day_lease(db.db_path,d,cam))
+                with db._lock:
+                    if not args.force_render and any(
+                        db.conn.execute("SELECT 1 FROM render_tasks WHERE date=? AND cam_index=? AND status='COMPLETED'", (d, c)).fetchone()
+                        for d, c in groups
+                    ):
+                        parser.error("所选范围包含已交付日期；重析请同时使用 --force-render（尚未重置任何数据）")
+                    try:
+                        for d, cam in groups:
+                            db.conn.execute(
+                                """UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL,
+                                   analysis_status='PENDING', analysis_segments=NULL, processing_fingerprint=NULL,
+                                   retry_count=0, error_msg=NULL WHERE date=? AND cam_index=?""", (d, cam),
+                            )
+                            db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, cam))
+                        db.conn.commit()
+                    except BaseException:
+                        db.conn.rollback()
+                        raise
             console.print(f"[bold cyan]ℹ 已重置所选 {len(groups)} 个日期机位组的分析缓存；人工审核保留。[/bold cyan]")
         finally:
             db.close()
@@ -241,13 +257,18 @@ def main():
                         stopped_reason = "LOW_DISK_SPACE"
                         break
                     t0 = time.monotonic()
-                    ok = process_date_cam(
-                        db, d, cam,
-                        skip_render=skip_render,
-                        dashboard_enabled=dashboard_enabled,
-                        force_render=getattr(args, "force_render", False),
-                        config=config,
-                    )
+                    try:
+                        ok = process_date_cam(
+                            db, d, cam,
+                            skip_render=skip_render,
+                            dashboard_enabled=dashboard_enabled,
+                            force_render=getattr(args, "force_render", False),
+                            config=config,
+                        )
+                    except MediaTerminationUnconfirmed:
+                        logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
+                        ok = False
+                        stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
                     wall_s = time.monotonic() - t0
                     if ok:
                         if already_completed:
@@ -261,7 +282,14 @@ def main():
                     batch_summary_list.append(build_batch_summary_item(
                         db, d, cam, OUTPUT_DIR, config, wall_s, status, skip_render=skip_render,
                     ))
+                    try:
+                        FFmpegProcessRegistry.require_cleanups()
+                    except MediaTerminationUnconfirmed:
+                        logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
+                        stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
                     cleanup_resources()
+                    if stopped_reason:
+                        break
 
                 logging.shutdown()
 
@@ -293,7 +321,6 @@ def main():
             sys.exit(1)
 
     except KeyboardInterrupt:
-        from src.renderer import FFmpegProcessRegistry
         FFmpegProcessRegistry.mark_interrupted()
         FFmpegProcessRegistry.kill_all()
         console.print("\n[bold yellow]⚠ 任务已中断。已终止受管子进程与硬件会话，保留已保存的分析结果和有效批次。下次启动将自动断点续传。[/bold yellow]")

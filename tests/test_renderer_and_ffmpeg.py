@@ -14,6 +14,174 @@ from unittest.mock import patch
 
 import pytest
 
+
+@pytest.mark.parametrize("kind,rate,frame_samples", [
+    ("dense", 48000, 4096), ("legacy", 48000, 137), ("simple", 44100, 4096),
+])
+def test_final_audio_clock_uses_exact_samples_for_long_variable_frames(
+        tmp_path, monkeypatch, kind, rate, frame_samples):
+    import shutil
+    import av
+    import src.stages.timeline as timeline
+    from src.hardware.ffmpeg import run_ffmpeg
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg required for AAC packet clock validation")
+    segments = [timeline.TimelineSegment("source", 0, 0, 10, "NIGHT_STATIONARY", 10),
+                timeline.TimelineSegment("source", 0, 10, 300, "DYNAMIC", 290)]
+    if kind == "simple":
+        segments = [timeline.TimelineSegment("source", 0, 0, 300, "DYNAMIC", 300)]
+    if kind == "legacy":
+        monkeypatch.setattr(timeline, "_single_pass_dense_video", lambda *args, **kwargs: None)
+    graph = timeline.build_concat_filter(
+        segments, [{"filepath": "source", "has_audio": 1}], scale_mode="cpu",
+        audio_sample_rate=rate, simple_dynamic=kind == "simple", speed_ramping=False,
+        config={"presence": {"night_speed_factor": 16}})
+    # Exercise the actual terminal chain with long inputs and differing frame boundaries.
+    audio = graph.rsplit(";", 1)[-1].replace("[a_tmp]", "[0:a]")
+    output = tmp_path / "clock.m4a"
+    result = run_ffmpeg([
+        "-f", "lavfi", "-i", f"sine=sample_rate={rate}:duration=300,asetnsamples=n={frame_samples}:p=0",
+        "-filter_complex", audio, "-map", "[a]", "-c:a", "aac", "-b:a", "96k", str(output),
+    ], timeout=60)
+    assert result.returncode == 0 and not result.timed_out, result.stderr_text[-2000:]
+    with av.open(str(output)) as container:
+        stream = container.streams.audio[0]
+        packets = [p for p in container.demux(stream) if p.size]
+        assert len(packets) > 12000  # Includes long-range clock rounding boundaries.
+        for index, packet in enumerate(packets):
+            assert packet.pts == packet.dts == (index - 1) * 1024
+        assert all(a.pts + a.duration == b.pts for a, b in zip(packets, packets[1:]))
+        assert packets[-1].pts + packets[-1].duration == stream.duration
+
+
+@pytest.mark.parametrize("offset,end", [(0, 45), (.7, 45), (0, 48)])
+def test_single_pass_dense_video_matches_legacy_pixels_pts_and_audio(tmp_path, monkeypatch, offset, end):
+    import shutil
+    import src.stages.timeline as timeline
+    from src.hardware.ffmpeg import run_ffmpeg
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg required for real clock/pixel/audio equivalence")
+    source = tmp_path / "input.mkv"
+    generated = run_ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=128x128:rate=15:duration=45",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=45",
+        "-c:v", "libx264", "-crf", "0", "-c:a", "pcm_s16le", "-shortest", str(source)], timeout=30)
+    assert generated.returncode == 0, generated.stderr_text[-1000:]
+    cfg = {"render": {"speed_ramping_enabled": False}, "presence": {"night_speed_factor": 16},
+           "micro_motion": {"cruise_speed": 16}}
+    intervals = [(0, 7.025, "NIGHT_STATIONARY"), (7.025, 10.275, "DYNAMIC"),
+                 (10.275, 39.333, "MICRO_MOTION"), (39.333, end, "NIGHT_STATIONARY")]
+    segments = [timeline.TimelineSegment(str(source), 0, start, stop, state, stop-start)
+                for start, stop, state in intervals]
+    kwargs = {"rows": [{"filepath": str(source), "has_audio": 1}], "output_fps": 20,
+              "output_width": 64, "output_height": 64, "scale_mode": "cpu", "config": cfg}
+    optimized = timeline.build_concat_filter(segments, **kwargs)
+    with monkeypatch.context() as context:
+        context.setattr(timeline, "_single_pass_dense_video", lambda *args, **kwargs: None)
+        legacy = timeline.build_concat_filter(segments, **kwargs)
+    assert "split=" not in optimized and "split=" in legacy
+    for index, graph in enumerate((legacy, optimized)):
+        script = tmp_path / f"graph{index}.txt"
+        script.write_text(graph, encoding="utf-8")
+        result = run_ffmpeg(["-itsoffset", str(offset), "-i", str(source), "-/filter_complex", str(script),
+            "-map", "[v]", "-c:v", "rawvideo", "-pix_fmt", "yuv420p", "-f", "framemd5", str(tmp_path/f"{index}.frames"),
+            "-map", "[a]", "-c:a", "pcm_s16le", "-f", "hash", "-hash", "sha256", str(tmp_path/f"{index}.audio")], timeout=30)
+        assert result.returncode == 0, result.stderr_text[-1000:]
+    assert (tmp_path/"0.frames").read_bytes() == (tmp_path/"1.frames").read_bytes()
+    assert (tmp_path/"0.audio").read_bytes() == (tmp_path/"1.audio").read_bytes()
+
+
+@pytest.mark.parametrize("unsupported", ["static", "osd", "multiple_files", "subframe", "overlap"])
+def test_single_pass_dense_video_preserves_legacy_for_unsupported_slices(unsupported):
+    import src.stages.timeline as timeline
+    segments = [timeline.TimelineSegment("source.mp4", 0, 0, 10, "NIGHT_STATIONARY", 10),
+                timeline.TimelineSegment("source.mp4", 0, 10, 15, "DYNAMIC", 5)]
+    kwargs = {"rows": [{"filepath": "source.mp4", "has_audio": 0}], "scale_mode": "cpu"}
+    if unsupported == "static":
+        segments[0].state = "STATIC"
+    elif unsupported == "osd":
+        kwargs["timecode_osd"] = True
+    elif unsupported == "multiple_files":
+        segments[1].filepath = "other.mp4"
+        segments[1].input_index = 1
+    elif unsupported == "subframe":
+        segments[0].end_in_file = .025
+        segments[0].duration = .025
+    else:
+        segments[1].start_in_file = 9.5
+    graph = timeline.build_concat_filter(segments, **kwargs)
+    assert "[v_tmp]" in graph  # original paired audio/video concat remains
+
+
+@pytest.mark.parametrize("cache_hit", [False, True])
+def test_batch_inspection_uses_real_cache_decision_without_encoding(tmp_path, monkeypatch, cache_hit):
+    from src.stages import renderer, timeline
+    from src.hardware import render_cache
+    monkeypatch.setattr(renderer, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(render_cache, "reusable", lambda *args, **kwargs: cache_hit)
+    monkeypatch.setattr(renderer.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Inspection launched encoder"))
+    segment = timeline.TimelineSegment(str(tmp_path / "source.mp4"), 0, 0, 120, "STATIC", 120)
+    descriptor = tmp_path / "_edl_batch0_20261012_cam0.ffconcat"
+    descriptor.write_text("preserve an existing task descriptor", encoding="utf-8")
+    reports = []
+    cfg = {"render": {"virtual_concat_enabled": True}}
+    renderer.build_batch_render([segment], 0, "nv", 20, 128, 128, {}, {}, {}, "20261012", 0,
+                                [{"filepath": segment.filepath, "has_audio": 0}], config=cfg,
+                                inspect_only=True, cache_observer=reports.append)
+    assert len(reports) == 1 and reports[0]["cache_hit"] is cache_hit
+    assert len(reports[0]["fingerprint"]) == 64
+    assert reports[0]["expected_duration_s"] > 0
+    assert descriptor.read_text(encoding="utf-8") == "preserve an existing task descriptor"
+    assert not list(tmp_path.glob("*.mp4"))
+
+
+def test_explicit_camera_config_reaches_filter_validation_and_subtitles(tmp_path, monkeypatch):
+    import src.stages.renderer as renderer
+    import src.stages.timeline as timeline
+    cfg = {"output": {"fps": 20}, "presence": {"speed_factor": 8},
+           "render": {"virtual_concat_enabled": False, "virtual_concat_mixed_enabled": False,
+                      "speed_ramping_enabled": False}}
+    segment = timeline.TimelineSegment("source.mp4", 0, 0, 20, "PRESENCE", 20)
+    captured = {}
+    def capture(*args, **kwargs):
+        captured.update(kwargs)
+        captured["filter"] = args[1]
+        return str(tmp_path / "batch.mp4")
+    monkeypatch.setattr(renderer, "_run_batch_render", capture)
+    monkeypatch.setattr(timeline, "load_config", lambda: {"presence": {"speed_factor": 4}})
+    renderer.build_batch_render([segment], 0, "nv", 20, 128, 128, {}, {}, {}, "20260901", 0,
+                                [{"filepath": "source.mp4", "has_audio": 0}], config=cfg)
+    assert captured["config"] is cfg
+    assert captured["expected_duration"] == 2.5
+    assert "end_frame=50" in captured["filter"]
+    srt = timeline.generate_timecode_subtitles([segment], config=cfg)
+    assert "00:00:02,500" in srt
+    assert "00:00:05,000" not in srt
+
+
+def test_virtual_batch_unconfirmed_stop_preserves_inputs_and_never_falls_back(tmp_path, monkeypatch):
+    import src.stages.renderer as renderer
+    from src.stages.timeline import TimelineSegment
+    monkeypatch.setattr(renderer,'TEMP_DIR',tmp_path)
+    source=tmp_path/'source.mp4';source.write_bytes(b'original preserved')
+    staged=tmp_path/'staged.mp4';staged.write_bytes(b'staged reader input')
+    monkeypatch.setattr(renderer,'_stage_source_for_render',lambda *a,**k: staged)
+    calls=[]
+    def fail(*args,**kwargs):
+        calls.append(args)
+        assert kwargs['prepare_input']()
+        raise renderer.RenderTerminationUnconfirmed('retained virtual reader')
+    monkeypatch.setattr(renderer,'_run_batch_render',fail)
+    segment=TimelineSegment(str(source),0,0,60,'STATIC',60)
+    cfg={'render':{'virtual_concat_enabled':True,'local_staging_enabled':True}}
+    with pytest.raises(renderer.RenderTerminationUnconfirmed,match='retained virtual reader'):
+        renderer.build_batch_render([segment],0,'nv',20,128,128,{}, {}, {},'20260901',0,
+            [{'filepath':str(source),'has_audio':0}],config=cfg)
+    assert len(calls)==1
+    assert source.read_bytes()==b'original preserved'
+    assert staged.read_bytes()==b'staged reader input'
+    assert (tmp_path/'_edl_batch0_20260901_cam0.ffconcat').exists()
+
 from src.renderer import (
     FFmpegProcessRegistry,
     _startup_watchdog_timeout,
@@ -723,3 +891,1379 @@ class TestBuildEncArgs:
         qsv_args = _build_enc_args("qsv", out_cfg)
         assert qsv_args[qsv_args.index("-g") + 1] == "120"
         assert qsv_args[qsv_args.index("-look_ahead_depth") + 1] == "32"
+
+
+
+def test_delivery_mapping_covers_all_states_on_integer_batch_clock():
+    from src.stages.companion import build_delivery_mapping
+    from src.stages.timeline import TimelineSegment, compute_display_plans, display_plan_options
+    timeline = [TimelineSegment("same.mp4",0,start,start+duration,state,duration) for start,duration,state in
+                [(0,3,"DYNAMIC"),(3,10,"PRESENCE"),(13,40,"STATIC"),(53,10,"MICRO_MOTION"),(63,10,"NIGHT_STATIONARY")]]
+    config = {"output":{"fps":20},"render":{"batch_max_files":1}}
+    mapping = build_delivery_mapping(timeline,config)
+    expected = sum(round(duration*20) for duration,_ in compute_display_plans(timeline,**display_plan_options(config)))
+    assert mapping["planned_frames"] == expected
+    assert len(mapping["segments"]) == 5
+    assert mapping["segments"][0]["output_start_frame"] == 0
+    assert mapping["segments"][-1]["output_end_frame"] == expected
+    assert all(a["output_end_frame"] == b["output_start_frame"] for a,b in zip(mapping["segments"],mapping["segments"][1:]))
+    assert [item.state for item in timeline] == ["DYNAMIC","PRESENCE","STATIC","MICRO_MOTION","NIGHT_STATIONARY"]
+
+
+@pytest.mark.parametrize("case,available", [
+    ("nominal", True), ("average_rate_drift", True), ("b_frame_order", True),
+    ("wrong_frames", False), ("missing_pts", False), ("interior_gap", False),
+    ("duplicate_pts", False), ("missing_packet", False), ("extra_packet", False),
+    ("late_origin", False), ("changed_media", False), ("io_denied", False),
+])
+def test_delivery_mapping_verifies_packet_clock(tmp_path, monkeypatch, case, available):
+    from fractions import Fraction
+    from types import SimpleNamespace
+    import threading
+    import av
+    import src.hardware.scheduler as scheduler
+    from src.stages.companion import bind_delivery_mapping
+    from src.stages.timeline import TimelineSegment
+
+    movie = tmp_path / "movie.mp4"
+    movie.write_bytes(b"unchanged")
+    timeline = [TimelineSegment("source.mp4", 0, 0, 3.05, "DYNAMIC", 3.05)]
+    config = {"output": {"fps": 20}, "render": {"batch_max_files": 1},
+              "segment": {"dynamic_speed": 1}}
+    frames = 61
+    stream = SimpleNamespace(frames=frames, average_rate=Fraction(20), time_base=Fraction(1, 10240))
+    timestamps = [215 + index * 512 for index in range(frames)]
+    if case == "average_rate_drift":
+        stream.average_rate = Fraction(frames * 20, frames - 1)
+    elif case == "b_frame_order":
+        timestamps[1:4] = [timestamps[3], timestamps[1], timestamps[2]]
+    elif case == "wrong_frames":
+        stream.frames -= 1
+    elif case == "missing_pts":
+        timestamps[20] = None
+    elif case == "interior_gap":
+        timestamps[20] += 256  # Same average rate and endpoints, invalid interior clock.
+    elif case == "duplicate_pts":
+        timestamps[20] = timestamps[19]
+    elif case == "missing_packet":
+        timestamps.pop()
+    elif case == "extra_packet":
+        timestamps.append(timestamps[-1] + 512)
+    elif case == "late_origin":
+        timestamps = [pts + 1024 for pts in timestamps]
+
+    class Container:
+        streams = SimpleNamespace(video=[stream])
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def demux(self, selected):
+            assert selected is stream
+            for pts in timestamps:
+                yield SimpleNamespace(size=10, pts=pts)
+            yield SimpleNamespace(size=0, pts=None)
+            if case == "changed_media":
+                movie.write_bytes(b"changed size")
+
+    budget = threading.BoundedSemaphore(1)
+    if case == "io_denied":
+        budget.acquire()
+        monkeypatch.setattr(scheduler, "acquire_with_retry", lambda *args, **kwargs: False)
+    monkeypatch.setattr(scheduler, "get_disk_semaphore", lambda: budget)
+    monkeypatch.setattr(av, "open", lambda *args, **kwargs: Container())
+    result = bind_delivery_mapping(movie, timeline, config)
+    assert (result["status"] == "AVAILABLE") is available, result
+    if available:
+        assert result["planned_frames"] == frames
+        assert result["media_identity"]["fps"] == result["fps"] == 20
+        assert result["clock_validation"]["packets"] == frames
+    else:
+        assert result["reason"]
+    if case == "io_denied":
+        assert not budget.acquire(blocking=False)
+        budget.release()
+    assert budget.acquire(blocking=False), "I/O lease was not returned after verification"
+    budget.release()
+@pytest.mark.parametrize("io_timeout", [None, .05])
+def test_managed_ffmpeg_admission_options_preserve_defaults(monkeypatch, io_timeout):
+    from src.hardware import ffmpeg, scheduler
+    calls = []
+    monkeypatch.setattr(scheduler, "get_disk_semaphore", lambda: object())
+    def denied(semaphore, **kwargs):
+        calls.append(kwargs)
+        return False
+    monkeypatch.setattr(scheduler, "acquire_with_retry", denied)
+    monkeypatch.setattr(ffmpeg.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Admission denial spawned FFmpeg"))
+    result = ffmpeg.run_ffmpeg(["-version"], io_timeout=io_timeout)
+    assert result.returncode != 0
+    assert calls == ([{}] if io_timeout is None else [{"timeout": .05, "retries": 1}])
+
+
+@pytest.mark.parametrize("io_timeout", [0, -1, float("nan"), float("inf")])
+def test_managed_ffmpeg_rejects_invalid_admission_timeout(io_timeout):
+    from src.hardware.ffmpeg import run_ffmpeg
+    with pytest.raises(ValueError, match="finite and positive"):
+        run_ffmpeg(["-version"], io_timeout=io_timeout)
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows owned process Job')
+@pytest.mark.parametrize('failure',['create','assign'])
+def test_registry_ownership_failure_stops_new_process(monkeypatch,failure):
+    import sys
+    from src.hardware import ffmpeg
+    class FailedJob:
+        def __init__(self):
+            if failure=='create':raise OSError('Controlled Job creation failure')
+        def assign(self,proc):raise OSError('Controlled Job assignment failure')
+        def close(self):pass
+    monkeypatch.setattr(ffmpeg,'OwnedProcessJob',FailedJob)
+    proc=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+    try:
+        with pytest.raises(OSError,match='Controlled Job'):
+            ffmpeg.FFmpegProcessRegistry.register('ownership_failure',proc)
+        assert proc.poll() is not None
+        assert 'ownership_failure' not in ffmpeg.FFmpegProcessRegistry._processes
+        assert 'ownership_failure' not in ffmpeg.FFmpegProcessRegistry._jobs
+    finally:
+        if proc.poll() is None:proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_registry_duplicate_does_not_replace_owned_process():
+    import sys
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    first=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+    second=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+    FFmpegProcessRegistry.reset_interrupted()
+    try:
+        FFmpegProcessRegistry.register('same_key',first)
+        FFmpegProcessRegistry.register('same_key',first)  # Idempotent same instance.
+        with pytest.raises(RuntimeError,match='already owned'):
+            FFmpegProcessRegistry.register('same_key',second)
+        assert first.poll() is None and second.poll() is not None
+        assert FFmpegProcessRegistry._processes['same_key'] is first
+    finally:
+        FFmpegProcessRegistry.deregister('same_key')
+        for proc in (first,second):
+            if proc.poll() is None:proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_registry_deregister_relinquishes_live_process_without_killing():
+    import sys
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    proc=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+    try:
+        FFmpegProcessRegistry.register('detach_live',proc)
+        FFmpegProcessRegistry.deregister('detach_live')
+        assert proc.poll() is None
+        assert 'detach_live' not in FFmpegProcessRegistry._jobs
+        assert 'detach_live' not in FFmpegProcessRegistry._processes
+    finally:
+        if proc.poll() is None:proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_registry_failed_job_close_keeps_diagnosable_ownership(monkeypatch):
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    class Process:
+        def kill(self):pass
+    class Job:
+        def close(self):raise OSError('controlled close failure')
+    proc,job=Process(),Job()
+    monkeypatch.setattr(FFmpegProcessRegistry,'_processes',{'failed_close':proc})
+    monkeypatch.setattr(FFmpegProcessRegistry,'_jobs',{'failed_close':job})
+    FFmpegProcessRegistry.kill_all()
+    assert FFmpegProcessRegistry._processes['failed_close'] is proc
+    assert FFmpegProcessRegistry._jobs['failed_close'] is job
+    FFmpegProcessRegistry.reset_interrupted()
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows registered FFmpeg ownership')
+@pytest.mark.parametrize('detach',[False,True,'before_registration'])
+def test_registry_parent_death_terminates_only_registered_ffmpeg(tmp_path,detach):
+    import _winapi
+    import json
+    import os
+    import shutil
+    import sys
+    from src.core.visual_index import reader_process_state
+    if not shutil.which('ffmpeg'):pytest.skip('FFmpeg required')
+    record=tmp_path/'registered.json'
+    program=r'''
+import json,subprocess,sys,time
+from pathlib import Path
+from src.hardware.ffmpeg import FFmpegProcessRegistry
+from src.core.visual_index import reader_process_state
+if sys.argv[2]=='before_registration':
+    def pause_before_registration(key,child):
+        Path(sys.argv[1]).write_text(json.dumps(reader_process_state(child.pid,handle=child._handle)))
+        time.sleep(30)
+    FFmpegProcessRegistry.register=pause_before_registration
+p=FFmpegProcessRegistry.start('parent_test',['ffmpeg','-nostdin','-loglevel','error','-re','-f','lavfi','-i','testsrc2=size=64x64:rate=2','-t','30','-f','null','-'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+if sys.argv[2]=='detach':FFmpegProcessRegistry.deregister('parent_test')
+Path(sys.argv[1]).write_text(json.dumps(reader_process_state(p.pid,handle=p._handle)))
+time.sleep(30)
+'''
+    env=os.environ.copy();env['PYTHONPATH']=str(Path(__file__).resolve().parents[1])
+    independent=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])
+    mode='before_registration' if detach=='before_registration' else ('detach' if detach else 'registered')
+    parent=subprocess.Popen([sys.executable,'-c',program,str(record),mode],env=env)
+    handle=None
+    try:
+        deadline=time.monotonic()+5
+        while not record.exists() and parent.poll() is None and time.monotonic()<deadline:time.sleep(.02)
+        assert record.exists()
+        child=json.loads(record.read_text());handle=_winapi.OpenProcess(0x101001,False,child['pid'])
+        assert reader_process_state(child['pid'],handle=handle)['created']==child['created']
+        parent.kill();parent.wait(timeout=5)
+        result=_winapi.WaitForSingleObject(handle,300 if detach is True else 5000)
+        assert result==(_winapi.WAIT_TIMEOUT if detach is True else _winapi.WAIT_OBJECT_0)
+        assert independent.poll() is None
+    finally:
+        if parent.poll() is None:parent.kill()
+        parent.wait(timeout=5)
+        if handle is not None:
+            if _winapi.WaitForSingleObject(handle,0)!=_winapi.WAIT_OBJECT_0:_winapi.TerminateProcess(handle,1)
+            assert _winapi.WaitForSingleObject(handle,5000)==_winapi.WAIT_OBJECT_0
+            _winapi.CloseHandle(handle)
+        independent.kill();independent.wait(timeout=5)
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows creation-time Job ownership')
+@pytest.mark.parametrize('merged',[False,True])
+def test_owned_start_preserves_popen_streams_and_single_job(tmp_path,merged):
+    import os
+    import sys
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    FFmpegProcessRegistry.reset_interrupted()
+    env=os.environ.copy();env['HOMEVLOG_OWNED_TEST']='测试'
+    proc=FFmpegProcessRegistry.start('owned_stdio',[sys.executable,'-c',
+        "import sys,os,json;print(json.dumps([os.getcwd(),os.environ['HOMEVLOG_OWNED_TEST']]));print('stderr',file=sys.stderr)"],
+        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT if merged else subprocess.PIPE,cwd=tmp_path,env=env)
+    try:
+        assert FFmpegProcessRegistry._jobs['owned_stdio'] is proc.owned_job
+        out,err=proc.communicate(timeout=5)
+        assert proc.returncode==0 and b'stderr' in (out if merged else err)
+        assert str(tmp_path).replace('\\','\\\\').encode() in out and b'\\u6d4b\\u8bd5' in out
+    finally:
+        if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+        FFmpegProcessRegistry.deregister('owned_stdio')
+    assert 'owned_stdio' not in FFmpegProcessRegistry._jobs
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows creation-time Job ownership')
+def test_owned_start_job_creation_failure_preserves_registry(tmp_path,monkeypatch):
+    from src.hardware import ffmpeg
+    jobs=[]
+    class FailedJob(ffmpeg.OwnedProcessJob):
+        def __init__(self):super().__init__();jobs.append(self)
+        def create_process(self,*args,**kwargs):raise OSError('Controlled native creation failure')
+    monkeypatch.setattr(ffmpeg,'OwnedProcessJob',FailedJob)
+    with pytest.raises(OSError,match='Controlled native creation'):
+        ffmpeg.FFmpegProcessRegistry.start('native_failure',['missing'],stdout=subprocess.PIPE)
+    assert jobs and jobs[0].handle is None
+    assert 'native_failure' not in ffmpeg.FFmpegProcessRegistry._processes
+    assert 'native_failure' not in ffmpeg.FFmpegProcessRegistry._jobs
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows creation-time Job ownership')
+def test_owned_start_registration_failure_stops_created_child(monkeypatch):
+    import sys
+    from src.hardware import ffmpeg
+    children=[]
+    class RecordingPopen(ffmpeg._OwnedFFmpegPopen):
+        def __init__(self,*args,**kwargs):super().__init__(*args,**kwargs);children.append(self)
+    monkeypatch.setattr(ffmpeg,'_OwnedFFmpegPopen',RecordingPopen)
+    def refuse(*args):raise RuntimeError('Controlled registry refusal')
+    monkeypatch.setattr(ffmpeg.FFmpegProcessRegistry,'register',refuse)
+    with pytest.raises(RuntimeError,match='registry refusal'):
+        ffmpeg.FFmpegProcessRegistry.start('refused',[sys.executable,'-c','import time;time.sleep(30)'])
+    assert len(children)==1 and children[0].poll() is not None
+    assert children[0].owned_job.handle is None
+
+
+@pytest.mark.skipif(__import__('os').name!='nt',reason='Windows creation-time Job ownership')
+def test_owned_start_cancel_and_detach_reregister_contract():
+    import sys
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+    FFmpegProcessRegistry.reset_interrupted()
+    proc=FFmpegProcessRegistry.start('owned_detach',[sys.executable,'-c','import time;time.sleep(30)'])
+    try:
+        FFmpegProcessRegistry.deregister('owned_detach')
+        assert proc.poll() is None and proc.owned_job.handle is None
+        FFmpegProcessRegistry.register('owned_detach',proc)
+        assert FFmpegProcessRegistry._jobs['owned_detach'].handle
+        FFmpegProcessRegistry.kill_all()
+        proc.wait(timeout=5)
+        assert proc.poll() is not None
+        interrupted=FFmpegProcessRegistry.start('already_cancelled',[sys.executable,'-c','import time;time.sleep(30)'])
+        try:interrupted.wait(timeout=5);assert interrupted.poll() is not None
+        finally:FFmpegProcessRegistry.deregister('already_cancelled')
+    finally:
+        if proc.poll() is None:proc.kill();proc.wait(timeout=5)
+        FFmpegProcessRegistry.deregister('owned_detach')
+        FFmpegProcessRegistry.reset_interrupted()
+
+
+@pytest.mark.parametrize('outcome', ['success', 'nonzero', 'empty', 'invalid', 'timeout', 'cancel', 'spawn'])
+def test_metadata_probe_lifecycle_and_existing_results(monkeypatch, outcome):
+    import subprocess
+    from unittest.mock import MagicMock
+    from src.hardware import ffmpeg, scheduler
+    registry = ffmpeg.FFmpegProcessRegistry
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    semaphore = MagicMock()
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: semaphore)
+    monkeypatch.setattr(scheduler, 'acquire_with_retry', lambda sem: True)
+    process = MagicMock()
+    process.__enter__.return_value = process
+    process.poll.return_value = None
+    process.returncode = 1 if outcome == 'nonzero' else 0
+
+    def communicate(*args, timeout=None):
+        assert process in registry._processes.values(), 'metadata reader bypassed lifecycle registry'
+        if outcome == 'timeout' and process.communicate.call_count == 1:
+            raise subprocess.TimeoutExpired('ffprobe', timeout, output=b'partial')
+        if outcome == 'cancel':
+            registry.kill_all()
+            process.returncode = -9
+        process.poll.return_value = process.returncode
+        output = {'empty': b'', 'invalid': b'{broken'}.get(outcome, b'{"format":{"duration":"2.0"}}')
+        return output, b''
+
+    process.communicate.side_effect = communicate
+    if outcome == 'spawn':
+        monkeypatch.setattr(ffmpeg.subprocess, 'Popen', MagicMock(side_effect=OSError('missing ffprobe')))
+    else:
+        monkeypatch.setattr(ffmpeg.subprocess, 'Popen', MagicMock(return_value=process))
+    try:
+        if outcome in ('timeout', 'spawn'):
+            with pytest.raises(subprocess.TimeoutExpired if outcome == 'timeout' else OSError):
+                ffmpeg.run_ffprobe('isolated.mp4', timeout=.2)
+        else:
+            result = ffmpeg.run_ffprobe('isolated.mp4', timeout=.2)
+            assert result == ({'format': {'duration': '2.0'}} if outcome == 'success' else None)
+        assert not registry._processes and not registry._jobs
+        semaphore.release.assert_called_once_with()
+        if outcome in ('timeout', 'cancel'):
+            process.kill.assert_called()
+    finally:
+        registry.reset_interrupted()
+
+
+def test_metadata_probe_admission_failure_does_not_spawn(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware import ffmpeg, scheduler
+    semaphore = MagicMock()
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: semaphore)
+    monkeypatch.setattr(scheduler, 'acquire_with_retry', lambda sem: False)
+    spawn = MagicMock()
+    monkeypatch.setattr(ffmpeg.subprocess, 'Popen', spawn)
+    assert ffmpeg.run_ffprobe('unread.mp4') is None
+    spawn.assert_not_called()
+    semaphore.release.assert_not_called()
+
+
+def test_metadata_probe_unconfirmed_stop_retains_reader_and_permit(monkeypatch):
+    import subprocess
+    from unittest.mock import MagicMock
+    from src.hardware import ffmpeg, scheduler
+    registry = ffmpeg.FFmpegProcessRegistry
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    semaphore, process = MagicMock(), MagicMock()
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: semaphore)
+    monkeypatch.setattr(scheduler, 'acquire_with_retry', lambda sem: True)
+    monkeypatch.setattr(ffmpeg.subprocess, 'Popen', MagicMock(return_value=process))
+    process.poll.return_value = None
+    process.communicate.side_effect = subprocess.TimeoutExpired('ffprobe', .1)
+    process.wait.side_effect = subprocess.TimeoutExpired('ffprobe cleanup', 5)
+    with pytest.raises(ffmpeg.MediaTerminationUnconfirmed, match='cleanup'):
+        ffmpeg.run_ffprobe('controlled.mp4', .1)
+    assert process in registry._processes.values()
+    semaphore.release.assert_not_called()
+    process.stdout.close.assert_not_called()
+
+
+def test_metadata_probe_real_local_duration_and_invalid_file(tmp_path):
+    import shutil
+    import wave
+    from src.hardware.ffmpeg import FFmpegProcessRegistry, get_duration, run_ffprobe
+    if not shutil.which('ffprobe'):
+        pytest.skip('ffprobe required')
+    source = tmp_path / 'one_second.wav'
+    with wave.open(str(source), 'wb') as output:
+        output.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+        output.writeframes(b'\0\0' * 8000)
+    assert run_ffprobe(str(source), 5)['streams'][0]['codec_name'] == 'pcm_s16le'
+    assert get_duration(str(source)) == pytest.approx(1.0)
+    assert run_ffprobe(str(tmp_path / 'missing.mp4'), 5) is None
+    assert not FFmpegProcessRegistry._processes and not FFmpegProcessRegistry._jobs
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_metadata_probe_real_stalled_network_timeout_or_cancel(cancel):
+    import shutil
+    import socket
+    import subprocess
+    import threading
+    from src.hardware.ffmpeg import FFmpegProcessRegistry, run_ffprobe
+    from src.hardware.scheduler import get_disk_semaphore
+    if not shutil.which('ffprobe'):
+        pytest.skip('ffprobe required')
+    results, errors = [], []
+    semaphore = get_disk_semaphore()
+    available = semaphore.available
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)  # HTTP peer accepts TCP but never sends a response.
+        def probe():
+            try:
+                results.append(run_ffprobe(f'http://127.0.0.1:{listener.getsockname()[1]}/blocked', 5 if cancel else .3))
+            except BaseException as error:
+                errors.append(error)
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        child = None
+        try:
+            deadline = time.monotonic() + 3
+            while child is None and worker.is_alive() and time.monotonic() < deadline:
+                with FFmpegProcessRegistry._lock:
+                    child = next(iter(FFmpegProcessRegistry._processes.values()), None)
+                time.sleep(.01)
+            assert child is not None
+            if cancel:
+                FFmpegProcessRegistry.kill_all()
+            worker.join(timeout=6)
+            assert not worker.is_alive()
+            assert child.poll() is not None
+            assert (results == [None] and not errors) if cancel else (
+                not results and len(errors) == 1 and isinstance(errors[0], subprocess.TimeoutExpired))
+            assert not FFmpegProcessRegistry._processes and not FFmpegProcessRegistry._jobs
+            assert semaphore.available == available
+        finally:
+            if worker.is_alive():
+                FFmpegProcessRegistry.kill_all()
+                worker.join(timeout=6)
+            FFmpegProcessRegistry.reset_interrupted()
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows ffprobe creation-time ownership')
+@pytest.mark.parametrize('before_registration', [False, True])
+def test_metadata_probe_parent_death_stops_reader(tmp_path, before_registration):
+    import _winapi
+    import json
+    import os
+    import shutil
+    import socket
+    import sys
+    from src.core.visual_index import reader_process_state
+    if not shutil.which('ffprobe'):
+        pytest.skip('ffprobe required')
+    record = tmp_path / 'probe_identity.json'
+    program = r'''
+import json,sys,time
+from pathlib import Path
+from src.hardware.ffmpeg import FFmpegProcessRegistry,run_ffprobe
+from src.core.visual_index import reader_process_state
+register=FFmpegProcessRegistry.register
+def pause(key,child):
+    if sys.argv[3]=='after':register(key,child)
+    Path(sys.argv[1]).write_text(json.dumps(reader_process_state(child.pid,handle=child._handle)))
+    time.sleep(30)
+FFmpegProcessRegistry.register=pause
+run_ffprobe(sys.argv[2],30)
+'''
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1])
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        independent = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'])
+        parent = subprocess.Popen([sys.executable, '-c', program, str(record),
+                                   f'http://127.0.0.1:{listener.getsockname()[1]}/blocked',
+                                   'before' if before_registration else 'after'], env=env)
+        handle = None
+        try:
+            deadline = time.monotonic() + 5
+            while not record.exists() and parent.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert record.exists()
+            identity = json.loads(record.read_text())
+            handle = _winapi.OpenProcess(0x101001, False, identity['pid'])
+            state = reader_process_state(identity['pid'], handle=handle)
+            assert state['created'] == identity['created'] and not state['kernel_ended']
+            parent.kill()
+            parent.wait(timeout=5)
+            assert _winapi.WaitForSingleObject(handle, 5000) == _winapi.WAIT_OBJECT_0
+            assert independent.poll() is None
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=5)
+            if handle is not None:
+                if _winapi.WaitForSingleObject(handle, 0) != _winapi.WAIT_OBJECT_0:
+                    _winapi.TerminateProcess(handle, 1)
+                assert _winapi.WaitForSingleObject(handle, 5000) == _winapi.WAIT_OBJECT_0
+                _winapi.CloseHandle(handle)
+            independent.kill()
+            independent.wait(timeout=5)
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows owned descendants')
+@pytest.mark.parametrize('mode', ['capture', 'stream', 'probe', 'probe_dead_parent'])
+def test_managed_timeout_stops_descendant_pipe_owner(tmp_path, monkeypatch, mode):
+    import json
+    import sys
+    from src.hardware import ffmpeg
+    from src.core.visual_index import reader_process_state
+    registry = ffmpeg.FFmpegProcessRegistry
+    original_start = registry.start
+    record = tmp_path / 'descendant.json'
+    program = r'''
+import json,subprocess,sys,time
+from pathlib import Path
+from src.core.visual_index import reader_process_state
+child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(4)'])
+Path(sys.argv[1]).write_text(json.dumps(reader_process_state(child.pid,handle=child._handle)))
+if sys.argv[2]!='dead':time.sleep(30)
+'''
+    def start(key, command, **kwargs):
+        return original_start(key, [sys.executable, '-c', program, str(record),
+                                   'dead' if mode == 'probe_dead_parent' else 'alive'], **kwargs)
+    monkeypatch.setattr(registry, 'start', start)
+    independent = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'])
+    try:
+        began = time.monotonic()
+        if mode.startswith('probe'):
+            with pytest.raises(subprocess.TimeoutExpired):
+                ffmpeg.run_ffprobe('controlled.mp4', timeout=.8)
+        else:
+            result = ffmpeg.run_ffmpeg([], timeout=.8, stdout_consumer=(lambda block: None) if mode == 'stream' else None)
+        elapsed = time.monotonic() - began
+        assert record.exists()
+        identity = json.loads(record.read_text())
+        state = reader_process_state(identity['pid'])
+        assert state.get('missing') or state.get('kernel_ended') or state.get('created') != identity['created']
+        if not mode.startswith('probe'):
+            assert result.timed_out and result.returncode == -9
+        assert elapsed < 2.5, f'Timeout waited for descendant natural exit: {elapsed:.3f}s'
+        assert independent.poll() is None
+        assert not registry._processes and not registry._jobs
+    finally:
+        registry.kill_all()
+        registry.reset_interrupted()
+        independent.kill()
+        independent.wait(timeout=5)
+
+
+def test_streaming_cleanup_error_still_checks_reader_before_release(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware import ffmpeg, scheduler
+    registry = ffmpeg.FFmpegProcessRegistry
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    process, permit, reader, timer = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    process._handle = None
+    process.stdout_thread = process.stderr_thread = None
+    process.stdout.read.return_value = b''
+    process.poll.return_value = None
+    process.wait.side_effect = OSError('controlled execution wait error')
+    reader.is_alive.return_value = True
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: permit)
+    monkeypatch.setattr(scheduler, 'acquire_with_retry', lambda sem: True)
+    monkeypatch.setattr(ffmpeg.subprocess, 'Popen', MagicMock(return_value=process))
+    terminate = MagicMock(side_effect=[OSError('first cleanup failed'), None])
+    monkeypatch.setattr(registry, 'terminate', terminate)
+    monkeypatch.setattr(registry, 'wait_for_exit', MagicMock())
+    class ControlledReader:
+        def __new__(cls, *args, **kwargs):
+            return reader
+    with patch('threading.Thread', ControlledReader), patch('threading.Timer', return_value=timer):
+        with pytest.raises(ffmpeg.MediaTerminationUnconfirmed):
+            ffmpeg.run_ffmpeg([], timeout=1, stdout_consumer=lambda block: None)
+    assert terminate.call_count == 2
+    reader.join.assert_called_once_with(timeout=5)
+    permit.release.assert_not_called()
+    item = next(iter(registry._deferred.values()))
+    assert item['proc'] is process and item['io_sem'] is permit and reader in item['readers']
+    reader.is_alive.return_value = False
+    process.poll.return_value = 0
+    assert len(registry.reap_cleanups()['recovered']) == 1
+    permit.release.assert_called_once()
+    assert not registry.reap_cleanups()['recovered']
+
+
+def test_managed_pipe_cleanup_failure_keeps_registry_and_permit(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware import ffmpeg, scheduler
+    registry = ffmpeg.FFmpegProcessRegistry
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    semaphore, process = MagicMock(), MagicMock()
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: semaphore)
+    monkeypatch.setattr(scheduler, 'acquire_with_retry', lambda sem: True)
+    monkeypatch.setattr(ffmpeg.subprocess, 'Popen', MagicMock(return_value=process))
+    process.poll.return_value = None
+    process.communicate.side_effect = [subprocess.TimeoutExpired('ffmpeg', .1),
+                                       subprocess.TimeoutExpired('pipe cleanup', 5)]
+    with pytest.raises(ffmpeg.MediaTerminationUnconfirmed, match='pipe cleanup'):
+        ffmpeg.run_ffmpeg([], .1)
+    assert process in registry._processes.values()
+    assert process.communicate.call_args.kwargs['timeout'] == 5
+    semaphore.release.assert_not_called()
+    assert next(iter(registry._deferred.values()))['io_sem'] is semaphore
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows per-key Job termination')
+def test_registry_terminate_preserves_unrelated_registered_task():
+    import sys
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    first = registry.start('terminate_first', [sys.executable, '-c', 'import time;time.sleep(30)'])
+    second = registry.start('keep_second', [sys.executable, '-c', 'import time;time.sleep(30)'])
+    try:
+        registry.terminate('terminate_first')
+        first.wait(timeout=5)
+        assert first.poll() is not None and second.poll() is None
+        assert not registry.is_interrupted()
+        assert registry._processes['terminate_first'] is first
+        assert registry._processes['keep_second'] is second
+        assert registry._jobs['keep_second'].handle
+    finally:
+        for key, child in [('terminate_first', first), ('keep_second', second)]:
+            registry.terminate(key)
+            child.wait(timeout=5)
+            registry.deregister(key)
+
+
+def test_registry_terminate_failed_job_close_retains_ownership(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    process, job = MagicMock(), MagicMock()
+    job.close.side_effect = OSError('controlled Job close failure')
+    monkeypatch.setattr(registry, '_processes', {'failure': process})
+    monkeypatch.setattr(registry, '_jobs', {'failure': job})
+    with pytest.raises(OSError, match='Job close failure'):
+        registry.terminate('failure')
+    assert registry._processes['failure'] is process and registry._jobs['failure'] is job
+    assert not registry.is_interrupted()
+
+
+@pytest.mark.parametrize('pending_reason', ['process', 'reader', 'job', 'ready', 'close_failure', 'release_failure'])
+def test_deferred_cleanup_requires_all_terminal_evidence(monkeypatch, pending_reason):
+    from unittest.mock import MagicMock
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    process, permit, reader, job = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    process.poll.return_value = None if pending_reason == 'process' else 0
+    reader.is_alive.return_value = pending_reason == 'reader'
+    job.handle = 123 if pending_reason == 'job' else None
+    if pending_reason == 'close_failure':
+        process.stdout.close.side_effect = OSError('controlled pipe close failure')
+    if pending_reason == 'release_failure':
+        permit.release.side_effect = ValueError('controlled permit release failure')
+    monkeypatch.setattr(registry, '_processes', {'deferred': process})
+    monkeypatch.setattr(registry, '_jobs', {'deferred': job})
+    monkeypatch.setattr(registry, '_deferred', {})
+    registry.defer_cleanup('deferred', process, permit, [reader])
+    registry.defer_cleanup('deferred', process, permit, [reader])
+    if pending_reason == 'ready':
+        assert registry.reap_cleanups() == {'recovered': ['deferred'], 'pending': []}
+        assert registry.reap_cleanups() == {'recovered': [], 'pending': []}
+        permit.release.assert_called_once_with()
+        assert not registry._processes and not registry._jobs
+    else:
+        assert registry.reap_cleanups() == {'recovered': [], 'pending': ['deferred']}
+        assert registry._processes['deferred'] is process
+        if pending_reason != 'release_failure':
+            permit.release.assert_not_called()
+        with pytest.raises(RuntimeError, match='still deferred'):
+            registry.deregister('deferred')
+    assert not registry.is_interrupted()
+
+
+def test_deferred_cleanup_identity_conflict_and_concurrent_recovery(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import MagicMock
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    process, permit = MagicMock(), MagicMock()
+    process.poll.return_value = 0
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    registry.defer_cleanup('once', process, permit)
+    with pytest.raises(RuntimeError, match='identity conflict'):
+        registry.defer_cleanup('once', process, MagicMock())
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        reports = list(pool.map(lambda _: registry.reap_cleanups(), range(4)))
+    assert sum(len(x['recovered']) for x in reports) == 1
+    permit.release.assert_called_once_with()
+    assert not registry._deferred
+
+
+def test_deferred_cleanup_survives_global_cancel_and_reset(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    process, permit = MagicMock(), MagicMock()
+    process.poll.return_value = None
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    registry.defer_cleanup('pending', process, permit)
+    registry.kill_all()
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+        registry.reset_interrupted()
+    assert registry.is_interrupted()
+    assert registry._processes['pending'] is process
+    assert registry.reap_cleanups()['pending'] == ['pending']
+    permit.release.assert_not_called()
+    process.poll.return_value = 0
+    assert registry.reap_cleanups()['recovered'] == ['pending']
+    permit.release.assert_called_once_with()
+    registry.reset_interrupted()
+    assert not registry.is_interrupted()
+    permit.release.assert_called_once_with()
+
+
+def test_cancellation_reset_refuses_an_unresolved_start_claim(monkeypatch):
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    monkeypatch.setattr(registry, '_starting', {'old-start': {'proc': None}})
+    with pytest.raises(MediaTerminationUnconfirmed, match='old-start'):
+        registry.reset_interrupted()
+    assert registry.is_interrupted() and 'old-start' in registry._starting
+    registry._starting.clear()
+    registry.require_cleanups()
+    assert registry.is_interrupted()  # A read-only admission check never resumes cancellation.
+    registry.reset_interrupted()
+    assert not registry.is_interrupted()
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows actual deferred readers')
+def test_deferred_cleanup_real_reader_recovers_on_next_probe(tmp_path, monkeypatch):
+    import _winapi
+    import shutil
+    import sys
+    from src.hardware import ffmpeg, scheduler
+    if not shutil.which('ffprobe'):
+        pytest.skip('ffprobe required')
+    registry = ffmpeg.FFmpegProcessRegistry
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    original_start, original_terminate = registry.start, registry.terminate
+    disk = scheduler.get_disk_semaphore()
+    available = disk.available
+    children = []
+    def start(key, command, **kwargs):
+        child = original_start(key, [sys.executable, '-c', 'import time;time.sleep(30)'], **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(registry, 'start', start)
+    monkeypatch.setattr(registry, 'terminate', lambda key: (_ for _ in ()).throw(OSError('controlled stop failure')))
+    key = None
+    try:
+        with pytest.raises(ffmpeg.MediaTerminationUnconfirmed, match='cleanup') as raised:
+            ffmpeg.run_ffprobe('controlled.mp4', .15)
+        assert isinstance(raised.value.__cause__, OSError)
+        key = next(iter(registry._deferred))
+        child = children[0]
+        pending = registry._deferred[key]
+        assert child.poll() is None and pending['io_sem'] is disk
+        assert len(pending['readers']) == 2
+        assert disk.available == available - 1
+        assert registry.reap_cleanups()['pending'] == [key]
+        with pytest.raises(ffmpeg.MediaTerminationUnconfirmed, match='still pending'):
+            registry.reset_interrupted()
+        assert disk.available == available - 1
+        original_terminate(key)
+        child.wait(timeout=5)
+        assert _winapi.WaitForSingleObject(child._handle, 5000) == _winapi.WAIT_OBJECT_0
+        for reader in pending['readers']:
+            reader.join(timeout=2)
+            assert not reader.is_alive()
+        monkeypatch.setattr(registry, 'start', original_start)
+        monkeypatch.setattr(registry, 'terminate', original_terminate)
+        registry.reset_interrupted()
+        assert ffmpeg.run_ffprobe(str(tmp_path/'missing.mp4'), 5) is None
+        assert not registry._deferred and not registry._processes and not registry._jobs
+        assert disk.available == available
+        assert registry.reap_cleanups() == {'recovered': [], 'pending': []}
+        assert disk.available == available
+    finally:
+        if key is not None and key in registry._processes:
+            original_terminate(key)
+            children[0].wait(timeout=5)
+            for reader in registry._deferred.get(key, {}).get('readers', []):
+                reader.join(timeout=2)
+            registry.reap_cleanups()
+
+
+@pytest.fixture
+def local_batch_lifecycle(tmp_path, monkeypatch, request):
+    """Exercise actual Windows ownership with local Python, no media or GPU."""
+    import json
+    import os
+    import sys
+    import threading
+    from types import SimpleNamespace
+    from src.hardware import render_cache, scheduler
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
+    from src.stages import renderer
+
+    if os.name != 'nt':
+        pytest.skip('Windows actual batch ownership and kernel identity')
+    import _winapi
+    from src.core.visual_index import reader_process_state
+
+    monkeypatch.setattr(registry, '_processes', {})
+    monkeypatch.setattr(registry, '_jobs', {})
+    monkeypatch.setattr(registry, '_deferred', {})
+    original_start, original_terminate = registry.start, registry.terminate
+    children, leases, disk_releases, hardware_releases, observations = [], [], [], [], []
+
+    class Budget(scheduler.FileBudget):
+        def release(self, weight=1):
+            super().release(weight)
+            disk_releases.append(weight)
+
+    class Hardware(threading.BoundedSemaphore):
+        def release(self, n=1):
+            super().release(n)
+            hardware_releases.append(n)
+
+    class Clock:
+        def __init__(self):
+            self.value = 0.0
+        def monotonic(self):
+            self.value += .25
+            return self.value
+
+    disk, hardware = Budget(3), Hardware(1)
+    state = SimpleNamespace(mode='timeout', fail_stop=False, output=tmp_path/'batch.mp4')
+    temporary = tmp_path/'batch.tmp.mp4'
+    script = tmp_path/'_fc_batch0_20261014_cam0.txt'
+    monkeypatch.setattr(renderer, 'TEMP_DIR', tmp_path)
+    monkeypatch.setattr(renderer, 'time', Clock())
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    monkeypatch.setattr(scheduler, 'get_nvenc_semaphore', lambda: hardware)
+    monkeypatch.setattr(render_cache, 'reusable', lambda *args, **kwargs: False)
+    monkeypatch.setattr(render_cache, 'render_fingerprint', lambda *args, **kwargs: 'local-batch-identity')
+
+    def lease_factory(resource, inputs):
+        lease = scheduler.VideoLease(resource, inputs)
+        leases.append(lease)
+        return lease
+
+    def progress(*args):
+        if state.mode == 'exception':
+            raise RuntimeError('controlled local render observation failure')
+        return {'enc_frames': -1}
+
+    def start(key, command, **kwargs):
+        program = 'pass' if state.mode == 'success' else 'import time;time.sleep(30)'
+        child = original_start(key, [sys.executable, '-c', program], **kwargs)
+        original_wait = child.wait
+        children.append((key, child, original_wait))
+        temporary.write_bytes(b'controlled incomplete output')
+        def wait(timeout=None):
+            if timeout == 2.0 and state.mode != 'success':
+                raise subprocess.TimeoutExpired('controlled render progress wait', timeout)
+            if state.fail_stop and child.poll() is None:
+                raise subprocess.TimeoutExpired('controlled unconfirmed stop wait', timeout)
+            return original_wait(timeout=timeout)
+        child.wait = wait
+        return child
+
+    def terminate(key):
+        if state.fail_stop:
+            raise OSError('controlled batch Job stop failure')
+        return original_terminate(key)
+
+    def observe(stage, child):
+        identity = reader_process_state(child.pid, handle=child._handle)
+        observations.append({'stage': stage, **identity,
+                             'same_process_handle': int(child._handle),
+                             'kernel_wait': _winapi.WaitForSingleObject(child._handle, 0),
+                             'disk_available': disk.available,
+                             'hardware_available': hardware._value,
+                             'registry_processes': list(registry._processes),
+                             'registry_jobs': list(registry._jobs),
+                             'registry_deferred': list(registry._deferred),
+                             'interrupted': registry.is_interrupted(),
+                             'disk_releases': list(disk_releases),
+                             'hardware_releases': list(hardware_releases)})
+        return observations[-1]
+
+    def run():
+        return renderer._run_batch_render(
+            ['local-a.mp4', 'local-b.mp4'], 'controlled graph', state.output, 'nv', 20,
+            {}, {}, '20261014', 0,
+            config={'render': {'inactivity_timeout_s': .1, 'startup_inactivity_timeout_s': .1}})
+
+    monkeypatch.setattr(renderer, 'VideoLease', lease_factory)
+    monkeypatch.setattr(renderer, '_parse_ffmpeg_progress', progress)
+    monkeypatch.setattr(registry, 'start', start)
+    monkeypatch.setattr(registry, 'terminate', terminate)
+    workspace = SimpleNamespace(run=run, state=state, registry=registry, renderer=renderer,
+                                children=children, leases=leases, disk=disk, hardware=hardware,
+                                disk_releases=disk_releases, hardware_releases=hardware_releases,
+                                temporary=temporary, script=script, observe=observe,
+                                original_terminate=original_terminate, winapi=_winapi)
+    try:
+        yield workspace
+    finally:
+        state.fail_stop = False
+        for key, child, original_wait in children:
+            child.wait = original_wait
+            if key in registry._processes:
+                original_terminate(key)
+            elif _winapi.WaitForSingleObject(child._handle, 0) != _winapi.WAIT_OBJECT_0:
+                child.kill()
+            original_wait(timeout=5)
+            assert _winapi.WaitForSingleObject(child._handle, 5000) == _winapi.WAIT_OBJECT_0
+            observe('finally_kernel_ended', child)
+        registry.reap_cleanups()
+        for key in list(registry._processes):
+            registry.deregister(key)
+        request.node.user_properties.append(('local_batch_kernel_evidence',
+                                             json.dumps(observations, sort_keys=True)))
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'exception'])
+def test_batch_render_unconfirmed_stop_retains_original_weighted_lease_and_recovers(
+        local_batch_lifecycle, failure):
+    w = local_batch_lifecycle
+    w.state.mode, w.state.fail_stop = failure, True
+    with pytest.raises(w.renderer.RenderTerminationUnconfirmed):
+        w.run()
+    key, child, original_wait = w.children[0]
+    pending = w.registry._deferred[key]
+    assert pending['proc'] is child and pending['io_sem'] is w.leases[0]
+    assert pending['io_sem'].disk is w.disk and pending['io_sem'].hardware is w.hardware
+    assert pending['io_sem'].inputs == 2
+    assert w.registry._processes[key] is child and w.registry._jobs[key].handle
+    assert w.observe('unconfirmed_still_live', child)['kernel_wait'] == w.winapi.WAIT_TIMEOUT
+    assert w.disk.available == 1 and not w.hardware.acquire(blocking=False)
+    assert not w.disk_releases and not w.hardware_releases
+    assert w.temporary.read_bytes() == b'controlled incomplete output'
+    previous_script = w.script.read_bytes()
+    with pytest.raises(w.renderer.RenderTerminationUnconfirmed):
+        w.run()
+    assert len(w.children) == 1 and len(w.leases) == 1
+    assert w.temporary.read_bytes() == b'controlled incomplete output'
+    assert w.script.read_bytes() == previous_script
+    assert w.disk.available == 1 and not w.disk_releases and not w.hardware_releases
+
+    w.state.fail_stop = False
+    w.original_terminate(key)
+    original_wait(timeout=5)
+    assert w.winapi.WaitForSingleObject(child._handle, 5000) == w.winapi.WAIT_OBJECT_0
+    assert w.observe('explicitly_stopped_permit_still_held', child)['kernel_wait'] == w.winapi.WAIT_OBJECT_0
+    assert w.disk.available == 1 and not w.disk_releases and not w.hardware_releases
+    w.state.mode = 'timeout'
+    assert w.run() is None  # The next renderer entry reaps the old exact lease.
+    assert len(w.children) == 2
+    assert w.disk.available == 3 and w.disk_releases == [2, 2]
+    assert w.hardware_releases == [1, 1]
+    assert w.hardware._value == 1
+    assert not w.registry._processes and not w.registry._jobs and not w.registry._deferred
+    assert not w.registry.is_interrupted()
+    before = list(w.disk_releases), list(w.hardware_releases)
+    assert w.registry.reap_cleanups() == {'recovered': [], 'pending': []}
+    assert before == (w.disk_releases, w.hardware_releases)
+    assert not w.temporary.exists() and not w.script.exists()
+
+
+@pytest.mark.parametrize('mode', ['timeout', 'exception', 'success'])
+def test_batch_render_confirmed_cleanup_releases_weighted_lease_once(local_batch_lifecycle, monkeypatch, mode):
+    from src.hardware import render_cache
+    w = local_batch_lifecycle
+    w.state.mode = mode
+    if mode == 'success':
+        monkeypatch.setattr(render_cache, 'valid_video', lambda *args, **kwargs: True)
+        monkeypatch.setattr(render_cache, 'save_manifest', lambda *args, **kwargs: None)
+    result = w.run()
+    assert result == (str(w.state.output) if mode == 'success' else None)
+    _, child, _ = w.children[0]
+    assert w.observe('confirmed_cleanup', child)['kernel_wait'] == w.winapi.WAIT_OBJECT_0
+    assert w.disk.available == 3 and w.disk_releases == [2]
+    assert w.hardware_releases == [1]
+    assert w.hardware._value == 1
+    assert not w.registry._processes and not w.registry._jobs and not w.registry._deferred
+    assert not w.registry.is_interrupted()
+    assert not w.script.exists()
+
+
+def test_batch_render_cached_returncode_does_not_release_live_kernel_process(local_batch_lifecycle):
+    w = local_batch_lifecycle
+    w.state.fail_stop = True
+    with pytest.raises(w.renderer.RenderTerminationUnconfirmed):
+        w.run()
+    key, child, _ = w.children[0]
+    child.returncode = 0  # Controlled cached-value injection, not a real SMB failure.
+    assert w.observe('cached_zero_kernel_still_live', child)['kernel_wait'] == w.winapi.WAIT_TIMEOUT
+    assert not w.registry.has_exited(child)
+    assert w.registry.reap_cleanups() == {'recovered': [], 'pending': [key]}
+    assert w.disk.available == 1 and not w.disk_releases and not w.hardware_releases
+    assert w.registry._deferred[key]['io_sem'] is w.leases[0]
+    w.state.fail_stop = False
+    w.original_terminate(key)
+    assert w.winapi.WaitForSingleObject(child._handle, 5000) == w.winapi.WAIT_OBJECT_0
+    assert w.registry.has_exited(child)
+    assert w.disk.available == 1  # Exit confirmation alone does not replace lease recovery.
+    assert w.run() is None
+    assert w.disk.available == 3 and w.disk_releases == [2, 2] and w.hardware_releases == [1, 1]
+    assert not w.registry._processes and not w.registry._jobs and not w.registry._deferred
+
+
+@pytest.fixture
+def native_startup_failure(tmp_path, monkeypatch, request):
+    """Real owned children; stop failures and short native-wait injection are controlled."""
+    import json
+    import os
+    import sys
+    import threading
+    from types import SimpleNamespace
+    from src.core.visual_index import reader_process_state
+    from src.hardware import ffmpeg, scheduler, render_cache
+    from src.stages import detector, prescreen, renderer
+    if os.name != 'nt':
+        pytest.skip('Windows actual startup ownership')
+    import _winapi
+    registry = ffmpeg.FFmpegProcessRegistry
+    for field in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, field, {})
+    monkeypatch.setattr(registry, '_interrupted', False)
+    original_popen = ffmpeg._OwnedFFmpegPopen
+    original_register, original_wait = registry.register, registry.wait_for_exit
+    original_stop = registry.terminate
+    children, leases, releases, observations = [], [], [], []
+    state = SimpleNamespace(cached=False, fail_cleanup=True, route=None, block_creation=False,
+                            reached=threading.Event(), allow=threading.Event())
+
+    class Budget(scheduler.FileBudget):
+        def release(self, weight=1):
+            super().release(weight)
+            releases.append(weight)
+
+    disk, hardware = Budget(3), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    for name in ('get_qsv_semaphore', 'get_nv_semaphore', 'get_nvdec_semaphore', 'get_nvenc_semaphore'):
+        monkeypatch.setattr(scheduler, name, lambda: hardware)
+    monkeypatch.setattr('src.core.utils.TEMP_DIR', tmp_path)
+    monkeypatch.setattr(renderer, 'TEMP_DIR', tmp_path)
+    monkeypatch.setattr(render_cache, 'reusable', lambda *args, **kwargs: False)
+    monkeypatch.setattr(render_cache, 'render_fingerprint', lambda *args, **kwargs: 'startup-controlled')
+    output = tmp_path/'batch.mp4'
+    temporary = tmp_path/'batch.tmp.mp4'
+    script = tmp_path/'_fc_batch0_20261015_cam0.txt'
+
+    def make_lease(resource, inputs=1):
+        lease = scheduler.VideoLease(resource, inputs)
+        leases.append(lease)
+        return lease
+    for module in (detector, prescreen, renderer):
+        monkeypatch.setattr(module, 'VideoLease', make_lease)
+
+    class LocalPopen(original_popen):
+        def __init__(self, command, **kwargs):
+            super().__init__([sys.executable, '-c', 'import time;time.sleep(30)'], **kwargs)
+            job = self.owned_job
+            children.append(dict(proc=self, job=job, kill=self.kill, wait=self.wait,
+                                 close=job.close, key=None))
+            if state.cached:
+                self.returncode = 0
+            if state.fail_cleanup:
+                def failed_kill():
+                    raise OSError('controlled startup child kill failure')
+                def failed_close():
+                    raise OSError('controlled startup Job close failure')
+                self.kill, job.close = failed_kill, failed_close
+            if state.route == 'renderer':
+                temporary.write_bytes(b'preserve unconfirmed startup output')
+            if state.block_creation:
+                state.reached.set()
+                if not state.allow.wait(timeout=3):
+                    raise RuntimeError('controlled startup claim barrier expired')
+
+    def reject(key, proc):
+        children[-1]['key'] = key
+        raise RuntimeError('controlled registration failure')
+
+    def bounded_wait(proc, timeout=5):
+        if state.fail_cleanup and _winapi.WaitForSingleObject(proc._handle, 0) == _winapi.WAIT_TIMEOUT:
+            # Avoid 5s per case; this tests real liveness, not an actual deadline.
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        return original_wait(proc, timeout)
+
+    def observe(stage, proc):
+        observations.append(dict(stage=stage, **reader_process_state(proc.pid, handle=proc._handle),
+                                 handle=int(proc._handle),
+                                 kernel_wait=_winapi.WaitForSingleObject(proc._handle, 0),
+                                 disk_available=disk.available, hardware_available=hardware._value,
+                                 releases=list(releases), owned=list(registry._processes),
+                                 deferred=list(registry._deferred), starting=list(registry._starting)))
+        return observations[-1]
+
+    monkeypatch.setattr(ffmpeg, '_OwnedFFmpegPopen', LocalPopen)
+    monkeypatch.setattr(registry, 'register', reject)
+    monkeypatch.setattr(registry, 'wait_for_exit', bounded_wait)
+
+    def run(route):
+        state.route = route
+        if route == 'ffmpeg':
+            return ffmpeg.run_ffmpeg(['controlled-no-media'], timeout=.1)
+        if route == 'ffprobe':
+            return ffmpeg.run_ffprobe('controlled-no-media', .1)
+        if route == 'extract':
+            return prescreen._extract_frame('controlled-no-media', 0, 64, 48, timeout=.1)
+        if route == 'prescreen':
+            return prescreen._prescreen_stream_fps('controlled-no-media', 2, 1, 64, 48, 8, 'qsv', .1)
+        if route == 'detector':
+            instance = detector.MotionDetector(
+                {'detection': {'analysis_resolution': '64x48', 'analysis_fps_adaptive': False},
+                 'yolo': {'enabled': False}, 'audio_vad': {'enabled': False}}, decode_gpu='qsv')
+            monkeypatch.setattr(instance, '_decode_file_pyav',
+                                lambda *a: pytest.fail('Unconfirmed startup reached a second decoder'))
+            return instance._decode_file('controlled-no-media', 2)
+        return renderer._run_batch_render(
+            ['local-a', 'local-b'], 'controlled startup graph', output, 'nv', 20, {}, {}, '20261015', 0,
+            config={'render': {}})
+
+    workspace = SimpleNamespace(run=run, state=state, registry=registry, ffmpeg=ffmpeg,
+                                renderer=renderer, disk=disk, hardware=hardware, releases=releases,
+                                leases=leases, children=children, observe=observe, winapi=_winapi,
+                                original_register=original_register, original_wait=original_wait,
+                                original_stop=original_stop, output=output, temporary=temporary, script=script)
+    try:
+        yield workspace
+    finally:
+        state.allow.set()
+        for entry in children:
+            proc, job = entry['proc'], entry['job']
+            proc.kill, proc.wait, job.close = entry['kill'], entry['wait'], entry['close']
+            job.close()
+            if _winapi.WaitForSingleObject(proc._handle, 5000) != _winapi.WAIT_OBJECT_0:
+                _winapi.TerminateProcess(proc._handle, 1)
+            assert _winapi.WaitForSingleObject(proc._handle, 5000) == _winapi.WAIT_OBJECT_0
+            original_wait(proc, timeout=5)
+            observe('finally_kernel_ended', proc)
+        registry.reap_cleanups()
+        for key, proc in list(registry._processes.items()):
+            registry.deregister(key, proc)
+        for entry in children:
+            for stream in (entry['proc'].stdout, entry['proc'].stderr):
+                if stream is not None:
+                    stream.close()
+        assert not registry._starting
+        request.node.user_properties.append(('native_startup_evidence', json.dumps(observations, sort_keys=True)))
+
+
+@pytest.mark.parametrize('route', ['ffmpeg', 'ffprobe', 'detector', 'prescreen', 'renderer', 'extract'])
+@pytest.mark.parametrize('cached', [False, True], ids=['kill_close_failure', 'cached_zero_close_failure'])
+def test_startup_unconfirmed_child_returns_to_exact_original_lease(native_startup_failure, route, cached):
+    w = native_startup_failure
+    w.state.cached = cached
+    error_type = w.renderer.RenderTerminationUnconfirmed if route == 'renderer' else w.ffmpeg.MediaTerminationUnconfirmed
+    with pytest.raises(error_type) as caught:
+        w.run(route)
+    assert len(w.children) == 1
+    entry = w.children[0]
+    proc, job, key = entry['proc'], entry['job'], entry['key']
+    contexts, pending_errors = [], [caught.value]
+    while pending_errors:
+        error = pending_errors.pop()
+        if any(error is old for old in contexts):
+            continue
+        contexts.append(error)
+        pending_errors.extend(x for x in (error.__cause__, error.__context__) if x is not None)
+    start_error = next(error for error in contexts if isinstance(error, w.ffmpeg.MediaStartTerminationUnconfirmed))
+    assert start_error.process is proc and start_error.process_key == key
+    assert w.registry._processes[key] is proc and w.registry._jobs[key] is job and job.handle
+    held = w.registry._deferred[key]['io_sem']
+    weight = 2 if route == 'renderer' else 1
+    assert held is (w.disk if route in ('ffmpeg', 'ffprobe') else w.leases[0])
+    if route not in ('ffmpeg', 'ffprobe'):
+        assert held.disk is w.disk and held.hardware is w.hardware and held.inputs == weight
+    assert w.observe('unreturned_start_still_live', proc)['kernel_wait'] == w.winapi.WAIT_TIMEOUT
+    assert w.disk.available == 3-weight and not w.releases and not w.registry._starting
+    if route == 'renderer':
+        previous = w.temporary.read_bytes(), w.script.read_bytes()
+        with pytest.raises(w.renderer.RenderTerminationUnconfirmed):
+            w.run(route)
+        assert len(w.children) == 1 and len(w.leases) == 1
+        assert previous == (w.temporary.read_bytes(), w.script.read_bytes())
+    proc.kill, proc.wait, job.close = entry['kill'], entry['wait'], entry['close']
+    w.original_stop(key)
+    w.original_wait(proc, timeout=5)
+    assert w.observe('stopped_before_original_lease_reap', proc)['kernel_wait'] == w.winapi.WAIT_OBJECT_0
+    assert w.disk.available == 3-weight and not w.releases
+    assert w.registry.reap_cleanups() == {'recovered': [key], 'pending': []}
+    assert w.disk.available == 3 and w.hardware._value == 1 and w.releases == [weight]
+    assert w.registry.reap_cleanups() == {'recovered': [], 'pending': []}
+    assert w.releases == [weight]
+
+
+def test_startup_confirmed_registration_failure_preserves_ordinary_contract(native_startup_failure):
+    w = native_startup_failure
+    w.state.fail_cleanup = False
+    with pytest.raises(RuntimeError, match='controlled registration failure'):
+        w.run('ffmpeg')
+    proc = w.children[0]['proc']
+    assert w.observe('confirmed_start_failure', proc)['kernel_wait'] == w.winapi.WAIT_OBJECT_0
+    assert w.disk.available == 3 and w.releases == [1]
+    assert not w.registry._processes and not w.registry._jobs and not w.registry._deferred and not w.registry._starting
+
+
+def test_startup_creation_failure_returns_spawn_error_without_leaking_claim(native_startup_failure, monkeypatch):
+    w = native_startup_failure
+    def missing(*args, **kwargs):
+        raise FileNotFoundError('controlled missing executable')
+    monkeypatch.setattr(w.ffmpeg, '_OwnedFFmpegPopen', missing)
+    result = w.run('ffmpeg')
+    assert result.returncode == -1 and 'spawn failed' in result.stderr_text
+    assert not w.children and w.disk.available == 3 and w.releases == [1]
+    assert not w.registry._starting and not w.registry._processes
+
+
+def test_startup_existing_owner_and_wrong_identity_cannot_be_deregistered(native_startup_failure, monkeypatch):
+    from types import SimpleNamespace
+    w = native_startup_failure
+    w.state.fail_cleanup = False
+    monkeypatch.setattr(w.registry, 'register', w.original_register)
+    args = ['controlled-existing-key']
+    key = f'ffmpeg:{id(args)}:1.0'
+    owner = w.registry.start(key, ['local-python'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with pytest.raises(RuntimeError, match='identity mismatch'):
+        w.registry.deregister(key, object())
+    assert w.registry._processes[key] is owner
+    # Exercise caller proc=None finally against an already-owned generated key.
+    monkeypatch.setattr(w.ffmpeg, '_time', SimpleNamespace(monotonic=lambda: 1.0))
+    with pytest.raises(RuntimeError, match='already owned'):
+        w.ffmpeg.run_ffmpeg(args)
+    assert len(w.children) == 1 and w.registry._processes[key] is owner
+    assert w.observe('existing_owner_preserved', owner)['kernel_wait'] == w.winapi.WAIT_TIMEOUT
+    assert w.disk.available == 3 and w.releases == [1]
+
+
+def test_startup_concurrent_same_key_has_one_child_and_one_claim(native_startup_failure, monkeypatch):
+    import threading
+    w = native_startup_failure
+    w.state.fail_cleanup, w.state.block_creation = False, True
+    monkeypatch.setattr(w.registry, 'register', w.original_register)
+    outcomes, errors = [], []
+    def start_first():
+        try:
+            outcomes.append(w.registry.start('same-start', ['local-python'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=start_first)
+    thread.start()
+    try:
+        assert w.state.reached.wait(timeout=2)
+        assert w.registry.is_owned('same-start')
+        with pytest.raises(RuntimeError, match='already owned'):
+            w.registry.start('same-start', ['must-not-create'])
+        with pytest.raises(RuntimeError, match='being started'):
+            w.registry.register('same-start', object())
+        with pytest.raises(RuntimeError, match='startup still pending'):
+            w.registry.deregister('same-start', object())
+        assert len(w.children) == 1
+    finally:
+        w.state.allow.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert not errors and len(outcomes) == 1
+    assert w.registry._processes['same-start'] is outcomes[0] and not w.registry._starting
+    assert w.observe('concurrent_start_single_owner', outcomes[0])['kernel_wait'] == w.winapi.WAIT_TIMEOUT
+
+
+@pytest.mark.parametrize('cleanup_would_fail', [False, True])
+def test_concat_unconfirmed_reader_preserves_original_failure_and_live_inputs(tmp_path, monkeypatch, cleanup_would_fail):
+    from src.stages import renderer
+    from src.hardware.ffmpeg import MediaTerminationUnconfirmed
+    output = tmp_path/'delivery.pending.mp4'
+    output.write_bytes(b'retained old candidate')
+    batch = tmp_path/'batch.mp4'
+    batch.write_bytes(b'retained complete batch')
+    temporary = output.with_name(output.stem+'.tmp.mp4')
+    listing = output.with_name('.concat_'+output.stem+'.txt')
+    fatal = MediaTerminationUnconfirmed('concat reader still owns files')
+    def encode(*args, **kwargs):
+        temporary.write_bytes(b'live partial output')
+        raise fatal
+    monkeypatch.setattr(renderer, 'run_ffmpeg', encode)
+    original_unlink = Path.unlink
+    def unlink(path, *args, **kwargs):
+        if cleanup_would_fail and path in (temporary, listing):
+            raise PermissionError('still in use')
+        return original_unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'unlink', unlink)
+    timings = {}
+    with pytest.raises(MediaTerminationUnconfirmed) as caught:
+        renderer.concat_output_files([batch, batch], output, durations=[2, 2], timings=timings)
+    assert caught.value is fatal
+    assert temporary.read_bytes() == b'live partial output' and listing.is_file()
+    assert output.read_bytes() == b'retained old candidate' and batch.read_bytes() == b'retained complete batch'
+    assert not (tmp_path/'.concat_failures').exists()
+    assert timings['status'] == 'termination_unconfirmed' and timings['retained_temporary'] == str(temporary)
+
+
+def test_concat_pending_reader_refuses_before_rewriting_retained_inputs(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from src.stages import renderer
+    from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
+    for field in ('_processes', '_jobs', '_deferred', '_starting'):
+        monkeypatch.setattr(registry, field, {})
+    process = MagicMock()
+    process.poll.return_value = None
+    permit = MagicMock()
+    registry.defer_cleanup('old-concat-reader', process, permit)
+    output = tmp_path/'pending.mp4'
+    listing = output.with_name('.concat_'+output.stem+'.txt')
+    temporary = output.with_name(output.stem+'.tmp.mp4')
+    for path in (output, listing, temporary):
+        path.write_bytes(b'owned retained asset')
+    encode = MagicMock(side_effect=AssertionError('Pending owner admitted another concat'))
+    monkeypatch.setattr(renderer, 'run_ffmpeg', encode)
+    with pytest.raises(MediaTerminationUnconfirmed, match='still pending'):
+        renderer.concat_output_files([output], output, durations=[2])
+    assert all(path.read_bytes() == b'owned retained asset' for path in (output, listing, temporary))
+    permit.release.assert_not_called()
+    encode.assert_not_called()
+
+
+def test_diagnostic_extract_frame_uses_managed_real_media(tmp_path):
+    import shutil
+    from scripts.inspect_detection import extract_frame
+    from src.hardware.ffmpeg import run_ffmpeg, FFmpegProcessRegistry
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg required")
+    source = tmp_path / "source.mp4"
+    result = run_ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1",
+                         "-c:v", "libx264", str(source)], timeout=10)
+    assert result.returncode == 0, result.stderr_text
+    output = tmp_path / "frame.png"
+    assert extract_frame(str(source), .2, output)
+    import cv2
+    frame = cv2.imread(str(output))
+    assert frame is not None and frame.shape[:2] == (64, 64)
+    assert not FFmpegProcessRegistry._processes
+    assert not FFmpegProcessRegistry._deferred
+
+
+def test_diagnostic_extract_frame_propagates_unknown_stop_and_reports_failure(tmp_path, monkeypatch):
+    from scripts import inspect_detection as tool
+    from src.hardware.ffmpeg import FFmpegResult, MediaTerminationUnconfirmed
+    def failed(args, **kwargs):
+        assert kwargs == {"timeout": 15, "io_timeout": 3}
+        return FFmpegResult(-1, b"", b"timeout", timed_out=True)
+    monkeypatch.setattr(tool, "run_ffmpeg", failed)
+    assert not tool.extract_frame("source.mp4", 0, tmp_path / "frame.png")
+    def unknown(*args, **kwargs):
+        raise MediaTerminationUnconfirmed("reader still pending")
+    monkeypatch.setattr(tool, "run_ffmpeg", unknown)
+    with pytest.raises(MediaTerminationUnconfirmed, match="pending"):
+        tool.extract_frame("source.mp4", 0, tmp_path / "frame.png")

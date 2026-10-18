@@ -284,6 +284,12 @@ def parse_res(spec: str) -> tuple[int, int]:
 
 
 def cleanup_temp_artifacts(clean_batches: bool = False) -> int:
+    from src.core.process_lock import workspace_lease
+    with workspace_lease(TEMP_DIR):
+        return _cleanup_temp_artifacts_owned(clean_batches)
+
+
+def _cleanup_temp_artifacts_owned(clean_batches: bool = False) -> int:
     """清理 temp/ 下上次运行遗留的中间临时产物。
 
     默认 clean_batches=False：保留已渲染完成的完整 _batch*.mp4，仅清理未完成的 *.tmp.mp4、

@@ -3,6 +3,10 @@
   "format": "homevlog_gold_benchmark_v2",
   "created_at": "2026-10-11 02:11:36",
   "total_samples": 100,
+  "review_status": "unverified_heuristic",
+  "independently_verified_samples": 0,
+  "quality_acceptance": "UNAVAILABLE",
+  "provenance_note": "User confirmed on 2026-10-11 that these 100 samples have not been independently reviewed. Original labels are retained as historical hypotheses.",
   "distribution": {
     "CONFIRMED_MOTION": 30,
     "MISSED_MOTION": 25,
