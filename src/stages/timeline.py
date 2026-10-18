@@ -892,7 +892,7 @@ class GroupedAudioPlan:
 
 # Deliberately narrower than a general break-even rule: only the high-complexity
 # cohort, with a hard mono PCM ceiling. Smaller graphs keep the ordinary path.
-GROUPED_AUDIO_MIN_SEGMENTS = 384
+GROUPED_AUDIO_MIN_SEGMENTS = 180
 GROUPED_AUDIO_SEGMENTS = 48
 GROUPED_AUDIO_MAX_BYTES = 256 * 1024**2
 

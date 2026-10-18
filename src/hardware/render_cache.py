@@ -114,6 +114,7 @@ def valid_video(path, expected_duration=None, checkpoints=(), require_audio=Fals
             if duration <= 0:
                 _log.warning("valid_video: file %s has invalid duration %.3fs", path, duration)
                 return False
+            details["duration"] = round(duration, 6)
             try:
                 first_frame = next(container.decode(stream), None)
                 if first_frame is None:
@@ -221,9 +222,12 @@ def reusable(path, fingerprint, expected_duration=None, require_audio=False):
         return False
 
 
-def save_manifest(path, fingerprint):
+def save_manifest(path, fingerprint, duration=None):
     manifest = _manifest_path(path)
     manifest.parent.mkdir(parents=True, exist_ok=True)
     temporary = manifest.with_name(manifest.name + ".tmp")
-    temporary.write_text(json.dumps({"fingerprint": fingerprint, "output": file_identity(path)}), encoding="utf-8")
+    data = {"fingerprint": fingerprint, "output": file_identity(path)}
+    if duration is not None:
+        data["duration"] = round(float(duration), 6)
+    temporary.write_text(json.dumps(data), encoding="utf-8")
     temporary.replace(manifest)

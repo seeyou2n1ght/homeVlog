@@ -1068,18 +1068,27 @@ class StreamingOrchestrator:
                                         active_nv = self._active_nv_renders
                                     q_len = heavy_queue.qsize()
                                     # 收尾硬屏障 (Tail Guard):
-                                    # 当所有素材派发完毕且队列已空，QSV 立即退出
-                                    if all_dispatched_event.is_set() and heavy_queue.empty():
+                                    # 当所有素材派发完毕且队列已空，或剩余批次不足以填满 NVENC 编队时，QSV 立即停止偷取并退出，
+                                    # 避免 QSV 在尾盘偷取最后任务，拖累端到端完工时间 (Makespan)
+                                    if all_dispatched_event.is_set() and (heavy_queue.empty() or q_len <= active_nv):
                                         break
 
                                     # 实时 Makespan 竞价模型 (Cost-Based ETA Bidding):
                                     # 双路 NVENC 平均耗时 ~42s/批次，预估 NVENC 编队清空当前所有排队批次所需的剩余完工时间 (T_nv_eta)：
                                     with nv_duration_lock:
-                                        avg_nv_time = (sum(nv_batch_durations[-8:]) / len(nv_batch_durations[-8:])) if nv_batch_durations else 42.0
+                                        if nv_batch_durations:
+                                            import statistics
+                                            avg_nv_time = statistics.median(nv_batch_durations[-8:])
+                                            avg_nv_time = min(90.0, max(20.0, float(avg_nv_time)))
+                                        else:
+                                            avg_nv_time = 42.0
                                     t_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * avg_nv_time)
-                                    # 当处于尾部收尾阶段且 NVENC 正在满负荷渲染时，动态适度放宽窃取门限至 1.5x (有 fallback on nv 兜底)
-                                    effective_max_dyn = max_qsv_dynamic_s * 1.5 if (all_dispatched_event.is_set() and active_nv >= 1) else max_qsv_dynamic_s
-                                    allowed_dyn_s = effective_max_dyn if t_nv_eta >= 35.0 else min(effective_max_dyn, max(60.0, t_nv_eta * 2.5))
+                                    # 当处于尾部收尾阶段时，收紧 QSV 窃取门限，杜绝 QSV 耗时超过 NVENC 清空剩余队列的时间
+                                    if all_dispatched_event.is_set():
+                                        effective_max_dyn = min(max_qsv_dynamic_s, 180.0, t_nv_eta * 0.8)
+                                    else:
+                                        effective_max_dyn = max_qsv_dynamic_s
+                                    allowed_dyn_s = effective_max_dyn if t_nv_eta >= 35.0 else min(effective_max_dyn, max(60.0, t_nv_eta * 1.5))
                                     item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
                                     if item is None:
                                         if all_dispatched_event.is_set() and (heavy_queue.empty() or q_len <= active_nv):

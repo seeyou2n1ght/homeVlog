@@ -695,7 +695,7 @@ def _prepare_grouped_audio(input_file, plan, pcm_path, script_path):
                 joined.write(block)
                 written += len(block)
             result = run_ffmpeg([
-                "-fflags", "+genpts", "-i", str(input_file), "-/filter_complex", str(script_path),
+                "-fflags", "+genpts", "-vn", "-i", str(input_file), "-/filter_complex", str(script_path),
                 "-map", "[chunk]", "-c:a", "pcm_f32le", "-ar", str(plan.sample_rate),
                 "-ac", "1", "-f", "f32le", "-",
             ], timeout=min(300, remaining), io_timeout=30, stdout_consumer=consume)
@@ -1026,10 +1026,11 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
 
     if proc is not None and proc.returncode == 0 and tmp_output_path.exists():
         try:
-            if valid_video(tmp_output_path, expected_duration, require_audio=True):
+            val_diag = {}
+            if valid_video(tmp_output_path, expected_duration, require_audio=True, diagnostics=val_diag):
                 # 原子重命名为正式批次成片，保证断点续传绝不复用半成品
                 tmp_output_path.replace(output_path)
-                save_manifest(output_path, fingerprint)
+                save_manifest(output_path, fingerprint, duration=val_diag.get("duration", expected_duration))
             else:
                 logger.warning("batch-render cam%d batch%d output failed container/duration validation (%d bytes), discarding",
                                cam_index, batch_idx, tmp_output_path.stat().st_size)
@@ -1165,6 +1166,18 @@ def concat_output_files(
             from concurrent.futures import ThreadPoolExecutor
 
             def _probe_duration(p: Path) -> float | None:
+                try:
+                    from src.hardware.render_cache import _manifest_path, file_identity
+                    mp = _manifest_path(p)
+                    if mp.exists():
+                        import json
+                        manifest = json.loads(mp.read_text(encoding="utf-8"))
+                        if manifest.get("output") == file_identity(p) and manifest.get("duration"):
+                            d = float(manifest["duration"])
+                            if d > 0:
+                                return d
+                except Exception:
+                    pass
                 try:
                     import av
                     with av.open(str(p), timeout=30.0) as container:

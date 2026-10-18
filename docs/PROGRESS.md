@@ -149,8 +149,33 @@ BENCHMARK与TESTING已改为最终基准/规范与证据索引，完整原文及
      - **微观耗时构成**：在灰度转换中，`video_frame_to_gray` 对 4K NV12 进行 CPU swscale 转换占 97.8%（8.85s），而双线性缩放仅占 2.2%（0.19s）；
      - **业务算法极其轻量**：EMA 运动滤波（2.60%）、候选 JPEG 编码（2.34%）、音频 VAD（7.45%）、YOLO 批推理（2.01%）合计仅占 14.39%；
      - **横向设备对照**：CUDA 63.9 fps（4.24x）> CPU 59.8 fps（3.97x）> QSV 59.0 fps（3.91x），CUDA 比 QSV/软解吞吐高出 ~8.3%。
-3. **交付与收尾阶段磁盘 I/O 审计**：
+3. **交付与收尾阶段磁盘 I/O 审计与耗时根因修正**：
    - 实测 6.68GB 成片 SHA256 顺序读计算耗时仅 5.815s，证实 SHA256 并非磁盘瓶颈；
    - 交付流采用原子重命名，无大文件重复物理拷贝；
-   - 确认 20260328 cam0 中 `final_concat` 耗时 341.64s 的根因为 FFmpeg 拼接写盘与 144 个检查点在 `valid_video` 中并发多线程 seek-decode 产生的 NVMe 写入缓冲区争用。
+   - 深入审查勘误：20260328 cam0 中 `final_concat` 耗时 341.64s 并非并发抢占（FFmpeg 进程与 `valid_video` 实际为严格串行），其真正构成为：单核 CPU 对全天 7.81 小时 AAC 音频执行重编码（`171.98s`）+ 16 线程 PyAV 重新探测 145 批次文件时长（`17.63s`）+ 8 线程 144 检查点接缝完整性校验（`152.02s`）。
+
+## 异构调度尾盘屏障与音频分组扩展实施（2026-10-19）
+
+围绕全天 145 批次端到端耗时（Makespan）的核心瓶颈，完成了严格基于可观察证据的针对性优化与落地实施：
+
+1. **异构调度收尾硬屏障（Tail Guard）与中位数竞价模型**（`src/pipeline.py`）：
+   - 修复了此前在素材全部分发完毕（`all_dispatched_event.is_set()`）后反向将 QSV 偷取门限放大至 1.5x（`630s`）并误偷取最后单个批次导致 Makespan 拖长 200s 的缺陷；
+   - 在 QSV 偷取前置增加硬屏障：当 `all_dispatched_event.is_set()` 且剩余重批次队列数 `q_len <= active_nv` 时，QSV 立即停止偷取并退出，将最后批次完全交由速度快 3.5 倍的双路 NVENC 快速收尾；
+   - 竞价模型引入 `statistics.median` 替代易受极值批次污染的简单均值，并将 `avg_nv_time` 上下界约束在 `[20.0s, 90.0s]`；
+   - 新增针对性契约回归测试 `test_heterogeneous_tail_guard_prevents_qsv_stealing_when_queue_low`。
+
+2. **音频分组阈值覆盖重度批次与 `-vn` 纯音频解复用优化**（`src/stages/timeline.py`、`src/stages/renderer.py`）：
+   - 遥测审计证实全天 60 个 NV 批次中，仅 7 个分段数 $>55$ 的长批次即占据 70.0% 工时，其中 `batch_144`（283 段，626.8s）、`batch_3`（215 段，400.2s）、`batch_2`（183 段，309.4s）此前因高于 `384` 门限而漏网；
+   - 将 `GROUPED_AUDIO_MIN_SEGMENTS` 由保守的 `384` 下调至 `180`，使上述长耗时批次全部纳入分组加速；
+   - `_prepare_grouped_audio` 在执行分组 FFmpeg 命令时注入 `-vn`，跳过无用的 4K 视频包解复用；实测验证与原始命令输出 PCM 浮点音频 SHA256 哈希 100% 逐比特完全一致。
+
+3. **成片拼接时长清单缓存加速**（`src/hardware/render_cache.py`、`src/stages/renderer.py`）：
+   - `valid_video` 在通过容器与时长校验时，将精确的视频物理时长回填至 `details["duration"]`；
+   - `save_manifest` 将该经过验证的实际时长安全持久化至批次 `.manifest.json`；
+   - `concat_output_files` 探测阶段优先读取批次清单中的已验证时长，未命中时无缝回退 PyAV 多线程探测，消除了 145 个批次成片在拼接前重复打开容器探测的开销。
+
+4. **工程与回归验收**：
+   - 全库 15 个测试套件 **913 passed, 6 skipped, 0 failures/errors**（142.17s）；
+   - `compileall` 与 `ruff check` 100% 通过；所有修改遵循最小改动面与可逆等价原则。
+
 
