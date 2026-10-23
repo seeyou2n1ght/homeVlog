@@ -1,6 +1,6 @@
 """HomeVlog 独立审核工作台业务逻辑层 (Audit Service)
 
-提供数据库检索、FFmpeg 截帧与 WebP 动图生成、YOLO 增强检测与打标导出功能。
+提供数据库检索、FFmpeg 截帧与 WebP 动图生成、YOLO 增强检测、人工事件复核与日常观看导出。
 """
 
 import io
@@ -11,7 +11,6 @@ import logging
 import threading
 import subprocess
 import hashlib
-import os
 import uuid
 from copy import deepcopy
 from pathlib import Path
@@ -22,19 +21,6 @@ from src.database import VlogDatabase
 from src.feedback import normalize_label
 from src.hardware.ffmpeg import FFmpegProcessRegistry, run_ffmpeg
 from src.core.visual_index import VisualReaderStopError, inspect_source_identity_owned
-from src.core.benchmark import (
-    DEFAULT_BENCHMARK_FILE,
-    VERSIONS_DIR,
-    load_benchmark_dataset,
-    merge_benchmark_samples,
-    save_benchmark_dataset,
-)
-from src.core.tuner import (
-    TuningSimulator,
-    apply_config_safe,
-    generate_config_diff,
-    rollback_config,
-)
 
 logger = logging.getLogger("homevlog.audit")
 CACHE_DIR = PROJECT_ROOT / "temp" / "audit_cache"
@@ -86,7 +72,17 @@ def unpack_notes(notes_str: str | None) -> tuple[str, str]:
     return "", s
 
 
+def _nested_value(config, key):
+    value = config
+    for part in key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
 class AuditService:
+    _watch_initialization_lock = threading.RLock()
     CONTEXT_KEYS = (
         "detection.profile", "detection.motion_sensitivity", "detection.min_motion_threshold",
         "detection.fg_threshold", "detection.ambient_drift_suppress", "detection.camera_motion_suppress",
@@ -98,7 +94,6 @@ class AuditService:
     def get_review_context(self, segment_id: int) -> dict[str, Any]:
         from src.core import config as core
         from src.core.profiles import resolve_camera_config, _explicit_config
-        from src.core.tuner import _get_nested_param
         from src.stages.timeline import build_timeline_from_rows
         from src.core.replay_evidence import interval_display_details
         from src.core.utils import ts_to_unix
@@ -122,11 +117,11 @@ class AuditService:
             self.config = load_config(reload=True)
             config = self.config
             effective = resolve_camera_config(config, filepath=segment["filepath"], cam_index=segment["cam_index"])
-            config_hash = generate_config_diff({})["config_sha256"]
+            config_hash = hashlib.sha256(Path(core.CONFIG_PATH).read_bytes()).hexdigest()
         explicit = _explicit_config(config)
-        parameters = [{"param": key, "global": _get_nested_param(config, key),
-                       "camera": _get_nested_param(effective, key),
-                       "explicit_global": _get_nested_param(explicit, key) is not None}
+        parameters = [{"param": key, "global": _nested_value(config, key),
+                       "camera": _nested_value(effective, key),
+                       "explicit_global": _nested_value(explicit, key) is not None}
                       for key in self.CONTEXT_KEYS]
         row = tasks[0]
         unreviewed = deepcopy(row)
@@ -150,6 +145,20 @@ class AuditService:
         self.config = load_config()
         self._shared_yolo = None
 
+    def watch_exports(self):
+        from scripts.audit_tool.watch_export import WatchExportManager
+        from src.core.config import OUTPUT_DIR, TEMP_DIR
+        with self._watch_initialization_lock:
+            if not hasattr(self, "_watch_exports"):
+                self._watch_exports = WatchExportManager(self.db.db_path,
+                    getattr(self, "watch_output_root", OUTPUT_DIR), TEMP_DIR,
+                    parent_root=getattr(self, "watch_parent_root", None))
+            return self._watch_exports
+
+    def watch_playback(self, date, camera, export_id, kind="daily", item_id=None):
+        manager = self.watch_exports()
+        return manager.playback(date, camera, export_id, kind, item_id)
+
     def is_registered_filepath(self, filepath: str) -> bool:
         if not filepath:
             return False
@@ -162,6 +171,20 @@ class AuditService:
     def exclude_file(self, filepath: str, reason: str = "MANUAL_EXCLUDED") -> bool:
         """从工作台手动排除坏片/无需处理的原片"""
         return self.db.exclude_file_task(filepath, reason=reason)
+
+    def get_review_inventory(self):
+        """Count explicit human labels; these counts are not recognition accuracy."""
+        from collections import Counter
+        with self.db._lock:
+            rows = self.db.conn.execute(
+                "SELECT manual_label FROM segments WHERE manual_label IS NOT NULL").fetchall()
+        categories = {"CONFIRMED_MOTION": "tp", "FALSE_ALARM": "fp",
+                      "MISSED_MOTION": "fn", "CONFIRMED_STATIC": "tn"}
+        counts = Counter(categories.get(normalize_label(row[0]), "unknown") for row in rows)
+        return {"total_reviewed": len(rows),
+                "distribution": {key: counts[key] for key in ("tp", "fp", "fn", "tn")},
+                "unknown_labels": counts["unknown"],
+                "distribution_basis": "explicit_review_labels_not_confusion_matrix"}
 
     def get_overview(self) -> dict[str, Any]:
         """获取审核库存；准确度只能来自独立参考上的生产重放。"""
@@ -176,7 +199,7 @@ class AuditService:
                 "SELECT COUNT(*) FROM segments WHERE manual_label IS NOT NULL"
             ).fetchone()[0]
 
-            inventory = self.get_tuning_insights()
+            inventory = self.get_review_inventory()
             tp, fp, fn, tn = (inventory["distribution"][key] for key in ("tp", "fp", "fn", "tn"))
             # Label inventory can be changed by human overlays and is not a
             # current independent prediction measurement.
@@ -765,504 +788,6 @@ class AuditService:
             t.start()
         return count
 
-    def export_gold_benchmark(
-        self,
-        output_path: str | Path | None = None,
-        version: str = "1.0",
-        incremental_merge: bool = True,
-        archive_version: bool = True,
-    ) -> dict[str, Any]:
-        """导出人工复核切片为标准的基准评测数据集，支持增量合并与历史快照版本化。"""
-        out_file = Path(output_path) if output_path else DEFAULT_BENCHMARK_FILE
-
-        with self.db._lock:
-            rows = self.db.conn.execute(
-                """SELECT id, filepath, cam_index, date, start_time, end_time, duration,
-                          state, max_energy, avg_confidence, manual_label, review_notes, reviewed_at
-                   FROM segments
-                   WHERE manual_label IS NOT NULL
-                   ORDER BY date DESC, filepath ASC, start_time ASC"""
-            ).fetchall()
-
-        benchmark_items = []
-        for r in rows:
-            sc, user_notes = unpack_notes(r["review_notes"])
-            benchmark_items.append({
-                "segment_id": r["id"],
-                "filepath": r["filepath"],
-                "filename": Path(r["filepath"]).name,
-                "cam_index": r["cam_index"],
-                "date": r["date"],
-                "start_time": round(float(r["start_time"]), 2),
-                "end_time": round(float(r["end_time"]), 2),
-                "duration": round(float(r["duration"] or (r["end_time"] - r["start_time"])), 2),
-                "algo_state": r["state"],
-                "max_energy": round(float(r["max_energy"] or 0.0), 2),
-                "avg_confidence": round(float(r["avg_confidence"] or 0.0), 3),
-                "gold_label": normalize_label(r["manual_label"]),
-                "raw_label": r["manual_label"],
-                "scenario": sc,
-                "notes": user_notes,
-                "review_basis": unpack_review_basis(r["review_notes"]),
-                "reviewed_at": r["reviewed_at"],
-            })
-
-        from src.core.benchmark import _dataset_lock
-        with _dataset_lock:
-            if incremental_merge and out_file.exists():
-                # Invalid or incomplete prior data must never be overwritten.
-                existing_items, _ = load_benchmark_dataset(out_file)
-                benchmark_items = merge_benchmark_samples(existing_items, benchmark_items)
-            saved_path = save_benchmark_dataset(
-                benchmark_items, output_path=out_file, version=version,
-                archive_version_copy=archive_version,
-            )
-
-        return {
-            "success": True,
-            "count": len(benchmark_items),
-            "output_path": str(saved_path),
-            "version": version,
-        }
-
-    def get_benchmark_versions(self) -> list[dict[str, Any]]:
-        """列出已归档的基准评测数据集版本历史。"""
-        if not VERSIONS_DIR.exists():
-            return []
-        versions = []
-        for meta_p in sorted(VERSIONS_DIR.glob("*.meta.json"), reverse=True):
-            try:
-                with open(meta_p, "r", encoding="utf-8") as f:
-                    m = json.load(f)
-                v_data = meta_p.with_name(meta_p.name[:-10] + ".json")
-                versions.append({
-                    "version": m.get("version", "unknown"),
-                    "file": str(v_data),
-                    "created_at": m.get("created_at"),
-                    "total_samples": m.get("total_samples", 0),
-                    "distribution": m.get("distribution", {}),
-                })
-            except Exception:
-                continue
-        return versions
-
-    def simulate_tuning(self, candidate_params: dict[str, Any], expected_sha256: str | None = None) -> dict[str, Any]:
-        """运行 What-If 离线参数灵敏度仿真。"""
-        from src.core import config as core
-        with core._config_lock:
-            self.config = load_config(reload=True)
-            preview_hash = generate_config_diff(candidate_params)["config_sha256"]
-            if expected_sha256 is not None and expected_sha256 != preview_hash:
-                from src.core.tuner import ConfigurationConflict
-                raise ConfigurationConflict("Configuration changed since context view; reopen the parameter panel")
-            from src.core.replay_evidence import ProductionReplayStore
-            store = ProductionReplayStore()
-            references = store.references()
-            simulator = TuningSimulator(benchmark_samples=references, config=self.config, replay=store)
-            result = simulator.simulate(candidate_params)
-            result["config_sha256"] = preview_hash
-            return result
-
-    def get_tuning_diff(self, proposed_params: dict[str, Any]) -> dict[str, Any]:
-        """获取候选参数与当前 settings.yaml 的 Diff 比较。"""
-        return generate_config_diff(proposed_params)
-
-    def apply_tuning(self, proposed_params: dict[str, Any], expected_sha256: str | None = None) -> dict[str, Any]:
-        """安全应用调优参数并刷新当前服务的配置缓存。"""
-        res = apply_config_safe(proposed_params, create_backup=True, expected_sha256=expected_sha256)
-        self.config = load_config(reload=True)
-        return res
-
-    def rollback_tuning(self, backup_path: str) -> dict[str, Any]:
-        """回滚指定备份的配置并刷新缓存。"""
-        res = rollback_config(backup_path)
-        self.config = load_config(reload=True)
-        return res
-
-    def save_bounding_box(
-        self,
-        boxes: list[dict],
-        image_name: str | None = None,
-        segment_id: int | None = None,
-    ) -> dict[str, Any]:
-        """保存人工标注的目标边界框 (BBox) 至 .txt 标注文件 (YOLO 格式)。
-        
-        boxes 格式示例:
-            [{"class_id": 0, "x_center": 0.45, "y_center": 0.52, "width": 0.12, "height": 0.28}, ...]
-        """
-        valid_lines = []
-        for b in boxes:
-            cls_id = int(b.get("class_id", b.get("class", 0)))
-            # COCO: 0=person, 15=cat, 16=dog
-            if cls_id not in (0, 15, 16):
-                cls_id = 0
-            xc = float(b.get("x_center", b.get("xc", 0.0)))
-            yc = float(b.get("y_center", b.get("yc", 0.0)))
-            w = float(b.get("width", b.get("w", 0.0)))
-            h = float(b.get("height", b.get("h", 0.0)))
-
-            # 约束归一化范围 [0, 1]
-            xc = max(0.0, min(1.0, xc))
-            yc = max(0.0, min(1.0, yc))
-            w = max(0.001, min(1.0, w))
-            h = max(0.001, min(1.0, h))
-
-            valid_lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
-
-        txt_content = "\n".join(valid_lines) + ("\n" if valid_lines else "")
-        saved_paths = []
-
-        # 1. 若提供了 segment_id，写入归档目录中的对应伴随 txt
-        if segment_id is not None:
-            seg = self.db.get_segment_by_id(segment_id)
-            if seg:
-                arch_path = seg.get("archived_frame_path")
-                if not arch_path:
-                    try:
-                        from src.archiver import extract_and_archive_frame
-                        arch_path = extract_and_archive_frame(self.db, segment_id)
-                    except Exception as e:
-                        logger.debug("Failed to extract frame during save_bbox: %s", e)
-
-                if arch_path:
-                    p = Path(arch_path)
-                    if not p.is_absolute():
-                        p = PROJECT_ROOT / p
-                    txt_p = p.with_suffix(".txt")
-                    txt_p.parent.mkdir(parents=True, exist_ok=True)
-                    txt_p.write_text(txt_content, encoding="utf-8")
-                    saved_paths.append(str(txt_p))
-
-        # 2. 若提供了 image_name，同时在 cache 或 archive 中保存伴随 txt
-        if image_name:
-            clean_name = Path(image_name).name
-            # 在临时缓存目录保存
-            cache_txt = CACHE_DIR / f"{Path(clean_name).stem}.txt"
-            cache_txt.write_text(txt_content, encoding="utf-8")
-            saved_paths.append(str(cache_txt))
-
-            # 在归档 images 目录查找若存在同名图片，也写入 txt
-            arch_img = ARCHIVE_DIR / "images" / clean_name
-            if arch_img.exists():
-                arch_txt = arch_img.with_suffix(".txt")
-                arch_txt.write_text(txt_content, encoding="utf-8")
-                saved_paths.append(str(arch_txt))
-
-        return {
-            "success": True,
-            "box_count": len(valid_lines),
-            "saved_paths": saved_paths,
-        }
-
-    def _target_frame(self, segment_id):
-        """Resolve only the registered archive with matching v2 captured provenance."""
-        import math
-        import cv2
-        import numpy as np
-        from src.core.replay_journal import digest
-        segment = self.db.get_segment_by_id(segment_id)
-        if not segment or not segment.get("archived_frame_path"):
-            raise ValueError("当前片段没有归档帧；请先复核事件并生成原片帧")
-        image = Path(segment["archived_frame_path"])
-        image = image if image.is_absolute() else PROJECT_ROOT / image
-        image = image.resolve()
-        if not image.is_relative_to((ARCHIVE_DIR / "images").resolve()):
-            raise ValueError("归档帧不属于当前反馈库")
-        canonical = lambda value: os.path.normcase(str(Path(value).resolve()))
-        provenance = None
-        manifest = ARCHIVE_DIR / "manifest.jsonl"
-        if manifest.exists():
-            for line in manifest.read_text(encoding="utf-8").splitlines():
-                try:
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        continue
-                    candidate = Path(record.get("archived_image_path", ""))
-                    candidate = candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
-                    if record.get("segment_id") == segment_id and candidate.resolve() == image:
-                        provenance = record
-                except (ValueError, TypeError):
-                    continue
-        payload = image.read_bytes()
-        identity = provenance.get("source_identity") if provenance else None
-        stamp = float(provenance.get("frame_timestamp", float("nan"))) if provenance else float("nan")
-        if (not provenance or provenance.get("provenance_version") != 2
-                or provenance.get("frame_origin") != "ffmpeg_seek"
-                or provenance.get("image_sha256") != hashlib.sha256(payload).hexdigest()
-                or canonical(provenance.get("filepath", "")) != canonical(segment["filepath"])
-                or not isinstance(identity, list) or len(identity) != 3
-                or canonical(identity[0]) != canonical(segment["filepath"])
-                or type(identity[1]) is not int or identity[1] <= 0
-                or type(identity[2]) is not int or identity[2] <= 0
-                or not math.isfinite(stamp) or not segment["start_time"] <= stamp < segment["end_time"]):
-            raise ValueError("归档来源或时刻不能核验；请重新生成原片帧，不沿用旧图目标标签")
-        decoded = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-        if decoded is None:
-            raise ValueError("归档帧无法解码")
-        snapshot = digest({"segment_id": segment_id, "source": segment["filepath"],
-                           "start": segment["start_time"], "end": segment["end_time"],
-                           "provenance": provenance})
-        return image, payload, provenance, snapshot, decoded.shape
-
-    def get_target_review(self, segment_id):
-        from scripts.export_dataset import DatasetItem, verified_target_annotation, validate_target_boxes
-        image, payload, provenance, snapshot, shape = self._target_frame(segment_id)
-        path = image.with_suffix(".targets.json")
-        previous = path.read_bytes() if path.exists() else b""
-        review = json.loads(previous) if previous else None
-        if review is not None and not isinstance(review, dict):
-            raise ValueError("目标记录格式错误，不能当作已复核目标")
-        if review:
-            if review.get("image_sha256") != provenance["image_sha256"]:
-                review = None  # A new archived image cannot inherit old target labels.
-            elif review.get("all_targets_reviewed") is True:
-                item = DatasetItem(image, "UNKNOWN", segment_id, provenance["filepath"], provenance["frame_timestamp"])
-                verified_target_annotation(item)
-            else:
-                validate_target_boxes(review.get("boxes", []), shape[1], shape[0])
-        return {"status": "AVAILABLE", "segment_id": segment_id, "snapshot": snapshot,
-                "review_sha256": hashlib.sha256(previous).hexdigest() if previous else None,
-                "image_sha256": hashlib.sha256(payload).hexdigest(), "width": shape[1], "height": shape[0],
-                "frame_timestamp": provenance["frame_timestamp"], "source_video": provenance["filepath"],
-                "timestamp_kind": provenance.get("timestamp_kind"), "review": review,
-                "image_url": f"/api/target_image?segment_id={segment_id}&snapshot={snapshot}"}
-
-    def save_target_review(self, segment_id, *, snapshot, review_sha256, boxes, decision, all_targets_reviewed):
-        from scripts.export_dataset import validate_target_boxes
-        from src.core.replay_journal import run_lease, atomic_json
-        if decision not in {"objects", "no_targets", "uncertain", "draft"}:
-            raise ValueError("请选择目标、无目标、不能确定或草稿")
-        lock_dir = ARCHIVE_DIR / ".target_locks" / str(segment_id)
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        with run_lease(lock_dir):
-            context = self.get_target_review(segment_id)
-            if context["snapshot"] != snapshot or context["review_sha256"] != review_sha256:
-                raise ValueError("图片、来源或目标记录已变化；重新打开后再核对")
-            validate_target_boxes(boxes, context["width"], context["height"])
-            complete = decision in {"objects", "no_targets"}
-            if (complete and all_targets_reviewed is not True
-                    or decision == "objects" and not boxes or decision == "no_targets" and boxes):
-                raise ValueError("完整复核须确认全部可见目标；无目标不能同时保留框")
-            image, _, provenance, current_snapshot, _ = self._target_frame(segment_id)
-            if current_snapshot != snapshot:
-                raise ValueError("归档帧已变化")
-            path = image.with_suffix(".targets.json")
-            review = {"schema": 1, "label_source": "human_target_review", "decision": decision,
-                      "all_targets_reviewed": complete, "no_targets": not boxes,
-                      "reviewed_at": time.strftime("%Y-%m-%d %H:%M:%S"), "boxes": boxes,
-                      "source_video": provenance["filepath"], "source_identity": provenance["source_identity"],
-                      "frame_timestamp": provenance["frame_timestamp"], "timestamp_kind": provenance.get("timestamp_kind"),
-                      "image_sha256": context["image_sha256"], "previous_review_sha256": review_sha256}
-            if path.exists():
-                history = ARCHIVE_DIR / "target_history" / hashlib.sha256(str(image).encode()).hexdigest()
-                history.mkdir(parents=True, exist_ok=True)
-                history_path = history / f"{review_sha256}.json"
-                if not history_path.exists():
-                    atomic_json(history_path, json.loads(path.read_text(encoding="utf-8")))
-            atomic_json(path, review)
-        return {"success": True, "training_eligible": complete, "context": self.get_target_review(segment_id)}
-
-    def _validate_agent_proposal(self, segment_id, review, payload):
-        """Validate a suggestion against registered segment and captured image, offline."""
-        import cv2
-        import numpy as np
-        from scripts.export_dataset import validate_target_boxes
-        segment = self.db.get_segment_by_id(segment_id)
-        if not segment or not isinstance(review, dict):
-            raise ValueError("智能体建议没有对应的登记片段")
-        provenance = review.get("source_provenance", {})
-        if not isinstance(provenance, dict):
-            raise ValueError("智能体建议来源格式非法")
-        canonical = lambda value: os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
-        identity = provenance.get("source_identity")
-        decision = review.get("decision")
-        if (review.get("schema") != 1 or review.get("label_source") != "agent_visual_review"
-                or review.get("segment_id") != segment_id or provenance.get("segment_id") != segment_id
-                or provenance.get("provenance_version") != 2 or provenance.get("frame_origin") != "ffmpeg_seek"
-                or canonical(provenance.get("filepath", "")) != canonical(segment["filepath"])
-                or not isinstance(identity, list) or len(identity) != 3
-                or canonical(identity[0]) != canonical(segment["filepath"])
-                or type(identity[1]) is not int or identity[1] <= 0
-                or type(identity[2]) is not int or identity[2] <= 0
-                or provenance.get("start_time") != segment["start_time"]
-                or provenance.get("end_time") != segment["end_time"]
-                or not segment["start_time"] <= float(provenance.get("frame_timestamp", -1)) < segment["end_time"]
-                or decision not in {"objects", "no_targets", "uncertain"}
-                or type(review.get("all_visible_targets_reviewed")) is not bool
-                or review["all_visible_targets_reviewed"] != (decision != "uncertain")
-                or review.get("human_truth_certified") is not False
-                or review.get("independent_test_eligible") is not False
-                or review.get("image_sha256") != hashlib.sha256(payload).hexdigest()
-                or provenance.get("image_sha256") != review["image_sha256"]):
-            raise ValueError("智能体建议的来源、图片或复核身份不匹配")
-        decoded = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-        if decoded is None:
-            raise ValueError("智能体建议图片无法解码")
-        boxes = review.get("boxes")
-        validate_target_boxes(boxes, decoded.shape[1], decoded.shape[0])
-        if decision == "objects" and not boxes or decision == "no_targets" and boxes:
-            raise ValueError("智能体建议目标状态与框不一致")
-        return decoded.shape
-
-    def import_agent_target_proposal(self, segment_id, review, image_payload):
-        """Publish an immutable suggestion; never write human targets or business rows."""
-        from src.core.replay_journal import atomic_json, digest, run_lease
-        self._validate_agent_proposal(segment_id, review, image_payload)
-        root = ARCHIVE_DIR / "agent_proposals" / str(int(segment_id))
-        with run_lease(ARCHIVE_DIR / ".target_locks" / str(int(segment_id))):
-            self._validate_agent_proposal(segment_id, review, image_payload)
-            revision = uuid.uuid4().hex
-            folder = root / revision
-            folder.mkdir(parents=True)
-            with (folder / "frame.jpg").open("xb") as stream:
-                stream.write(image_payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            atomic_json(folder / "review.json", review)
-            atomic_json(root / "current.json", {"revision": revision, "review_digest": digest(review)})
-        return self.get_agent_target_proposal(segment_id)
-
-    def _agent_proposal_frame(self, segment_id):
-        from src.core.replay_journal import digest
-        root = ARCHIVE_DIR / "agent_proposals" / str(int(segment_id))
-        pointer_path = root / "current.json"
-        if not pointer_path.is_file():
-            raise ValueError("该片段尚无智能体复核建议")
-        pointer_bytes = pointer_path.read_bytes()
-        pointer = json.loads(pointer_bytes)
-        revision = pointer.get("revision", "")
-        if not isinstance(revision, str) or len(revision) != 32 or any(c not in "0123456789abcdef" for c in revision):
-            raise ValueError("智能体建议版本非法")
-        folder = root / revision
-        review = json.loads((folder / "review.json").read_text(encoding="utf-8"))
-        payload = (folder / "frame.jpg").read_bytes()
-        shape = self._validate_agent_proposal(segment_id, review, payload)
-        if digest(review) != pointer.get("review_digest") or pointer_path.read_bytes() != pointer_bytes:
-            raise ValueError("智能体建议已变化，请重新打开")
-        return review, payload, digest(pointer), shape
-
-    def get_agent_target_proposal(self, segment_id):
-        review, _, snapshot, shape = self._agent_proposal_frame(segment_id)
-        try:
-            human = self.get_target_review(segment_id)
-            human_priority = bool(human.get("review", {}).get("all_targets_reviewed")) if human.get("review") else False
-            human_status = "AVAILABLE"
-        except (ValueError, OSError, TypeError, KeyError) as error:
-            human_priority, human_status = False, str(error)
-        return {"status": "AVAILABLE", "segment_id": segment_id, "snapshot": snapshot,
-                "review": review, "width": shape[1], "height": shape[0],
-                "human_review_has_priority": human_priority, "human_review_status": human_status,
-                "training_eligible": False, "independent_test_eligible": False,
-                "image_url": f"/api/agent_target_image?segment_id={segment_id}&snapshot={snapshot}"}
-
-    def prepare_target_frame(self, segment_id):
-        from src.archiver import extract_and_archive_frame
-        if not extract_and_archive_frame(self.db, segment_id, archive_dir=ARCHIVE_DIR):
-            raise ValueError("无法生成原片帧；先确认事件已复核且原片可读取")
-        return self.get_target_review(segment_id)
-
-    def export_yolo_dataset(
-        self,
-        val_ratio: float = 0.2,
-        output_dir: str | Path | None = None,
-    ) -> dict[str, Any]:
-        """将已复核并归档的样本一键导出为标准 YOLO 数据集结构。"""
-        from scripts.export_dataset import (
-            build_yolo_dataset,
-            load_archive_items,
-            load_db_fallback_items,
-        )
-
-        out_path = Path(output_dir) if output_dir else (PROJECT_ROOT / "data" / "yolo_dataset" / "exports" / uuid.uuid4().hex)
-        archive_dir = ARCHIVE_DIR
-
-        items = load_archive_items(archive_dir)
-        if not items:
-            items = load_db_fallback_items(self.db.db_path)
-
-        if not items:
-            return {
-                "success": False,
-                "message": "未找到任何已复核的样本数据。请先在工作台审核打标切片。",
-                "stats": {},
-            }
-
-        stats = build_yolo_dataset(
-            items=items,
-            output_dir=out_path,
-            val_ratio=val_ratio,
-            yolo_model_path=None,
-        )
-
-        usable = bool(stats.get("usable"))
-        return {
-            "success": usable,
-            "message": "仅导出已绑定图像且完整人工复核的目标标注。" if usable else
-                       "尚无可用人工目标训练/调优/留出集，需要至少三个有效来源组。事件标签不证明无人，旧txt和自动预测均未作为真值导出。",
-            "output_dir": str(out_path),
-            "yaml_path": str(out_path / "data.yaml"),
-            "train_cmd": f'uv run python scripts/train_yolo.py --data "{out_path / "data.yaml"}"' if usable else None,
-            "stats": stats,
-        }
-
-    def get_tuning_insights(self) -> dict[str, Any]:
-        """Describe recorded reviews; candidates require measured replay."""
-        from collections import Counter
-        from src.core.profiles import resolve_camera_config
-        from src.scanner import parse_camera_dir
-        with self.db._lock:
-            rows = [dict(row) for row in self.db.conn.execute(
-                "SELECT state,manual_label,max_energy,duration,review_notes,filepath,"
-                "cam_index,start_time,id FROM segments WHERE manual_label IS NOT NULL")]
-        labels, scenarios, cross, groups = Counter(), Counter(), Counter(), {}
-        energies = {"fp": [], "fn": []}
-        categories = {"CONFIRMED_MOTION": "tp", "FALSE_ALARM": "fp",
-                      "MISSED_MOTION": "fn", "CONFIRMED_STATIC": "tn"}
-        disagreements = []
-        for row in rows:
-            label = normalize_label(row["manual_label"])
-            category = categories.get(label, "unknown")
-            labels[category] += 1
-            scenario, _ = unpack_notes(row.get("review_notes"))
-            scenarios[scenario or "UNKNOWN"] += 1
-            cross[(label, row["state"])] += 1
-            if category in energies:
-                energies[category].append(float(row.get("max_energy") or 0))
-            cfg = resolve_camera_config(self.config, filepath=row["filepath"], cam_index=row["cam_index"])
-            identity = parse_camera_dir(str(Path(row["filepath"]).parent)).get("mac")
-            identity = identity or str(Path(row["filepath"]).parent) or f"cam{row['cam_index']}"
-            hour = (float(row["start_time"]) / 3600) % 24
-            lower, upper = cfg.get("presence", {}).get("night_hours", [23, 7])
-            night = (hour >= lower or hour < upper) if lower > upper else lower <= hour < upper
-            key = (identity, "night" if night else "day")
-            group = groups.setdefault(key, Counter())
-            group[category] += 1
-            if label == "MISSED_MOTION" and row["state"] not in ("STATIC",):
-                disagreements.append({"segment_id": row["id"], "state": row["state"],
-                                      "reason": "Check event boundary, speed or detection semantics"})
-        candidates = []
-        if labels["fp"]:
-            candidates.append({"category": "误报候选调查", "param": "detection.min_motion_threshold",
-                               "status": "REQUIRES_REPLAY", "suggested_value": None,
-                               "rationale": "先分机位确认视觉、声音或目标误识别原因；能量分布不能证明门限收益"})
-        if labels["fn"]:
-            candidates.append({"category": "漏检候选调查", "param": "yolo.confidence",
-                               "status": "REQUIRES_REPLAY", "suggested_value": None,
-                               "rationale": "先区分未检出、事件边界和播放速度；不直接降低目标门限"})
-        return {"total_reviewed": len(rows),
-                "distribution": {key: labels[key] for key in ("tp", "fp", "fn", "tn")},
-                "distribution_basis": "explicit_review_labels_not_confusion_matrix",
-                "unknown_labels": labels["unknown"], "scenario_counts": dict(scenarios),
-                "prediction_cross_tab": [{"label": label, "state": state, "count": count}
-                                         for (label, state), count in sorted(cross.items())],
-                "groups": [{"camera": camera, "period": period, "counts": dict(counts),
-                            "total": sum(counts.values())} for (camera, period), counts in sorted(groups.items())],
-                "requires_attribution": disagreements,
-                "energy_stats": {key: value for category, values in energies.items()
-                                 for key, value in ((category + "_count", len(values)),
-                                    (category + "_avg_energy", round(sum(values)/len(values), 2) if values else 0))},
-                "recommendations": candidates, "evidence_basis": "review_inventory",
-                "auto_apply_allowed": False}
 
     def get_archive_stats(self) -> dict[str, Any]:
         """获取反馈帧归档库容量与分布统计。"""

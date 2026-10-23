@@ -8,15 +8,13 @@
 5. 数据库碎片切片合并修复逻辑。
 """
 
-import sqlite3
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from src.segment import Segment, _merge_same_state
+from src.segment import Segment
 from src.yolo_verifier import YoloVerifier
 from src.filters import SpatialGridMotionFilter, AudioEnergyVAD
-from scripts.verify_accuracy import fix_database_fragmentation, audit_database
 
 
 def test_temporal_events_survive_smoothing_yolo_rejection_and_audio_overlap():
@@ -172,63 +170,6 @@ def test_audio_vad_effective_min_dbfs():
     events, stats = vad.detect_events(audio)
     # 因为底噪 < -60 dBFS，有效能量门限提升至 -38 dBFS，-40 dBFS 的杂音不应误唤醒
     assert len(events) == 0
-
-
-def test_fix_database_fragmentation(tmp_path):
-    """验证数据库碎片切片合并修复逻辑。"""
-    db_file = tmp_path / "test_vlog.db"
-    conn = sqlite3.connect(str(db_file))
-    conn.execute(
-        """CREATE TABLE file_tasks (
-            id INTEGER PRIMARY KEY,
-            filepath TEXT,
-            cam_index INTEGER,
-            date TEXT,
-            analysis_status TEXT,
-            analysis_segments TEXT
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE segments (
-            id INTEGER PRIMARY KEY,
-            file_id INTEGER,
-            filepath TEXT,
-            cam_index INTEGER,
-            date TEXT,
-            start_time REAL,
-            end_time REAL,
-            duration REAL,
-            state TEXT,
-            max_energy REAL,
-            avg_confidence REAL,
-            file_start_offset REAL
-        )"""
-    )
-
-    conn.execute(
-        "INSERT INTO file_tasks VALUES (1, 'cam0_01.mp4', 0, '20260320', 'ANALYZED', '')"
-    )
-    # 插入连续 3 个静态切片
-    conn.execute("INSERT INTO segments VALUES (1, 1, 'cam0_01.mp4', 0, '20260320', 0.0, 5.0, 5.0, 'STATIC', 0.0, 0.0, 0.0)")
-    conn.execute("INSERT INTO segments VALUES (2, 1, 'cam0_01.mp4', 0, '20260320', 5.0, 10.0, 5.0, 'STATIC', 1.2, 0.0, 0.0)")
-    conn.execute("INSERT INTO segments VALUES (3, 1, 'cam0_01.mp4', 0, '20260320', 10.0, 20.0, 10.0, 'STATIC', 0.5, 0.0, 0.0)")
-    conn.commit()
-    conn.close()
-
-    before_cnt, after_cnt = fix_database_fragmentation(db_file)
-    assert before_cnt == 3
-    assert after_cnt == 1
-
-    conn = sqlite3.connect(str(db_file))
-    segs = conn.execute("SELECT start_time, end_time, duration, state, max_energy FROM segments").fetchall()
-    conn.close()
-
-    assert len(segs) == 1
-    assert segs[0][0] == 0.0
-    assert segs[0][1] == 20.0
-    assert segs[0][2] == 20.0
-    assert segs[0][3] == "STATIC"
-    assert segs[0][4] == 1.2
 
 
 def test_min_motion_threshold_floor():
@@ -781,7 +722,6 @@ def test_multi_feature_hysteresis_activity_decision():
 
     # 验证 50s 的单格微弱扰动未被误判为 1x
     assert not any(s.state == "DYNAMIC" and s.start_time <= 50 <= s.end_time for s in refined)
-
 
 
 # =========================================================================

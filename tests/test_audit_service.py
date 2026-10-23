@@ -6,272 +6,6 @@ from src.segment import Segment
 from scripts.audit_tool.service import AuditService
 
 
-@pytest.fixture
-def target_frame_service(tmp_path, monkeypatch):
-    import json
-    import hashlib
-    from unittest.mock import MagicMock
-    import cv2
-    import numpy as np
-    from scripts.audit_tool import service as module
-    archive = tmp_path / "feedback"
-    (archive / "images").mkdir(parents=True)
-    monkeypatch.setattr(module, "ARCHIVE_DIR", archive)
-    image = archive / "images/frame.jpg"
-    cv2.imwrite(str(image), np.full((48, 64, 3), 120, np.uint8))
-    source = tmp_path / "original.mp4"
-    source.write_bytes(b"original bytes preserved")
-    stat = source.stat()
-    record = {"segment_id": 1, "archived_image_path": str(image), "filepath": str(source),
-              "provenance_version": 2, "frame_origin": "ffmpeg_seek", "frame_timestamp": 12.5,
-              "timestamp_kind": "requested_seek", "source_identity": [str(source), stat.st_size, stat.st_mtime_ns],
-              "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
-    def write_manifest():
-        (archive / "manifest.jsonl").write_text(json.dumps(record)+"\n", encoding="utf-8")
-    write_manifest()
-    audit = object.__new__(AuditService)
-    audit.db = MagicMock()
-    audit.db.get_segment_by_id.return_value = {"id": 1, "filepath": str(source), "start_time": 10.,
-                                               "end_time": 15., "archived_frame_path": str(image)}
-    return audit, image, source, record, write_manifest
-
-
-def agent_proposal_record(target_frame_service, decision="no_targets"):
-    audit, image, _, provenance, _ = target_frame_service
-    return {"schema": 1, "segment_id": 1, "label_source": "agent_visual_review", "decision": decision,
-            "all_visible_targets_reviewed": decision != "uncertain", "boxes": [], "notes": "视觉复核建议",
-            "image_sha256": provenance["image_sha256"], "human_truth_certified": False,
-            "independent_test_eligible": False,
-            "source_provenance": {**provenance, "start_time": 10., "end_time": 15.}}
-
-
-def test_agent_proposal_keeps_human_priority_and_immutable_versions(target_frame_service):
-    from scripts.audit_tool import service as module
-    audit, image, _, _, _ = target_frame_service
-    context = audit.get_target_review(1)
-    audit.save_target_review(1, snapshot=context["snapshot"], review_sha256=None,
-                            boxes=[], decision="no_targets", all_targets_reviewed=True)
-    human_before = image.with_suffix(".targets.json").read_bytes()
-    record = agent_proposal_record(target_frame_service)
-    first = audit.import_agent_target_proposal(1, record, image.read_bytes())
-    second = audit.import_agent_target_proposal(1, {**record, "notes": "第二版"}, image.read_bytes())
-    assert first["snapshot"] != second["snapshot"]
-    assert second["human_review_has_priority"] and not second["training_eligible"]
-    assert not second["independent_test_eligible"]
-    assert len(list((module.ARCHIVE_DIR / "agent_proposals/1").glob("*/review.json"))) == 2
-    assert image.with_suffix(".targets.json").read_bytes() == human_before
-    audit.db.set_segment_archived_path.assert_not_called()
-
-
-@pytest.mark.parametrize("mutation", ["image", "source", "interval", "human_claim", "empty_positive"])
-def test_agent_proposal_rejects_wrong_identity_before_publication(target_frame_service, mutation):
-    from scripts.audit_tool import service as module
-    audit, image, _, _, _ = target_frame_service
-    record = agent_proposal_record(target_frame_service)
-    payload = image.read_bytes()
-    if mutation == "image": payload += b"changed"
-    elif mutation == "source": record["source_provenance"]["filepath"] = "other.mp4"
-    elif mutation == "interval": record["source_provenance"]["frame_timestamp"] = 99.
-    elif mutation == "human_claim": record["human_truth_certified"] = True
-    elif mutation == "empty_positive": record["decision"] = "objects"
-    with pytest.raises(ValueError): audit.import_agent_target_proposal(1, record, payload)
-    assert not (module.ARCHIVE_DIR / "agent_proposals").exists()
-
-
-def test_agent_proposal_read_rejects_tampered_image_and_cannot_enter_human_export(target_frame_service):
-    import json
-    from scripts.audit_tool import service as module
-    from scripts.export_dataset import DatasetItem, verified_target_annotation
-    audit, image, source, _, _ = target_frame_service
-    record = agent_proposal_record(target_frame_service)
-    audit.import_agent_target_proposal(1, record, image.read_bytes())
-    image.with_suffix(".targets.json").write_text(json.dumps({**record, "all_targets_reviewed": True}), encoding="utf-8")
-    with pytest.raises(ValueError, match="human completeness"):
-        verified_target_annotation(DatasetItem(image, "UNKNOWN", 1, str(source), 12.5))
-    stored = next((module.ARCHIVE_DIR / "agent_proposals/1").glob("*/frame.jpg"))
-    stored.write_bytes(stored.read_bytes()+b"tampered")
-    with pytest.raises(ValueError): audit.get_agent_target_proposal(1)
-
-
-def test_agent_proposal_uncertain_and_failed_publication_preserve_pointer(target_frame_service, monkeypatch):
-    from src.core import replay_journal
-    audit, image, _, _, _ = target_frame_service
-    record = agent_proposal_record(target_frame_service, "uncertain")
-    first = audit.import_agent_target_proposal(1, record, image.read_bytes())
-    assert not first["review"]["all_visible_targets_reviewed"] and not first["training_eligible"]
-    original = replay_journal.atomic_json
-    def fail_current(path, value):
-        if path.name == "current.json": raise OSError("simulated pointer publication failure")
-        return original(path, value)
-    monkeypatch.setattr(replay_journal, "atomic_json", fail_current)
-    with pytest.raises(OSError): audit.import_agent_target_proposal(1, {**record, "notes": "未发布"}, image.read_bytes())
-    assert audit.get_agent_target_proposal(1)["snapshot"] == first["snapshot"]
-
-
-def test_agent_proposal_http_pins_image_revision(target_frame_service, monkeypatch):
-    import json
-    import threading
-    import urllib.request
-    import urllib.error
-    import http.cookiejar
-    from http.server import HTTPServer
-    from scripts.audit_tool import app
-    audit, image, _, _, _ = target_frame_service
-    audit.import_agent_target_proposal(1, agent_proposal_record(target_frame_service), image.read_bytes())
-    monkeypatch.setattr(app, "service", audit)
-    server = HTTPServer(("127.0.0.1", 0), app.AuditHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-    try:
-        opener.open(base + "/").read()
-        context = json.loads(opener.open(base + "/api/agent_target_review?segment_id=1").read())
-        response = opener.open(base + context["image_url"])
-        assert response.read() == image.read_bytes() and response.headers["Cache-Control"] == "no-store"
-        assert not context["training_eligible"]
-        with pytest.raises(urllib.error.HTTPError) as stale:
-            opener.open(base + "/api/agent_target_image?segment_id=1&snapshot=stale")
-        assert stale.value.code == 409
-        with pytest.raises(urllib.error.HTTPError):
-            opener.open(base + "/api/agent_target_review?segment_id=999")
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
-
-
-def test_target_review_explicit_truth_draft_and_history(target_frame_service):
-    import json
-    from scripts.export_dataset import DatasetItem, verified_target_annotation
-    audit, image, source, _, _ = target_frame_service
-    context = audit.get_target_review(1)
-    image_bytes, source_bytes = image.read_bytes(), source.read_bytes()
-    boxes = [{"class_id": 0, "x_center": .5, "y_center": .5, "width": .2, "height": .4}]
-    def save(decision, boxes, complete):
-        nonlocal context
-        result = audit.save_target_review(1, snapshot=context["snapshot"], review_sha256=context["review_sha256"],
-                                          boxes=boxes, decision=decision, all_targets_reviewed=complete)
-        context = result["context"]
-        return result
-    item = DatasetItem(image, "FALSE_ALARM", 1, str(source), 12.5)
-    assert save("draft", boxes, False)["training_eligible"] is False
-    with pytest.raises(ValueError, match="completeness"):
-        verified_target_annotation(item)
-    assert save("objects", boxes, True)["training_eligible"] is True
-    assert len(verified_target_annotation(item)[0]) == 1  # Event false alarm is not target absence.
-    assert save("no_targets", [], True)["training_eligible"] is True
-    assert verified_target_annotation(item)[0] == []
-    assert save("uncertain", [], False)["training_eligible"] is False
-    with pytest.raises(ValueError):
-        verified_target_annotation(item)
-    history = list((image.parents[1]/"target_history").rglob("*.json"))
-    assert len(history) == 3
-    assert any(json.loads(p.read_text())["decision"] == "objects" for p in history)
-    assert image.read_bytes() == image_bytes and source.read_bytes() == source_bytes
-    audit.db.submit_review.assert_not_called()
-
-
-@pytest.mark.parametrize("decision,boxes,complete", [
-    ("objects", [], True), ("no_targets", [{"class_id": 0, "x_center": .5, "y_center": .5, "width": .2, "height": .4}], True),
-    ("no_targets", [], False), ("other", [], True),
-    ("objects", [{"class_id": 0, "x_center": .99, "y_center": .5, "width": .2, "height": .4}], True),
-])
-def test_target_review_invalid_write_does_not_create_truth(target_frame_service, decision, boxes, complete):
-    audit, image, _, _, _ = target_frame_service
-    context = audit.get_target_review(1)
-    with pytest.raises(ValueError):
-        audit.save_target_review(1, snapshot=context["snapshot"], review_sha256=None, boxes=boxes,
-                                 decision=decision, all_targets_reviewed=complete)
-    assert not image.with_suffix(".targets.json").exists()
-
-
-def test_target_review_stale_and_writer_conflict(target_frame_service):
-    from src.core.replay_journal import run_lease
-    audit, image, _, _, _ = target_frame_service
-    context = audit.get_target_review(1)
-    kwargs = dict(snapshot=context["snapshot"], review_sha256=None, boxes=[], decision="no_targets", all_targets_reviewed=True)
-    result = audit.save_target_review(1, **kwargs)
-    before = image.with_suffix(".targets.json").read_bytes()
-    with pytest.raises(ValueError, match="已变化"):
-        audit.save_target_review(1, **kwargs)
-    kwargs["review_sha256"] = result["context"]["review_sha256"]
-    with run_lease(image.parents[1]/".target_locks/1"):
-        with pytest.raises(RuntimeError):
-            audit.save_target_review(1, **kwargs)
-    assert image.with_suffix(".targets.json").read_bytes() == before
-
-
-@pytest.mark.parametrize("change", ["legacy", "sha", "source", "time", "identity"])
-def test_target_frame_requires_bound_provenance(target_frame_service, change):
-    audit, _, _, record, write_manifest = target_frame_service
-    if change == "legacy": record.pop("provenance_version")
-    elif change == "sha": record["image_sha256"] = "changed"
-    elif change == "source": record["filepath"] = "other.mp4"
-    elif change == "time": record["frame_timestamp"] = 25
-    else: record["source_identity"] = None
-    write_manifest()
-    with pytest.raises(ValueError, match="来源"):
-        audit.get_target_review(1)
-
-
-def test_target_review_http_snapshot_and_explicit_empty(target_frame_service, monkeypatch):
-    import json
-    import threading
-    import http.cookiejar
-    import urllib.request
-    import urllib.error
-    from http.server import HTTPServer
-    from scripts.audit_tool import app
-    audit, image, _, _, _ = target_frame_service
-    monkeypatch.setattr(app, "service", audit)
-    server = HTTPServer(("127.0.0.1", 0), app.AuditHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-    try:
-        opener.open(base + "/").read()
-        context = json.loads(opener.open(base + "/api/target_review?segment_id=1").read())
-        assert opener.open(base + context["image_url"]).read() == image.read_bytes()
-        with pytest.raises(urllib.error.HTTPError) as stale:
-            opener.open(base + "/api/target_image?segment_id=1&snapshot=stale")
-        assert stale.value.code == 409
-        request = dict(segment_id=1, snapshot=context["snapshot"], review_sha256=None,
-                       boxes=[], decision="no_targets", all_targets_reviewed=True)
-        result = json.loads(opener.open(urllib.request.Request(base + "/api/save_target_review",
-                            data=json.dumps(request).encode(), headers={"Content-Type": "application/json"})).read())
-        assert result["training_eligible"] is True
-        assert result["context"]["review"]["no_targets"] is True
-        with pytest.raises(urllib.error.HTTPError) as conflict:
-            opener.open(urllib.request.Request(base + "/api/save_target_review", data=json.dumps(request).encode(),
-                        headers={"Content-Type": "application/json"}))
-        assert conflict.value.code == 409
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
-
-
-def test_target_review_atomic_failure_preserves_previous(target_frame_service, monkeypatch):
-    from src.core import replay_journal
-    audit, image, _, _, _ = target_frame_service
-    context = audit.get_target_review(1)
-    result = audit.save_target_review(1, snapshot=context["snapshot"], review_sha256=None,
-                                     boxes=[], decision="no_targets", all_targets_reviewed=True)
-    before = image.with_suffix(".targets.json").read_bytes()
-    original = replay_journal.atomic_json
-    def fail_publish(path, value):
-        if str(path).endswith(".targets.json"):
-            raise OSError("controlled publication failure")
-        return original(path, value)
-    monkeypatch.setattr(replay_journal, "atomic_json", fail_publish)
-    with pytest.raises(OSError):
-        audit.save_target_review(1, snapshot=context["snapshot"], review_sha256=result["context"]["review_sha256"],
-                                 boxes=[], decision="uncertain", all_targets_reviewed=False)
-    assert image.with_suffix(".targets.json").read_bytes() == before
-
-
 def test_preview_cache_separates_source_identity_and_exact_seek(tmp_path, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
@@ -858,6 +592,18 @@ def test_audit_http_export():
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(foreign)
         assert exc.value.code == 403
+        # Retired product surfaces must not be reachable through the retained server.
+        for endpoint in ("/prototype", "/prototype.js", "/api/tuning_insights",
+                         "/api/benchmark_versions", "/api/target_review?segment_id=1"):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                opener.open(f"http://127.0.0.1:{port}{endpoint}")
+            assert error.value.code == 404
+        for endpoint in ("/api/tuning_apply", "/api/export_yolo_dataset", "/api/save_bbox"):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}{endpoint}", data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST")
+            with pytest.raises(urllib.error.HTTPError) as error:
+                opener.open(request)
+            assert error.value.code == 404
     finally:
         server.shutdown()
         server.server_close()
@@ -1053,85 +799,7 @@ def test_overview_inventory_does_not_claim_accuracy_from_mutable_states(tmp_path
         db.close()
 
 
-def test_save_bounding_box(tmp_path, monkeypatch):
-    """测试人工绘制 BBox 并保存为 YOLO 规范的 txt 文件"""
-    from pathlib import Path
-    db_path = tmp_path / "test_bbox.db"
-    db = VlogDatabase(db_path=db_path)
-    service = AuditService(db=db)
-
-    # 隔离归档目录到临时目录
-    fake_archive = tmp_path / "feedback_archive"
-    fake_archive.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr("scripts.audit_tool.service.ARCHIVE_DIR", fake_archive)
-
-    try:
-        boxes = [
-            {"class_id": 0, "x_center": 0.5, "y_center": 0.6, "width": 0.2, "height": 0.4},
-            {"class_id": 15, "x_center": 0.8, "y_center": 0.9, "width": 0.1, "height": 0.1},
-        ]
-        res = service.save_bounding_box(boxes=boxes, image_name="test_peak.jpg")
-        assert res["success"] is True
-        assert res["box_count"] == 2
-        assert len(res["saved_paths"]) >= 1
-
-        # 检查生成的文件内容
-        saved_txt = Path(res["saved_paths"][0])
-        assert saved_txt.exists()
-        lines = saved_txt.read_text(encoding="utf-8").strip().splitlines()
-        assert len(lines) == 2
-        assert lines[0] == "0 0.500000 0.600000 0.200000 0.400000"
-        assert lines[1] == "15 0.800000 0.900000 0.100000 0.100000"
-    finally:
-        db.close()
-
-
-def test_tuning_insights(tmp_path):
-    """测试根据人工审核记录量化生成 settings.yaml 调参建议"""
-    db_path = tmp_path / "test_tuning.db"
-    db = VlogDatabase(db_path=db_path)
-    service = AuditService(db=db)
-
-    try:
-        fp = "test_tuning_cam0.mp4"
-        db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
-        sample_segs = [
-            Segment(start_time=0.0, end_time=10.0, state="DYNAMIC", source_file=fp, max_energy=3.2),
-            Segment(start_time=10.0, end_time=20.0, state="DYNAMIC", source_file=fp, max_energy=3.8),
-            Segment(start_time=20.0, end_time=30.0, state="DYNAMIC", source_file=fp, max_energy=4.0),
-            Segment(start_time=30.0, end_time=40.0, state="STATIC", source_file=fp, max_energy=2.0),
-            Segment(start_time=40.0, end_time=50.0, state="STATIC", source_file=fp, max_energy=1.8),
-        ]
-        db.set_analysis_result(fp, "ANALYZED", sample_segs)
-
-        segs = service.get_file_segments(filepath=fp)["segments"]
-        # 3 处光影误报
-        service.submit_review(segs[0]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
-        service.submit_review(segs[1]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
-        service.submit_review(segs[2]["id"], "FALSE_ALARM", scenario="LIGHT_SHADOW")
-        # 2 处婴儿微动漏报
-        service.submit_review(segs[3]["id"], "MISSED_MOTION", scenario="INFANT_MOTION")
-        service.submit_review(segs[4]["id"], "MISSED_MOTION", scenario="INFANT_MOTION")
-
-        insights = service.get_tuning_insights()
-        assert insights["total_reviewed"] == 5
-        assert insights["scenario_counts"]["LIGHT_SHADOW"] == 3
-        assert insights["scenario_counts"]["INFANT_MOTION"] == 2
-
-        # 检查是否给出了 min_motion_threshold 与 yolo.confidence 的调参建议
-        recs = insights["recommendations"]
-        params = [r["param"] for r in recs]
-        assert "detection.min_motion_threshold" in params
-        assert "yolo.confidence" in params
-        assert insights["distribution"] == {"tp": 0, "fp": 3, "fn": 2, "tn": 0}
-        assert sum(group["total"] for group in insights["groups"]) == 5
-        assert not insights["auto_apply_allowed"]
-        assert all(r["suggested_value"] is None and r["status"] == "REQUIRES_REPLAY" for r in recs)
-    finally:
-        db.close()
-
-
-def test_tuning_inventory_counts_accelerated_and_unknown_labels(tmp_path):
+def test_review_inventory_counts_accelerated_and_unknown_labels(tmp_path):
     db = VlogDatabase(tmp_path / "inventory.db")
     try:
         path = "source.mp4"
@@ -1142,12 +810,9 @@ def test_tuning_inventory_counts_accelerated_and_unknown_labels(tmp_path):
         for row, label in zip(db.get_all_segments_for_date("20260901", 0), ["FN", "FN", "TP", "TN", "UNKNOWN"]):
             db.conn.execute("UPDATE segments SET manual_label=? WHERE id=?", (label, row["id"]))
         db.conn.commit()
-        result = AuditService(db).get_tuning_insights()
+        result = AuditService(db).get_review_inventory()
         assert result["distribution"] == {"tp": 1, "fp": 0, "fn": 2, "tn": 1}
         assert result["unknown_labels"] == 1
-        assert len(result["requires_attribution"]) == 2
-        assert sum(r["count"] for r in result["prediction_cross_tab"]) == 5
-        assert result["scenario_counts"] == {"UNKNOWN": 5}
         overview = AuditService(db).get_overview()
         assert overview["labels"] == result["distribution"]
         assert overview["unknown_labels"] == 1
@@ -1185,229 +850,6 @@ def test_anomaly_offset_pagination(tmp_path):
         db.close()
 
 
-def test_audit_http_new_endpoints(tmp_path, monkeypatch):
-    """测试新增加的 HTTP 端点: /api/tuning_insights, /api/clear_review, /api/save_bbox, /api/export_yolo_dataset"""
-    import http.cookiejar
-    import json
-    import threading
-    import urllib.request
-    from http.server import HTTPServer
-    from scripts.audit_tool.app import AuditHandler
-
-    fake_archive = tmp_path / "feedback_archive"
-    fake_archive.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr("scripts.audit_tool.service.ARCHIVE_DIR", fake_archive)
-
-    server = HTTPServer(("127.0.0.1", 0), AuditHandler)
-    port = server.server_address[1]
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-    try:
-        cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-        opener.open(f"http://127.0.0.1:{port}/").read()
-
-        # GET /api/tuning_insights
-        with opener.open(f"http://127.0.0.1:{port}/api/tuning_insights") as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read().decode("utf-8"))
-            assert "total_reviewed" in data
-            assert "recommendations" in data
-
-        # POST /api/save_bbox
-        bbox_payload = json.dumps({
-            "boxes": [{"class_id": 0, "x_center": 0.5, "y_center": 0.5, "width": 0.1, "height": 0.2}],
-            "image_name": "test_http_bbox.jpg"
-        }).encode("utf-8")
-        req_bbox = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/save_bbox",
-            data=bbox_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_bbox) as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read().decode("utf-8"))
-            assert data["success"] is True
-            assert data["box_count"] == 1
-
-        # POST /api/clear_review
-        clear_payload = json.dumps({"segment_id": 99999}).encode("utf-8")
-        req_clear = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/clear_review",
-            data=clear_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_clear) as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read().decode("utf-8"))
-            assert "success" in data
-
-        # POST /api/export_yolo_dataset
-        exp_payload = json.dumps({"val_ratio": 0.2, "output_dir": str(tmp_path / "yolo_out")}).encode("utf-8")
-        req_exp = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/export_yolo_dataset",
-            data=exp_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_exp) as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read().decode("utf-8"))
-            assert "success" in data
-
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-def test_audit_api_benchmark_and_tuning_integration(tmp_path):
-    """测试基准版本化、What-If 仿真与流式视频播放的 HTTP 端点集成"""
-    import json
-    import urllib.request
-    import urllib.parse
-    import socket
-    import http.cookiejar
-    from http.server import HTTPServer
-    import threading
-    from scripts.audit_tool import app
-    from src.core.config import OUTPUT_DIR
-
-    db_path = tmp_path / "test_api_bm.db"
-    db = VlogDatabase(db_path=db_path)
-    test_service = AuditService(db=db)
-
-    # 预置 1 个样本供测试
-    fp = "sample_test.mp4"
-    db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901100500", 300.0)
-    segs = [
-        Segment(start_time=10.0, end_time=20.0, state="DYNAMIC", source_file=fp, max_energy=4.5, avg_confidence=0.8)
-    ]
-    db.set_analysis_result(fp, "ANALYZED", segs)
-    db_segs = db.get_segments_for_file(fp)
-    test_service.submit_review(db_segs[0]["id"], "CONFIRMED_MOTION", scenario="ADULT_MOTION")
-
-    # 动态端口
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
-    app.service = test_service
-    server = HTTPServer(("127.0.0.1", port), app.AuditHandler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-
-    try:
-        # 1. 握手获取 Cookie Token
-        req_root = urllib.request.Request(f"http://127.0.0.1:{port}/")
-        with opener.open(req_root) as resp:
-            assert resp.status == 200
-
-        # 2. POST /api/export_gold_benchmark (版本化导出)
-        gold_out = tmp_path / "api_gold.json"
-        exp_payload = json.dumps({
-            "output_path": str(gold_out),
-            "version": "2.0_test",
-            "incremental_merge": False,
-        }).encode("utf-8")
-        req_exp = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/export_gold_benchmark",
-            data=exp_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_exp) as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read().decode("utf-8"))
-            assert data["success"] is True
-            assert data["version"] == "2.0_test"
-            assert gold_out.exists()
-
-        # 3. GET /api/benchmark_versions
-        req_v = urllib.request.Request(f"http://127.0.0.1:{port}/api/benchmark_versions")
-        with opener.open(req_v) as resp:
-            assert resp.status == 200
-            v_data = json.loads(resp.read().decode("utf-8"))
-            assert isinstance(v_data, list)
-
-        # 4. POST /api/tuning_simulate
-        sim_payload = json.dumps({
-            "candidate_params": {"detection.min_motion_threshold": 3.5}
-        }).encode("utf-8")
-        req_sim = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/tuning_simulate",
-            data=sim_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_sim) as resp:
-            assert resp.status == 200
-            sim_res = json.loads(resp.read().decode("utf-8"))
-            assert "verdict" in sim_res
-
-        # 5. POST /api/tuning_diff
-        diff_payload = json.dumps({
-            "params": {"detection.min_motion_threshold": 3.5}
-        }).encode("utf-8")
-        req_diff = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/tuning_diff",
-            data=diff_payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with opener.open(req_diff) as resp:
-            assert resp.status == 200
-            diff_res = json.loads(resp.read().decode("utf-8"))
-            assert "total_changes" in diff_res
-
-        # 6. GET /api/video_stream (Range 请求分片播放)
-        test_video = OUTPUT_DIR / f"test_stream_{port}.mp4"
-        test_video.write_bytes(b"ABCDEFGHIJ" * 50)
-        try:
-            url = f"http://127.0.0.1:{port}/api/video_stream?filepath={urllib.parse.quote(str(test_video))}"
-            payload = test_video.read_bytes()
-            for header, start, end in [("bytes=0-9", 0, 9), ("bytes=-4", 496, 499),
-                                       ("bytes=498-999", 498, 499), ("bytes=498-", 498, 499),
-                                       ("bytes=-999", 0, 499)]:
-                req_stream = urllib.request.Request(url, headers={"Range": header})
-                with opener.open(req_stream, timeout=5) as resp:
-                    assert resp.status == 206
-                    assert resp.headers["Content-Range"] == f"bytes {start}-{end}/500"
-                    assert int(resp.headers["Content-Length"]) == end - start + 1
-                    assert resp.read() == payload[start:end + 1]
-            for header in ["bytes=500-", "bytes=9-2", "bytes=-0", "bytes=-", "bytes=abc-def",
-                           "bytes=0-1,4-5", "bytes=+1-4", "items=0-1"]:
-                with pytest.raises(urllib.error.HTTPError) as rejected:
-                    opener.open(urllib.request.Request(url, headers={"Range": header}), timeout=5)
-                with rejected.value as resp:
-                    assert resp.code == 416
-                    assert resp.headers["Content-Range"] == "bytes */500"
-                    assert resp.read() == b""
-            with opener.open(url, timeout=5) as resp:
-                assert resp.status == 200 and resp.read() == payload
-            test_video.write_bytes(b"")
-            with pytest.raises(urllib.error.HTTPError) as rejected:
-                opener.open(urllib.request.Request(url, headers={"Range": "bytes=0-"}), timeout=5)
-            with rejected.value as resp:
-                assert resp.code == 416 and resp.headers["Content-Range"] == "bytes */0"
-                assert resp.read() == b""
-        finally:
-            test_video.unlink(missing_ok=True)
-
-    finally:
-        server.shutdown()
-        server.server_close()
-        db.close()
-        from src.core.benchmark import VERSIONS_DIR
-        for p in VERSIONS_DIR.glob("*2.0_test*"):
-            p.unlink(missing_ok=True)
-
-
 def test_audit_service_exclude_file(tmp_path):
     db_path = tmp_path / "test_exclude.db"
     db = VlogDatabase(db_path=db_path)
@@ -1421,8 +863,6 @@ def test_audit_service_exclude_file(tmp_path):
     assert task["prescreen_status"] == "SKIPPED_EXCLUDED"
     assert task["analysis_status"] == "SKIPPED_EXCLUDED"
     assert task["error_msg"] == "PHYSICAL_CORRUPT"
-
-
 
 
 @pytest.fixture
@@ -1525,7 +965,6 @@ const response=(id,total)=>({ok:true,json:async()=>({items:[{id}],counts:{all:to
     subprocess.run([node,"-e",script,str(Path(__file__).resolve().parents[1]/"scripts/audit_tool/static/app.js")],check=True,capture_output=True,timeout=10)
 
 
-
 def test_review_queue_counts_refresh_after_confirmed_label_change(queue_inventory):
     service, ids = queue_inventory
     original = service.get_review_queue("all")
@@ -1536,7 +975,6 @@ def test_review_queue_counts_refresh_after_confirmed_label_change(queue_inventor
     assert changed["total_items"] == 18
     assert ids[1] not in [item["id"] for item in changed["items"]]
     assert service.db.get_segment_by_id(ids[1])["review_notes"] == "controlled fixture only"
-
 
 
 def test_delivery_comparison_uses_bound_artifact_mapping_and_history(tmp_path, monkeypatch):
@@ -1582,7 +1020,6 @@ def test_delivery_comparison_uses_bound_artifact_mapping_and_history(tmp_path, m
         db.close()
 
 
-
 def test_selected_representative_frame_survives_late_clip_response():
     import shutil
     import subprocess
@@ -1609,38 +1046,6 @@ document.getElementById('thumb-mid').onmouseenter();assert.equal(state.previewPi
 ` ,context);
 """
     subprocess.run([node,"-e",script,str(Path(__file__).resolve().parents[1]/"scripts/audit_tool/static/app.js")],check=True,capture_output=True,timeout=10)
-
-
-def test_tuning_quality_summary_preserves_unknown_and_gate_reasons():
-    import shutil
-    import subprocess
-    from pathlib import Path
-    node = shutil.which('node')
-    if not node:
-        pytest.skip('Node required')
-    script = r"""
-const fs=require('fs'),vm=require('vm'),assert=require('assert');
-const source=fs.readFileSync(process.argv[1],'utf8');
-const start=source.indexOf('function qualityGateSummary('),end=source.indexOf('\n}',start)+2;
-const context={};vm.createContext(context);vm.runInContext(source.slice(start,end),context);
-const summary=context.qualityGateSummary;
-assert(summary(null).includes('资料暂不可用'));
-assert(summary({independent_counts:{}}).includes('未知/未知组'));
-const gate={verified_samples:27,required_independent_groups:10,
-independent_counts:{ADULT_MOTION:0,INFANT_MOTION:9,EMPTY_ROOM:10,LIGHT_SHADOW:0},
-excluded_samples:{not_holdout:72,used_for_tuning:0,unreviewed:1,missing_source:0,invalid_interval:0,duplicates:2,conflicts:1},
-insufficient_scenarios:['ADULT_MOTION','INFANT_MOTION','LIGHT_SHADOW'],failed_scenarios:['EMPTY_ROOM']};
-const text=summary(gate);
-for(const word of ['27条','成人活动 0/10组','婴幼儿活动 9/10组','非留出 72条','重复 2条','冲突 1个区间','待补齐：成人活动、婴幼儿活动、光影','未达标：空镜','诊断比较'])assert(text.includes(word),word);
-assert(!summary({independent_counts:{ADULT_MOTION:NaN},required_independent_groups:1}).includes('NaN'));
-const runStart=source.indexOf('async function runTuningSimulation()');
-const runBody=source.slice(runStart,source.indexOf('async function applyTuning',runStart));
-assert(runBody.includes("setElementText('sim-quality-details', '')"));
-assert(runBody.includes('qualityGateSummary(null)'));
-assert(runBody.includes('qualityGateSummary(data.quality_gate)'));
-"""
-    subprocess.run([node, '-e', script, str(Path(__file__).resolve().parents[1]/'scripts/audit_tool/static/app.js')],
-                   check=True, capture_output=True, timeout=10)
 
 
 @pytest.mark.parametrize('basis', ['unknown','representative_frame','video_interval','video_audio_interval','uncertain'])
@@ -1691,45 +1096,6 @@ def test_review_basis_api_validates_before_writes(monkeypatch):
         assert service.submit_review.call_args.kwargs['preserve_attribution'] is False
     finally:
         server.shutdown(); server.server_close(); worker.join(timeout=3)
-
-
-def test_target_canvas_coordinates_and_pointer_ownership():
-    import shutil
-    import subprocess
-    from pathlib import Path
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node required")
-    script = r"""
-const fs=require('fs'),vm=require('vm'),assert=require('assert');
-const source=fs.readFileSync(process.argv[1],'utf8');
-const section=source.slice(source.indexOf('const targetEditor ='),source.indexOf("document.addEventListener('DOMContentLoaded'"));
-const nodes={},handlers={},ctx={clearRect(){},drawImage(){},strokeRect(){},fillText(){}};
-const canvas={width:1920,height:1080,getContext:()=>ctx,getBoundingClientRect:()=>({left:20,top:30,width:802,height:452}),setPointerCapture(){},addEventListener:(name,fn)=>handlers[name]=fn};
-nodes['target-canvas']=canvas;
-const context={document:{getElementById:id=>nodes[id]??=({value:'0',checked:true,addEventListener(){},classList:{add(){},remove(){}}}),querySelectorAll:()=>[]},getComputedStyle:()=>({borderLeftWidth:'1px',borderRightWidth:'1px',borderTopWidth:'1px',borderBottomWidth:'1px'}),assert};
-vm.createContext(context);vm.runInContext(section,context);
-vm.runInContext('initTargetReview();targetEditor.image={};targetEditor.context={};',context);
-const point=(x,y,pointerId=1)=>({clientX:21+x*800,clientY:31+y*450,button:0,pointerId});
-handlers.pointerdown(point(.6,.8));handlers.pointermove(point(.1,.2));handlers.pointerup(point(.1,.2));
-const box=vm.runInContext('targetEditor.boxes[0]',context);
-for(const [key,value] of Object.entries({x_center:.35,y_center:.5,width:.5,height:.6}))assert(Math.abs(box[key]-value)<1e-12);
-vm.runInContext('targetEditor.boxes=[];',context);
-handlers.pointerdown(point(.2,.2));handlers.pointermove(point(.9,.9,2));handlers.pointerup(point(.9,.9,2));handlers.pointercancel(point(.9,.9,2));
-assert.equal(vm.runInContext('targetEditor.boxes.length',context),0);
-assert(vm.runInContext('targetEditor.drag!==null',context));
-handlers.pointerup(point(.8,.8));assert.equal(vm.runInContext('targetEditor.boxes.length',context),1);
-handlers.pointerdown(point(.2,.2));vm.runInContext('targetEditor.busy=true;',context);handlers.pointerup(point(.8,.8));
-assert.equal(vm.runInContext('targetEditor.boxes.length',context),1);
-vm.runInContext('targetEditor.busy=false;',context);
-handlers.pointerdown(point(.2,.2));vm.runInContext('targetEditor.serial++;',context);handlers.pointerup(point(.8,.8));
-assert.equal(vm.runInContext('targetEditor.boxes.length',context),1);
-handlers.pointerdown(point(-.2,-.2));handlers.pointerup(point(1.2,1.2));
-const full=vm.runInContext('targetEditor.boxes[1]',context);assert.equal(full.width,1);assert.equal(full.height,1);
-handlers.pointerdown(point(.3,.3));handlers.pointercancel(point(.4,.4));assert.equal(vm.runInContext('targetEditor.drag',context),null);
-"""
-    source = Path(__file__).resolve().parents[1] / "scripts/audit_tool/static/app.js"
-    subprocess.run([node,"-e",script,str(source)],check=True,capture_output=True,timeout=10)
 
 
 def test_preview_managed_cancellation_reaps_process_and_releases_io(tmp_path, monkeypatch):
@@ -1803,26 +1169,6 @@ def test_preview_busy_io_does_not_spawn_or_publish(tmp_path,monkeypatch):
     disk.release()
 
 
-def test_target_export_does_not_archive_or_read_another_database(tmp_path,monkeypatch):
-    from pathlib import Path
-    from scripts import export_dataset
-    db=VlogDatabase(tmp_path/"isolated.db")
-    service=AuditService(db=db)
-    def forbidden():
-        raise AssertionError("Export must not modify archive or launch source extraction")
-    monkeypatch.setattr(service,"batch_archive_all",forbidden)
-    monkeypatch.setattr(export_dataset,"load_archive_items",lambda path:[])
-    seen=[]
-    monkeypatch.setattr(export_dataset,"load_db_fallback_items",lambda path:(seen.append(Path(path)) or [object()]))
-    monkeypatch.setattr(export_dataset,"build_yolo_dataset",lambda **kwargs:{"usable":False,"excluded":1,"train_images":0,"val_images":0})
-    try:
-        result=service.export_yolo_dataset(output_dir=tmp_path/"out")
-        assert seen==[db.db_path]
-        assert result["success"] is False and result["train_cmd"] is None
-        assert "事件标签" in result["message"]
-    finally:db.close()
-
-
 def test_exclude_http_returns_conflict_for_owned_day(tmp_path, monkeypatch):
     import json
     import http.cookiejar
@@ -1856,4 +1202,155 @@ def test_exclude_http_returns_conflict_for_owned_day(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         worker.join(timeout=3)
+        db.close()
+
+
+@pytest.fixture
+def watch_plan_input(tmp_path):
+    from scripts.audit_tool.watch_export import canonical
+    source=canonical(tmp_path/'source.mp4')
+    mapping={"fps":20,"planned_frames":120,"segments":[
+        {"source_file":source,"source_start_s":n,"source_end_s":n+2,
+         "output_start_frame":n*20,"output_end_frame":(n+2)*20,"state":"DYNAMIC"} for n in (0,2,4)]}
+    analysis=[{"source_file":source,"start":0,"end":6,"state":"DYNAMIC","avg_confidence":.9}]
+    return mapping,analysis,source
+
+
+def test_watch_partition_budget_and_human_negative_priority(watch_plan_input):
+    from scripts.audit_tool.watch_export import plan_selection
+    m,a,source=watch_plan_input
+    human=[{"source_file":source,"start":.1,"end":.5,"manual_label":"CONFIRMED_MOTION"},
+           {"source_file":source,"start":1,"end":1.5,"manual_label":"FALSE_ALARM"}]
+    plan=plan_selection(m,a,human,budget_s=3)
+    assert plan['selected_frames']==40
+    assert len(plan['items'])==3
+    assert plan['items'][0]['disposition']=='review'
+    assert plan['items'][0]['evidence_status']=='mixed_human_decisions'
+    assert plan['items'][0]['evidence']['human']==human
+    assert sum(i['frames'] for i in plan['items'])==120
+    assert plan==plan_selection(m,a,human,budget_s=3)
+
+
+def test_watch_budget_conflict_and_association_gap(watch_plan_input):
+    from scripts.audit_tool.watch_export import plan_selection
+    m,a,source=watch_plan_input
+    positive=[{"source_file":source,"start":0,"end":6,"manual_label":"CONFIRMED_MOTION"}]
+    assert plan_selection(m,a,positive,budget_s=3)['status']=='BUDGET_CONFLICT'
+    plan=plan_selection(m,[],[])
+    assert plan['status']=='EMPTY'
+    assert all('analysis_association_unknown' in i['dispute_reasons'] for i in plan['items'])
+    m['segments'][1]['output_start_frame']=41
+    with pytest.raises(ValueError,match='partition'): plan_selection(m,a,[])
+
+
+def test_watch_manager_stale_duplicate_cancel_and_publish(tmp_path,monkeypatch):
+    import threading
+    import json
+    from scripts.audit_tool import watch_export as w
+    manager=w.WatchExportManager(tmp_path/'isolated.db',tmp_path/'out',tmp_path/'temp')
+    frozen={'snapshot':'pending','binding':{'date':'20260330','camera':0,'budget_s':1200,'parent':{'path':'parent'}},
+            'plan':{'status':'AVAILABLE','items':[],'review':[]}}
+    key=w.digest(frozen['binding']);frozen['snapshot']=key
+    monkeypatch.setattr(manager,'parent',lambda *args:'parent')
+    monkeypatch.setattr(w,'capture',lambda *args,**kwargs:frozen)
+    gate=threading.Event();started=threading.Event()
+    def encode(f,p,c,progress):
+        started.set();gate.wait(5)
+        if c.is_set():raise InterruptedError('cancelled')
+        (p/'daily.mp4').write_bytes(b'controlled media')
+        return {'controlled':True}
+    monkeypatch.setattr(w,'encode_daily',encode)
+    with pytest.raises(ValueError,match='STALE'):manager.start('20260330',0,'b'*64)
+    first=manager.start('20260330',0,key); assert started.wait(3)
+    assert manager.start('20260330',0,key)['snapshot']==first['snapshot']
+    assert manager.cancel(key);gate.set();manager.workers[key].join(5)
+    assert manager.status('20260330',0,key)['status']=='CANCELLED'
+    assert not manager.directory('20260330',0,key).exists()
+    manager.start('20260330',0,key);manager.workers[key].join(5)
+    result=manager.status('20260330',0,key)
+    assert result['status']=='COMPLETED' and not result['worker_alive']
+    directory,manifest=manager.package('20260330',0,key)
+    assert manager.start('20260330',0,key)['status']=='COMPLETED'
+    assert manager.listing('20260330',0,key)['total']==0
+    (directory/'review.json').write_text(json.dumps({'items':[{}]}),encoding='utf-8')
+    with pytest.raises(ValueError,match='identity'):manager.package('20260330',0,key)
+
+
+def test_watch_playback_refuses_changed_frozen_source(tmp_path,monkeypatch):
+    import json
+    from scripts.audit_tool import watch_export as w
+    manager=w.WatchExportManager(tmp_path/'db',tmp_path,tmp_path)
+    source=tmp_path/'source.mp4';source.write_bytes(b'original')
+    item={'item_id':'interval','source_file':w.canonical(source),'start':2,'end':4}
+    for name,items in [('selection',[item]),('review',[])]:
+        (tmp_path/(name+'.json')).write_text(json.dumps({'items':items}),encoding='utf-8')
+    manifest={'binding':{'parent':{},'sources':{w.canonical(source):w.source_identity(source)}}}
+    monkeypatch.setattr(manager,'package',lambda *args:(tmp_path,manifest))
+    assert manager.playback('20260330',0,'a'*64,'source','interval')['intervals']==[{'start':2,'end':4}]
+    source.write_bytes(b'replacement is different')
+    with pytest.raises(ValueError,match='identity changed'):manager.playback('20260330',0,'a'*64,'source','interval')
+    source.unlink()
+    with pytest.raises(ValueError,match='unavailable'):manager.playback('20260330',0,'a'*64,'source','interval')
+
+
+def test_watch_lazy_managers_are_singletons_under_concurrent_requests(tmp_path,monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from scripts.audit_tool import app
+    from unittest.mock import MagicMock
+    audit=object.__new__(AuditService);audit.db=MagicMock();audit.db.db_path=tmp_path/'db'
+    monkeypatch.setattr(app,'service',None)
+    monkeypatch.setattr(app,'AuditService',lambda:audit)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        services=list(pool.map(lambda _:app.initialize_service(),range(24)))
+        managers=list(pool.map(lambda _:audit.watch_exports(),range(24)))
+    assert all(s is audit for s in services)
+    assert all(m is managers[0] for m in managers)
+
+
+def test_watch_full_validation_releases_io_on_failure_and_cancel(monkeypatch):
+    import threading
+    from unittest.mock import MagicMock
+    from scripts.audit_tool import watch_export as w
+    from src.hardware import scheduler
+    disk=MagicMock()
+    monkeypatch.setattr(scheduler,'get_disk_semaphore',lambda:disk)
+    monkeypatch.setattr(scheduler,'acquire_with_retry',lambda *a,**kw:True)
+    monkeypatch.setattr(w,'_decode_daily',lambda *args:(_ for _ in ()).throw(ValueError('bad clock')))
+    with pytest.raises(ValueError,match='clock'):w.validate_daily('media',10,20)
+    disk.release.assert_called_once()
+    disk.reset_mock();cancel=threading.Event();cancel.set()
+    with pytest.raises(InterruptedError):w.validate_daily('media',10,20,cancel)
+    disk.release.assert_not_called()
+
+
+def test_watch_capture_uses_current_analysis_and_human_reviews(tmp_path, monkeypatch, watch_plan_input):
+    import json
+    from scripts.audit_tool import watch_export as w
+    mapping, _, source = watch_plan_input
+    from pathlib import Path
+    Path(source).write_bytes(b"controlled source identity")
+    parent = tmp_path / "parent.mp4"
+    parent.write_bytes(b"controlled parent identity")
+    parent.with_suffix('.meta.json').write_text(json.dumps({
+        "date": "20260330", "camera": {"cam_index": 0},
+        "delivery_mapping": {**mapping, "version": 1, "status": "AVAILABLE"}}), encoding='utf-8')
+    monkeypatch.setattr(w, 'inspect_parent', lambda *args: {
+        **w.file_identity(parent), 'fps': 20, 'frames': 120, 'video_origin_s': 0})
+    db = VlogDatabase(tmp_path / 'watch.db')
+    try:
+        db.add_file_task(source, 0, '20260330', '20260330000000', '20260330000006', 6)
+        db.set_analysis_result(source, [Segment(0, 6, 'DYNAMIC', source, avg_confidence=.9)])
+        segment = db.get_segments_for_file(source)[0]
+        db.update_segment_review(segment['id'], 'CONFIRMED_MOTION')
+        frozen = w.capture(db.db_path, parent, '20260330', 0)
+        assert frozen['plan']['required_seconds'] == 6
+        assert all(item['priority'] for item in frozen['plan']['items'])
+        assert sum(item['frames'] for item in frozen['plan']['items']) == 120
+        assert frozen['binding']['selection_sha256'] == w.digest(frozen['plan'])
+        assert w.capture(db.db_path, parent, '20260330', 0)['snapshot'] == frozen['snapshot']
+        db.update_segment_review(segment['id'], 'FALSE_ALARM')
+        changed = w.capture(db.db_path, parent, '20260330', 0)
+        assert changed['snapshot'] != frozen['snapshot']
+        assert changed['plan']['selected_frames'] == 0
+    finally:
         db.close()

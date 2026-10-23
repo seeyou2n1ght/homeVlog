@@ -1,7 +1,7 @@
 """tests/test_prescreen_adaptive.py
 
 验证预筛选阶段自适应动态阈值、4x4网格空间集中度算子、时间邻域先验保护
-以及 tune_thresholds 超参数寻优工具的逻辑准确性。
+以及纯预筛决策的行为。
 """
 
 import json
@@ -14,12 +14,6 @@ from src.prescreen import (
     _calc_spatial_concentration,
     _prescreen_keyframes,
     prescreen_file,
-)
-from scripts.tune_thresholds import (
-    PrescreenSample,
-    evaluate_grid,
-    run_grid_search,
-    simulate_prediction,
 )
 
 
@@ -554,76 +548,9 @@ def test_prescreen_checks_last_keyframe_skipped_by_stride():
     assert json.loads(result["result_json"])["sample_ts"] == [0.0, 99.0]
 
 
-def test_tune_thresholds_simulation_and_grid_search():
-    """验证超参数寻优算法对暗光漏检和强光误报样本的正确打分与最优推荐"""
-    samples = [
-        # 样本1: 暗光真实人体移动 (luma 28, max_diff 4.0, 集中度高) -> 真值 MOTION
-        PrescreenSample(
-            file_id=1,
-            filepath="night_motion.mp4",
-            ground_truth="MOTION",
-            max_diff=4.0,
-            mean_luma=28.0,
-            concentration=1.55,
-            diffs=[1.0, 4.0],
-        ),
-        # 样本2: 傍晚光照渐变 (luma 120, max_diff 9.5, 但全图弥漫 concentration 1.05) -> 真值 STATIC
-        PrescreenSample(
-            file_id=2,
-            filepath="dusk_light_shift.mp4",
-            ground_truth="STATIC",
-            max_diff=9.5,
-            mean_luma=120.0,
-            concentration=1.05,
-            diffs=[2.0, 9.5],
-        ),
-        # 样本3: 白天正常人物穿行 (luma 130, max_diff 14.0, concentration 1.6) -> 真值 MOTION
-        PrescreenSample(
-            file_id=3,
-            filepath="day_motion.mp4",
-            ground_truth="MOTION",
-            max_diff=14.0,
-            mean_luma=130.0,
-            concentration=1.6,
-            diffs=[1.0, 14.0],
-        ),
-    ]
-
-    # 1. 验证单一预测：
-    # 当 base_threshold=8.0, night_factor=0.4 时：
-    # 样本1 的有效阈值是 8.0*0.4=3.2，4.0 > 3.2 且 concentration=1.55 >= 1.35 -> 识别为 MOTION (TP)
-    pred_sample1 = simulate_prediction(samples[0], base_threshold=8.0, night_factor=0.4, concentration_thresh=1.35)
-    assert pred_sample1 == "MOTION"
-
-    # 若未开启暗光自适应 (night_factor=1.0)：
-    # 样本1 的阈值为 8.0，4.0 < 8.0 -> 误判为 STATIC (FN 漏检！)
-    pred_sample1_rigid = simulate_prediction(samples[0], base_threshold=8.0, night_factor=1.0, concentration_thresh=1.35)
-    assert pred_sample1_rigid == "STATIC"
-
-    # 2. 验证网格评估打分：
-    eval_adaptive = evaluate_grid(samples, base_threshold=8.0, night_factor=0.4, concentration_thresh=1.35)
-    eval_rigid = evaluate_grid(samples, base_threshold=8.0, night_factor=1.0, concentration_thresh=1.35)
-
-    # 开启自适应时 0 漏检 (fn=0, recall=1.0)
-    assert eval_adaptive.fn == 0
-    assert eval_adaptive.recall == 1.0
-
-    # 未开启自适应时有 1 处严重漏检 (fn=1)
-    assert eval_rigid.fn == 1
-
-    # 成本打分对比：自适应方案显著优于僵化方案
-    assert eval_adaptive.cost_score < eval_rigid.cost_score
-
-    # 3. 验证全网格搜索能够推选出正确的最优解
-    results = run_grid_search(samples, base_thresholds=[6.0, 8.0, 10.0], night_factors=[0.4, 0.9])
-    best = results[0]
-    assert best.night_factor == 0.4
-    assert best.fn == 0
-
-
 def test_calc_spatial_metrics_and_pure_evaluation_policy():
     """验证重构后的纯函数算子与多轨运动决策策略行为准确性。"""
-    from src.stages.prescreen import _calc_spatial_metrics, _evaluate_prescreen_motion, MotionDecision
+    from src.stages.prescreen import _calc_spatial_metrics, _evaluate_prescreen_motion
 
     # 1. 空间指标计算边界验证
     empty_map = np.zeros((0, 0), dtype=np.float32)
@@ -746,34 +673,3 @@ def test_prescreen_keyframes_error_after_samples_routes_to_suspicious():
     meta = json.loads(res["result_json"])
     assert meta.get("truncated") is True
     assert "stream_error" in meta.get("reason", "")
-
-
-def test_legacy_threshold_tool_rejects_application_before_io(tmp_path, monkeypatch):
-    from scripts import tune_thresholds as tool
-    config = tmp_path / "settings.yaml"
-    config.write_text("detection: {prescreen_diff_threshold: 8.5}\n")
-    original = config.read_bytes()
-    with pytest.raises(RuntimeError, match="disabled"):
-        tool.apply_best_config(config, None)
-    monkeypatch.setattr("sys.argv", ["tune_thresholds.py", "--apply"])
-    monkeypatch.setattr(tool, "print_dataset_summary", lambda *a: pytest.fail("database accessed"))
-    with pytest.raises(SystemExit) as stopped:
-        tool.main()
-    assert stopped.value.code == 2
-    assert config.read_bytes() == original
-    assert not config.with_suffix(".yaml.bak").exists()
-
-
-def test_legacy_threshold_partial_negative_is_not_file_truth(tmp_path):
-    import sqlite3
-    import json
-    from scripts.tune_thresholds import load_labeled_samples
-    db = tmp_path / "legacy.db"
-    with sqlite3.connect(db) as conn:
-        conn.executescript("CREATE TABLE file_tasks(id INTEGER,filepath TEXT,prescreen_result TEXT); "
-                           "CREATE TABLE segments(file_id INTEGER,manual_label TEXT);")
-        conn.execute("INSERT INTO file_tasks VALUES(1,?,?)", ("source.mp4", json.dumps({"max_diff": 5})))
-        conn.execute("INSERT INTO segments VALUES(1,'FALSE_ALARM')")
-    before = db.read_bytes()
-    assert load_labeled_samples(db) == []
-    assert db.read_bytes() == before

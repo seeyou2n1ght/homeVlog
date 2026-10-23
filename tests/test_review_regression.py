@@ -270,18 +270,15 @@ def test_checkpoint_open_fallback_preserves_integrity(tmp_path, monkeypatch, fai
     original_window = render_cache._window_is_continuous
     main_thread = threading.current_thread()
     serial_boundaries = []
-    open_lock = threading.Lock()
-    independent_opens = 0
+    opens = 0
     def open_container(*args, **kwargs):
-        nonlocal independent_opens
-        if threading.current_thread() != main_thread and failure != "checkpoint":
-            with open_lock:
-                independent_opens += 1
-                fail = failure != "partial_open" or independent_opens == 1
-            if fail:
-                raise av.error.EOFError(541478725, "controlled container-open failure")
+        nonlocal opens
+        opens += 1
+        assert threading.current_thread() == main_thread
+        if opens > 1 and failure != "checkpoint" and (failure != "partial_open" or opens == 5):
+            raise av.error.EOFError(541478725, "controlled container-open failure")
         return original_open(*args, **kwargs)
-    def window(container, stream, boundary, duration):
+    def window(container, stream, boundary, duration, **kwargs):
         if threading.current_thread() != main_thread and failure == "checkpoint":
             return False
         if threading.current_thread() == main_thread:
@@ -290,7 +287,7 @@ def test_checkpoint_open_fallback_preserves_integrity(tmp_path, monkeypatch, fai
                 return False
             if failure == "serial_error" and boundary == 8:
                 raise av.error.InvalidDataError(1094995529, "controlled decode failure")
-        return original_window(container, stream, boundary, duration)
+        return original_window(container, stream, boundary, duration, **kwargs)
     monkeypatch.setattr(av, "open", open_container)
     monkeypatch.setattr(render_cache, "_window_is_continuous", window)
     if failure.startswith("changed"):
@@ -316,6 +313,86 @@ def test_checkpoint_open_fallback_preserves_integrity(tmp_path, monkeypatch, fai
         assert details["stage"] == "file_changed"
 
 
+@pytest.mark.parametrize("failure", [None, "open", "decode", "pool", "close"])
+def test_checkpoint_readers_owned_by_caller_until_workers_finish(tmp_path, monkeypatch, failure):
+    import concurrent.futures
+    import threading
+    from src.hardware import render_cache
+
+    path = make_video(tmp_path / "reader_lifecycle.mp4", seconds=20, fps=5)
+    raw_open = av.open
+    raw_window = render_cache._window_is_continuous
+    caller = threading.current_thread()
+    readers = []
+    closed = []
+    active = set()
+    lock = threading.Lock()
+    level = av.logging.get_level()
+
+    class Reader:
+        def __init__(self, container):
+            self.container = container
+
+        def __getattr__(self, name):
+            return getattr(self.container, name)
+
+        def __enter__(self):
+            self.container.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            assert threading.current_thread() == caller
+            assert not active
+            assert self not in closed
+            closed.append(self)
+            result = self.container.__exit__(*args)
+            if failure == "close" and self is readers[3]:
+                raise OSError("controlled close failure")
+            return result
+
+    def open_reader(*args, **kwargs):
+        assert threading.current_thread() == caller
+        assert not active
+        if failure == "open" and len(readers) == 4:
+            raise OSError("controlled open failure")
+        reader = Reader(raw_open(*args, **kwargs))
+        readers.append(reader)
+        return reader
+
+    def window(container, stream, boundary, duration, **kwargs):
+        if threading.current_thread() == caller:
+            return raw_window(container, stream, boundary, duration, **kwargs)
+        # All independent readers exist before the first worker can decode.
+        assert len(readers) == 9
+        assert container is not readers[0]
+        with lock:
+            assert container not in active and container not in closed
+            active.add(container)
+        try:
+            if failure == "decode":
+                raise RuntimeError("controlled worker decode failure")
+            return raw_window(container, stream, boundary, duration, **kwargs)
+        finally:
+            with lock:
+                active.remove(container)
+
+    def broken_pool(**kwargs):
+        raise RuntimeError("controlled pool construction failure")
+
+    monkeypatch.setattr(av, "open", open_reader)
+    monkeypatch.setattr(render_cache, "_window_is_continuous", window)
+    if failure == "pool":
+        monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", broken_pool)
+    details = {}
+    assert render_cache.valid_video(path, 20, checkpoints=[2., 4., 6., 8., 10., 12., 14., 16.],
+                                   diagnostics=details) is (failure in (None, "open"))
+    assert set(closed) == set(readers) and len(closed) == len(readers)
+    assert not active
+    assert av.logging.get_level() == level
+    assert ("checkpoint_fallback" in details) is (failure == "open")
+    if failure is None:
+        assert len(details["checkpoint_chunks"]) == 8
+        assert all(d["total_s"] >= d["open_s"] for d in details["checkpoint_chunks"])
 
 
 def test_camera_indices_persist_across_scan_order(tmp_path):
@@ -420,17 +497,6 @@ def test_worker_failure_signals_abort(tmp_path):
     orch._guard_worker(fail)
     assert orch.abort_event.is_set() and orch.render_finished_event.is_set()
     db.close()
-
-
-@pytest.mark.parametrize("label", ["FP", "TN", "FALSE_ALARM", "CONFIRMED_STATIC"])
-def test_event_negative_labels_are_not_object_negatives(tmp_path, label):
-    from scripts.export_dataset import DatasetItem, generate_yolo_labels_for_item
-    target = tmp_path / "label.txt"
-    model = MagicMock()
-    item = DatasetItem(tmp_path/"image.jpg", label, 1, "x", 0)
-    assert generate_yolo_labels_for_item(item,target,model) == -1
-    assert not target.exists()
-    model.assert_not_called()
 
 
 def test_frame_pool_is_lossless_and_bounded():
@@ -602,3 +668,32 @@ def test_human_reviewed_segment_immune_to_short_smoothing():
     assert res[1].end_time == 101.5
     assert res[1].is_human_reviewed is True
 
+
+def test_human_feedback_remedy_guarantee(tmp_path):
+    """验证人机协同复核机制对争议切片具有 100% 纠偏保护力 (Timeline Invariant)."""
+    from src.segment import Segment
+    from src.timeline import build_timeline
+
+    db = VlogDatabase(tmp_path / "remedy.sqlite")
+    fp = "sample_clip.mp4"
+    db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901101000", 600)
+
+    # 模拟 1 个被误判为 DYNAMIC 的光影假阳性切片
+    seg = Segment(10.0, 30.0, "DYNAMIC", fp, max_energy=18.0, avg_confidence=0.0)
+    db.set_analysis_result(fp, [seg])
+
+    # 初始成片时间轴: 该切片处于 DYNAMIC 原速
+    initial_tl = build_timeline(db, "20260901", 0)
+    assert any(t.state == "DYNAMIC" for t in initial_tl)
+
+    # 模拟人工工作台将其标记为 FALSE_ALARM (光影误报)
+    db_segs = db.get_segments_for_file(fp)
+    seg_id = db_segs[0]["id"]
+    db.update_segment_review(seg_id, "FALSE_ALARM", notes="树影晃动纠偏")
+
+    # 复核后成片时间轴: build_timeline 必须保证纠偏生效，降级为 STATIC 快进
+    corrected_tl = build_timeline(db, "20260901", 0)
+    assert not any(t.state == "DYNAMIC" for t in corrected_tl)
+    assert all(t.state == "STATIC" for t in corrected_tl)
+
+    db.close()

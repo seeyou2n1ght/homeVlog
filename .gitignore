@@ -111,3 +111,5 @@ Thumbs.db
 .DS_Store
 desktop.ini
 backup/
+*.bak
+*.bak_*

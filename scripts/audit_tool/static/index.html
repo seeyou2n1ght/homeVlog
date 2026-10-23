@@ -43,12 +43,6 @@
           <button class="menu-item" id="btn-index-visual-source">为当前原片建立视觉索引</button>
           <button class="menu-item" id="btn-delivery-comparison">▶ 当前片段：成片版本对比</button>
           <button class="menu-item" id="btn-review-context">✍ 当前片段：配置、归因与对比</button>
-          <button class="menu-item" id="btn-export-gold">🏆 导出评测基准 (Benchmark)</button>
-          <button class="menu-item" id="btn-open-whatif">🔬 参数实测对照</button>
-          <button class="menu-item" id="btn-open-tuning">💡 调参量化建议</button>
-          <button class="menu-item" id="btn-open-yolo">🏷️ 导出 YOLO 数据集</button>
-          <button class="menu-item" id="btn-target-review">当前归档帧：人工目标框</button>
-          <button class="menu-item" id="btn-agent-target-review">查看智能体目标复核建议</button>
           <button class="menu-item" id="btn-open-rerender">🚀 重新浓缩成片</button>
           <button class="menu-item" id="btn-export-csv">📊 导出 CSV 报表</button>
         </div>
@@ -200,79 +194,6 @@
     </div>
   </footer>
 
-  <!-- 调参仿真 (What-If) 模态框 -->
-  <div class="modal-overlay hidden" id="modal-whatif">
-    <div class="modal-card modal-whatif-card">
-      <div class="modal-header">
-        <span class="modal-title">参数对照：生产重放记录</span>
-        <button class="btn-modal-close" id="btn-close-whatif">✕</button>
-      </div>
-      <div class="modal-body">
-        <p class="modal-desc">比较完整生产重放与独立核验参考。候选仅修改全局专家参数；机位覆盖可能使某些值保持不变。缺少匹配收据时不显示收益，参考数量与质量门禁由实测返回。</p>
-        <p id="sim-context-hint" role="status"></p>
-        
-        <div class="whatif-form-grid">
-          <div class="form-field">
-            <label>动能敏感门限 (min_motion_threshold)</label>
-            <input type="number" step="0.1" id="sim-input-energy" class="sim-input" />
-            <span class="field-hint" id="sim-hint-energy"></span>
-          </div>
-          <div class="form-field">
-            <label>最小运动时长 (min_motion_duration)</label>
-            <input type="number" step="0.1" id="sim-input-dur" class="sim-input" />
-            <span class="field-hint" id="sim-hint-dur"></span>
-          </div>
-          <div class="form-field">
-            <label>YOLO 目标置信度 (confidence)</label>
-            <input type="number" step="0.01" id="sim-input-yolo" class="sim-input" />
-            <span class="field-hint" id="sim-hint-yolo"></span>
-          </div>
-        </div>
-
-        <div class="whatif-actions-bar">
-          <button class="btn-sim-action" id="btn-run-simulation" disabled>读取实测重放对照</button>
-          <button class="btn-apply-action hidden" id="btn-apply-tuning-config">💾 安全应用至 settings.yaml</button>
-        </div>
-
-        <!-- 仿真结果输出面板 -->
-        <div class="sim-report-box hidden" id="sim-report-box">
-          <div class="sim-verdict-banner" id="sim-verdict-banner">
-            <span class="verdict-tag" id="sim-verdict-tag">待测</span>
-            <span class="verdict-reason font-mono" id="sim-verdict-reason">--</span>
-          </div>
-
-          <div class="sim-stats-grid font-mono">
-            <div class="stat-cell">
-              <span class="stat-label">基准 F1</span>
-              <span class="stat-val" id="stat-base-f1">--</span>
-            </div>
-            <div class="stat-cell highlight">
-              <span class="stat-label">候选实测 F1</span>
-              <span class="stat-val" id="stat-sim-f1">--</span>
-            </div>
-            <div class="stat-cell">
-              <span class="stat-label">Δ F1 净增</span>
-              <span class="stat-val" id="stat-delta-f1">--</span>
-            </div>
-            <div class="stat-cell">
-              <span class="stat-label">误报减少 (FP)</span>
-              <span class="stat-val text-green" id="stat-fp-red">--</span>
-            </div>
-            <div class="stat-cell">
-              <span class="stat-label">漏报代价 (FN)</span>
-              <span class="stat-val text-yellow" id="stat-fn-inc">--</span>
-            </div>
-          </div>
-          <p id="sim-quality-details" class="sim-quality-details" aria-live="polite"></p>
-          <p>逐参考保留与展示贡献（比例计量，不证明动作清晰度）</p>
-          <div class="rerender-table-wrap"><table>
-            <thead><tr><th>片段/机位</th><th>场景</th><th>参考活动</th><th>基线保留</th><th>候选保留</th><th>状态：前→后</th><th>展示贡献：前→后</th></tr></thead>
-            <tbody id="sim-sample-changes"></tbody>
-          </table></div>
-        </div>
-      </div>
-    </div>
-  </div>
 
   <div class="modal-overlay hidden" id="modal-context">
     <div class="modal-card modal-player-card">
@@ -361,50 +282,22 @@
   </div>
 
   <!-- 吐司消息通知 (Toast) -->
-  <div class="modal-overlay hidden" id="modal-target-export">
-    <div class="modal-card">
-      <div class="modal-header"><span>导出人工目标数据集</span><button class="btn-modal-close" id="btn-close-target-export">✕</button></div>
-      <div class="modal-body">
-        <p>导出当前反馈库中已完成全部目标复核的图片，训练/调优/留出按来源分组，比例约为60%/20%/20%。同一天原片和相同图片不跨组；实际比例取决于来源组数量。</p>
-        <p>草稿、不能确定、事件标签和旧目标文件不能替代目标真值。每次创建新的导出目录，不覆盖以前的数据集；本操作不启动训练或更换模型。</p>
-        <button class="btn-menu-trigger" id="btn-create-target-export">创建新的数据集导出</button>
-        <pre id="target-export-result" role="status"></pre>
-      </div>
-    </div>
-  </div>
-  <div class="modal-overlay hidden" id="modal-agent-target-review">
-    <div class="modal-card modal-player-card">
-      <div class="modal-header"><span>智能体目标复核建议</span><button class="btn-modal-close" id="btn-close-agent-target-review">✕</button></div>
-      <div class="modal-body">
-        <p id="agent-target-status" role="status"></p>
-        <p id="agent-target-notes"></p>
-        <p>目标框为近似视觉建议。已有人工裁决优先；建议不会自动成为人工标签，也不进入当前训练或独立测试集。</p>
-        <canvas id="agent-target-canvas" aria-label="智能体目标框建议，只读" style="display:block;max-width:100%;max-height:65vh"></canvas>
-      </div>
-    </div>
-  </div>
-  <div class="modal-overlay hidden" id="modal-target-review">
-    <div class="modal-card modal-player-card">
-      <div class="modal-header"><span>人工目标框 · 固定归档帧</span><button class="btn-modal-close" id="btn-close-target-review">✕</button></div>
-      <div class="modal-body">
-        <p id="target-review-status" role="status"></p>
-        <p>拖动画框，点击框可选中删除。只标当前图片中可见的人物、猫和狗；被褥或蚊帐遮挡无法确认时选“不能确定”。事件误报或静止不能代替无目标核对。</p>
-        <button id="target-prepare" class="btn-menu-trigger">重新生成原片归档帧</button>
-        <div><label>新框类别 <select id="target-class"><option value="0">人物</option><option value="15">猫</option><option value="16">狗</option></select></label>
-        <button id="target-delete" class="btn-menu-trigger">删除选中框</button><button id="target-clear" class="btn-menu-trigger">清空框</button></div>
-        <canvas id="target-canvas" aria-label="目标框画布"></canvas>
-        <p id="target-box-count"></p>
-        <label><input type="checkbox" id="target-complete">我已检查当前图片全部可见目标，框和类别均已核对</label>
-        <div id="target-save-actions">
-          <button id="target-save-objects" class="btn-menu-trigger">保存全部目标</button>
-          <button id="target-save-empty" class="btn-menu-trigger">确认当前图片无目标</button>
-          <button id="target-save-uncertain" class="btn-menu-trigger">不能确定</button>
-          <button id="target-save-draft" class="btn-menu-trigger">保存草稿</button>
-        </div>
-        <p>草稿和不能确定不参与训练。此处保存不改变事件分类或成片时间轴；只确认当前图片，不证明整个原片无人。</p>
-      </div>
-    </div>
-  </div>
+
+
+
+  <details id="watch-panel" style="position:fixed;top:56px;left:12px;z-index:210;background:#172033;color:#eee;padding:12px;max-width:92vw;max-height:calc(100vh - 160px);overflow:auto;border:1px solid #65718b;border-radius:8px">
+    <summary>日常版／争议复核／完整版本</summary>
+    <p>按需生成≤20分钟日常版；算法候选不是已确认事件，预算未选不等于误检。冻结清单仅播放，裁决请核对实时审核区间。</p>
+    <label>日期 <input id="watch-date" placeholder="YYYYMMDD" maxlength="8"></label>
+    <label>机位 <input id="watch-camera" type="number" min="0" value="0"></label>
+    <button id="watch-preview">预览计划</button><button id="watch-start" disabled>生成日常版</button><button id="watch-cancel">取消任务</button>
+    <button id="watch-load">查找已完成版本</button><select id="watch-exports" aria-label="观看版本"></select>
+    <p id="watch-status" role="status"></p>
+    <button id="watch-daily">日常版</button><a id="watch-download" download="daily.mp4">下载日常版</a>
+    <button id="watch-review">争议复核</button><button id="watch-selection">其余片段及日常映射</button><button id="watch-full">完整版本</button>
+    <p id="watch-count"></p><button id="watch-prev">上一页</button><button id="watch-next">下一页</button>
+    <div id="watch-list"></div>
+  </details>
   <div class="toast-container" id="toast-container"></div>
   <script src="/app.js"></script>
 </body>

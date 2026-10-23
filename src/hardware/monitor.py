@@ -16,6 +16,7 @@ class StageStats:
     name: str
     start_ts: float
     end_ts: float = 0.0
+    include_in_total: bool = True
     cpu_pct: list[float] = field(default_factory=list)
     # Per-GPU metrics: list of lists, one per GPU
     gpu_load: list[list[int]] = field(default_factory=list)
@@ -242,8 +243,8 @@ class Monitor:
             pass
 
     @contextmanager
-    def stage(self, name: str):
-        s = StageStats(name=name, start_ts=time.monotonic())
+    def stage(self, name: str, *, include_in_total: bool = True):
+        s = StageStats(name=name, start_ts=time.monotonic(), include_in_total=include_in_total)
         with self._active_lock:
             self._active_stages.add(s)
             self._stages.append(s)
@@ -274,7 +275,8 @@ class Monitor:
         lines = ["--- Monitor Summary ---"]
         total = 0.0
         for s in stages:
-            total += s.duration
+            if s.include_in_total:
+                total += s.duration
             parts = [
                 f"  [{s.name}] {s.duration:.1f}s  cpu={s.avg_cpu:.1f}%  ram={s.avg_ram:.1f}%"
             ]
@@ -298,6 +300,7 @@ class Monitor:
             entry = {
                 "name": s.name,
                 "duration": round(s.duration, 2),
+                "include_in_total": s.include_in_total,
                 "avg_cpu": round(s.avg_cpu, 1),
                 "avg_ram": round(s.avg_ram, 1),
             }

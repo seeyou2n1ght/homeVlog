@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import time
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 
@@ -38,20 +39,34 @@ def processing_fingerprint(filepath, config):
     return render_fingerprint([filepath], "analysis-v5-ordered-prescreen-prior", "analysis", 0, {}, {}, selected)
 
 
-def _window_is_continuous(container, stream, boundary: float, duration: float) -> bool:
+def _window_is_continuous(container, stream, boundary: float, duration: float, *, diagnostics=None) -> bool:
     frame_step = 1.0 / float(stream.average_rate or 20)
     start = max(0.0, boundary - 0.5)
     stop = min(duration, boundary + 0.5)
-    container.seek(int(start / stream.time_base), stream=stream, backward=True)
+    started = time.monotonic()
+    try:
+        container.seek(int(start / stream.time_base), stream=stream, backward=True)
+    finally:
+        if diagnostics is not None:
+            diagnostics["seek_s"] = diagnostics.get("seek_s", 0.0) + time.monotonic() - started
+    started = time.monotonic()
+    decoded = 0
     seen = []
-    for frame in container.decode(stream):
-        if frame.is_corrupt or frame.pts is None:
-            return False
-        timestamp = float(frame.pts * frame.time_base)
-        if timestamp >= start:
-            seen.append(timestamp)
-        if timestamp >= stop:
-            break
+    try:
+        for frame in container.decode(stream):
+            decoded += 1
+            if frame.is_corrupt or frame.pts is None:
+                return False
+            timestamp = float(frame.pts * frame.time_base)
+            if timestamp >= start:
+                seen.append(timestamp)
+            if timestamp >= stop:
+                break
+    finally:
+        if diagnostics is not None:
+            diagnostics["decode_s"] = diagnostics.get("decode_s", 0.0) + time.monotonic() - started
+            diagnostics["decoded_frames"] = diagnostics.get("decoded_frames", 0) + decoded
+            diagnostics["windows_attempted"] = diagnostics.get("windows_attempted", 0) + 1
     return bool(
         seen
         and seen[0] <= start + 2 * frame_step
@@ -61,16 +76,19 @@ def _window_is_continuous(container, stream, boundary: float, duration: float) -
 
 
 def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: float,
-                               *, diagnostics: dict | None = None) -> bool:
+                               *, diagnostics: dict | None = None, container=None) -> bool:
     import av
     import logging
     _log = logging.getLogger("homevlog")
     details = diagnostics if diagnostics is not None else {}
     started = time.monotonic()
-    details["stage"] = "open"
+    borrowed = container is not None
+    open_s = details.get("open_s", 0.0) if borrowed else 0.0
+    details["stage"] = "checkpoint" if borrowed else "open"
     try:
-        with av.open(str(path), timeout=60.0) as container:
-            details["open_s"] = round(time.monotonic() - started, 6)
+        with (nullcontext(container) if borrowed else av.open(str(path), timeout=60.0)) as container:
+            if not borrowed:
+                details["open_s"] = round(time.monotonic() - started, 6)
             details["stage"] = "checkpoint"
             if not container.streams.video:
                 _log.warning("valid_video checkpoint chunk: file %s has no video stream", path)
@@ -78,7 +96,7 @@ def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: f
             stream = container.streams.video[0]
             for boundary in chunk:
                 details["boundary_s"] = boundary
-                if not _window_is_continuous(container, stream, boundary, duration):
+                if not _window_is_continuous(container, stream, boundary, duration, diagnostics=details):
                     _log.warning("valid_video: boundary %.2fs gap or frame discontinuity in %s", boundary, path)
                     return False
         return True
@@ -88,6 +106,8 @@ def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: f
         details.update(error_type=type(e).__name__, error=str(e), errno=getattr(e, "errno", None))
         _log.warning("valid_video checkpoint chunk exception for %s: %s", path, e, exc_info=True)
         return False
+    finally:
+        details["total_s"] = round(open_s + time.monotonic() - started, 6)
 
 
 def valid_video(path, expected_duration=None, checkpoints=(), require_audio=False, *, diagnostics=None):
@@ -158,14 +178,37 @@ def valid_video(path, expected_duration=None, checkpoints=(), require_audio=Fals
                     from concurrent.futures import ThreadPoolExecutor
                     num_workers = min(8, len(checkpoints_list))
                     chunks = [checkpoints_list[i::num_workers] for i in range(num_workers) if checkpoints_list[i::num_workers]]
-                    chunk_details = [{} for _ in chunks]
-                    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                        results = list(pool.map(
-                            lambda item: _validate_checkpoint_chunk(item[0], path, duration, diagnostics=item[1]),
-                            zip(chunks, chunk_details),
-                        ))
-                    if not all(results):
-                        failed = [info for ok, info in zip(results, chunk_details) if not ok]
+                    chunk_details = []
+                    details["checkpoint_chunks"] = chunk_details
+                    failed = []
+                    # PyAV's logging callback can stall concurrent container opens.
+                    # The caller owns readers; workers only seek/decode one each.
+                    with ExitStack() as readers:
+                        containers = []
+                        for _ in chunks:
+                            info = {"stage": "open"}
+                            chunk_details.append(info)
+                            started = time.monotonic()
+                            try:
+                                containers.append(readers.enter_context(av.open(str(path), timeout=60.0)))
+                            except Exception as e:
+                                info.update(error_type=type(e).__name__, error=str(e), errno=getattr(e, "errno", None))
+                                failed.append(info)
+                                _log.warning("valid_video checkpoint open exception for %s: %s", path, e, exc_info=True)
+                            finally:
+                                info["open_s"] = round(time.monotonic() - started, 6)
+                            if failed:
+                                info["total_s"] = info["open_s"]
+                                break
+                        if not failed:
+                            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                                results = list(pool.map(
+                                    lambda item: _validate_checkpoint_chunk(
+                                        item[0], path, duration, diagnostics=item[1], container=item[2]),
+                                    zip(chunks, chunk_details, containers),
+                                ))
+                            failed = [info for ok, info in zip(results, chunk_details) if not ok]
+                    if failed:
                         details["checkpoint_errors"] = failed
                         # Only an independent container-open failure can retry.
                         # Decode/PTS/continuity failures remain terminal.

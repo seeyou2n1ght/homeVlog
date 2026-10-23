@@ -15,6 +15,49 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.mark.parametrize("failure", [None, "corrupt", "missing_pts", "seek", "decode"])
+def test_checkpoint_timings_preserve_validation_failures(monkeypatch, failure):
+    from fractions import Fraction
+    from types import SimpleNamespace
+    import av
+    from src.hardware import render_cache
+    stream = SimpleNamespace(average_rate=20, time_base=Fraction(1, 20))
+
+    class Container:
+        streams = SimpleNamespace(video=[stream])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def seek(self, offset, **kwargs):
+            if failure == "seek":
+                raise OSError("seek failed")
+            self.offset = offset
+
+        def decode(self, _stream):
+            if failure == "decode":
+                raise RuntimeError("decode failed")
+            for i in range(21):
+                yield SimpleNamespace(is_corrupt=failure == "corrupt",
+                    pts=None if failure == "missing_pts" else self.offset + i,
+                    time_base=stream.time_base)
+
+    monkeypatch.setattr(av, "open", lambda *a, **k: Container())
+    details = {}
+    assert render_cache._validate_checkpoint_chunk([1, 2], "media", 3, diagnostics=details) is (failure is None)
+    assert details["open_s"] >= 0 and details["total_s"] >= details["open_s"]
+    assert details["seek_s"] >= 0
+    if failure != "seek":
+        assert details["decode_s"] >= 0
+        assert details["windows_attempted"] == (2 if failure is None else 1)
+        assert details["decoded_frames"] == (42 if failure is None else 0 if failure == "decode" else 1)
+    if failure in ("seek", "decode"):
+        assert details["error_type"] in ("OSError", "RuntimeError")
+
+
 @pytest.mark.parametrize("kind,rate,frame_samples", [
     ("dense", 48000, 4096), ("legacy", 48000, 137), ("simple", 44100, 4096),
 ])
@@ -653,13 +696,14 @@ class TestFiltergraphGenerationAndClosure:
 class TestConcatOutputFiles:
     """测试切片拼接器的边界条件。"""
 
-    def test_audio_padding_cannot_shift_video_seams(self, tmp_path):
+    @pytest.mark.parametrize("clip_count", [2, 6])
+    def test_audio_padding_cannot_shift_video_seams(self, tmp_path, clip_count):
         import av
         import hashlib
         import numpy as np
 
         clips = []
-        for i, color in enumerate(["red", "blue"]):
+        for i, color in enumerate(["red", "blue"] * (clip_count // 2)):
             path = tmp_path / f"clip{i}.mp4"
             subprocess.run([
                 "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
@@ -681,11 +725,11 @@ class TestConcatOutputFiles:
         assert {"probe_s", "ffmpeg_s", "validation_s", "checkpoints", "promote_s"} <= set(timings)
         assert timings["status"] == "completed"
         assert timings["failure_stage"] is None
-        assert timings["checkpoints"] == 1
+        assert timings["checkpoints"] == clip_count - 1
         assert all(timings[key] >= 0 for key in ("probe_s", "ffmpeg_s", "validation_s", "promote_s"))
         frames = video(output)
         assert [h for _, h in frames] == expected_hashes
-        assert len(frames) == 80
+        assert len(frames) == clip_count * 40
         assert all(b[0] - a[0] == pytest.approx(0.05) for a, b in zip(frames, frames[1:]))
         with av.open(str(output)) as container:
             samples = np.concatenate([f.to_ndarray().ravel() for f in container.decode(audio=0)])
@@ -2267,3 +2311,232 @@ def test_diagnostic_extract_frame_propagates_unknown_stop_and_reports_failure(tm
     monkeypatch.setattr(tool, "run_ffmpeg", unknown)
     with pytest.raises(MediaTerminationUnconfirmed, match="pending"):
         tool.extract_frame("source.mp4", 0, tmp_path / "frame.png")
+
+
+@pytest.mark.parametrize("count,rate,fps,has_audio,eligible", [
+    (179, 48000, 20, True, False), (180, 48000, 20, True, True),
+    (183, 48000, 20, True, True), (215, 48000, 20, True, True),
+    (283, 48000, 20, True, True), (397, 48000, 20, True, True),
+    (180, 44100, 20, True, False), (180, 48000, 29.97, True, False),
+    (180, 48000, 20, False, False),
+])
+def test_grouped_audio_eligibility_preserves_sample_closure(count, rate, fps, has_audio, eligible):
+    from src.stages import timeline
+    segments = [timeline.TimelineSegment("source", 0, i * 2, (i + 1) * 2,
+        "DYNAMIC" if i % 2 else "NIGHT_STATIONARY", 2) for i in range(count)]
+    plans = []
+    timeline.build_concat_filter(segments, [{"filepath": "source", "has_audio": has_audio}],
+        scale_mode="cpu", output_fps=fps, audio_sample_rate=rate,
+        speed_ramping=False, audio_groups_out=plans)
+    assert bool(plans) is eligible
+    if eligible:
+        assert len(plans) == 1
+        assert sum(samples for _, samples in plans[0].groups) == plans[0].samples
+        assert len(plans[0].groups) == (count + 47) // 48
+        assert plans[0].samples * 4 <= timeline.GROUPED_AUDIO_MAX_BYTES
+
+
+@pytest.mark.parametrize("failure", ["short", "overflow", "nonzero", "timeout", "cancel", "unknown"])
+def test_grouped_audio_preparation_reports_incomplete_or_unknown_reader(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    from src.stages import renderer, timeline
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "is_interrupted", lambda: failure == "cancel")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if failure == "unknown":
+            raise renderer.MediaTerminationUnconfirmed("reader alive")
+        kwargs["stdout_consumer"](b"x" * (8 if failure == "overflow" else 2 if failure == "short" else 4))
+        return SimpleNamespace(returncode=1 if failure == "nonzero" else 0,
+            timed_out=failure == "timeout", stderr_text="diagnostic")
+
+    monkeypatch.setattr(renderer, "run_ffmpeg", run)
+    plan = timeline.GroupedAudioPlan("", (("graph", 1),), "", 48000, 1)
+    error = renderer.RenderInterrupted if failure == "cancel" else (
+        renderer.MediaTerminationUnconfirmed if failure == "unknown" else RuntimeError)
+    with pytest.raises(error):
+        renderer._prepare_grouped_audio("source", plan, tmp_path / "audio.f32", tmp_path / "graph.txt")
+    assert bool(calls) is (failure != "cancel")
+
+
+@pytest.mark.parametrize("reason", ["disk", "cap"])
+def test_grouped_audio_resource_limit_does_not_open_source(tmp_path, monkeypatch, reason):
+    from types import SimpleNamespace
+    from src.stages import renderer, timeline
+    monkeypatch.setattr(renderer.shutil, "disk_usage",
+        lambda _path: SimpleNamespace(free=0 if reason == "disk" else 2**40))
+    monkeypatch.setattr(renderer, "run_ffmpeg", lambda *a, **k: pytest.fail("unsupported audio launched"))
+    plan = timeline.GroupedAudioPlan("", (("graph", 1),), "", 48000,
+        timeline.GROUPED_AUDIO_MAX_BYTES if reason == "cap" else 1)
+    pcm = tmp_path / "audio.f32"
+    assert not renderer._prepare_grouped_audio("source", plan, pcm, tmp_path / "graph.txt")
+    assert not pcm.exists()
+
+
+@pytest.mark.parametrize("mode", ["success", "fallback", "unknown", "cancel", "cache"])
+def test_grouped_audio_dispatch_preserves_graph_lease_and_failure_contract(tmp_path, monkeypatch, mode):
+    from src.stages import renderer, timeline
+    from src.hardware import render_cache
+    retained = {}
+    monkeypatch.setattr(renderer, "_retained_batch_locks", retained)
+    monkeypatch.setattr(renderer, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(render_cache, "reusable", lambda *a, **k: mode == "cache")
+    monkeypatch.setattr(render_cache, "render_fingerprint", lambda *a, **k: "identity")
+    calls = []
+
+    def prepare(source, plan, pcm, script):
+        calls.append("prepare")
+        pcm.write_bytes(b"pcm")
+        script.write_text("group")
+        if mode == "unknown":
+            raise renderer.MediaTerminationUnconfirmed("live reader")
+        if mode == "cancel":
+            raise renderer.RenderInterrupted("cancelled")
+        if mode == "fallback":
+            raise RuntimeError("confirmed failed preparation")
+        return True
+
+    def acquire(lease, **kwargs):
+        calls.append("admission")
+        assert lease.inputs == (2 if mode == "success" else 1)
+        graph = (tmp_path / "_fc_batch0_20260328_cam0.txt").read_text()
+        assert graph == ("video;audio" if mode == "success" else "original")
+        return False
+
+    monkeypatch.setattr(renderer, "_prepare_grouped_audio", prepare)
+    monkeypatch.setattr(renderer, "acquire_with_retry", acquire)
+    output = tmp_path / "batch.mp4"
+    plan = timeline.GroupedAudioPlan("video", (("group", 1),), "audio", 48000, 1)
+    args = (["source"], "original", output, "nv", 20, {}, {}, "20260328", 0)
+    try:
+        if mode in ("unknown", "cancel"):
+            error = renderer.RenderTerminationUnconfirmed if mode == "unknown" else renderer.RenderInterrupted
+            with pytest.raises(error):
+                renderer._run_batch_render(*args, config={}, audio_plan=plan)
+            assert calls == ["prepare"]
+        else:
+            result = renderer._run_batch_render(*args, config={}, audio_plan=plan)
+            assert result == (str(output) if mode == "cache" else None)
+            assert calls == ([] if mode == "cache" else ["prepare", "admission"])
+        assert (tmp_path / "batch.audio.f32").exists() is (mode == "unknown")
+    finally:
+        for stack in retained.values():
+            stack.close()
+
+
+@pytest.mark.parametrize("manifest_state", ["valid", "missing", "legacy", "stale", "malformed", "zero"])
+def test_concat_duration_cache_falls_back_and_keeps_full_validation(tmp_path, monkeypatch, manifest_state):
+    import json
+    from fractions import Fraction
+    from types import SimpleNamespace
+    import av
+    from src.hardware import render_cache
+    from src.hardware.ffmpeg import FFmpegResult
+    from src.stages import renderer
+    batch, output = tmp_path / "batch.mp4", tmp_path / "final.mp4"
+    batch.write_bytes(b"original batch")
+    render_cache.save_manifest(batch, "identity", duration=2)
+    manifest_path = render_cache._manifest_path(batch)
+    data = json.loads(manifest_path.read_text())
+    if manifest_state == "missing":
+        manifest_path.unlink()
+    elif manifest_state == "malformed":
+        manifest_path.write_text("{")
+    else:
+        if manifest_state == "legacy":
+            del data["duration"]
+        elif manifest_state == "stale":
+            data["output"][1] += 1
+        elif manifest_state == "zero":
+            data["duration"] = 0
+        manifest_path.write_text(json.dumps(data))
+    probes, validations = [], []
+
+    class Container:
+        duration = 2 * av.time_base
+        streams = SimpleNamespace(video=[SimpleNamespace(duration=40, time_base=Fraction(1, 20))])
+
+        def __enter__(self):
+            probes.append(True)
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def encode(args, **kwargs):
+        descriptor = Path(args[args.index("-i") + 1]).read_text()
+        assert descriptor.count("duration 2.000000000") == 2
+        Path(args[-1]).write_bytes(b"joined media")
+        return FFmpegResult(0, b"", b"")
+
+    def validate(path, expected, **kwargs):
+        validations.append((expected, kwargs["checkpoints"], kwargs["require_audio"]))
+        kwargs["diagnostics"]["stage"] = "completed"
+        return True
+
+    monkeypatch.setattr(av, "open", lambda *a, **k: Container())
+    monkeypatch.setattr(renderer, "run_ffmpeg", encode)
+    monkeypatch.setattr(render_cache, "valid_video", validate)
+    assert renderer.concat_output_files([batch, batch], output)
+    assert len(probes) == (0 if manifest_state == "valid" else 2)
+    assert validations == [(4, [2], True)]
+    assert output.read_bytes() == b"joined media"
+    assert batch.read_bytes() == b"original batch"
+
+
+def test_watch_export_real_frame_boundaries_and_integer_audio(tmp_path,monkeypatch):
+    import av
+    import threading
+    import numpy as np
+    from scripts.audit_tool.watch_export import encode_daily
+    from src.hardware.ffmpeg import run_ffmpeg
+    source=tmp_path/'parent.mp4'
+    result=run_ffmpeg(['-f','lavfi','-i','testsrc2=size=320x180:rate=20:duration=6',
+        '-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=6',
+        '-c:v','libx264','-c:a','aac','-output_ts_offset','0.021',str(source)],timeout=30)
+    assert result.returncode==0,result.stderr
+    with av.open(str(source)) as c:
+        parent_frames=list(c.decode(video=0))
+        origin=float(parent_frames[0].pts*parent_frames[0].time_base)
+    pending=tmp_path/'pending';pending.mkdir()
+    from scripts.audit_tool import watch_export as w
+    # Exercise the real trim/concat/validation graph without requiring GPU CI.
+    def software_encode(args,**kwargs):
+        args=list(args)
+        if 'h264_nvenc' in args:
+            args[args.index('h264_nvenc')]='libx264'
+            args[args.index('p4')]='fast'
+        return run_ffmpeg(args,**kwargs)
+    monkeypatch.setattr(w,'run_ffmpeg',software_encode)
+    intervals=[(21,47),(87,115)]
+    items=[{'disposition':'daily','daily_start_frame':cursor,'output_start_frame':a,'output_end_frame':b,'frames':b-a}
+        for cursor,(a,b) in zip((0,26),intervals)]
+    frozen={'plan':{'fps':20,'items':items,'selected_frames':54},
+            'binding':{'parent':{'video_origin_s':origin,'path':str(source)}}}
+    result=encode_daily(frozen,pending,threading.Event(),lambda **kwargs:None)
+    assert result['decoded_video_frames']==54 and result['all_joins_clock_checked']
+    with av.open(str(pending/'daily.mp4')) as c: daily=list(c.decode(video=0))
+    for new,old in ((0,21),(25,46),(26,87),(53,114)):
+        a=parent_frames[old].to_ndarray(format='gray').astype(float)
+        b=daily[new].to_ndarray(format='gray').astype(float)
+        assert np.mean((a-b)**2)<25  # Independent boundary correspondence, beyond total frame count.
+
+
+def test_run_ffmpeg_task_cancel_stops_owned_process_only(tmp_path):
+    import threading
+    import time
+    from src.hardware.ffmpeg import FFmpegProcessRegistry,run_ffmpeg
+    event=threading.Event();result=[]
+    before=set(FFmpegProcessRegistry._processes)
+    worker=threading.Thread(target=lambda:result.append(run_ffmpeg([
+        '-re','-f','lavfi','-i','testsrc2=size=64x64:rate=20','-t','60',
+        '-c:v','libx264',str(tmp_path/'cancel.mp4')],timeout=20,cancel_event=event)))
+    worker.start()
+    deadline=time.monotonic()+5
+    while set(FFmpegProcessRegistry._processes)==before and time.monotonic()<deadline:time.sleep(.02)
+    assert set(FFmpegProcessRegistry._processes)!=before
+    event.set();worker.join(8)
+    assert not worker.is_alive() and result[0].returncode!=0
+    assert set(FFmpegProcessRegistry._processes)==before
+    assert not FFmpegProcessRegistry.is_interrupted()

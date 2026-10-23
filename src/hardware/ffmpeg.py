@@ -1,4 +1,6 @@
 import logging
+import hashlib
+from pathlib import Path
 import os
 import subprocess
 import time as _time
@@ -8,6 +10,8 @@ from dataclasses import dataclass
 
 from src.core.config import load_config
 from src.core.process_lock import OwnedProcessJob
+
+MEDIA_IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 logger = logging.getLogger("homevlog")
 
@@ -358,6 +362,7 @@ def run_ffmpeg(
     stdout_consumer=None,
     io_timeout: float | None = None,
     io_lease=None,
+    cancel_event=None,
 ) -> FFmpegResult:
     """Run managed FFmpeg; optional io_timeout bounds one admission attempt.
 
@@ -399,9 +404,19 @@ def run_ffmpeg(
     key = f"ffmpeg:{id(args)}:{t0}"
     retain_reader = False
     cleanup_readers = []
+    cancel_done = threading.Event() if cancel_event is not None else None
+    cancel_watcher = None
     try:
         try:
             proc = FFmpegProcessRegistry.start(key,cmd,**kwargs)
+            if cancel_event is not None:
+                def watch_cancel():
+                    while not cancel_done.wait(.1):
+                        if cancel_event.is_set():
+                            FFmpegProcessRegistry.terminate(key)
+                            return
+                cancel_watcher = threading.Thread(target=watch_cancel, daemon=True)
+                cancel_watcher.start()
         except MediaStartTerminationUnconfirmed as error:
             proc, key = error.process, error.process_key
             raise
@@ -409,7 +424,6 @@ def run_ffmpeg(
             if stdout_consumer is None:
                 stdout, stderr = proc.communicate(timeout=timeout)
             else:
-                import threading
                 from collections import deque
                 errors = deque(maxlen=128)
                 expired = threading.Event()
@@ -452,7 +466,7 @@ def run_ffmpeg(
                     proc.stdout.close()
                     proc.stderr.close()
                 stdout, stderr = b"", b"".join(errors)
-            returncode = proc.returncode
+            returncode = -9 if cancel_event is not None and cancel_event.is_set() else proc.returncode
             timed_out = False
         except subprocess.TimeoutExpired:
             FFmpegProcessRegistry.terminate(key)
@@ -478,6 +492,10 @@ def run_ffmpeg(
             duration=_time.monotonic() - t0,
         )
     finally:
+        if cancel_done is not None:
+            cancel_done.set()
+        if cancel_watcher is not None:
+            cancel_watcher.join(timeout=5)
         try:
             if proc is not None:
                 FFmpegProcessRegistry.terminate(key)

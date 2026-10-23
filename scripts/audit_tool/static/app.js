@@ -17,143 +17,9 @@ let queueSearchTimer;
 const prefetchSet = new Set();
 const frameCache = new Map();
 
-async function exportTargetDataset() {
-  const button=document.getElementById('btn-create-target-export'),status=document.getElementById('target-export-result');
-  if(button.disabled)return;button.disabled=true;status.textContent='正在核对人工目标记录并导出…';
-  try {
-    const response=await fetch('/api/export_yolo_dataset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const result=await response.json();if(!response.ok||result.error)throw new Error(result.error||'导出失败');
-    const stats=result.stats||{};
-    status.textContent=`${result.message}\n训练 ${stats.train_images||0} 张 · 调优 ${stats.val_images||0} 张 · 留出 ${stats.test_images||0} 张\n排除 ${stats.excluded||0} 张 · 重复 ${stats.duplicates||0} 张 · 冲突 ${stats.conflicts||0} 张\n${result.output_dir||''}${result.train_cmd?`\n训练命令：${result.train_cmd}`:''}`;
-  }catch(error){status.textContent=error.message;}
-  finally{button.disabled=false;}
-}
-
-const targetEditor = { id:null, serial:0, context:null, image:null, boxes:[], selected:-1, drag:null, busy:false };
-function closeTargetReview() {
-  targetEditor.serial++;
-  targetEditor.drag = null;
-  document.getElementById('modal-target-review').classList.add('hidden');
-}
-function targetControls() {
-  const enabled = !!targetEditor.context && !!targetEditor.image && !targetEditor.busy;
-  document.querySelectorAll('#target-save-actions button, #target-delete, #target-clear').forEach(button => { button.disabled = !enabled; });
-  document.getElementById('target-prepare').disabled = targetEditor.busy;
-}
-function drawTargets() {
-  const canvas = document.getElementById('target-canvas');
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  if (!targetEditor.image) return;
-  ctx.drawImage(targetEditor.image,0,0,canvas.width,canvas.height);
-  const names = {0:'人物',15:'猫',16:'狗'};
-  targetEditor.boxes.forEach((box,index) => {
-    const x=(box.x_center-box.width/2)*canvas.width,y=(box.y_center-box.height/2)*canvas.height;
-    ctx.strokeStyle=index===targetEditor.selected?'#ffcc44':'#4be3a0';ctx.lineWidth=Math.max(2,canvas.width/350);
-    ctx.strokeRect(x,y,box.width*canvas.width,box.height*canvas.height);
-    ctx.font=`${Math.max(16,canvas.width/70)}px sans-serif`;ctx.fillStyle=ctx.strokeStyle;
-    ctx.fillText(`${index+1} ${names[box.class_id]}`,x,Math.max(24,y));
-  });
-  if(targetEditor.drag){const d=targetEditor.drag;ctx.strokeStyle='#8ac6ff';ctx.strokeRect(d.x*canvas.width,d.y*canvas.height,(d.endX-d.x)*canvas.width,(d.endY-d.y)*canvas.height);}
-  document.getElementById('target-box-count').textContent=`${targetEditor.boxes.length} 个目标框${targetEditor.selected>=0?` · 选中 ${targetEditor.selected+1}`:''}`;
-}
-async function loadTargetContext(prepare=false) {
-  const serial=++targetEditor.serial,id=targetEditor.id;
-  targetEditor.busy=true;targetEditor.drag=null;targetEditor.context=null;targetEditor.image=null;targetEditor.boxes=[];targetEditor.selected=-1;
-  document.getElementById('target-complete').checked=false;drawTargets();targetControls();
-  const status=document.getElementById('target-review-status');status.textContent=prepare?'正在从原片生成固定归档帧…':'正在核对归档来源…';
-  try {
-    const response=await fetch(prepare?'/api/prepare_target_frame':`/api/target_review?segment_id=${id}`,prepare?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segment_id:id})}:{});
-    const context=await response.json();if(!response.ok||context.error)throw new Error(context.error||'归档不可用');
-    const image=new Image();image.src=context.image_url;await image.decode();
-    if(serial!==targetEditor.serial)return;
-    targetEditor.context=context;targetEditor.image=image;targetEditor.boxes=structuredClone(context.review?.boxes||[]);
-    const canvas=document.getElementById('target-canvas');canvas.width=context.width;canvas.height=context.height;
-    const decisions={objects:'全部目标已复核',no_targets:'已确认无目标',uncertain:'不能确定',draft:'草稿'};
-    status.textContent=`片段 #${id} · 截帧位置 ${context.frame_timestamp.toFixed(3)}s · ${decisions[context.review?.decision]||'尚未目标复核'}。只核对当前固定图片。`;
-    drawTargets();
-  } catch(error) { if(serial===targetEditor.serial)status.textContent=error.message; }
-  finally { if(serial===targetEditor.serial){targetEditor.busy=false;targetControls();} }
-}
-async function saveTargets(decision) {
-  if(!targetEditor.context||targetEditor.busy)return;
-  const serial=targetEditor.serial;targetEditor.busy=true;targetControls();
-  try {
-    const context=targetEditor.context;
-    const response=await fetch('/api/save_target_review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segment_id:targetEditor.id,snapshot:context.snapshot,review_sha256:context.review_sha256,boxes:targetEditor.boxes,decision,all_targets_reviewed:document.getElementById('target-complete').checked})});
-    const result=await response.json();if(!response.ok||!result.success)throw new Error(result.error||'保存失败');
-    if(serial!==targetEditor.serial)return;
-    targetEditor.context=result.context;document.getElementById('target-complete').checked=false;
-    document.getElementById('target-review-status').textContent=result.training_eligible?'完整目标复核已保存，可参与数据集导出。':'已保存；草稿或不能确定不参与训练。';
-    showToast('目标记录已保存','success');
-  } catch(error){if(serial===targetEditor.serial)document.getElementById('target-review-status').textContent=error.message;}
-  finally{if(serial===targetEditor.serial){targetEditor.busy=false;targetControls();}}
-}
-let agentReviewSerial=0;
-function closeAgentTargetReview(){agentReviewSerial++;document.getElementById('modal-agent-target-review').classList.add('hidden');}
-async function openAgentTargetReview(id){
-  const serial=++agentReviewSerial,modal=document.getElementById('modal-agent-target-review');
-  const status=document.getElementById('agent-target-status'),notes=document.getElementById('agent-target-notes');
-  const canvas=document.getElementById('agent-target-canvas'),ctx=canvas.getContext('2d');
-  modal.classList.remove('hidden');status.textContent='正在核对智能体复核建议…';notes.textContent='';ctx.clearRect(0,0,canvas.width,canvas.height);
-  try{
-    const response=await fetch(`/api/agent_target_review?segment_id=${id}`),context=await response.json();
-    if(!response.ok||context.error)throw new Error(context.error||'尚无智能体目标复核建议');
-    const image=new Image();image.src=context.image_url;await image.decode();
-    if(serial!==agentReviewSerial)return;
-    canvas.width=context.width;canvas.height=context.height;ctx.drawImage(image,0,0);
-    const names={0:'人',15:'猫',16:'狗'};ctx.strokeStyle='#ff4343';ctx.fillStyle='#ff4343';ctx.lineWidth=Math.max(2,canvas.width/600);ctx.font=`${Math.max(18,canvas.width/65)}px sans-serif`;
-    for(const [i,box] of context.review.boxes.entries()){
-      const x=(box.x_center-box.width/2)*canvas.width,y=(box.y_center-box.height/2)*canvas.height;
-      ctx.strokeRect(x,y,box.width*canvas.width,box.height*canvas.height);ctx.fillText(`${i+1} ${names[box.class_id]}`,x,Math.max(canvas.width/65,y));
-    }
-    const decisions={objects:'有可见目标',no_targets:'无可见目标',uncertain:'不能确定'};
-    status.textContent=`片段 #${id} · 来源：智能体视觉复核 · ${decisions[context.review.decision]} · ${context.review.boxes.length} 个近似框${context.human_review_has_priority?' · 已有人工裁决优先':''}`;
-    notes.textContent=context.review.notes||'';
-  }catch(error){if(serial===agentReviewSerial)status.textContent=error.message;}
-}
-function initTargetReview() {
-  document.getElementById('btn-agent-target-review')?.addEventListener('click',()=>{
-    const item=state.filteredItems[state.selectedIndex];if(!item)return showToast('先选择片段','error');openAgentTargetReview(item.id);
-  });
-  document.getElementById('btn-close-agent-target-review')?.addEventListener('click',closeAgentTargetReview);
-  document.getElementById('modal-agent-target-review')?.addEventListener('click',event=>{if(event.target.id==='modal-agent-target-review')closeAgentTargetReview();});
-  document.getElementById('btn-target-review')?.addEventListener('click',()=>{
-    const item=state.filteredItems[state.selectedIndex];if(!item)return showToast('先选择片段','error');
-    targetEditor.id=item.id;document.getElementById('modal-target-review').classList.remove('hidden');loadTargetContext();
-  });
-  document.getElementById('btn-close-target-review')?.addEventListener('click',closeTargetReview);
-  document.getElementById('target-prepare')?.addEventListener('click',()=>loadTargetContext(true));
-  for(const [id,decision] of [['objects','objects'],['empty','no_targets'],['uncertain','uncertain'],['draft','draft']])document.getElementById(`target-save-${id}`)?.addEventListener('click',()=>saveTargets(decision));
-  document.getElementById('target-delete')?.addEventListener('click',()=>{if(targetEditor.selected>=0)targetEditor.boxes.splice(targetEditor.selected,1);targetEditor.selected=-1;document.getElementById('target-complete').checked=false;drawTargets();});
-  document.getElementById('target-clear')?.addEventListener('click',()=>{targetEditor.boxes=[];targetEditor.selected=-1;document.getElementById('target-complete').checked=false;drawTargets();});
-  const canvas=document.getElementById('target-canvas');
-  if (!canvas) return;
-  const point=event=>{
-    const r=canvas.getBoundingClientRect(),style=getComputedStyle(canvas);
-    const px=name=>parseFloat(style[name])||0;
-    const left=px('borderLeftWidth')+px('paddingLeft'),right=px('borderRightWidth')+px('paddingRight');
-    const top=px('borderTopWidth')+px('paddingTop'),bottom=px('borderBottomWidth')+px('paddingBottom');
-    return {x:Math.max(0,Math.min(1,(event.clientX-r.left-left)/(r.width-left-right))),y:Math.max(0,Math.min(1,(event.clientY-r.top-top)/(r.height-top-bottom)))};
-  };
-  canvas.addEventListener('pointerdown',event=>{if(!targetEditor.image||targetEditor.busy||targetEditor.drag||event.button!==0)return;const p=point(event);targetEditor.drag={...p,endX:p.x,endY:p.y,pointerId:event.pointerId,serial:targetEditor.serial};canvas.setPointerCapture(event.pointerId);});
-  canvas.addEventListener('pointermove',event=>{const d=targetEditor.drag;if(!d||event.pointerId!==d.pointerId)return;if(targetEditor.busy||d.serial!==targetEditor.serial){targetEditor.drag=null;drawTargets();return;}const p=point(event);d.endX=p.x;d.endY=p.y;drawTargets();});
-  canvas.addEventListener('pointerup',event=>{
-    if(!targetEditor.drag||event.pointerId!==targetEditor.drag.pointerId)return;const d=targetEditor.drag;targetEditor.drag=null;
-    if(targetEditor.busy||d.serial!==targetEditor.serial||!targetEditor.image){drawTargets();return;}const p=point(event);
-    const width=Math.abs(p.x-d.x),height=Math.abs(p.y-d.y);
-    if(width*canvas.width>=1&&height*canvas.height>=1){targetEditor.boxes.push({class_id:Number(document.getElementById('target-class').value),x_center:(p.x+d.x)/2,y_center:(p.y+d.y)/2,width,height});targetEditor.selected=targetEditor.boxes.length-1;document.getElementById('target-complete').checked=false;}
-    else{targetEditor.selected=targetEditor.boxes.findLastIndex(box=>Math.abs(p.x-box.x_center)<=box.width/2&&Math.abs(p.y-box.y_center)<=box.height/2);}
-    drawTargets();
-  });
-  canvas.addEventListener('pointercancel',event=>{if(targetEditor.drag&&event.pointerId===targetEditor.drag.pointerId){targetEditor.drag=null;drawTargets();}});
-}
-
 document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
   loadQueue();
-  const agentId=new URLSearchParams(window.location.search).get('agent_segment_id');
-  if(agentId&&/^\d+$/.test(agentId)&&Number.isSafeInteger(Number(agentId))&&Number(agentId)>0)openAgentTargetReview(Number(agentId));
 });
 
 // ================== 1. 事件监听与键盘绑定 ==================
@@ -263,56 +129,12 @@ function initEventListeners() {
     });
   }
 
-  // 导出黄金基准
-  const btnExportGold = document.getElementById('btn-export-gold');
-  if (btnExportGold) {
-    btnExportGold.addEventListener('click', exportGoldBenchmark);
-  }
-
-  // 调参仿真 (What-If) 模态框
-  const btnOpenWhatif = document.getElementById('btn-open-whatif');
-  const modalWhatif = document.getElementById('modal-whatif');
-  const btnCloseWhatif = document.getElementById('btn-close-whatif');
-  if (btnOpenWhatif && modalWhatif) {
-    btnOpenWhatif.addEventListener('click', openTuningPanel);
-  }
   document.getElementById('btn-index-visual-source')?.addEventListener('click', indexCurrentVisualSource);
   document.getElementById('btn-delivery-comparison')?.addEventListener('click', openDeliveryComparison);
   document.getElementById('btn-close-delivery-comparison')?.addEventListener('click', () => document.getElementById('modal-delivery-comparison').classList.add('hidden'));
   document.getElementById('btn-review-context')?.addEventListener('click', openReviewContext);
   document.getElementById('btn-close-context')?.addEventListener('click', () => document.getElementById('modal-context').classList.add('hidden'));
   document.getElementById('btn-save-review-context')?.addEventListener('click', saveReviewContext);
-  initTargetReview();
-  document.getElementById('btn-open-yolo')?.addEventListener('click',()=>document.getElementById('modal-target-export').classList.remove('hidden'));
-  document.getElementById('btn-close-target-export')?.addEventListener('click',()=>document.getElementById('modal-target-export').classList.add('hidden'));
-  document.getElementById('btn-create-target-export')?.addEventListener('click',exportTargetDataset);
-  if (btnCloseWhatif && modalWhatif) {
-    btnCloseWhatif.addEventListener('click', () => modalWhatif.classList.add('hidden'));
-  }
-
-  const btnRunSim = document.getElementById('btn-run-simulation');
-  if (btnRunSim) {
-    btnRunSim.addEventListener('click', runTuningSimulation);
-  }
-
-  const btnApplyCfg = document.getElementById('btn-apply-tuning-config');
-  if (btnApplyCfg) {
-    btnApplyCfg.addEventListener('click', applyTuningConfig);
-  }
-
-  // 仿真输入回车监听
-  ['sim-input-energy', 'sim-input-dur', 'sim-input-yolo'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) {
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          runTuningSimulation();
-        }
-      });
-    }
-  });
-
   // 视频播放模态框
   const btnClosePlayer = document.getElementById('btn-close-player');
   const modalPlayer = document.getElementById('modal-player');
@@ -335,7 +157,7 @@ function initEventListeners() {
   });
 
   // 模态框遮罩点击关闭 (惯性交互)
-  [modalWhatif, modalPlayer].forEach(modal => {
+  [modalPlayer].forEach(modal => {
     if (modal) {
       modal.addEventListener('click', (e) => {
         if (e.target === modal) {
@@ -357,20 +179,6 @@ function initEventListeners() {
 }
 
 function handleKeydown(e) {
-  const agentModal=document.getElementById('modal-agent-target-review');
-  if(agentModal&&!agentModal.classList.contains('hidden')){
-    if(e.key==='Escape'){closeAgentTargetReview();e.preventDefault();}
-    return;
-  }
-  const exportModal=document.getElementById('modal-target-export');
-  if(exportModal&&!exportModal.classList.contains('hidden')){
-    if(e.key==='Escape'){exportModal.classList.add('hidden');e.preventDefault();}return;
-  }
-  const targetModal = document.getElementById('modal-target-review');
-  if (targetModal && !targetModal.classList.contains('hidden')) {
-    if (e.key === 'Escape') { closeTargetReview(); e.preventDefault(); }
-    return;
-  }
   // ESC 键优先关闭打开的模态框
   if (e.key === 'Escape') {
     const contextModal = document.getElementById('modal-context');
@@ -385,12 +193,6 @@ function handleKeydown(e) {
       renderModal.classList.add('hidden');
       return;
     }
-    const modalWhatif = document.getElementById('modal-whatif');
-    if (modalWhatif && !modalWhatif.classList.contains('hidden')) {
-      e.preventDefault();
-      modalWhatif.classList.add('hidden');
-      return;
-    }
     const modalPlayer = document.getElementById('modal-player');
     if (modalPlayer && !modalPlayer.classList.contains('hidden')) {
       e.preventDefault();
@@ -403,8 +205,6 @@ function handleKeydown(e) {
 
   // 如果在输入框内打字，不拦截按键
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
-  const whatifModal = document.getElementById('modal-whatif');
-  if (whatifModal && !whatifModal.classList.contains('hidden')) return;
   const contextModal = document.getElementById('modal-context');
   if (contextModal && !contextModal.classList.contains('hidden')) return;
   const renderModal = document.getElementById('modal-rerender');
@@ -850,22 +650,6 @@ async function clearCurrentReview() {
 }
 
 let activeReviewContext = null;
-let tuningContextHash = null;
-let tuningContextValues = {};
-
-function qualityGateSummary(gate) {
-  if (!gate || !gate.independent_counts) return '独立验收资料暂不可用；全部参考的 F1 仅用于诊断比较。';
-  const count = value => Number.isInteger(value) && value >= 0 ? String(value) : '未知';
-  const names = {ADULT_MOTION:'成人活动', INFANT_MOTION:'婴幼儿活动', EMPTY_ROOM:'空镜', LIGHT_SHADOW:'光影'};
-  const required = count(gate.required_independent_groups);
-  const groups = Object.entries(names).map(([key,name]) => `${name} ${count(gate.independent_counts[key])}/${required}组`).join('；');
-  const excluded = gate.excluded_samples || {};
-  const missing = (gate.insufficient_scenarios || []).map(key => names[key] || '未知场景').join('、');
-  const failed = (gate.failed_scenarios || []).map(key => names[key] || '未知场景').join('、');
-  return [`独立验收：准入留出参考 ${count(gate.verified_samples)}条。${groups}。`,
-    `未用于验收：非留出 ${count(excluded.not_holdout)}条，已用于调优 ${count(excluded.used_for_tuning)}条，未核验 ${count(excluded.unreviewed)}条；来源缺失 ${count(excluded.missing_source)}条，无效区间 ${count(excluded.invalid_interval)}条，重复 ${count(excluded.duplicates)}条，冲突 ${count(excluded.conflicts)}个区间。`,
-    `${missing ? '待补齐：'+missing+'。' : ''}${failed ? '未达标：'+failed+'。' : ''}上方全部参考的 F1 仅用于诊断比较；质量门禁按独立事件组评估。`].join('\n');
-}
 
 async function fetchReviewContext(id) {
   const response = await fetch(`/api/review_context?segment_id=${id}`);
@@ -928,171 +712,6 @@ async function saveReviewContext() {
   } else { button.disabled = false; }
 }
 
-async function openTuningPanel() {
-  document.getElementById('modal-whatif').classList.remove('hidden');
-  document.getElementById('btn-run-simulation').disabled = true;
-  document.getElementById('sim-report-box').classList.add('hidden');
-  document.getElementById('btn-apply-tuning-config').classList.add('hidden');
-  tuningContextHash = null;
-  tuningContextValues = {};
-  const item = state.filteredItems[state.selectedIndex];
-  if (!item) return setElementText('sim-context-hint', '请先选择机位片段。');
-  try {
-    const context = await fetchReviewContext(item.id);
-    if (state.filteredItems[state.selectedIndex]?.id !== item.id) throw Error('选中片段已改变，请重新打开参数对照。');
-    tuningContextHash = context.config_sha256;
-    [['energy','detection.min_motion_threshold'],['dur','segment.min_motion_duration'],['yolo','yolo.confidence']].forEach(([field,key]) => {
-      const parameter = context.parameters.find(entry => entry.param === key);
-      tuningContextValues[key] = parameter?.global;
-      document.getElementById(`sim-input-${field}`).value = parameter?.global ?? '';
-      setElementText(`sim-hint-${field}`, `全局解析值 ${parameter?.global ?? '未提供'}；机位${context.segment.cam_index}解析值 ${parameter?.camera ?? '未提供'}`);
-    });
-    setElementText('sim-context-hint', `读取当前配置；选中 #${item.id} / 机位${context.segment.cam_index}。候选作用域为全局，初始值没有建议含义。`);
-    document.getElementById('btn-run-simulation').disabled = false;
-  } catch (err) { setElementText('sim-context-hint', err.message); }
-}
-
-// ================== 5. 工具功能与导出 ==================
-async function exportGoldBenchmark() {
-  try {
-    showToast('⏳ 正在导出黄金评测基准...', 'info');
-    const res = await fetch('/api/export_gold_benchmark', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ version: '1.0', incremental_merge: true })
-    });
-    const data = await res.json();
-    if (data.success) {
-      showToast(`已导出 ${data.count} 条审核记录；独立参考核验需另行完成`, 'success');
-    } else {
-      showToast('导出基准失败: ' + (data.error || '未知原因'), 'error');
-    }
-  } catch (err) {
-    showToast('网络异常: ' + err.message, 'error');
-  }
-}
-
-let lastSimulationParams = null;
-let lastSimulationConfigHash = null;
-
-async function runTuningSimulation() {
-  const energyVal = parseFloat(document.getElementById('sim-input-energy').value);
-  const durVal = parseFloat(document.getElementById('sim-input-dur').value);
-  const yoloVal = parseFloat(document.getElementById('sim-input-yolo').value);
-  if (!tuningContextHash || ![energyVal, durVal, yoloVal].every(Number.isFinite) || energyVal <= 0 || durVal <= 0 || yoloVal <= 0 || yoloVal > 1) {
-    return showToast('请读取当前配置并输入有效正数；置信度须不大于1。', 'error');
-  }
-
-  const enteredParams = {
-    'detection.min_motion_threshold': energyVal,
-    'segment.min_motion_duration': durVal,
-    'yolo.confidence': yoloVal,
-  };
-  const candidateParams = Object.fromEntries(Object.entries(enteredParams).filter(([key,value]) => value !== tuningContextValues[key]));
-  lastSimulationParams = null;
-  lastSimulationConfigHash = null;
-
-  document.getElementById('sim-report-box').classList.add('hidden');
-  document.getElementById('sim-sample-changes').replaceChildren();
-  setElementText('sim-quality-details', '');
-  document.getElementById('btn-apply-tuning-config').classList.add('hidden');
-  showToast('正在检查独立参考标签与生产算法重放证据...', 'info');
-  try {
-    const res = await fetch('/api/tuning_simulate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ candidate_params: candidateParams, expected_sha256: tuningContextHash })
-    });
-    const data = await res.json();
-    if (data.error) {
-      document.getElementById('sim-report-box').classList.remove('hidden');
-      setElementText('sim-verdict-tag', 'UNAVAILABLE');
-      setElementText('sim-quality-details', qualityGateSummary(null));
-      setElementText('sim-verdict-reason', `${data.error}；有效参考 ${data.reviewed_samples ?? '未知'}/${data.total_samples ?? '未知'}，未显示收益。`);
-      ['stat-base-f1','stat-sim-f1','stat-delta-f1','stat-fp-red','stat-fn-inc'].forEach(id => setElementText(id, '—'));
-      return;
-    }
-    lastSimulationParams = candidateParams;
-    lastSimulationConfigHash = data.config_sha256;
-
-    // 渲染报告
-    const box = document.getElementById('sim-report-box');
-    box.classList.remove('hidden');
-
-    const vTag = document.getElementById('sim-verdict-tag');
-    const vReason = document.getElementById('sim-verdict-reason');
-    vTag.innerText = data.verdict;
-    vReason.innerText = `${data.rationale}；有效参考 ${data.reviewed_samples}/${data.total_samples}`;
-    setElementText('sim-quality-details', qualityGateSummary(data.quality_gate));
-
-    if (data.verdict === 'IMPROVED') {
-      vTag.style.background = '#10b981';
-    } else if (data.verdict === 'FAVORABLE_TRADEOFF') {
-      vTag.style.background = '#3b82f6';
-    } else if (data.verdict === 'REGRESSED') {
-      vTag.style.background = '#ef4444';
-    } else {
-      vTag.style.background = '#64748b';
-    }
-
-    setElementText('stat-base-f1', `${data.baseline.f1}%`);
-    setElementText('stat-sim-f1', `${data.simulated.f1}%`);
-    const deltaSign = data.deltas.f1 >= 0 ? '+' : '';
-    setElementText('stat-delta-f1', `${deltaSign}${data.deltas.f1}%`);
-    setElementText('stat-fp-red', `${data.deltas.fp_reduction}`);
-    setElementText('stat-fn-inc', `${data.deltas.fn_increase}`);
-    const sampleBody = document.getElementById('sim-sample-changes');
-    const contribution = details => details?.status === 'MEASURED' ? `${details.display_s.toFixed(3)}s` : '未测';
-    const states = details => details?.status === 'MEASURED' ? [...new Set(details.portions.map(part => part.state))].join(',') : '未测';
-    (data.sample_changes || []).forEach(sample => appendTableRow(sampleBody, [
-      `#${sample.segment_id ?? '—'} / 机位${sample.cam_index ?? '—'}`, sample.scenario || 'UNKNOWN',
-      sample.reference_active ? '活动' : '静止', sample.baseline_retained ? '保留' : '静态压缩',
-      sample.candidate_retained ? '保留' : '静态压缩', `${states(sample.baseline_display)} → ${states(sample.candidate_display)}`, `${contribution(sample.baseline_display)} → ${contribution(sample.candidate_display)}`
-    ]));
-
-    // 显示应用配置按钮
-    const btnApply = document.getElementById('btn-apply-tuning-config');
-    if (data.quality_gate?.verdict === 'PASS') {
-      btnApply.classList.remove('hidden');
-    } else {
-      vReason.innerText += `；质量门禁 ${data.quality_gate?.verdict || 'UNAVAILABLE'}，不能据此自动应用参数`;
-    }
-
-    showToast(`重放完成: 参考子集 F1 变化 ${deltaSign}${data.deltas.f1}%`, 'success');
-  } catch (err) {
-    showToast('网络错误: ' + err.message, 'error');
-  }
-}
-
-async function applyTuningConfig() {
-  if (!lastSimulationParams) {
-    showToast('未检测到仿真参数，请先执行推演', 'info');
-    return;
-  }
-  if (!confirm('确定将当前仿真参数应用至生产配置文件 settings.yaml 吗？系统将自动创建备份文件。')) {
-    return;
-  }
-
-  showToast('💾 正在安全写入配置并热重载...', 'info');
-  try {
-    const res = await fetch('/api/tuning_apply', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ params: lastSimulationParams, expected_sha256: lastSimulationConfigHash })
-    });
-    const data = await res.json();
-    if (data.success) {
-      showToast('✅ 配置已安全更新并备份，热重载已生效！', 'success');
-      const btnApply = document.getElementById('btn-apply-tuning-config');
-      btnApply.classList.add('hidden');
-    } else {
-      showToast('写入配置失败: ' + (data.error || '校验不通过'), 'error');
-    }
-  } catch (err) {
-    showToast('网络异常: ' + err.message, 'error');
-  }
-}
-
 let playerInterval = null;
 
 function closeVideoPlayer() {
@@ -1128,8 +747,9 @@ function openVideoPlayer(filepath, title = '', interval = null, deliveryUrl = nu
   if (title && titleEl) {
     titleEl.innerText = `▶ ${title}`;
   }
+  videoEl.playbackRate = 1.0;
   videoEl.src = deliveryUrl || `/api/video_stream?filepath=${encodeURIComponent(filepath)}`;
-  if (deliveryUrl && hint) hint.innerText = `实际成片 ${interval.start.toFixed(3)}–${interval.end.toFixed(3)}秒；完整展示分段，含上下文及成片音轨。`;
+  if (deliveryUrl && interval && hint) hint.innerText = `实际成片 ${interval.start.toFixed(3)}–${interval.end.toFixed(3)}秒；完整展示分段，含上下文及成片音轨。`;
   videoEl.onloadedmetadata = () => {
     if (interval && (!Number.isFinite(videoEl.duration) || interval.end > videoEl.duration + 0.05)) {
       videoEl.pause();
@@ -1373,3 +993,108 @@ async function indexCurrentVisualSource() {
   } catch (error) { showToast(`视觉索引不可用：${error.message}`,'error'); }
   finally { button.disabled = false; }
 }
+
+
+// Viewing editions use frozen intervals, never mutable segment IDs or training writes.
+(() => {
+  const el = id => document.getElementById(`watch-${id}`);
+  if (!document.getElementById || !el('date')?.addEventListener) return;
+  let preview = null, kind = 'review', offset = 0, total = 0, serial = 0, timer = null;
+  const scope = () => ({date: el('date').value.trim(), cam_index: Number(el('camera').value)});
+  const query = (extra={}) => new URLSearchParams({...scope(), export_id: el('exports').value, ...extra});
+  const status = value => { el('status').textContent = value; };
+  async function api(path, params, post=false) {
+    const r = await fetch(`/api/watch_${path}${post ? '' : '?'+params}`, post ? {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params)
+    } : {});
+    const data = await r.json();
+    if (!r.ok || data.error) throw new Error(data.error || `HTTP ${r.status}`);
+    return data;
+  }
+  const safe = fn => async () => { try { await fn(); } catch(e) { status(e.message); } };
+  function invalidate() {
+    serial++; preview = null; el('start').disabled = true;
+    el('exports').replaceChildren(); el('list').replaceChildren(); el('download').removeAttribute('href');
+    if (timer) clearTimeout(timer); timer = null;
+    status('日期或机位已变化，请重新预览或查找版本。');
+  }
+  ['date','camera'].forEach(id => el(id).addEventListener('input', invalidate));
+  function downloadLink() { el('download').href = `/api/watch_stream?${query({kind:'daily'})}`; }
+  async function catalog() {
+    const request = ++serial, q = query();
+    const d = await api('catalog', q);
+    if (request !== serial) return;
+    el('exports').replaceChildren();
+    d.exports.forEach(id => { const o = document.createElement('option'); o.value=id; o.textContent=id.slice(0,16); el('exports').append(o); });
+    status(`已完成版本 ${d.exports.length} 个`); if (d.exports.length) downloadLink();
+  }
+  el('load').onclick = safe(catalog);
+  el('exports').onchange = () => { offset=0; el('list').replaceChildren(); downloadLink(); };
+  el('preview').onclick = safe(async () => {
+    const request = ++serial, current = scope(); preview=null; el('start').disabled=true;
+    const p = await api('preview', new URLSearchParams(current));
+    if (request !== serial) return;
+    preview = {...current, expected_snapshot:p.snapshot};
+    el('start').disabled = p.status !== 'AVAILABLE';
+    status(`${p.status} · ${p.duration_s || p.required_seconds || 0}秒 · 日常${p.counts?.daily || 0}段 · 完整争议库存${p.review_total || 0}条 · 优先项${p.required_seconds}秒。`);
+  });
+  async function poll(request, requestSerial) {
+    const s = await api('status', new URLSearchParams({...request, export_id:request.expected_snapshot}));
+    if (requestSerial !== serial) return;
+    status(`${s.status} · ${s.completed_segments || 0}/${s.total_segments || 0}段 ${s.error || ''}`);
+    if (s.worker_alive) timer=setTimeout(() => safe(() => poll(request, requestSerial))(), 1500);
+    else if (s.status === 'COMPLETED') await catalog();
+  }
+  el('start').onclick = safe(async () => {
+    if (!preview) throw new Error('请先预览');
+    const request={...preview}, requestSerial=serial; el('start').disabled=true;
+    const s=await api('start',request,true); status(s.status); await poll(request,requestSerial);
+  });
+  el('cancel').onclick = safe(async () => {
+    if (!preview) throw new Error('没有当前任务');
+    const r=await api('cancel',preview,true); status(r.cancel_requested ? '正在取消，等待工作者确认退出' : '任务已退出');
+  });
+  async function play(mediaKind, itemId=null) {
+    const extra={kind:mediaKind}; if(itemId) extra.item_id=itemId;
+    const q=query(extra), result=await api('playback',q);
+    const stream=`/api/watch_stream?${q}`;
+    if (!result.intervals.length) openVideoPlayer('',mediaKind==='daily'?'日常版':'完整版本',null,stream);
+    else result.intervals.forEach((interval,index) => {
+      if (index === 0) openVideoPlayer('',mediaKind==='source'?'原片正常速度与原声':'完整版本（含上下文）',interval,stream);
+    });
+    if (result.normal_speed) {
+      document.getElementById('vlog-video-el').playbackRate = 1.0;
+      document.getElementById('player-interval-hint').textContent = '原片文件内区间，正常速度 1.0×，含原声；请打开音量。未听审声音仍为争议。';
+    }
+    // Every intersecting full mapping interval remains selectable, including disjoint intervals.
+    if (result.intervals.length > 1) {
+      const links=document.createElement('div');
+      result.intervals.forEach((interval,index) => {
+        const b=document.createElement('button'); b.textContent=`完整相交段 ${index+1}`;
+        b.onclick=()=>openVideoPlayer('', '完整相交段（含上下文）', interval, stream); links.append(b);
+      });
+      el('list').prepend(links);
+    }
+  }
+  el('daily').onclick=safe(()=>play('daily')); el('full').onclick=safe(()=>play('full'));
+  async function listing() {
+    const request=++serial, q=query({kind,offset,limit:50});
+    const result=await api('list',q); if(request!==serial) return;
+    total=result.total; el('list').replaceChildren(); el('count').textContent=`完整库存 ${total} 条；当前 ${offset+1}–${Math.min(total,offset+50)}（只读冻结区间）`;
+    el('prev').disabled=offset===0; el('next').disabled=offset+50>=total;
+    for(const item of result.items) {
+      const row=document.createElement('div'), text=document.createElement('p');
+      const id=item.review_id || item.item_id;
+      text.textContent=`${id.slice(0,22)} · ${item.start.toFixed(2)}–${item.end.toFixed(2)}秒 · ${item.disposition || '争议'} · ${(item.reasons || item.dispute_reasons || []).join(', ')} · ${item.source_file}`;
+      row.append(text);
+      for(const [mode,label] of [['full','看完整相交段（含上下文）'],['source','看原片并听声音（身份验证）']]) {
+        const b=document.createElement('button'); b.textContent=label; b.onclick=safe(()=>play(mode,id)); row.append(b);
+      }
+      el('list').append(row);
+    }
+  }
+  el('review').onclick=safe(async()=>{kind='review';offset=0;await listing();});
+  el('selection').onclick=safe(async()=>{kind='selection';offset=0;await listing();});
+  el('prev').onclick=safe(async()=>{offset=Math.max(0,offset-50);await listing();});
+  el('next').onclick=safe(async()=>{if(offset+50<total){offset+=50;await listing();}});
+})();

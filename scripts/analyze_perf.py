@@ -68,6 +68,13 @@ def analyze_file(path: Path, top_n: int) -> None:
         f" dec {gpu0.get('avg_dec', 0):.0f}% mem_peak {gpu0.get('peak_mem_mb', 0)}MB"
         + (f"  │  iGPU {igpu}" if igpu else "")
     )
+    for prefix, label in (("upstream", "粗筛/分析与渲染重叠"), ("render_tail", "纯渲染尾段"),
+                          ("final_concat", "最终拼接与校验")):
+        phase = next((s for s in stages if s.get("name") == f"{prefix}_{date}_cam{d.get('cam', 0)}"), None)
+        if phase:
+            gpu = phase.get("gpu0") or {}
+            print(f"   {label}: {_fmt_s(phase['duration'])} │ CPU {phase.get('avg_cpu', 0):.0f}%"
+                  f" │ NVDEC {gpu.get('avg_dec', 0):.0f}% NVENC {gpu.get('avg_enc', 0):.0f}%")
 
     # 累计工时与并发度
     total_worker_time = primary_worker_time(summary)

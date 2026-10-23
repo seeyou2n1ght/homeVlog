@@ -328,6 +328,25 @@ class WorkStealingManager:
             logger.debug("WorkStealing: VRAM probe error: %s", e)
         return False
 
+    def has_vram_headroom(self) -> bool:
+        """Admit optional extra work only with a valid sample below the watermark.
+
+        Unlike ordinary decode fallback, an unavailable probe must not authorize
+        an additional NV render worker. This is an admission check, not a lease.
+        """
+        import math
+
+        probe = self._vram_probe_fn
+        if probe is None:
+            return False
+        try:
+            used_mb = probe()
+            return (used_mb is not None and math.isfinite(used_mb)
+                    and 0 <= used_mb < self.vram_watermark_mb)
+        except Exception as exc:
+            logger.debug("WorkStealing: extra NV admission probe failed: %s", exc)
+            return False
+
     def enable_cold_start_burst(self) -> None:
         """激活冷启动破冰模式：在渲染任务就绪前优先调用 NVDEC 协同解码冲刷队列。"""
         with self._lock:
@@ -527,6 +546,11 @@ class DualEndedBatchQueue:
             if tail.dynamic_duration <= max_dynamic_s:
                 return self._items.pop()
             return None
+
+    def lightest_dynamic_duration(self) -> float | None:
+        """Inspect eligibility without removing or reordering a queued batch."""
+        with self._lock:
+            return self._items[-1].dynamic_duration if self._items else None
 
     def notify_all(self) -> None:
         """唤醒所有等待中的 worker。"""

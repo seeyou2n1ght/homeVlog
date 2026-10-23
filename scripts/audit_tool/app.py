@@ -16,6 +16,7 @@ import math
 import time
 import socket
 import secrets
+import threading
 import logging
 import argparse
 import webbrowser
@@ -40,7 +41,17 @@ logging.basicConfig(
 logger = logging.getLogger("homevlog.audit.server")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-service = AuditService()
+service = None
+_service_lock = threading.RLock()
+
+
+def initialize_service():
+    global service
+    with _service_lock:
+        if service is None:
+            service = AuditService()
+        return service
+
 rerender_mgr = ReRenderManager()
 AUDIT_TOKEN = secrets.token_urlsafe(32)
 
@@ -95,6 +106,51 @@ class AuditHandler(BaseHTTPRequestHandler):
                 self._stream_open_video(stream, stat.st_size)
         except FileNotFoundError:
             self.send_error(404, "Video file not found")
+
+    def _watch_get(self, path, params):
+        try:
+            q = {k:v[0] for k,v in params.items()}
+            date, camera = q.get("date", ""), int(q.get("cam_index", 0))
+            manager = service.watch_exports()
+            if path == "/api/watch_preview":
+                result = manager.preview(date, camera, float(q.get("budget_s", 1200)))
+            elif path == "/api/watch_catalog":
+                from datetime import datetime
+                datetime.strptime(date, "%Y%m%d")
+                if len(date) != 8 or camera < 0:
+                    raise ValueError("Invalid date/camera")
+                folder = manager.root/"watch_exports"/f"{date}_cam{camera}"
+                result = {"exports": [p.parent.name for p in sorted(folder.glob("*/manifest.json")) if not p.parent.name.startswith(".")]}
+            elif path == "/api/watch_status":
+                result = manager.status(date, camera, q["export_id"])
+            elif path == "/api/watch_list":
+                result = manager.listing(date, camera, q["export_id"], q.get("kind", "review"), int(q.get("offset",0)), int(q.get("limit",50)))
+            elif path in ("/api/watch_playback", "/api/watch_stream"):
+                result = service.watch_playback(date, camera, q["export_id"], q.get("kind", "daily"), q.get("item_id"))
+                if path == "/api/watch_stream":
+                    self._send_video_stream(Path(result["path"]), expected_identity=result["identity"])
+                    return
+            elif path == "/api/watch_manifest":
+                directory, result = manager.package(date, camera, q["export_id"])
+            else:
+                raise ValueError("Unknown watch API")
+            self._send_json(result)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            self._send_json({"error": str(error)}, status=409)
+
+    def _watch_post(self, path, payload):
+        try:
+            manager = service.watch_exports()
+            if path == "/api/watch_start":
+                result = manager.start(str(payload["date"]), int(payload["cam_index"]),
+                                       str(payload["expected_snapshot"]), float(payload.get("budget_s",1200)))
+            elif path == "/api/watch_cancel":
+                result = {"cancel_requested": manager.cancel(str(payload["expected_snapshot"]))}
+            else:
+                raise ValueError("Unknown watch API")
+            self._send_json(result)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            self._send_json({"error": str(error)}, status=409)
 
     def _stream_open_video(self, f, file_size):
         """支持 HTTP 206 Partial Content 的流式视频分发"""
@@ -186,15 +242,6 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8", set_token_cookie=True)
             return
-        elif path in ("/prototype", "/prototype.html"):
-            self._send_file(STATIC_DIR / "prototype.html", "text/html; charset=utf-8", set_token_cookie=True)
-            return
-        elif path == "/prototype.js":
-            self._send_file(STATIC_DIR / "prototype.js", "application/javascript; charset=utf-8")
-            return
-        elif path == "/prototype.css":
-            self._send_file(STATIC_DIR / "prototype.css", "text/css; charset=utf-8")
-            return
         elif path == "/app.js":
             self._send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
             return
@@ -205,6 +252,10 @@ class AuditHandler(BaseHTTPRequestHandler):
         # 2. REST API 路由
         if path.startswith("/api/") and not self._trusted_request():
             self._send_json({"error": "Untrusted request origin"}, status=403)
+            return
+        initialize_service()
+        if path.startswith("/api/watch_"):
+            self._watch_get(path, params)
             return
         if path == "/api/overview":
             self._send_json(service.get_overview())
@@ -249,36 +300,6 @@ class AuditHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
-        elif path in ("/api/agent_target_review", "/api/agent_target_image"):
-            try:
-                segment_id = int(params.get("segment_id", ["0"])[0])
-                if path == "/api/agent_target_review":
-                    self._send_json(service.get_agent_target_proposal(segment_id))
-                else:
-                    _, payload, snapshot, _ = service._agent_proposal_frame(segment_id)
-                    if params.get("snapshot", [""])[0] != snapshot:
-                        self._send_json({"error": "智能体建议已变化，请重新打开"}, status=409)
-                    else:
-                        self._send_bytes(payload, "image/jpeg", no_store=True)
-            except (ValueError, TypeError, KeyError, OSError) as error:
-                self._send_json({"error": str(error)}, status=409)
-            return
-        elif path in ("/api/target_review", "/api/target_image"):
-            try:
-                segment_id = int(params.get("segment_id", ["0"])[0])
-                context = service.get_target_review(segment_id)
-                if path == "/api/target_review":
-                    self._send_json(context)
-                else:
-                    _, payload, _, snapshot, _ = service._target_frame(segment_id)
-                    if params.get("snapshot", [""])[0] != snapshot:
-                        self._send_json({"error": "归档帧已变化，请重新打开"}, status=409)
-                    else:
-                        self._send_bytes(payload, "image/jpeg", no_store=True)
-            except (ValueError, TypeError, KeyError, OSError) as error:
-                self._send_json({"error": str(error)}, status=400)
-            return
-
         elif path in ("/api/delivery_comparison", "/api/delivery_stream"):
             try:
                 segment_id = int(params.get("segment_id", [""])[0])
@@ -360,9 +381,6 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        elif path == "/api/tuning_insights":
-            self._send_json(service.get_tuning_insights())
-            return
         elif path == "/api/review_context":
             try:
                 segment_id = int(params.get("segment_id", [0])[0])
@@ -421,10 +439,6 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             self._send_video_stream(p)
             return
-        elif path == "/api/benchmark_versions":
-            self._send_json(service.get_benchmark_versions())
-            return
-
         self.send_error(404, "Endpoint not found")
 
     def do_POST(self):
@@ -448,6 +462,10 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Invalid JSON"}, status=400)
             return
 
+        initialize_service()
+        if path.startswith("/api/watch_"):
+            self._watch_post(path, payload)
+            return
         if path == "/api/index_visual_source":
             try:
                 segment_id = int(payload.get("segment_id",0))
@@ -515,98 +533,6 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             ok = service.clear_review(int(seg_id))
             self._send_json({"success": ok})
-            return
-
-        elif path == "/api/save_bbox":
-            boxes = payload.get("boxes", [])
-            image_name = payload.get("image_name")
-            segment_id = payload.get("segment_id")
-            if not boxes or not isinstance(boxes, list):
-                self._send_json({"error": "boxes must be a non-empty list"}, status=400)
-                return
-            res = service.save_bounding_box(
-                boxes=boxes,
-                image_name=str(image_name) if image_name else None,
-                segment_id=int(segment_id) if segment_id is not None else None,
-            )
-            self._send_json(res)
-            return
-
-        elif path in ("/api/save_target_review", "/api/prepare_target_frame"):
-            try:
-                segment_id = int(payload["segment_id"])
-                if path == "/api/prepare_target_frame":
-                    result = service.prepare_target_frame(segment_id)
-                else:
-                    result = service.save_target_review(
-                        segment_id, snapshot=payload.get("snapshot"), review_sha256=payload.get("review_sha256"),
-                        boxes=payload.get("boxes"), decision=payload.get("decision"),
-                        all_targets_reviewed=payload.get("all_targets_reviewed"))
-                self._send_json(result)
-            except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
-                self._send_json({"error": str(error)}, status=409)
-            return
-
-        elif path == "/api/export_yolo_dataset":
-            try:
-                val_ratio = float(payload.get("val_ratio", 0.2))
-                out_dir = payload.get("output_dir")
-                res = service.export_yolo_dataset(val_ratio=val_ratio, output_dir=out_dir)
-                self._send_json(res)
-            except (ValueError, TypeError, OSError) as error:
-                self._send_json({"error": str(error)}, status=400)
-            return
-
-        elif path == "/api/export_gold_benchmark":
-            out_path = payload.get("output_path")
-            version = str(payload.get("version", "1.0"))
-            inc = bool(payload.get("incremental_merge", True))
-            res = service.export_gold_benchmark(output_path=out_path, version=version, incremental_merge=inc)
-            self._send_json(res)
-            return
-
-        elif path == "/api/tuning_simulate":
-            cand = payload.get("candidate_params", {})
-            from src.core.tuner import ConfigurationConflict
-            try:
-                res = service.simulate_tuning(cand, expected_sha256=payload.get("expected_sha256"))
-            except ConfigurationConflict as exc:
-                self._send_json({"verdict": "UNAVAILABLE", "error": str(exc)}, status=409)
-                return
-            self._send_json(res)
-            return
-
-        elif path == "/api/tuning_diff":
-            cand = payload.get("params", {})
-            res = service.get_tuning_diff(cand)
-            self._send_json(res)
-            return
-
-        elif path == "/api/tuning_apply":
-            cand = payload.get("params", {})
-            from src.core.tuner import ConfigurationConflict
-            try:
-                res = service.apply_tuning(cand, expected_sha256=payload.get("expected_sha256"))
-            except ConfigurationConflict as exc:
-                self._send_json({"error": str(exc)}, status=409)
-                return
-            except (ValueError, TypeError) as exc:
-                self._send_json({"error": str(exc)}, status=400)
-                return
-            except OSError as exc:
-                logger.exception("Configuration apply failed")
-                self._send_json({"error": str(exc)}, status=500)
-                return
-            self._send_json(res)
-            return
-
-        elif path == "/api/tuning_rollback":
-            bk = payload.get("backup_path", "")
-            if not bk:
-                self._send_json({"error": "Missing backup_path"}, status=400)
-                return
-            res = service.rollback_tuning(bk)
-            self._send_json(res)
             return
 
         elif path == "/api/yolo_detect":
@@ -680,7 +606,18 @@ def main():
     parser = argparse.ArgumentParser(description="HomeVlog Audit Web Console")
     parser.add_argument("--port", type=int, default=8765, help="HTTP Server port")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
+    parser.add_argument("--db", help="Explicit isolated database; default uses the normal workbench database")
+    parser.add_argument("--watch-output", help="Parent media and independent watch_exports output directory")
+    parser.add_argument("--watch-parent-root", help="Explicit frozen parent directory; exports still use normal output root")
     args = parser.parse_args()
+    global service
+    from src.database import VlogDatabase
+    service = AuditService(VlogDatabase(args.db)) if args.db else AuditService()
+    if args.watch_output:
+        service.watch_output_root = Path(args.watch_output)
+    if args.watch_parent_root:
+        service.watch_parent_root = Path(args.watch_parent_root)
+
 
     port = find_free_port(args.port)
     server_addr = ("127.0.0.1", port)

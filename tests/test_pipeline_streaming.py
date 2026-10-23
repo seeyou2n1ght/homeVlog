@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 import pytest
 
@@ -166,7 +166,7 @@ def test_final_concat_failure_and_cancellation_are_measured(tmp_path, outcome):
         with patch("src.pipeline.load_config", return_value=config), \
              patch("src.pipeline.StreamingOrchestrator", return_value=orch), \
              patch("src.pipeline.OUTPUT_DIR", tmp_path), \
-             patch("src.pipeline.get_monitor"), \
+             patch("src.pipeline.get_monitor") as monitor, \
              patch("src.pipeline.print_startup_banner"), \
              patch("src.pipeline.get_perf", return_value=perf), \
              patch("src.pipeline._dump_perf") as dump, \
@@ -177,6 +177,8 @@ def test_final_concat_failure_and_cancellation_are_measured(tmp_path, outcome):
             else:
                 assert not process_date_cam(db, "20260901", 0, dashboard_enabled=False)
             dump.assert_called_once()
+            assert monitor.return_value.stage.call_args_list == [
+                call("pipeline_20260901_cam0"), call("final_concat_20260901_cam0")]
         import json
         perf.dump(tmp_path / "perf.json")
         records = [r for r in json.loads((tmp_path / "perf.json").read_text())["records"] if r["stage"] == "final_concat"]
@@ -2028,3 +2030,242 @@ with promote_vlog_assets(Path(sys.argv[1]), Path(sys.argv[2]), {'render': {'gene
     with promote_vlog_assets(candidate, w.output, w.config):
         pass
     assert w.output.read_bytes() == b'new media'
+
+
+def test_heterogeneous_tail_guard_leaves_last_heavy_batch_for_active_nv(tmp_path, monkeypatch):
+    """Exercise the real worker branch after dispatch, with NV busy and one queued batch."""
+    import queue
+    import threading
+    import src.pipeline as pipeline
+    from src.hardware.scheduler import DualEndedBatchQueue
+
+    db = VlogDatabase(tmp_path / "tail_guard.db")
+    cfg = {
+        "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
+        "render": {"batch_max_files": 1, "max_concurrency": 2, "local_staging_enabled": False},
+    }
+    for index in range(2):
+        source = f"tail{index}.mp4"
+        db.add_file_task(source, 0, "20260901", f"20260901000{index}00", f"20260901000{index+1}00", 60)
+        db.set_prescreen_result(source, "STATIC")
+    orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+    for index, duration in enumerate((100, 10)):
+        orch.render_batch_queue.put({"filepath": f"tail{index}.mp4", "status": "ANALYZED",
+            "dynamic_duration": duration, "is_heavy": True})
+    orch.stop_event.set()
+    dispatched, nv_started, qsv_done = (threading.Event() for _ in range(3))
+    original_queue = queue.Queue
+    calls, steal_calls, observations = [], [], []
+
+    class HeavyQueue(DualEndedBatchQueue):
+        def notify_all(self):
+            dispatched.set()
+            return super().notify_all()
+
+        def pop_heaviest(self, *args, **kwargs):
+            assert dispatched.wait(5)
+            return super().pop_heaviest(*args, **kwargs)
+
+        def qsize(self):
+            size = super().qsize()
+            observations.append((size, orch._active_nv_renders))
+            return size
+
+        def steal_lightest(self, *args, **kwargs):
+            steal_calls.append(kwargs)
+            return super().steal_lightest(*args, **kwargs)
+
+    class LightQueue(original_queue):
+        def get_nowait(self):
+            # Hold QSV before it snapshots active_nv; NV remains busy until QSV exits.
+            assert nv_started.wait(5)
+            raise queue.Empty
+
+    queue_count = 0
+
+    def make_queue(*args, **kwargs):
+        nonlocal queue_count
+        queue_count += 1
+        return (LightQueue if queue_count == 1 else original_queue)(*args, **kwargs)
+
+    original_guard = orch._guard_worker
+
+    def guard(worker, *args):
+        try:
+            return original_guard(worker, *args)
+        finally:
+            if args and args[0] == "qsv":
+                qsv_done.set()
+
+    def render(_segments, batch, gpu, *_args, **_kwargs):
+        calls.append((gpu, batch))
+        if gpu == "nv" and batch == 0:
+            nv_started.set()
+            assert qsv_done.wait(5), "QSV did not terminate at the tail guard"
+        return str(tmp_path / f"batch{batch}.mp4")
+
+    monkeypatch.setattr(pipeline, "DualEndedBatchQueue", HeavyQueue)
+    monkeypatch.setattr(pipeline.queue, "Queue", make_queue)
+    monkeypatch.setattr(pipeline, "build_batch_render", render)
+    monkeypatch.setattr(orch, "_guard_worker", guard)
+    thread = threading.Thread(target=orch._render_manager, daemon=True)
+    try:
+        thread.start()
+        thread.join(10)
+        assert not thread.is_alive()
+        assert (1, 1) in observations
+        assert not steal_calls
+        assert calls == [("nv", 0), ("nv", 1)]
+        assert sorted(batch for batch, _path in orch.batch_paths) == [0, 1]
+        assert not orch.errors
+    finally:
+        orch.abort_event.set()
+        nv_started.set()
+        qsv_done.set()
+        dispatched.set()
+        thread.join(5)
+        db.close()
+
+
+@pytest.mark.parametrize("mode", ["handoff", "budget", "eligible", "undispatched", "last", "cancel", "failure", "pressure", "unknown", "recovery"])
+def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, monkeypatch, mode):
+    import src.pipeline as pipeline
+    from src.hardware.scheduler import DualEndedBatchQueue
+    db = VlogDatabase(tmp_path / "tail_handoff.db")
+    cfg = {
+        "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
+        "hardware": {"max_nv_concurrency": 2 if mode == "budget" else 3},
+        "render": {"batch_max_files": 1, "max_concurrency": 3, "local_staging_enabled": False},
+    }
+    count = 3 if mode == "last" else 6
+    for index in range(count):
+        source = f"tail{index}.mp4"
+        db.add_file_task(source, 0, "20260901", f"20260901000{index}00", f"20260901000{index+1}00", 60)
+        db.set_prescreen_result(source, "STATIC")
+    orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+    probes = []
+
+    def vram_probe():
+        probes.append(True)
+        if mode in ("pressure", "unknown"):
+            release.set()
+            return None if mode == "unknown" else orch.work_stealing.vram_watermark_mb
+        if mode == "recovery" and len(probes) == 1:
+            assert "nv_tail_0" not in orch.render_worker_stats
+            return orch.work_stealing.vram_watermark_mb
+        return 0
+
+    orch.work_stealing.set_vram_probe_fn(vram_probe)
+    for index in range(count):
+        orch.render_batch_queue.put({"filepath": f"tail{index}.mp4", "status": "ANALYZED",
+            "dynamic_duration": 100 if mode == "eligible" else 500 if mode == "undispatched" else 300,
+            "is_heavy": True})
+    if mode != "undispatched":
+        orch.stop_event.set()
+    dispatched, nv_pair, release, early_checked = (threading.Event() for _ in range(4))
+    original_queue = queue.Queue
+    lock = threading.Lock()
+    calls, running, peak, failed = [], 0, 0, []
+
+    class HeavyQueue(DualEndedBatchQueue):
+        def notify_all(self):
+            dispatched.set()
+            return super().notify_all()
+
+        def pop_heaviest(self, *args, **kwargs):
+            if mode != "undispatched":
+                assert dispatched.wait(5)
+            return super().pop_heaviest(*args, **kwargs)
+
+        def lightest_dynamic_duration(self):
+            if mode == "budget":
+                release.set()
+            if mode == "undispatched" and not dispatched.is_set():
+                early_checked.set()
+            return super().lightest_dynamic_duration()
+
+    class LightQueue(original_queue):
+        def get_nowait(self):
+            assert nv_pair.wait(5)
+            raise queue.Empty
+
+    queue_count = 0
+
+    def make_queue(*args, **kwargs):
+        nonlocal queue_count
+        queue_count += 1
+        return (LightQueue if queue_count == 1 else original_queue)(*args, **kwargs)
+
+    def render(_segments, batch, gpu, *_args, **_kwargs):
+        nonlocal running, peak
+        with lock:
+            calls.append((gpu, batch))
+            if gpu == "nv":
+                running += 1
+                peak = max(peak, running)
+                if running >= 2:
+                    nv_pair.set()
+                if running == 3:
+                    if mode == "failure" and not failed:
+                        failed.append(batch)
+                    if mode == "cancel":
+                        orch.abort_event.set()
+                    release.set()
+            else:
+                release.set()
+        try:
+            assert release.wait(5), "QSV neither handed off nor made its eligibility decision"
+            if batch in failed:
+                return None
+            return str(tmp_path / f"batch{batch}.mp4")
+        finally:
+            if gpu == "nv":
+                with lock:
+                    running -= 1
+
+    monkeypatch.setattr(pipeline, "DualEndedBatchQueue", HeavyQueue)
+    monkeypatch.setattr(pipeline.queue, "Queue", make_queue)
+    monkeypatch.setattr(pipeline, "build_batch_render", render)
+    original_guard = orch._guard_worker
+
+    def guard(worker, *args):
+        try:
+            return original_guard(worker, *args)
+        finally:
+            if args and args[0] == "qsv":
+                release.set()
+
+    monkeypatch.setattr(orch, "_guard_worker", guard)
+    thread = threading.Thread(target=orch._render_manager, daemon=True)
+    try:
+        thread.start()
+        if mode == "undispatched":
+            assert early_checked.wait(5)
+            assert peak == 2 and "nv_tail_0" not in orch.render_worker_stats
+            orch.stop_event.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        assert orch._active_nv_renders == orch._active_qsv_renders == 0
+        handoff = mode in ("handoff", "undispatched", "cancel", "failure", "recovery")
+        assert orch.render_worker_stats["qsv_0"]["handoff_to_nv"] is handoff
+        assert ("nv_tail_0" in orch.render_worker_stats) is handoff
+        assert peak == (3 if handoff else 2)
+        if mode == "eligible":
+            assert any(gpu == "qsv" for gpu, _ in calls)
+        else:
+            assert all(gpu == "nv" for gpu, _ in calls)
+        if mode == "failure":
+            assert len(failed) == 1
+            assert sum(batch == failed[0] for _, batch in calls) == 2
+            assert any(f"render batch {failed[0]} returned no output" in error for error in orch.errors)
+        elif mode != "cancel":
+            assert sorted(batch for batch, _ in orch.batch_paths) == list(range(count))
+            assert not orch.errors
+    finally:
+        orch.abort_event.set()
+        orch.stop_event.set()
+        release.set()
+        nv_pair.set()
+        dispatched.set()
+        thread.join(5)
+        db.close()

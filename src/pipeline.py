@@ -1018,6 +1018,7 @@ class StreamingOrchestrator:
 
         def _render_worker(gpu: str, worker_id: str = ""):
             nonlocal qsv_workers_alive
+            handoff_to_nv = False
             worker_name = worker_id or gpu
             t_worker_start = time.monotonic()
             busy_time = 0.0
@@ -1092,6 +1093,19 @@ class StreamingOrchestrator:
                                     item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
                                     if item is None:
                                         if all_dispatched_event.is_set() and (heavy_queue.empty() or q_len <= active_nv):
+                                            break
+                                        lightest = heavy_queue.lightest_dynamic_duration()
+                                        # No more sources can arrive. If even the lightest batch
+                                        # exceeds the maximum tail admission, QSV cannot take any
+                                        # remaining work. Reuse this thread on NV within its existing
+                                        # configured lease budget; keep every remaining encoder NV.
+                                        if (all_dispatched_event.is_set()
+                                                and render_gpus.count("nv") == 2
+                                                and int(self.config.get("hardware", {}).get("max_nv_concurrency", 2)) >= 3
+                                                and lightest is not None
+                                                and lightest > min(max_qsv_dynamic_s, 180.0)
+                                                and self.work_stealing.has_vram_headroom()):
+                                            handoff_to_nv = True
                                             break
                                         if not heavy_queue.empty():
                                             qsv_steal_rejected += 1
@@ -1392,7 +1406,11 @@ class StreamingOrchestrator:
                         "qsv_light_batches": qsv_light_count,
                         "qsv_stolen_batches": qsv_stolen_count,
                         "qsv_steal_rejected": qsv_steal_rejected,
+                        "handoff_to_nv": handoff_to_nv,
                     }
+            if handoff_to_nv and not self.abort_event.is_set():
+                logger.info("QSV worker %s finished its eligible queue; reusing thread as NV tail worker", worker_name)
+                _render_worker("nv", "nv_tail_0")
 
         # 启动渲染编队：异构模式下采用 2 NVENC + 1 QSV 三路并行
         render_threads = []
@@ -1626,18 +1644,22 @@ class StreamingOrchestrator:
                     q.all_tasks_done.wait(timeout=0.2)
 
         try:
-            _wait_queue_interruptible(self.prescreen_queue)
-            self._analysis_warmup_event.set()
-            _wait_queue_interruptible(self.analysis_queue)
+            # These are subdivisions of the outer streaming clock, not extra work.
+            monitor = get_monitor()
+            with monitor.stage(f"upstream_{self.date}_cam{self.cam_index}", include_in_total=False):
+                _wait_queue_interruptible(self.prescreen_queue)
+                self._analysis_warmup_event.set()
+                _wait_queue_interruptible(self.analysis_queue)
             if self.render_enabled:
-                _wait_queue_interruptible(self.render_batch_queue)
-            # 通知上游与调度管理器：所有输入队列消费完毕，准备收尾
-            self.stop_event.set()
-            if self.render_enabled:
-                # 等待所有分发的渲染批次真正执行完成并完成对账
-                while not self.abort_event.is_set():
-                    if self.render_finished_event.wait(timeout=0.2):
-                        break
+                with monitor.stage(f"render_tail_{self.date}_cam{self.cam_index}", include_in_total=False):
+                    _wait_queue_interruptible(self.render_batch_queue)
+                    self.stop_event.set()
+                    # Completion requires worker exit and batch reconciliation.
+                    while not self.abort_event.is_set():
+                        if self.render_finished_event.wait(timeout=0.2):
+                            break
+            else:
+                self.stop_event.set()
         except (KeyboardInterrupt, SystemExit):
             logger.warning("StreamingOrchestrator interrupted. Terminating subprocesses...")
             self.abort_event.set()
@@ -1932,12 +1954,13 @@ def _process_date_cam_owned(
     ok = False
     try:
         try:
-            db.set_render_status(date, cam_index, "RENDERING")
-            if len(batch_paths) == 1:
-                shutil.copy2(batch_paths[0], candidate)
-                ok = True
-            else:
-                ok = concat_output_files(batch_paths, candidate, timings=concat_timings)
+            with monitor.stage(f"final_concat_{date}_cam{cam_index}"):
+                db.set_render_status(date, cam_index, "RENDERING")
+                if len(batch_paths) == 1:
+                    shutil.copy2(batch_paths[0], candidate)
+                    ok = True
+                else:
+                    ok = concat_output_files(batch_paths, candidate, timings=concat_timings)
         except (KeyboardInterrupt, SystemExit):
             concat_timings["status"] = "cancelled"
             raise

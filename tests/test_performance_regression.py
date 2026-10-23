@@ -20,17 +20,6 @@ def test_worker_total_does_not_double_count_render_children():
     assert primary_worker_time({"render_enc": {"total": 18}}) == 0
 
 
-def test_decoder_comparison_rejects_missing_or_different_frames():
-    from scripts.compare_analysis_decoders import compare_frames
-
-    frame = np.zeros((4, 4), dtype=np.uint8)
-    assert compare_frames([frame, frame], [frame, frame])["equivalent"]
-    assert not compare_frames([frame, frame], [frame])["equivalent"]
-    assert not compare_frames([frame], [frame + 1])["equivalent"]
-    assert not compare_frames([frame], [frame[:2]])["equivalent"]
-    assert not compare_frames([], [])["equivalent"]
-
-
 def test_perf_log_json_schema_validity(tmp_path):
     import json
     from src.monitor import PerfCollector, PerfRecord
@@ -174,101 +163,6 @@ def test_render_concurrency_controls_real_workers(tmp_path, workers):
         assert not orch.errors
         assert len(identities) == workers
         assert len(orch.batch_paths) == workers
-    finally:
-        db.close()
-
-
-def test_profile_decode_cost_receipt_structure(tmp_path):
-    """Verify non-invasive decode profiler produces structured 6-stage diagnostic receipt."""
-    from scripts.profile_decode_cost import resolve_media_path, profile_pass15_analysis
-    from src.core.config import load_config
-    import json
-
-    raw_media = "scratch/complex_batch_diagnosis/e35443eff91f4b11a0ba328cadffdb19/00_20260328002805_20260328013503.mp4"
-    try:
-        media_path = resolve_media_path(raw_media)
-    except FileNotFoundError:
-        pytest.skip(f"Target media {raw_media} not available in current environment")
-
-    cfg = load_config()
-    out_json = tmp_path / "decode_breakdown.json"
-
-    # Profile 30 frames with CUDA or CPU
-    report = profile_pass15_analysis(
-        video_path=media_path,
-        config=cfg,
-        max_frames=30,
-        hwaccel_mode="cuda",
-        analysis_res="416x234",
-        analysis_fps=5.0,
-        enable_yolo=False,
-    )
-
-    out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    loaded = json.loads(out_json.read_text(encoding="utf-8"))
-
-    # 1. Structure contract validation
-    assert loaded["report_version"] == "1.0"
-    assert "input_media" in loaded
-    assert loaded["input_media"]["native_resolution"] == "3840x2160"
-    assert loaded["execution_summary"]["video_frames_demuxed"] == 30
-
-    # 2. 6-stage breakdown validation
-    stages = loaded["stages"]
-    assert len(stages) == 6
-    stage_keys = [s["key"] for s in stages]
-    assert stage_keys == [
-        "demux_and_video_decode",
-        "grayscale_and_resize",
-        "ema_motion_analysis",
-        "candidate_jpeg_encoding",
-        "audio_demux_and_vad",
-        "yolo_verification",
-    ]
-
-    # 3. Normalized per-10k frames timing
-    for s in stages[:5]:
-        assert s["total_ms"] > 0
-        assert s["time_per_10k_frames_s"] > 0
-        assert 0.0 <= s["pct_of_analyzed"] <= 100.0
-
-    total_pct = sum(s["pct_of_analyzed"] for s in stages)
-    assert abs(total_pct - 100.0) < 0.5
-
-    # 4. Hardware metrics validation
-    hw = loaded["hardware_utilization"]
-    assert "cpu_avg_pct" in hw
-    assert "ram_peak_mb" in hw
-    assert "gpu_name" in hw
-
-
-def test_heterogeneous_tail_guard_prevents_qsv_stealing_when_queue_low(tmp_path):
-    from unittest.mock import patch
-    from src.database import VlogDatabase
-    from src.pipeline import StreamingOrchestrator
-
-    db = VlogDatabase(tmp_path / "tail_guard.db")
-    filepath = "tail.mp4"
-    db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000100", 60)
-    db.set_prescreen_result(filepath, "STATIC")
-    cfg = {
-        "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
-        "render": {"batch_max_files": 1, "max_concurrency": 2, "local_staging_enabled": False},
-    }
-    orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
-    orch.render_batch_queue.put({"filepath": filepath, "status": "STATIC"})
-    orch.stop_event.set()
-    calls = []
-
-    def render(_segments, _batch, gpu, *_args, **_kwargs):
-        calls.append(gpu)
-        return str(tmp_path / f"{gpu}.mp4")
-
-    try:
-        with patch("src.pipeline.build_batch_render", side_effect=render):
-            orch._render_manager()
-        assert [batch for batch, _ in orch.batch_paths] == [0]
-        assert not orch.errors
     finally:
         db.close()
 

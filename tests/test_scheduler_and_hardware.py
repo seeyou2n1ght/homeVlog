@@ -16,6 +16,30 @@ from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
 
+
+@pytest.mark.parametrize("used, expected", [(0, True), (6199, True), (6200, False),
+    (7686, False), (None, False), (-1, False), (float("nan"), False), (float("inf"), False)])
+def test_extra_nv_admission_requires_measured_vram_headroom(used, expected):
+    from src.hardware.scheduler import WorkStealingManager
+
+    manager = WorkStealingManager({"scheduler": {"vram_watermark_mb": 6200}})
+    manager.set_vram_probe_fn(lambda: used)
+    assert manager.has_vram_headroom() is expected
+
+
+def test_extra_nv_admission_rejects_unavailable_or_failed_probe():
+    from src.hardware.scheduler import WorkStealingManager
+
+    manager = WorkStealingManager({})
+    manager.set_vram_probe_fn(None)
+    assert not manager.has_vram_headroom()
+
+    def failed():
+        raise OSError("NVML unavailable")
+
+    manager.set_vram_probe_fn(failed)
+    assert not manager.has_vram_headroom()
+
 from src.utils import (
     WorkStealingManager,
     get_nv_semaphore,
@@ -245,6 +269,38 @@ class TestHardwareSemaphoresAndProtection:
 
 class TestSystemMonitoring:
     """测试监控与性能记录采集。"""
+
+    def test_nested_phase_samples_do_not_duplicate_total(self, monkeypatch):
+        from src.hardware import monitor as module
+        monitor = module.Monitor.__new__(module.Monitor)
+        monitor._active_lock = threading.Lock()
+        monitor._active_stages = set()
+        monitor._stages = []
+        monitor._num_gpus = 0
+        clock = iter((0.0, 1.0, 3.0, 4.0))
+        monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+        with monitor.stage("pipeline"):
+            with monitor.stage("render_tail", include_in_total=False):
+                for stage in monitor._active_stages:
+                    stage.cpu_pct.append(25.0)
+        data = monitor.stages_data()
+        assert [(s["name"], s["duration"], s["include_in_total"], s["avg_cpu"]) for s in data] == [
+            ("pipeline", 4.0, True, 25.0), ("render_tail", 2.0, False, 25.0)]
+        assert "TOTAL: 4.0s" in monitor.summary()
+        assert not monitor._active_stages
+
+    def test_queue_eligibility_inspection_does_not_consume_work(self):
+        from src.hardware.scheduler import DualEndedBatchQueue
+        queue = DualEndedBatchQueue()
+        assert queue.lightest_dynamic_duration() is None
+        queue.put(0, ["heavy"], 400)
+        queue.put(1, ["light"], 200)
+        assert queue.lightest_dynamic_duration() == 200
+        assert queue.qsize() == 2
+        assert queue.pop_heaviest().b_idx == 0
+        assert queue.lightest_dynamic_duration() == 200
+        assert queue.steal_lightest(200).b_idx == 1
+        assert queue.lightest_dynamic_duration() is None
 
     def test_monitor_stages_and_perf_collector(self, tmp_path):
         monitor = get_monitor()

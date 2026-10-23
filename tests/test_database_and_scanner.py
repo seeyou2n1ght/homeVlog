@@ -131,7 +131,6 @@ class TestFilenameParsingAndScanner:
         assert get_input_dirs({}) == []
 
 
-
     def test_scan_directory_incremental_and_groups(self, tmp_path, monkeypatch):
         monkeypatch.setattr("src.stages.scanner.load_config", lambda: {
             "recovery": {"skip_today": False, "scanner_freeze_minutes": 0}
@@ -189,7 +188,6 @@ class TestFilenameParsingAndScanner:
             assert ("20260901", 1) in groups
         finally:
             db.close()
-
 
 
 def test_scan_failure_preserves_registered_files_and_can_resume(tmp_path, monkeypatch, caplog):
@@ -535,30 +533,6 @@ class TestSegmentsTableLifecycle:
         assert not any(c["anomaly_type"] == "high_energy_no_target" for c in next_candidates)
 
         db.close()
-
-
-def test_legacy_audio_inspection_never_changes_rows_or_batches(tmp_path, monkeypatch):
-    import sqlite3
-    from scripts.repair_audio_metadata import repair_metadata
-    monkeypatch.chdir(tmp_path)
-    db = tmp_path / "legacy.db"
-    with sqlite3.connect(db) as conn:
-        conn.executescript("CREATE TABLE file_tasks(prescreen_status TEXT,has_audio INTEGER,date TEXT); "
-                           "INSERT INTO file_tasks VALUES('SUSPICIOUS',0,'20260101');")
-    batch = tmp_path / "temp" / "_batch0_20260101_cam0.mp4"
-    batch.parent.mkdir()
-    batch.write_bytes(b"preserve batch")
-    before = db.read_bytes()
-    assert repair_metadata(str(db), date="20260101") == 1
-    assert repair_metadata(str(db), date="20260102") == 0
-    with pytest.raises(ValueError, match="disabled"):
-        repair_metadata(str(db), clean_batches=True)
-    assert db.read_bytes() == before
-    assert batch.read_bytes() == b"preserve batch"
-    missing = tmp_path / "missing.db"
-    with pytest.raises(sqlite3.OperationalError):
-        repair_metadata(str(missing))
-    assert not missing.exists()
 
 
 def test_exclusion_claim_and_late_worker_results_preserve_human_terminal_state(tmp_path):

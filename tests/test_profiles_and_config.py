@@ -4,7 +4,6 @@
 1. 内置场景预设矩阵契约完整性 (living_room, baby_room, outdoor_corridor)
 2. 主旋钮 motion_sensitivity 反比动态缩放一致性与边界保护
 3. 机位绑定 (MAC / 路径 / 别名) 与分层解析优先级 (Layer 1 -> Layer 2 -> Layer 3)
-4. What-If 调参仿真器与真实黄金基准集无缝集成
 5. 负面异常拦截 (无效 Profile、非正 sensitivity 等)
 """
 
@@ -20,7 +19,6 @@ from src.core.profiles import (
     resolve_camera_config,
     resolve_profile_config,
 )
-from src.core.tuner import TuningSimulator
 from src.stages.scanner import resolve_camera_identity, resolve_camera_ui_name
 
 
@@ -223,49 +221,6 @@ def test_load_config_end_to_end_integration():
     bad_cam_cfg["cameras"] = {"CAM01": {"profile": "invalid_profile"}}
     with pytest.raises(ValueError, match="cameras.CAM01.profile unsupported"):
         validate_config(bad_cam_cfg)
-
-
-def test_what_if_tuning_simulation_with_profiles():
-    """验证 What-If 仿真器调用场景预设能够产生确定性的指标演进。"""
-    sim = TuningSimulator()
-    if not sim.samples:
-        pytest.skip("黄金基准集样本不可用")
-
-    # 仿真婴儿房高敏预设 (极低动作门限 1.8)
-    res = sim.simulate_profile("baby_room", sensitivity=1.0)
-    assert res["verdict"] == "UNAVAILABLE"
-    assert res["profile"] == "baby_room"
-    assert "deltas" not in res
-    assert res["reviewed_samples"] == 0
-
-
-def test_profile_simulation_passes_full_effective_profile_to_replay():
-    observed = []
-    sample = {"scenario": "ADULT_MOTION", "reference_active": True,
-              "review_status": "independent_visual", "review_evidence": "fixture"}
-    def replay(config, samples):
-        observed.append(config)
-        return [True]
-    sim = TuningSimulator([sample], {}, replay=replay)
-    sim.simulate_profile("baby_room", sensitivity=2.)
-    assert len(observed) == 2
-    assert observed[-1]["detection"]["profile"] == "baby_room"
-    assert observed[-1]["detection"]["motion_sensitivity"] == 2.
-    assert observed[-1]["detection"]["fg_threshold"] == 4.
-    assert observed[-1]["detection"]["ambient_drift_suppress"] is False
-
-
-def test_equal_global_values_do_not_skip_changed_camera_inheritance():
-    from src.core.profiles import resolve_camera_config
-    sample = {"filepath": "XiaomiCamera_01_B888805AA3CD/source.mp4", "cam_index": 1,
-              "reference_active": True, "review_status": "independent_visual", "review_evidence": "fixture"}
-    calls = []
-    def replay(config, samples):
-        calls.append(resolve_camera_config(config, filepath=sample["filepath"], cam_index=1)["detection"]["min_motion_threshold"])
-        return [True]
-    simulator = TuningSimulator([sample], {"cameras": {"B888805AA3CD": "baby_room"}}, replay=replay)
-    simulator.simulate({"detection.min_motion_threshold": 2.5})
-    assert calls == [1.8, 2.5]
 
 
 def test_scanner_camera_identity_compatibility():
