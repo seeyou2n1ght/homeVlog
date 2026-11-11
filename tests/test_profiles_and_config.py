@@ -22,6 +22,47 @@ from src.core.profiles import (
 from src.stages.scanner import resolve_camera_identity, resolve_camera_ui_name
 
 
+def test_config_load_prepares_candidate_before_validation(tmp_path):
+    settings = tmp_path / "settings.yaml"
+    settings.write_text(
+        "pipeline:\n  render_gpu_policy: heterogeneous\nrender:\n  max_concurrency: 1\n",
+        encoding="utf-8",
+    )
+
+    def prepare(candidate):
+        candidate["render"]["max_concurrency"] = 2
+        return candidate
+
+    with pytest.raises(ValueError, match="requires render.max_concurrency >= 2"):
+        load_config(settings)
+    prepared = load_config(settings, prepare=prepare)
+    assert prepared["render"]["max_concurrency"] == 2
+    assert load_config() is prepared
+
+
+@pytest.mark.parametrize("policy", ["cpu_only", "software"])
+def test_software_render_policy_allows_one_worker(policy):
+    config = {
+        "pipeline": {"render_gpu_policy": policy},
+        "render": {"max_concurrency": 1},
+    }
+    validate_config(config)
+    config["render"]["max_concurrency"] = 0.5
+    with pytest.raises(ValueError, match="render.max_concurrency >= 1"):
+        validate_config(config)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, 4, 2.5, True, "3"])
+def test_nv_tail_capacity_rejects_invalid_configuration(value):
+    with pytest.raises(ValueError, match="nv_tail_concurrency"):
+        validate_config({"render": {"nv_tail_concurrency": value}})
+
+
+@pytest.mark.parametrize("value", [2, 3])
+def test_nv_tail_capacity_accepts_bounded_configuration(value):
+    validate_config({"render": {"nv_tail_concurrency": value}})
+
+
 def test_available_profiles_and_contract():
     """验证场景预设列表与字段契约完整性。"""
     profiles = get_available_profiles()

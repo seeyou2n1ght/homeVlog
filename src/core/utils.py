@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import src.core.config as _config
@@ -30,33 +31,24 @@ def size_metrics(size_bytes: int | float) -> dict[str, float | int]:
     }
 
 
-def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:
+def load_config(
+    config_path: str | Path | None = None,
+    reload: bool = False,
+    *,
+    prepare: Callable[[dict], dict] | None = None,
+) -> dict:
     # Legacy assignments are explicit overrides, not a second configuration cache.
     # Consume them under the loader's lock; ordinary reads delegate via __getattr__.
     with _config._config_lock:
         for name in ("CONFIG_PATH", "SETTINGS"):
             if name in globals():
                 setattr(_config, name, globals().pop(name))
-        return _config.load_config(config_path=config_path, reload=reload)
+        return _config.load_config(config_path=config_path, reload=reload, prepare=prepare)
 
 
 def __getattr__(name):
     if name in ("CONFIG_PATH", "SETTINGS"):
         return getattr(_config, name)
-    if name in (
-        "reset_semaphores",
-        "get_disk_semaphore",
-        "get_nv_semaphore",
-        "get_nvenc_semaphore",
-        "get_nvdec_semaphore",
-        "get_qsv_semaphore",
-        "get_qsv_render_semaphore",
-        "WorkStealingManager",
-        "RenderBatchItem",
-        "DualEndedBatchQueue",
-    ):
-        import src.hardware.scheduler as _sched
-        return getattr(_sched, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -339,32 +331,6 @@ def cleanup_staging_files() -> int:
     if removed:
         logging.getLogger("homevlog").info("staging cleanup: removed %d cached NAS files", removed)
     return removed
-
-
-def cleanup_resources(db=None):
-    """Deep GC, clear CUDA cache, truncate SQLite WAL, and kill tracked ffmpeg processes."""
-    import gc
-    gc.collect()
-    
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as e:
-        logging.getLogger("homevlog").debug("CUDA cache clear skipped: %s", e)
-
-    if db is not None:
-        try:
-            db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception as e:
-            logging.getLogger("homevlog").debug("WAL checkpoint skipped: %s", e)
-
-    try:
-        from src.hardware.ffmpeg import FFmpegProcessRegistry
-        FFmpegProcessRegistry.kill_all()
-    except Exception as e:
-        logging.getLogger("homevlog").warning("cleanup error: %s", e)
-
 
 
 def check_disk_space(path: Path, min_gb: int | None = None) -> bool:

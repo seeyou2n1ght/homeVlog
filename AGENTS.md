@@ -74,7 +74,7 @@ Incomplete output must never be indistinguishable from valid completed output.
 
 ### Metadata
 
-`src/scanner.py` must remain lightweight.
+`src/stages/scanner.py` must remain lightweight.
 
 Do not introduce blocking per-file media probing during directory scanning.
 
@@ -88,9 +88,11 @@ Do not add configuration without wiring its behavior.
 
 Do not leave obsolete or unused configuration keys behind.
 
-### Human Feedback
+### Deterministic Algorithmic Condensation
 
-Explicit human review must take precedence over algorithmic classification when rebuilding the final timeline.
+The final timeline is 100% derived from deterministic algorithmic classification, sensor metrics (motion energy, VAD, YOLO confidence), and configured condensation rules.
+
+Manual review overrides and active-learning feedback loops are retired.
 
 ### Performance
 
@@ -118,7 +120,7 @@ Examples include:
 - atomic render batches and completion reconciliation;
 - timeline closure and source/display-time mapping;
 - adaptive analysis FPS;
-- active-learning and frame-archival behavior.
+- in-memory intermediate frame analysis and zero disk-caching contract.
 
 Do not duplicate detailed implementation rules here unless they apply broadly across multiple subsystems.
 
@@ -288,7 +290,7 @@ Prefer extending existing suites for areas such as:
 - timeline behavior;
 - rendering and FFmpeg;
 - hardware scheduling;
-- review and human feedback.
+- core algorithm regressions and synthetic E2E pipeline verification.
 
 Reusable fixtures, mock factories, and synthetic media helpers belong in shared test utilities such as `tests/conftest.py`.
 

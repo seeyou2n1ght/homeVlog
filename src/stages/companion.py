@@ -66,7 +66,7 @@ def promote_vlog_assets(candidate: Path, output: Path, config: dict, *, keep_pre
     # A crash during hashing leaves only an inert preparation directory.
     preparing = Path(tempfile.mkdtemp(prefix=".delivery_preparing_", dir=output.parent))
     backup_dir = preparing.with_name(preparing.name.replace(".delivery_preparing_", ".delivery_backup_", 1))
-    from src.core.delivery_recovery import prepare_transaction, commit_transaction
+    from src.stages.delivery_recovery import prepare_transaction, commit_transaction
     try:
         journal = prepare_transaction(preparing, output, sources, targets,
             fingerprint=fingerprint, context=context, keep_previous=keep_previous)

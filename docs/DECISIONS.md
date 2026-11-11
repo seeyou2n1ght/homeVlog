@@ -58,87 +58,88 @@ Superseded by: ADR xxxx
 
 | ADR | Decision | Status | Date | Relationship |
 |---|---|---|---|---|
-| ADR 0001 | 单次灰度解码与内存候选帧流转 | Accepted | 2026-03 | — |
+| ADR 0001 | 单次灰度解码与内存候选帧流转 | [ACTIVE] Accepted | 2026-03 | — |
 | ADR 0002 | 单一 NVENC 同构渲染策略 | Superseded | 2026-03 | Superseded by ADR 0008 |
-| ADR 0003 | 人机协同主动学习闭环 | Accepted | 2026-03 | — |
-| ADR 0004 | 原子渲染批次与确定性时间轴 | Accepted | 2026-03 | — |
+| ADR 0003 | 人机协同主动学习闭环 | Superseded | 2026-03 | Superseded by ADR 0082 |
+| ADR 0004 | 原子渲染批次与确定性时间轴 | [ACTIVE] Accepted | 2026-03 | — |
 | ADR 0005 | 硬件并发对齐、NVDEC 借调与强类型 PipelineTask | Partially Superseded | 2026-03 | Scheduling 部分演进至 ADR 0007；PipelineTask 保持有效 |
-| ADR 0006 | 命名模板、低照度抗噪与 Filter Graph 健壮性 | Accepted | 2026-04 | — |
-| ADR 0007 | NVENC/NVDEC 资源解耦与流水线错峰 | Accepted | 2026-04 | Evolves ADR 0005 |
-| ADR 0008 | NVENC + QSV 异构流式渲染 | Accepted | 2026-04 | Supersedes ADR 0002 |
-| ADR 0009 | 双端渲染工作窃取与基于真实成本的调度 | Accepted | 2026-04 | Evolves ADR 0008 |
-| ADR 0010 | Analysis SJF 与 QSV 弹性窃取策略 | Accepted | 2026-04 | Evolves ADR 0009 |
-| ADR 0011 | 进程生命周期下沉、配置解耦与架构瘦身治理 | Accepted | 2026-04 | 解耦 FFmpegProcessRegistry 与配置加载器 |
-| ADR 0012 | 四级自适应阶梯速率模型与防漏检保全 | Accepted | 2026-09 | — |
-| ADR 0013 | 五级自适应睡眠浓缩与滤镜图硬截断不变量 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0012 |
-| ADR 0014 | 异构分析与渲染 QSV 硬件信号量池隔离 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0010 |
-| ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
-| ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
-| ADR 0017 | 离线高质量编码重构与多特征迟滞动作判定 | Accepted | 2026-09 | Evolves ADR 0008, ADR 0012, ADR 0013 |
-| ADR 0018 | 异构 HEVC 参数与渲染时间轴身份 | Accepted | 2026-09 | — |
-| ADR 0019 | 人体空间门控、昼夜门限与云台巡航抑制 | Accepted | 2026-09 | Evolves ADR 0012, ADR 0013, ADR 0017 |
-| ADR 0020 | 虚拟拼接暂存绑定、QSV 重试与 SMB 探测边界 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0015, ADR 0016 |
-| ADR 0021 | 分层依赖、兼容入口与伴随资产职责 | Accepted | 2026-09 | Evolves ADR 0011, ADR 0014 |
-| ADR 0022 | QSV 尾部负载、并行接缝校验与算子优化 | Partially Superseded by ADR 0023 | 2026-09 | Evolves ADR 0015, ADR 0019, ADR 0020 |
-| ADR 0023 | 交付产物原子提交与共享媒体契约 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0013, ADR 0020, ADR 0022 |
-| ADR 0024 | 整数帧展示计划与取消结果 | Accepted | 2026-09 | Evolves ADR 0004 |
-| ADR 0025 | 预筛末关键帧覆盖 | Accepted | 2026-09 | Evolves ADR 0006, ADR 0015 |
-| ADR 0026 | 交付元数据保留分析证据 | Accepted | 2026-09 | Evolves ADR 0023 |
-| ADR 0027 | 看门狗配置语义闭环与 NVENC 瞬态重试兜底 | Accepted | 2026-09 | Evolves ADR 0004, ADR 0008, ADR 0011, ADR 0023 |
-| ADR 0028 | 已交付日期保留离线备份完成记录 | Accepted | 2026-10 | — |
-| ADR 0029 | 显式零字节源文件排除 | Accepted | 2026-10 | — |
-| ADR 0030 | 局部识别证据与显式批处理停止 | Accepted | 2026-10 | — |
-| ADR 0031 | 亚帧源区间必须输出计划帧 | Accepted | 2026-10 | — |
-| ADR 0032 | 可见启动与完整扫描门禁 | Accepted | 2026-10 | — |
-| ADR 0033 | 配置状态单一所有权与旧入口兼容 | Accepted | 2026-10 | Evolves ADR 0011, ADR 0021 |
-| ADR 0034 | 最终拼接故障证据与完整接缝回退 | Accepted | 2026-10 | Evolves ADR 0027 |
-| ADR 0035 | 持久审核撤销与精确源区间 | Accepted | 2026-10 | Evolves ADR 0003, ADR 0024 |
-| ADR 0036 | 可恢复资产提交与真实运行结果 | Accepted | 2026-10 | Evolves ADR 0023, ADR 0028 |
-
-后续决策索引（状态与演进范围以各节正文为准）：
-
-| ADR | Decision |
-|---|---|
-| [ADR 0037](#adr-0037--propagate-conclusive-render-interruptions) | Propagate Conclusive Render Interruptions |
-| [ADR 0038](#adr-0038--triad-human-in-the-loop-architecture-benchmark-priority-re-rendering-and-tuning-simulator) | Triad Human-in-the-Loop Architecture: Benchmark, Priority Re-rendering, and Tuning Simulator |
-| [ADR 0039](#adr-0039--hierarchical-configuration-governance-and-empirical-scenario-profiles) | Hierarchical Configuration Governance and Empirical Scenario Profiles |
-| [ADR 0040](#adr-0040--审计修复显式配置来源与审核资产提交边界) | 审计修复：显式配置来源与审核资产提交边界 |
-| [ADR 0041](#adr-0041--解码完成证据与不可用源范围) | 解码完成证据与不可用源范围 |
-| [ADR 0042](#adr-0042--单文件稠密加速时间轴的视频单次变换) | 单文件稠密加速时间轴的视频单次变换 |
-| [ADR 0043](#adr-0043--审核库存事件保留与播放清晰度分开验收) | 审核库存、事件保留与播放清晰度分开验收 |
-| [ADR 0044](#adr-0044--审核重渲使用共享缓存决策与启动快照) | 审核重渲使用共享缓存决策与启动快照 |
-| [ADR 0045](#adr-0045--复核归因与实测对照保持来源和确认边界) | 复核归因与实测对照保持来源和确认边界 |
-| [ADR 0046](#adr-0046--审核队列区分库存代表分组和随机抽查) | 审核队列区分库存、代表分组和随机抽查 |
-| [ADR 0047](#adr-0047--成片对比使用交付绑定映射及成功审核历史) | 成片对比使用交付绑定映射及成功审核历史 |
-| [ADR 0048](#adr-0048--视觉近似索引复用解码数据并与人工真值隔离) | 视觉近似索引复用解码数据并与人工真值隔离 |
-| [ADR 0049](#adr0049隔离分析重放的正式检查点与续跑) | 隔离分析重放的正式检查点与续跑 |
-| [ADR 0050](#adr0050事件审核不作为训练目标真值) | 事件审核不作为训练目标真值 |
-| [ADR 0051](#adr0051历史视觉补建使用受父进程管理的独立源读者) | 历史视觉补建使用受父进程管理的独立源读者 |
-| [ADR 0052](#adr0052主流程工作台与维护入口共用内核认领) | 主流程、工作台与维护入口共用内核认领 |
-| [ADR 0053](#adr0053交付包骤停恢复与完成标记一致性) | 交付包骤停恢复与完成标记一致性 |
-| [ADR 0054](#adr0054成片映射绑定验证后的计划帧时钟2026-10-13) | 成片映射绑定验证后的计划帧时钟（2026-10-13） |
-| [ADR 0055](#adr0055智能体视觉建议与人工目标真值分别持久化2026-10-13) | 智能体视觉建议与人工目标真值分别持久化（2026-10-13） |
-| [ADR 0056](#adr0056粗筛邻域状态按源顺序确定2026-10-14) | 粗筛邻域状态按源顺序确定（2026-10-14） |
-| [ADR 0057](#adr0057工作台预览复用托管ffmpeg与有界io准入2026-10-14) | 工作台预览复用托管FFmpeg与有界I/O准入（2026-10-14） |
-| [ADR 0058](#adr0058工作台预览身份读取复用拥有的元数据读者2026-10-14) | 工作台预览身份读取复用拥有的元数据读者（2026-10-14） |
-| [ADR 0059](#adr0059已注册ffmpeg复用共享windows进程job2026-10-14) | 已注册FFmpeg复用共享Windows进程Job（2026-10-14） |
-| [ADR 0060](#adr0060媒体启动时建立windows-job归属2026-10-14) | 媒体启动时建立Windows Job归属（2026-10-14） |
-| [ADR 0061](#adr0061按任务停止拥有树与有界管道回收2026-10-14) | 按任务停止拥有树与有界管道回收（2026-10-14） |
-| [ADR 0062](#adr0062未确认清理的原io许可转交与终态恢复2026-10-14) | 未确认清理的原I/O许可转交与终态恢复（2026-10-14） |
-| [ADR 0063](#adr0063识别质量门禁只接受留出集及独立事件组2026-10-14) | 识别质量门禁只接受留出集及独立事件组（2026-10-14） |
-| [ADR 0064](#adr0064逐条声明事件复核依据冻结时保守准入2026-10-14) | 逐条声明事件复核依据，冻结时保守准入（2026-10-14） |
-| [ADR 0065](#adr0065批次停止未确认保留租约并阻止重试2026-10-14) | 批次停止未确认保留租约并阻止重试（2026-10-14） |
-| [ADR 0066](#adr0066直接源读者未确认停止的资源保留与失败传播2026-10-15) | 直接源读者未确认停止的资源保留与失败传播（2026-10-15） |
-| [ADR 0067](#adr0067启动登记失败的实际进程交接与同key认领2026-10-15) | 启动登记失败的实际进程交接与同key认领（2026-10-15） |
-| [ADR 0068](#adr0068跨日期准入与致命媒体失败保留2026-10-15) | 跨日期准入与致命媒体失败保留（2026-10-15） |
-| [ADR 0069](#adr0069人工排除交付准备与配置写者边界2026-10-16) | 人工排除、交付准备与配置写者边界 |
-| [ADR 0070](#adr0070整数音频时钟与有界分组2026-10-17) | 整数音频时钟与有界分组 |
-| [ADR 0071](#adr0071非侵入式分析耗时微观分解与交付-io-审查2026-10-18) | 非侵入式分析耗时微观分解与交付 I/O 审查（2026-10-18） |
-| [ADR 0072](#adr0072在既有nv预算内复用闲置qsv尾段线程2026-10-19) | 可选NV尾段接管；默认第三路推广暂停，水位保护不替代整日验收 |
-| [ADR 0073](#adr0073调用线程拥有接缝校验容器2026-10-20) | 调用线程顺序打开接缝容器，原池并行解码 |
-| [ADR 0074](#adr0074驻留必须区分人物观测与推导状态2026-10-20) | 驻留必须区分人物观测与推导状态 |
-| [ADR 0075](#adr0075在交付帧序列上按需生成日常观看版2026-10-21) | 独立日常观看导出与完整父帧去向；限定交付已验收 |
-| [ADR 0076](#adr0076收敛为视频处理观看与人工事件复核2026-10-21) | 退役训练/调参/旧原型及实验适配，保留视频处理与人工事件复核 |
+| ADR 0006 | 命名模板、低照度抗噪与 Filter Graph 健壮性 | [ACTIVE] Accepted | 2026-04 | — |
+| ADR 0007 | NVENC/NVDEC 资源解耦与流水线错峰 | [ACTIVE] Accepted | 2026-04 | Evolves ADR 0005 |
+| ADR 0008 | NVENC + QSV 异构流式渲染 | [ACTIVE] Accepted | 2026-04 | Supersedes ADR 0002 |
+| ADR 0009 | 双端渲染工作窃取与基于真实成本的调度 | [ACTIVE] Accepted | 2026-04 | Evolves ADR 0008 |
+| ADR 0010 | Analysis SJF 与 QSV 弹性窃取策略 | [ACTIVE] Accepted | 2026-04 | Evolves ADR 0009 |
+| ADR 0011 | 进程生命周期下沉、配置解耦与架构瘦身治理 | [ACTIVE] Accepted | 2026-04 | 解耦 FFmpegProcessRegistry 与配置加载器 |
+| ADR 0012 | 四级自适应阶梯速率模型与防漏检保全 | [ACTIVE] Accepted | 2026-09 | — |
+| ADR 0013 | 五级自适应睡眠浓缩与滤镜图硬截断不变量 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004, ADR 0012 |
+| ADR 0014 | 异构分析与渲染 QSV 硬件信号量池隔离 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0008, ADR 0010 |
+| ADR 0015 | 白天漫射光影偏转软抑制与吸收短动态审计保全 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0006, ADR 0012 |
+| ADR 0016 | 流式批次时间轴稳定性与源任务完成门禁 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004, ADR 0008 |
+| ADR 0017 | 离线高质量编码重构与多特征迟滞动作判定 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0008, ADR 0012, ADR 0013 |
+| ADR 0018 | 异构 HEVC 参数与渲染时间轴身份 | [ACTIVE] Accepted | 2026-09 | — |
+| ADR 0019 | 人体空间门控、昼夜门限与云台巡航抑制 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0012, ADR 0013, ADR 0017 |
+| ADR 0020 | 虚拟拼接暂存绑定、QSV 重试与 SMB 探测边界 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004, ADR 0015, ADR 0016 |
+| ADR 0021 | 分层依赖、兼容入口与伴随资产职责 | Superseded | 2026-09 | Superseded by ADR 0082 |
+| ADR 0022 | QSV 尾部负载、并行接缝校验与算子优化 | Partially Superseded | 2026-09 | Evolves ADR 0015, ADR 0019, ADR 0020; 部分被 ADR 0023 替代 |
+| ADR 0023 | 交付产物原子提交与共享媒体契约 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004, ADR 0013, ADR 0020, ADR 0022 |
+| ADR 0024 | 整数帧展示计划与取消结果 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004 |
+| ADR 0025 | 预筛末关键帧覆盖 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0006, ADR 0015 |
+| ADR 0026 | 交付元数据保留分析证据 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0023 |
+| ADR 0027 | 看门狗配置语义闭环与 NVENC 瞬态重试兜底 | [ACTIVE] Accepted | 2026-09 | Evolves ADR 0004, ADR 0008, ADR 0011, ADR 0023 |
+| ADR 0028 | 已交付日期保留离线备份完成记录 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0029 | 显式零字节源文件排除 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0030 | 局部识别证据与显式批处理停止 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0031 | 亚帧源区间必须输出计划帧 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0032 | 可见启动与完整扫描门禁 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0033 | 配置状态单一所有权与旧入口兼容 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0034 | 最终拼接故障证据与完整接缝回退 | [ACTIVE] Accepted | 2026-10 | Evolves ADR 0027 |
+| ADR 0035 | 持久审核撤销与精确源区间 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0036 | 可恢复资产提交与真实运行结果 | [ACTIVE] Accepted | 2026-10 | Evolves ADR 0023, ADR 0028 |
+| ADR 0037 | 明确的渲染中断传播 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0038 | 人在回路三支柱架构（工作台/重渲/调参模拟器） | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0039 | 分层配置治理与实证场景 Profile | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0040 | 审计修复：显式配置来源与审核资产提交边界 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0041 | 解码完成证据与不可用源范围 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0042 | 单文件稠密加速时间轴的视频单次变换 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0043 | 审核库存、事件保留与播放清晰度分开验收 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0044 | 审核重渲使用共享缓存决策与启动快照 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0045 | 复核归因与实测对照保持来源和确认边界 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0046 | 审核队列区分库存、代表分组和随机抽查 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0047 | 成片对比使用交付绑定映射及成功审核历史 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0048 | 视觉近似索引复用解码数据并与人工真值隔离 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0049 | 隔离分析重放的正式检查点与续跑 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0050 | 事件审核不作为训练目标真值 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0051 | 历史视觉补建使用受父进程管理的独立源读者 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0052 | 主流程、工作台与维护入口共用内核认领 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0053 | 交付包骤停恢复与完成标记一致性 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0054 | 成片映射绑定验证后的计划帧时钟 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0055 | 智能体视觉建议与人工目标真值分别持久化 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0056 | 粗筛邻域状态按源顺序确定 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0057 | 工作台预览复用托管 FFmpeg 与有界 I/O 准入 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0058 | 工作台预览身份读取复用拥有的元数据读者 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0059 | 已注册 FFmpeg 复用共享 Windows 进程 Job | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0060 | 媒体启动时建立 Windows Job 归属 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0061 | 按任务停止拥有树与有界管道回收 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0062 | 未确认清理的原 I/O 许可转交与终态恢复 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0063 | 识别质量门禁只接受留出集及独立事件组 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0064 | 逐条声明事件复核依据，冻结时保守准入 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0065 | 批次停止未确认保留租约并阻止重试 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0066 | 直接源读者未确认停止的资源保留与失败传播 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0067 | 启动登记失败的实际进程交接与同 key 认领 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0068 | 跨日期准入与致命媒体失败保留 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0069 | 人工排除、交付准备与配置写者边界 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0070 | 整数音频时钟与有界分组 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0071 | 非侵入式分析耗时微观分解与交付 I/O 审查 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0072 | 可选 NV 尾段接管调度 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0073 | 调用线程拥有接缝校验容器 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0074 | 驻留必须区分人物观测与推导状态 | [ACTIVE] Accepted | 2026-10 | — |
+| ADR 0075 | 在交付帧序列上按需生成日常观看版 | Superseded | 2026-10 | Superseded by ADR 0076 / ADR 0082 |
+| ADR 0076 | 聚焦纯视频处理与流水线精炼 | Superseded | 2026-10 | Superseded by ADR 0082 |
+| ADR 0077 | 仅在上游完成后借用第三 NV 尾段许可 | Experimental | 2026-10 | — |
+| ADR 0078 | 硬件自适应画像探测与并发参数推荐 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0079 | 异构协同滞回调度控制 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0080 | 成本感知设备路由与重任务 NVDEC 优先 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0081 | 双端非对称优先调度与 NVMe 本地预暂存直通 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0082 | 纯命令行流水线收敛、整洁架构与规范对齐 | [ACTIVE] Accepted | 2026-11 | Supersedes ADR 0003, 0021, 0033, 0035, 0038, 0040, 0043-0048, 0050, 0051, 0055, 0057, 0058, 0064, 0075, 0076 |
 
 ---
 
@@ -2152,3 +2153,78 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
 旧训练/调参专用测试退役，保留子系统故障边界；人工审核优先回归迁入review套件。旧scratch/output证据由用户删除，历史验收不可再作为当前交付证书。验证记录见ACCEPTANCE与TESTING，不宣称识别或速度收益。
 
 替代/局部替代：ADR0038的三支柱、ADR0049的独立调参重放、ADR0050/0055的目标训练/建议，以及ADR0075的历史观察选择适配；这些决策中的通用人工区间、资源、恢复和身份合同不撤销。
+
+## ADR0077：仅在上游完成后借用第三NV尾段许可（2026-10-24）
+
+状态：Experimental，未默认推广。用户授权单日提速并保持识别。
+
+全程修改hardware.max_nv_concurrency会同时影响共用许可的NV预筛；先前整日对照出现分析设备和分段漂移。因此保留原共享预算，使用render.nv_tail_concurrency作为尾段目标预算。省略该键保持原行为，显式值限定2/3。上游完成必须由两队列unfinished_tasks归零且未取消证明，不能用empty或stop_event代替；再满足原all_dispatched、QSV无法接收剩余批次及显存准入，才借用一个许可。
+
+许可属于原NV semaphore；作用域退出有空闲额外许可则撤销，否则记债，由真实媒体租约归还偿还。不等待未知进程终态、不提前释放其资源，未清债时拒绝新借用。原预算3不再扩至4。约束适用于当前按日/机位串行入口，不推广为多个并行Orchestrator的全局屏障。
+
+12批隔离筛选已保持逐件媒体SHA相同，性能见BENCHMARK；全日新分析收益、受控比较和独立验收仍待完成。两次动态调度运行即使源码相同也可能分段不同，须明确冻结设备的受控比较与默认真实运行的不同证据范围。
+
+## ADR0078：硬件自适应画像探测与并发参数推荐（2026-11-10）
+
+状态：Accepted。
+
+为解决静态硬编码并发配置在异构硬件（不同 CPU 线程、核显规格、独立显卡显存）与不同视频输入规格下的脆弱性与调优成本，系统引入 `src/hardware/autotune.py`：
+1. 启动期或 `--doctor` 体检时深入探测系统底层硬件画像（CPU 逻辑/物理核心、物理内存、CUDA 设备及 VRAM 大小、NVIDIA 驱动版本、FFmpeg QSV 与 NVENC 加速能力）；
+2. 依据排队论平衡（Makespan 极小化）与硬件显存安全红线（VRAM 85% 防御），动态推导并推荐最优并发向量（包含 NVENC 渲染路数、NVDEC 解码协同路数、QSV 分析与渲染配额、分析 Worker 总数及 I/O 预算）；
+3. 当配置启用 `scheduler.auto_tune: true` 时，自动对缺省并发参数执行安全自适应注入，且严格遵循分层治理原则——用户显式配置具有最高优先级，决不覆盖用户专家设定。
+
+## ADR0079：异构协同滞回调度控制（2026-11-10）
+
+状态：Accepted。
+
+为消除此前在主渲染阶段由于微小队列波动导致 NVDEC 频繁让步震荡（Flapping）、致使大量解码任务单侧拥堵于 Intel QSV（造成上游分析耗时卡在 33 分钟物理上限）的瓶颈：
+1. 在 `WorkStealingManager.get_analysis_device` 的渲染运行分支中引入滞回比较器（Hysteresis Controller）；
+2. 当待分析队列达到高水位线（watermark_high）且显存与槽位安全时，激活 `COOPERATIVE_RENDER_COEXIST` 借调 NVDEC 槽位；
+3. 进入协同状态后，只要队列未完全回落至低水位线（watermark_low）以下且未超显存警戒线，持续保持 NVDEC 借调状态；
+4. 该机制彻底打通了 2 路 NVDEC 与 5 路 QSV 的双轨并行解码能力，将整体解码理论吞吐提升至 48~50x 实时速度，有效规避单卡饱和排队与死锁风险。
+
+
+## ADR0080：成本感知设备路由与重任务 NVDEC 优先（2026-11-10）
+
+状态：Accepted。
+
+针对实测遥测中揭示的“算力倒挂”瓶颈（单片耗时 505s 的 55 分钟夜间长视频被机械派发给慢速核显 QSV，而快 5.35 倍的 RTX 3060 Ti NVDEC 却因低积压水位闲置，导致 QSV 累计负载高达 10,057 秒并成为全局 Makespan 木桶短板）：
+1. 在 `WorkStealingManager` 调度决策链路引入 `file_duration` 任务成本感知（Cost-Aware Scheduling）；
+2. 凡录制时长超过 `heavy_file_duration_s`（默认 600s，实测夜间文件达 3300s~3500s）的重型载荷，在 NVDEC 槽位可用且显存安全前提下，**突破队列水位线限制，绝对优先调度至 CUDA (NVDEC)**；
+3. `acquire_nvdec_slot` 支持带超时等待机制（重型任务等待数十秒借调 CUDA，相比盲目落入 QSV 承受 8 分钟单片阻塞，总周转时间缩减 4~5 倍）；
+4. 结合 3 路 NVDEC 饱和解码支持，将单日夜间巨型文件的分析耗时从 3,500 秒压缩至不足 300 秒，使上游全流程分析耗时下探至 18~20 分钟内。
+
+
+## ADR0081：双端非对称优先调度与 NVMe 本地预暂存直通（2026-11-10）
+
+状态：Accepted。
+
+为攻破单日 24.82 小时素材（142 切片）处理总用时 30 分钟极限门槛，基于多次全量实测遥测数据中的根因诊断，落地两项关键架构演进：
+
+### 1. 非对称加速比与双端优先级队列（LPT / SJF）
+- **根因**：55 分钟 4K 夜间长切片（3,323s）在 RTX 3060 Ti NVDEC 上解码仅需 100 秒（35× 实时），而在 Intel UHD 770 QSV 上需 850 秒（14.2 分钟），加速比高达 8.5×；而 3~5 分钟日间切片在两者间差距仅数秒。若普通 QSV Worker 误领长文件，会导致长达 14 分钟的线程挂起并瘫痪核显编队。
+- **决策**：
+  - 在 `src/pipeline.py` 的 `AnalysisQueue` 中实现双端出队：Worker 0 作为 CUDA NVDEC 专属通道，通过 `get_heavy()` 优先消费最长作业（LPT），在 11.6 分钟内串行出清全部 7 个 55 分钟夜间长切片；
+  - 其余 6 个 QSV Worker 采用短作业优先（SJF）消费 3~5 分钟轻中度日间切片（15 秒/个），并在队列中仅剩长文件时主动让步等待（QSV Yield），严禁长文件沉沦核显；
+  - 彻底消除了分析阶段的非对称瓶颈，使上游全天 142 源分析完成时间由 37 分钟压缩至 26.5 分钟。
+
+### 2. NVMe 本地 SSD 预暂存直通
+- **决策**：扩展 `src/stages/renderer.py`，打通本地 NVMe SSD 预暂存机制，使全天所有单文件批次（含夜间 55 分钟大文件）在渲染前均自动通过后台异步 Prefetch 命中本地高速缓存，以 500~680 MB/s 极速读入，彻底消除 SMB 跨网络 Seek 阻塞与 I/O 气泡（单批次渲染用时从 402.2s 骤降至 92.1s）。
+- **成效**：全天处理总用时最终由 53 分 33 秒压缩至 **28 分 58 秒（1,738.9 秒）**，达成 51.4× 实时处理速度，全库 891 项测试 100% 通过。
+
+
+## ADR 0082 — 纯命令行流水线与关系表收敛（2026-11-10）
+
+状态：Accepted
+
+人工审核工作台、主动学习归档、视觉索引和人工标签覆盖退出生产流程。算法、场景配置和传感器指标决定时间轴，继续使用 `compute_display_plans()` 统一渲染、字幕及源时间映射。
+
+删除根目录兼容入口。文件身份和处理指纹由 `src/core/identity.py` 持有，媒体读者进程状态由 `src/hardware/ffmpeg.py` 持有。移除 `typeperf.exe` 轮询，CPU 采样改为非阻塞，遥测按设备增量聚合。
+
+交付恢复位于阶段层，硬件资源清理由硬件层负责。运行入口将硬件调优函数交给配置加载器，配置层只处理准备、验证和缓存。
+
+新库使用五张业务表。九列 `segments` 关系表保存算法结果，时长从起止时间计算，源记录删除时级联删除切片。已完成的空切片结果按任务状态解释。移除分析 JSON 副本、视觉索引表和审核触发器。`human_reviews` 仅保存历史事实供基准导入，生产分析和时间轴不访问它。旧库启动时拒绝套用新 schema，保留原库并重新扫描到新库。
+
+`pipeline.render_gpu_policy: cpu_only`（别名 `software`）使用软件预筛、分析和编码，仍通过共享 I/O 调度、FFmpeg 进程注册和事务性交付。它用于无 GPU 环境和合成端到端测试。硬件策略保留既有调度路径。
+
+替代 ADR 0003、0021、0033、0035、0038、0040、0043–0048、0050、0051、0055、0057、0058、0064、0075、0076。

@@ -148,6 +148,8 @@ class YoloVerifier:
                     try:
                         if isinstance(raw, (bytes, bytearray)) or getattr(raw, "ndim", 0) == 1:
                             img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        elif getattr(raw, "ndim", 0) == 2:
+                            img = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
                         else:
                             img = raw
                         if img is None:
@@ -170,7 +172,14 @@ class YoloVerifier:
                     yolo_lock_wait_total += (t_lock_acq - t_lock_req)
                     t_inf_start = time.monotonic()
                     with torch.inference_mode():
-                        results = list(self.model(frames, conf=min(thresholds), verbose=False, stream=True))
+                        infer_kwargs = {"conf": min(thresholds), "verbose": False, "stream": True}
+                        if self.device.startswith("cuda") and torch.cuda.is_available():
+                            infer_kwargs["half"] = True
+                        try:
+                            results = list(self.model(frames, **infer_kwargs))
+                        except TypeError:
+                            infer_kwargs.pop("half", None)
+                            results = list(self.model(frames, **infer_kwargs))
                     t_inf_end = time.monotonic()
                     yolo_infer_total += (t_inf_end - t_inf_start)
                 if len(results) != len(frames):

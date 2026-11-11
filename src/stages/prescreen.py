@@ -33,7 +33,7 @@ def _calc_sample_timestamps(duration: float, segments: int, margin: float = 0.5)
 
 
 def _extract_frame(filepath: str, timestamp: float, width: int, height: int, timeout: float = 30.0, gpu: str = "qsv") -> np.ndarray | None:
-    """使用硬件解码在指定时间点抽取单帧 RGB 图像。"""
+    """在指定时间点抽取单帧 RGB 图像。"""
     args = build_hw_decode_args(
         input_path=str(filepath),
         width=width,
@@ -43,10 +43,14 @@ def _extract_frame(filepath: str, timestamp: float, width: int, height: int, tim
         gpu=gpu,
     )
     from src.hardware.scheduler import get_qsv_semaphore, get_nv_semaphore
-    hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
+    if gpu == "cpu":
+        lease = None  # run_ffmpeg owns the shared disk permit.
+    else:
+        hardware = get_qsv_semaphore() if gpu == "qsv" else get_nv_semaphore()
+        lease = VideoLease(hardware)
     expected = width * height * 3
     for attempt in range(2):
-        result = run_ffmpeg(args, timeout=timeout, io_lease=VideoLease(hardware))
+        result = run_ffmpeg(args, timeout=timeout, io_lease=lease)
         if result.returncode == 0 and len(result.stdout) >= expected:
             frame = np.frombuffer(result.stdout[:expected], dtype=np.uint8).reshape((height, width, 3))
             return frame
@@ -518,7 +522,10 @@ def _build_stream_fps_args(
     height: int,
     gpu: str,
 ) -> list[str]:
-    if gpu == "qsv":
+    if gpu == "cpu":
+        hw_args = []
+        vf = f"scale={width}:{height},fps={sample_fps:.6f}"
+    elif gpu == "qsv":
         hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
         vf = f"scale_qsv=w={width}:h={height},hwdownload,format=nv12,fps={sample_fps:.6f}"
     else:
@@ -564,7 +571,10 @@ def _prescreen_stream_fps(
     sample_fps = max(1.0 / max(duration, 1.0), segments / max(duration, 1.0))
     cmd = _build_stream_fps_args(filepath, sample_fps, max_frames, width, height, gpu)
 
-    if gpu == "qsv":
+    if gpu == "cpu":
+        from src.hardware.scheduler import get_disk_semaphore
+        io_sem = get_disk_semaphore()
+    elif gpu == "qsv":
         from src.hardware.scheduler import get_qsv_semaphore
         io_sem = VideoLease(get_qsv_semaphore())
     else:

@@ -40,15 +40,15 @@ def test_extra_nv_admission_rejects_unavailable_or_failed_probe():
     manager.set_vram_probe_fn(failed)
     assert not manager.has_vram_headroom()
 
-from src.utils import (
+from src.core.utils import check_disk_space
+from src.hardware.scheduler import (
     WorkStealingManager,
     get_nv_semaphore,
     get_qsv_semaphore,
     get_disk_semaphore,
     reset_semaphores,
-    check_disk_space,
 )
-from src.monitor import get_monitor, get_perf, PerfRecord
+from src.hardware.monitor import get_monitor, get_perf, PerfRecord
 
 
 def test_io_wait_checks_cancellation_without_blocking_budget_release(monkeypatch):
@@ -124,7 +124,7 @@ class TestWorkStealingScheduler:
 
     def test_dual_rail_semaphores_and_render_cooperation(self):
         """测试 ADR 0007 双轨信号量解耦：NVENC 与 NVDEC 独立管控，支持渲染期间协同且零死锁。"""
-        from src.utils import get_nvenc_semaphore, get_nvdec_semaphore, reset_semaphores
+        from src.hardware.scheduler import get_nvenc_semaphore, get_nvdec_semaphore, reset_semaphores
         reset_semaphores()
 
         sem_enc = get_nvenc_semaphore()
@@ -219,6 +219,146 @@ class TestWorkStealingScheduler:
         assert mgr.active_nv_decoders == 0
 
 
+def _assert_nv_available(budget, count):
+    acquired = 0
+    try:
+        for _ in range(count):
+            assert budget.acquire(blocking=False)
+            acquired += 1
+        assert not budget.acquire(blocking=False)
+    finally:
+        if acquired:
+            budget.release(acquired)
+
+
+def test_nv_tail_scope_preserves_normal_admission_and_restores_capacity(monkeypatch):
+    from src.hardware import scheduler
+    budget = scheduler.NvencSemaphore(2)
+    monkeypatch.setattr(scheduler, 'get_nvenc_semaphore', lambda: budget)
+    assert type(budget).acquire is threading.Semaphore.acquire
+    _assert_nv_available(budget, 2)
+    with scheduler.nv_tail_capacity(False) as granted:
+        assert not granted
+        _assert_nv_available(budget, 2)
+    with pytest.raises(RuntimeError, match='tail failed'):
+        with scheduler.nv_tail_capacity() as granted:
+            assert granted
+            _assert_nv_available(budget, 3)
+            with scheduler.nv_tail_capacity() as second:
+                assert not second
+            raise RuntimeError('tail failed')
+    _assert_nv_available(budget, 2)
+    with scheduler.nv_tail_capacity() as next_day:
+        assert next_day
+    _assert_nv_available(budget, 2)
+
+
+@pytest.mark.parametrize('base,target', [(1, 3), (3, 3), (4, 3), (2, 2), (2, 4)])
+def test_nv_tail_capacity_only_lends_one_slot_to_two_slot_budget(base, target):
+    from src.hardware.scheduler import NvencSemaphore
+    budget = NvencSemaphore(base)
+    assert budget.try_tail_capacity(target) is None
+    _assert_nv_available(budget, base)
+
+
+@pytest.mark.parametrize('batched_release', [False, True])
+def test_nv_tail_retirement_preserves_active_leases_until_real_release(batched_release):
+    from src.hardware.scheduler import NvencSemaphore
+    budget = NvencSemaphore(2)
+    owner = budget.try_tail_capacity()
+    assert owner is not None
+    assert all(budget.acquire(blocking=False) for _ in range(3))
+    owner.close()
+    owner.close()
+    assert budget.try_tail_capacity() is None
+    assert not budget.acquire(blocking=False)
+    if batched_release:
+        budget.release(3)
+    else:
+        budget.release()
+        assert not budget.acquire(blocking=False), 'First release must retire the extra slot'
+        budget.release(2)
+    _assert_nv_available(budget, 2)
+    next_owner = budget.try_tail_capacity()
+    assert next_owner is not None
+    owner.close()  # An old owner's close cannot revoke the next day's slot.
+    _assert_nv_available(budget, 3)
+    next_owner.close()
+    _assert_nv_available(budget, 2)
+
+
+@pytest.mark.parametrize('n', [0, -1])
+def test_nv_tail_invalid_release_does_not_change_retirement(n):
+    from src.hardware.scheduler import NvencSemaphore
+    budget = NvencSemaphore(2)
+    owner = budget.try_tail_capacity()
+    assert all(budget.acquire(blocking=False) for _ in range(3))
+    owner.close()
+    with pytest.raises(ValueError):
+        budget.release(n)
+    assert budget.try_tail_capacity() is None
+    budget.release(3)
+    _assert_nv_available(budget, 2)
+
+
+def test_nv_tail_concurrent_requests_grant_exactly_one_owner():
+    from src.hardware.scheduler import NvencSemaphore
+    budget = NvencSemaphore(2)
+    start = threading.Barrier(9)
+    owners = []
+    lock = threading.Lock()
+
+    def request():
+        start.wait(timeout=5)
+        owner = budget.try_tail_capacity()
+        with lock:
+            owners.append(owner)
+
+    threads = [threading.Thread(target=request) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert len(owners) == 8
+    granted = [owner for owner in owners if owner is not None]
+    assert len(granted) == 1
+    _assert_nv_available(budget, 3)
+    granted[0].close()
+    _assert_nv_available(budget, 2)
+
+
+def test_nv_tail_deferred_registry_cleanup_keeps_original_video_lease(monkeypatch):
+    from src.hardware import ffmpeg, scheduler
+    registry = ffmpeg.FFmpegProcessRegistry
+    for name in ('_processes', '_jobs', '_deferred'):
+        monkeypatch.setattr(registry, name, {})
+    budget, disk = scheduler.NvencSemaphore(2), scheduler.FileBudget(3)
+    monkeypatch.setattr(scheduler, 'get_disk_semaphore', lambda: disk)
+    owner = budget.try_tail_capacity()
+    leases = [scheduler.VideoLease(budget) for _ in range(3)]
+    assert all(lease.acquire(timeout=1) for lease in leases)
+    process = MagicMock(stdout=None, stderr=None)
+    process.poll.return_value = None
+    registry.defer_cleanup('nv_tail_test', process, leases[2])
+    owner.close()
+    assert disk.available == 0
+    assert registry.reap_cleanups() == {'recovered': [], 'pending': ['nv_tail_test']}
+    assert budget.try_tail_capacity() is None
+    assert not budget.acquire(blocking=False)
+    process.poll.return_value = 0
+    assert registry.reap_cleanups() == {'recovered': ['nv_tail_test'], 'pending': []}
+    assert disk.available == 1
+    assert not budget.acquire(blocking=False), 'Recovered lease must repay retirement debt'
+    assert registry.reap_cleanups() == {'recovered': [], 'pending': []}
+    assert disk.available == 1
+    leases[0].release()
+    leases[1].release()
+    assert disk.available == 3
+    _assert_nv_available(budget, 2)
+
+
 class TestHardwareSemaphoresAndProtection:
     """测试硬件并发信号量与磁盘保护。"""
 
@@ -282,7 +422,7 @@ class TestSystemMonitoring:
         with monitor.stage("pipeline"):
             with monitor.stage("render_tail", include_in_total=False):
                 for stage in monitor._active_stages:
-                    stage.cpu_pct.append(25.0)
+                    stage.record_sample(cpu=25.0)
         data = monitor.stages_data()
         assert [(s["name"], s["duration"], s["include_in_total"], s["avg_cpu"]) for s in data] == [
             ("pipeline", 4.0, True, 25.0), ("render_tail", 2.0, False, 25.0)]
@@ -358,8 +498,8 @@ class TestSystemMonitoring:
 
 def test_pipe_decode_watchdog_terminates_hang(tmp_path):
     """测试 _decode_file_pipe 在子进程挂死时被独立硬看门狗主动终止，且信号量安全释放。"""
-    from src.detector import MotionDetector
-    from src.utils import get_qsv_semaphore
+    from src.stages.detector import MotionDetector
+    from src.hardware.scheduler import get_qsv_semaphore
 
     det = MotionDetector(config={"detection": {"decode_timeout": 1.0}}, decode_gpu="qsv")
     io_sem = get_qsv_semaphore()
@@ -385,7 +525,7 @@ def test_pipe_decode_watchdog_terminates_hang(tmp_path):
 
 def test_heterogeneous_fleet_allocates_two_nv_one_qsv(tmp_path):
     """测试异构模式下，渲染并发数为 3 时精准构建 2 NVENC + 1 QSV 编队。"""
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
     from src.pipeline import StreamingOrchestrator
     db = VlogDatabase(db_path=tmp_path / "fleet.db")
     cfg = {
@@ -403,7 +543,7 @@ def test_heterogeneous_fleet_allocates_two_nv_one_qsv(tmp_path):
 
 def test_dual_ended_batch_queue_lpt_spt():
     """测试双端批次调度队列：NVENC LPT 降序消费与 QSV SPT 逆向窃取。"""
-    from src.scheduler import DualEndedBatchQueue
+    from src.hardware.scheduler import DualEndedBatchQueue
 
     q = DualEndedBatchQueue()
     assert q.empty()
@@ -450,7 +590,7 @@ def test_dual_ended_batch_queue_lpt_spt():
 
 def test_dual_ended_batch_queue_concurrent_stealing():
     """测试多线程高并发下双端队列的工作窃取无丢批与无重复。"""
-    from src.scheduler import DualEndedBatchQueue
+    from src.hardware.scheduler import DualEndedBatchQueue
 
     q = DualEndedBatchQueue()
     total_batches = 50
@@ -531,7 +671,7 @@ def test_qsv_adaptive_duration_formula_and_elastic_expansion():
 def test_legacy_config_tracks_core_reload_and_preserves_explicit_overrides(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     import src.core.config as core
-    import src.utils as legacy
+    import src.core.utils as legacy
 
     saved_overrides = {name: legacy.__dict__[name] for name in ("SETTINGS", "CONFIG_PATH")
                        if name in legacy.__dict__}
@@ -554,7 +694,7 @@ def test_legacy_config_tracks_core_reload_and_preserves_explicit_overrides(tmp_p
             assert legacy.SETTINGS is updated
             assert legacy.CONFIG_PATH == second
             exported = {}
-            exec("from src.utils import *", exported)
+            exec("from src.core.utils import *", exported)
             assert exported["SETTINGS"] is updated
             assert exported["CONFIG_PATH"] == second
             with ThreadPoolExecutor(max_workers=4) as pool:
@@ -577,3 +717,161 @@ def test_legacy_config_tracks_core_reload_and_preserves_explicit_overrides(tmp_p
 
 
 
+
+
+class TestAutoTuner:
+    """测试异构硬件自适应画像探测与参数推导 (Hardware Auto-Tuner)。"""
+
+    def test_autotune_hardware_profile_derivations(self):
+        from src.hardware.autotune import HardwareSnapshot, compute_optimal_concurrency
+
+        # 1. 典型 8GB 显卡 (如 RTX 3060Ti / 4060) + 16 线程 CPU + QSV
+        snap_8g = HardwareSnapshot(
+            cpu_logical=16,
+            cpu_physical=10,
+            ram_total_gb=32.0,
+            has_cuda=True,
+            nv_device_count=1,
+            nv_vram_mb=8192,
+            has_nvenc=True,
+            has_qsv=True,
+        )
+        opt_8g = compute_optimal_concurrency(snap_8g)
+        assert opt_8g["hardware"]["max_nv_concurrency"] == 2
+        assert opt_8g["scheduler"]["max_nv_decoders"] == 2
+        assert opt_8g["render"]["max_concurrency"] == 3  # 2 NVENC + 1 QSV
+        assert opt_8g["detection"]["analysis_max_workers"] == 7  # 对齐 QSV 分析上限
+        assert opt_8g["scheduler"]["vram_watermark_mb"] == int(8192 * 0.78)
+
+        # 2. 24GB 顶级显卡 (如 RTX 4090 / 3090)
+        snap_24g = HardwareSnapshot(
+            cpu_logical=32,
+            cpu_physical=16,
+            ram_total_gb=64.0,
+            has_cuda=True,
+            nv_device_count=1,
+            nv_vram_mb=24576,
+            has_nvenc=True,
+            has_qsv=True,
+        )
+        opt_24g = compute_optimal_concurrency(snap_24g)
+        assert opt_24g["hardware"]["max_nv_concurrency"] == 2
+        assert opt_24g["scheduler"]["max_nv_decoders"] == 2
+        assert opt_24g["render"]["max_concurrency"] == 3
+
+        # 3. 纯核显/CPU 环境 (无独立显卡)
+        snap_igpu = HardwareSnapshot(
+            cpu_logical=8,
+            cpu_physical=4,
+            ram_total_gb=16.0,
+            has_cuda=False,
+            has_nvenc=False,
+            has_qsv=True,
+        )
+        opt_igpu = compute_optimal_concurrency(snap_igpu)
+        assert opt_igpu["hardware"]["max_nv_concurrency"] == 0
+        assert opt_igpu["scheduler"]["nvdec_cooperative"] is False
+        assert opt_igpu["render"]["max_concurrency"] == 1
+
+    def test_autotune_applies_without_overriding_explicit_config(self):
+        from src.hardware.autotune import apply_auto_tune
+
+        # auto_tune 为 False 时不发生改动
+        cfg_disabled = {"scheduler": {"auto_tune": False, "watermark_high": 10}}
+        res_disabled = apply_auto_tune(cfg_disabled, in_place=False)
+        assert res_disabled == cfg_disabled
+
+        # auto_tune 为 True 时注入推荐参数，但保留已有显式键
+        cfg_enabled = {
+            "scheduler": {"auto_tune": True, "watermark_high": 99},
+            "render": {"custom_user_key": "user_value"},
+        }
+        res_enabled = apply_auto_tune(cfg_enabled, in_place=False)
+        assert res_enabled["scheduler"]["watermark_high"] == 99  # 保留显式配置
+        assert res_enabled["render"]["custom_user_key"] == "user_value"
+        assert "max_concurrency" in res_enabled["render"]  # 自动补全推荐并发
+
+
+def test_cooperative_render_hysteresis():
+    """测试渲染协同下的滞回比较器 (Hysteresis) 机制，防止频繁让步震荡。"""
+    cfg = {
+        "scheduler": {
+            "watermark_high": 5,
+            "watermark_low": 2,
+            "nvdec_cooperative": True,
+            "max_nv_decoders": 2,
+            "cooperative_during_render": True,
+            "vram_watermark_mb": 6000,
+        },
+        "hardware": {"device": "cuda:0"},
+    }
+    mgr = WorkStealingManager(config=cfg)
+    mgr.set_vram_probe_fn(lambda: 3500)
+
+    # 1. 渲染启动，初始待分析队列 queue_size=3 (< 5)，未达高水线，让步 QSV
+    mgr.register_render_start()
+    assert mgr.get_analysis_device(queue_size=3) == "qsv"
+    assert mgr.state == "RENDER_PREEMPTION_YIELD"
+
+    # 2. 待分析队列积压激增至 6 (>= 5)，激活 COOPERATIVE_RENDER_COEXIST
+    assert mgr.get_analysis_device(queue_size=6) == "cuda"
+    assert mgr.state == "COOPERATIVE_RENDER_COEXIST"
+
+    # 3. 消费任务并占满 NVDEC 槽位：返回 qsv 溢出，但保持 COOPERATIVE_RENDER_COEXIST 状态不被破坏
+    assert mgr.acquire_nvdec_slot() is True
+    assert mgr.acquire_nvdec_slot() is True
+    assert mgr.get_analysis_device(queue_size=4) == "qsv"
+    assert mgr.state == "COOPERATIVE_RENDER_COEXIST"
+
+    # 4. NVDEC 槽位释放，下一任务无缝重回 CUDA
+    mgr.release_nvdec_slot()
+    assert mgr.get_analysis_device(queue_size=4) == "cuda"
+    assert mgr.state == "COOPERATIVE_RENDER_COEXIST"
+
+    # 5. 队列彻底回落至低水线 2 (<= 2)，平滑退出协同状态
+    mgr.release_nvdec_slot()
+    assert mgr.get_analysis_device(queue_size=2) == "qsv"
+    assert mgr.state == "RENDER_PREEMPTION_YIELD"
+
+
+def test_cost_aware_heavy_task_nvdec_priority():
+    """测试 ADR0080 成本感知设备路由：夜间巨型重文件 (>=600s) 突破水位线限制优先占用 NVDEC。"""
+    cfg = {
+        "scheduler": {
+            "watermark_high": 10,
+            "watermark_low": 3,
+            "nvdec_cooperative": True,
+            "max_nv_decoders": 2,
+            "cooperative_during_render": True,
+            "heavy_file_duration_s": 600.0,
+            "vram_watermark_mb": 6000,
+        },
+        "hardware": {"device": "cuda:0"},
+    }
+    mgr = WorkStealingManager(config=cfg)
+    mgr.set_vram_probe_fn(lambda: 3000)
+
+    # 1. 队列仅有 1 个任务 (queue_size=1 < watermark_high)，普通短任务 (300s) 走 QSV
+    assert mgr.get_analysis_device(queue_size=1, file_duration=300.0) == "qsv"
+    assert mgr.state == "NORMAL_DECOUPLED"
+
+    # 2. 队列同样只有 1 个任务，但为 55 分钟巨型文件 (3300s >= 600s)，成本感知优先路由至 CUDA
+    assert mgr.get_analysis_device(queue_size=1, file_duration=3300.0) == "cuda"
+    assert mgr.state == "COOPERATIVE_BURST"
+
+    # 3. 槽位被重任务占用
+    with mgr.lease_device(queue_size=1, file_duration=3300.0) as dev:
+        assert dev == "cuda"
+        assert mgr.active_nv_decoders == 1
+        # 第二个重任务继续借调第二个 NVDEC 槽位
+        with mgr.lease_device(queue_size=1, file_duration=3300.0) as dev2:
+            assert dev2 == "cuda"
+            assert mgr.active_nv_decoders == 2
+
+    # 4. 退出后槽位完全归还
+    assert mgr.active_nv_decoders == 0
+
+    # 5. 显存超警戒线时，即便巨型任务也必须安全降级回 QSV，杜绝 OOM
+    mgr.set_vram_probe_fn(lambda: 6500)
+    assert mgr.get_analysis_device(queue_size=1, file_duration=3300.0) == "qsv"
+    assert mgr.state == "VRAM_PRESSURE_YIELD"

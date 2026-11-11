@@ -1,4 +1,4 @@
-"""Behavioral regressions for the 2026-09-08 architecture review."""
+"""Core algorithmic and pipeline regressions (prescreen, YOLO, audio, timeline, I/O scheduler)."""
 import copy
 from fractions import Fraction
 from pathlib import Path
@@ -9,11 +9,11 @@ import av
 import numpy as np
 import pytest
 
-from src.database import VlogDatabase
-from src.detector import MotionDetector
-from src.prescreen import _prescreen_keyframes
-from src.segment import Segment
-from src.yolo_verifier import YoloVerifier
+from src.core.database import VlogDatabase
+from src.stages.detector import MotionDetector
+from src.stages.prescreen import _prescreen_keyframes
+from src.algorithms.segment import Segment
+from src.algorithms.yolo_verifier import YoloVerifier
 
 
 def make_video(path, seconds=60, fps=1, motion_at=20):
@@ -73,7 +73,7 @@ def test_missing_samples_never_become_negative():
     model = lambda frames, **kw: [SimpleNamespace(boxes=None) for _ in frames]
     segments = [Segment(0, 4, "DYNAMIC", "x"), Segment(100, 104, "DYNAMIC", "x")]
     result = verifier(model).verify("x", segments, frames_buffer={0: np.zeros((32,32,3), np.uint8)}, analysis_fps=2)
-    assert all(s.state == "DYNAMIC" and s.needs_review for s in result)
+    assert all(s.state == "DYNAMIC" for s in result)
 
 
 def test_low_confidence_enters_predict_and_microbatches_are_bounded():
@@ -122,13 +122,13 @@ def test_uncertain_motion_survives_smoothing_refinement_and_display(reason, offs
     from src.stages.timeline import TimelineSegment, compute_display_plans
 
     segments = [Segment(offset, offset + 3, "STATIC", "x"),
-                Segment(offset + 3, offset + 4, "DYNAMIC", "x", needs_review=True, review_reason=reason),
+                Segment(offset + 3, offset + 4, "DYNAMIC", "x", review_reason=reason),
                 Segment(offset + 4, offset + 7, "STATIC", "x")]
     segments = _filter_short(segments, min_motion=2, min_static=2)
     labels = [{"time": offset + i, "energy": 1, "raw_energy": 1} for i in range(8)]
     result = refine_activity_segments(segments, labels, {})
     protected = next(s for s in result if s.start_time <= offset + 3 < s.end_time)
-    assert protected.state == "DYNAMIC" and protected.needs_review
+    assert protected.state == "DYNAMIC"
     timeline = [TimelineSegment("x", 0, 3, 4, protected.state, 1)]
     assert compute_display_plans(timeline)[0][0] == 1
 
@@ -147,7 +147,7 @@ def test_partial_decode_falls_back_and_cancel_does_not(mock_config):
 
 
 def test_valid_small_video_and_cache_identity(tmp_path):
-    from src.render_cache import valid_video, render_fingerprint, reusable, save_manifest
+    from src.hardware.render_cache import valid_video, render_fingerprint, reusable, save_manifest
     path = make_video(tmp_path / "short.mp4", seconds=2)
     assert path.stat().st_size < 512 * 1024
     assert valid_video(path, 2)
@@ -165,7 +165,7 @@ def test_valid_small_video_and_cache_identity(tmp_path):
 
 
 def test_valid_video_duration_tolerance(tmp_path):
-    from src.render_cache import valid_video
+    from src.hardware.render_cache import valid_video
     path = make_video(tmp_path / "tol.mp4", seconds=10)
     # 期望 10s: 匹配 -> True
     assert valid_video(path, 10.0)
@@ -221,7 +221,7 @@ def test_subframe_active_interval_keeps_its_display_frame(tmp_path, fps, state, 
 
 
 def test_valid_video_requires_audio_and_rejects_internal_pts_gap(tmp_path):
-    from src.render_cache import _window_is_continuous, valid_video
+    from src.hardware.render_cache import _window_is_continuous, valid_video
 
     path = make_video(tmp_path / "video_only.mp4", seconds=2)
     assert not valid_video(path, 2, require_audio=True)
@@ -234,7 +234,7 @@ def test_valid_video_requires_audio_and_rejects_internal_pts_gap(tmp_path):
 
 
 def test_yuv_limited_range_uses_canonical_gray_conversion():
-    from src.filters import video_frame_to_gray
+    from src.algorithms.filters import video_frame_to_gray
 
     frame = av.VideoFrame(16, 16, "yuv420p")
     frame.planes[0].update(bytes([16]) * frame.planes[0].buffer_size)
@@ -247,7 +247,7 @@ def test_yuv_limited_range_uses_canonical_gray_conversion():
 
 
 def test_valid_video_checkpoints_sequential_and_parallel(tmp_path):
-    from src.render_cache import valid_video
+    from src.hardware.render_cache import valid_video
     path = make_video(tmp_path / "checkpoints.mp4", seconds=20, fps=5)
     # 1. 无接缝校验
     assert valid_video(path, 20.0, checkpoints=())
@@ -412,70 +412,9 @@ def test_camera_indices_persist_across_scan_order(tmp_path):
     db.close()
 
 
-def test_human_interval_survives_reanalysis_and_smoothing(tmp_path):
-    from src.timeline import build_timeline_from_rows
-    db = VlogDatabase(tmp_path / "review.sqlite")
-    db.add_file_task("x.mp4",0,"20260901","20260901000000","20260901000100",60)
-    db.set_prescreen_result("x.mp4", "SUSPICIOUS")
-    db.set_analysis_result("x.mp4", [Segment(20,21,"STATIC","x.mp4")])
-    db.update_segment_review(db.get_segments_for_file("x.mp4")[0]["id"], "FN")
-    db.set_analysis_result("x.mp4", [Segment(0,60,"STATIC","x.mp4")])
-    timeline = build_timeline_from_rows(db.get_all_file_tasks_for_date("20260901",0), "20260901", config={})
-    assert [(s.start_in_file,s.end_in_file) for s in timeline if s.state == "DYNAMIC"] == [(20,21)]
-    db.close()
 
 
-@pytest.mark.parametrize("reanalysis", [False, True])
-def test_clear_review_revokes_persistent_timeline_override(tmp_path, reanalysis):
-    from src.timeline import build_timeline_from_rows
-    db = VlogDatabase(tmp_path / "clear.sqlite")
-    try:
-        db.add_file_task("x.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
-        db.set_prescreen_result("x.mp4", "SUSPICIOUS")
-        db.set_analysis_result("x.mp4", [Segment(20, 21, "STATIC", "x.mp4")])
-        db.update_segment_review(db.get_segments_for_file("x.mp4")[0]["id"], "FN")
-        if reanalysis:
-            db.set_analysis_result("x.mp4", [Segment(0, 60, "STATIC", "x.mp4")])
-        current = db.get_segments_for_file("x.mp4")[0]["id"]
-        assert db.clear_segment_review(current)
-        rows = db.get_all_file_tasks_for_date("20260901", 0)
-        assert not rows[0]["human_reviews"]
-        timeline = build_timeline_from_rows(rows, "20260901", config={}, resolve_presence=False)
-        assert all(s.state == "STATIC" for s in timeline)
-    finally:
-        db.close()
 
-
-def test_clear_review_preserves_labels_outside_current_source_interval(tmp_path):
-    db = VlogDatabase(tmp_path / "partial-clear.sqlite")
-    try:
-        db.add_file_task("x.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
-        db.set_analysis_result("x.mp4", [Segment(20, 30, "STATIC", "x.mp4"), Segment(50, 55, "STATIC", "x.mp4")])
-        for seg in db.get_segments_for_file("x.mp4"):
-            db.update_segment_review(seg["id"], "FN", "preserve notes")
-        db.set_analysis_result("x.mp4", [Segment(25, 27, "STATIC", "x.mp4")])
-        assert db.clear_segment_review(db.get_segments_for_file("x.mp4")[0]["id"])
-        reviews = db.get_all_file_tasks_for_date("20260901", 0)[0]["human_reviews"]
-        assert sorted((r["start_time"], r["end_time"]) for r in reviews) == [(20, 25), (27, 30), (50, 55)]
-        assert all(r["manual_label"] == "FN" and r["review_notes"] == "preserve notes" for r in reviews)
-    finally:
-        db.close()
-
-
-def test_clear_review_rolls_back_both_tables_on_failure(tmp_path):
-    db = VlogDatabase(tmp_path / "rollback-review.sqlite")
-    try:
-        db.add_file_task("x", 0, "20260901", "20260901000000", "20260901000100", 60)
-        db.set_analysis_result("x", [Segment(0, 60, "STATIC", "x")])
-        seg_id = db.get_segments_for_file("x")[0]["id"]
-        db.update_segment_review(seg_id, "FN")
-        db.conn.execute("CREATE TRIGGER reject_clear BEFORE UPDATE ON segments WHEN NEW.manual_label IS NULL BEGIN SELECT RAISE(ABORT, 'reject clear'); END")
-        db.conn.commit()
-        assert not db.clear_segment_review(seg_id)
-        assert db.get_segment_by_id(seg_id)["manual_label"] == "FN"
-        assert len(db.get_all_file_tasks_for_date("20260901", 0)[0]["human_reviews"]) == 1
-    finally:
-        db.close()
 
 
 def test_failed_database_write_propagates(tmp_path):
@@ -500,7 +439,7 @@ def test_worker_failure_signals_abort(tmp_path):
 
 
 def test_frame_pool_is_lossless_and_bounded():
-    from src.frame_pool import FramePool
+    from src.hardware.frame_pool import FramePool
     frame = np.random.default_rng(3).integers(0,256,(128,128),dtype=np.uint8)
     pool = FramePool(20000)
     pool.append(frame)
@@ -510,7 +449,7 @@ def test_frame_pool_is_lossless_and_bounded():
 
 
 def test_io_budget_reserves_multi_input_atomically():
-    from src.scheduler import FileBudget
+    from src.hardware.scheduler import FileBudget
     budget = FileBudget(8)
     assert budget.acquire(weight=6,timeout=0)
     assert not budget.acquire(weight=3,timeout=0)
@@ -523,8 +462,8 @@ def test_io_budget_reserves_multi_input_atomically():
 
 
 def test_streaming_audio_matches_full_pcm():
-    from src.audio_features import AudioFeatures
-    from src.filters import AudioEnergyVAD
+    from src.algorithms.audio_features import AudioFeatures
+    from src.algorithms.filters import AudioEnergyVAD
     samples = np.zeros(16000 * 5, np.float32)
     samples[16000:48000] = .15 * np.sin(np.arange(32000) * 2 * np.pi * 220 / 16000)
     features = AudioFeatures()
@@ -537,13 +476,13 @@ def test_streaming_audio_matches_full_pcm():
     assert stats == stream_stats
 
 
-def test_analysis_json_matches_relational_segments(tmp_path):
-    import json
+def test_relational_segments_as_single_source_of_truth(tmp_path):
     db = VlogDatabase(tmp_path / 'segments.sqlite')
     db.add_file_task('x', 0, '20260901', '20260901000000', '20260901000100', 60)
     db.set_analysis_result('x', [Segment(0, 60, 'DYNAMIC', 'x')])
     row = db.get_all_file_tasks_for_date('20260901', 0)[0]
-    assert json.loads(row['analysis_segments'])[0]['state'] == 'DYNAMIC'
+    assert row.get('analysis_segments') is None
+    assert len(row['segments']) == 1
     assert row['segments'][0]['state'] == 'DYNAMIC'
     db.close()
 
@@ -553,7 +492,7 @@ def test_analysis_json_matches_relational_segments(tmp_path):
     'output:\n  qsv:\n    global_quality: 28\n    maxrate: 4M\n',
 ])
 def test_invalid_config_does_not_poison_cache(tmp_path, monkeypatch, settings):
-    import src.utils as utils
+    import src.core.utils as utils
     config = tmp_path / 'invalid.yaml'
     config.write_text(settings)
     previous = {'hardware': {'max_nv_concurrency': 2}}
@@ -565,7 +504,7 @@ def test_invalid_config_does_not_poison_cache(tmp_path, monkeypatch, settings):
 
 
 def test_pyav_fallback_completes_and_cancel_is_incomplete(tmp_path):
-    from src.renderer import FFmpegProcessRegistry
+    from src.stages.renderer import FFmpegProcessRegistry
     source = make_video(tmp_path / 'fallback.mp4', seconds=4, fps=2)
     detector = MotionDetector({'detection': {'analysis_resolution': '128x128',
                               'analysis_fps_adaptive': False, 'analysis_fps': 2},
@@ -579,11 +518,11 @@ def test_pyav_fallback_completes_and_cancel_is_incomplete(tmp_path):
 
 
 def test_stream_consumer_failure_releases_process_and_io(monkeypatch):
-    from src.ffmpeg import run_ffmpeg
-    from src.renderer import FFmpegProcessRegistry
-    from src.scheduler import FileBudget
+    from src.hardware.ffmpeg import run_ffmpeg
+    from src.stages.renderer import FFmpegProcessRegistry
+    from src.hardware.scheduler import FileBudget
     budget = FileBudget(1)
-    monkeypatch.setattr('src.utils.get_disk_semaphore', lambda: budget)
+    monkeypatch.setattr('src.hardware.scheduler.get_disk_semaphore', lambda: budget)
     observed = []
     def fail(chunk):
         observed.extend(FFmpegProcessRegistry._processes.values())
@@ -634,7 +573,7 @@ def test_yolo_candidate_sampling_is_bounded_for_long_files():
 
 
 def test_static_audio_gate_keeps_audio_events_conservative(monkeypatch):
-    from src.detector import detect_audio_activity
+    from src.stages.detector import detect_audio_activity
     cfg = {"audio_vad": {"enabled": True}}
     class FakeDetector:
         def __init__(self, config, decode_gpu):
@@ -647,53 +586,6 @@ def test_static_audio_gate_keeps_audio_events_conservative(monkeypatch):
             return 1
         def detect_events(self, features):
             return [(1.0, 2.0, "audio")], {"noise_floor_db": -40}
-    monkeypatch.setattr("src.detector.MotionDetector", FakeDetector)
+    monkeypatch.setattr("src.stages.detector.MotionDetector", FakeDetector)
     events, _ = detect_audio_activity("ignored", 2, cfg)
     assert events
-
-
-def test_human_reviewed_segment_immune_to_short_smoothing():
-    from src.algorithms.segment import _filter_short, Segment
-    segs = [
-        Segment(start_time=0.0, end_time=100.0, state="STATIC", source_file="f.mp4"),
-        Segment(start_time=100.0, end_time=101.5, state="DYNAMIC", source_file="f.mp4", is_human_reviewed=True),
-        Segment(start_time=101.5, end_time=200.0, state="STATIC", source_file="f.mp4"),
-    ]
-    # min_motion 设定为 3.0 秒，原本 1.5s 的微小动态段会被吞噬。
-    # 但因其带有 is_human_reviewed=True 豁免标记，必须 100% 独立保留！
-    res = _filter_short(segs, min_motion=3.0, min_static=10.0)
-    assert len(res) == 3
-    assert res[1].state == "DYNAMIC"
-    assert res[1].start_time == 100.0
-    assert res[1].end_time == 101.5
-    assert res[1].is_human_reviewed is True
-
-
-def test_human_feedback_remedy_guarantee(tmp_path):
-    """验证人机协同复核机制对争议切片具有 100% 纠偏保护力 (Timeline Invariant)."""
-    from src.segment import Segment
-    from src.timeline import build_timeline
-
-    db = VlogDatabase(tmp_path / "remedy.sqlite")
-    fp = "sample_clip.mp4"
-    db.add_file_task(fp, 0, "20260901", "20260901100000", "20260901101000", 600)
-
-    # 模拟 1 个被误判为 DYNAMIC 的光影假阳性切片
-    seg = Segment(10.0, 30.0, "DYNAMIC", fp, max_energy=18.0, avg_confidence=0.0)
-    db.set_analysis_result(fp, [seg])
-
-    # 初始成片时间轴: 该切片处于 DYNAMIC 原速
-    initial_tl = build_timeline(db, "20260901", 0)
-    assert any(t.state == "DYNAMIC" for t in initial_tl)
-
-    # 模拟人工工作台将其标记为 FALSE_ALARM (光影误报)
-    db_segs = db.get_segments_for_file(fp)
-    seg_id = db_segs[0]["id"]
-    db.update_segment_review(seg_id, "FALSE_ALARM", notes="树影晃动纠偏")
-
-    # 复核后成片时间轴: build_timeline 必须保证纠偏生效，降级为 STATIC 快进
-    corrected_tl = build_timeline(db, "20260901", 0)
-    assert not any(t.state == "DYNAMIC" for t in corrected_tl)
-    assert all(t.state == "STATIC" for t in corrected_tl)
-
-    db.close()

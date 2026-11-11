@@ -5,8 +5,8 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from src.filters import SpatialGridMotionFilter
-from src.detector import MotionDetector
+from src.algorithms.filters import SpatialGridMotionFilter
+from src.stages.detector import MotionDetector
 
 
 def test_worker_total_does_not_double_count_render_children():
@@ -22,7 +22,7 @@ def test_worker_total_does_not_double_count_render_children():
 
 def test_perf_log_json_schema_validity(tmp_path):
     import json
-    from src.monitor import PerfCollector, PerfRecord
+    from src.hardware.monitor import PerfCollector, PerfRecord
     from tests.helpers import validate_perf_json_schema
 
     perf = PerfCollector()
@@ -99,8 +99,8 @@ def test_frame_budget_failure_does_not_decode_source_twice():
 @pytest.mark.parametrize("fps", [.5, 1, 2, 5])
 @pytest.mark.parametrize("ema", [True, False])
 def test_streamed_motion_preserves_labels_and_closed_timeline(fps, ema):
-    from src.motion_trace import MotionTrace
-    from src.frame_pool import FramePool
+    from src.algorithms.motion_trace import MotionTrace
+    from src.hardware.frame_pool import FramePool
     cfg = {"detection": {"analysis_resolution": "96x64", "ema_background_enabled": ema},
            "audio_vad": {"enabled": False}}
     detector = MotionDetector(cfg)
@@ -133,7 +133,7 @@ def test_streamed_motion_preserves_labels_and_closed_timeline(fps, ema):
 @pytest.mark.parametrize("workers", [1, 3])
 def test_render_concurrency_controls_real_workers(tmp_path, workers):
     import threading
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
     from src.pipeline import StreamingOrchestrator
     db = VlogDatabase(db_path=tmp_path / "workers.db")
     cfg = {"pipeline": {"render_gpu_policy": "nv_only", "render_start_delay": 0},
@@ -185,9 +185,10 @@ def test_day_benchmark_seeds_explicit_isolated_workload(tmp_path, mode):
     task = {"id": 7, "filepath": source, "date": "20260829", "cam_index": 0,
             "camera_id": "camera", "file_start_time": "20260829000000", "file_end_time": "20260829000010",
             "file_duration": 9.4, "prescreen_status": "SUSPICIOUS", "analysis_status": "ANALYZED",
-            "analysis_segments": "[]", "duration_verified": 1, "processing_fingerprint": "historical", "has_audio": 1}
-    segment = {"id": 19, "file_id": 7, "filepath": source, "date": "20260829", "cam_index": 0,
-               "start_time": 0, "end_time": 9.4, "duration": 9.4, "state": "DYNAMIC"}
+            "duration_verified": 1, "processing_fingerprint": "historical", "has_audio": 1,
+            "analysis_segments": "[]"}
+    segment = {"id": 19, "file_id": 7, "start_time": 0, "end_time": 9.4, "state": "DYNAMIC",
+               "filepath": source, "duration": 5, "manual_label": "FALSE_POSITIVE"}
     review = {"filepath": source, "start_time": 2, "end_time": 3, "manual_label": "CONFIRMED_MOTION"}
     workload = {"tasks": [task], "segments": [segment], "human_reviews": [review],
                 "camera_registry": [{"camera_id": "camera", "cam_index": 0}]}
@@ -195,10 +196,15 @@ def test_day_benchmark_seeds_explicit_isolated_workload(tmp_path, mode):
     try:
         seed_workload(db, workload, mode)
         saved = dict(db.conn.execute("SELECT * FROM file_tasks").fetchone())
-        assert db.conn.execute("SELECT count(*) FROM human_reviews").fetchone()[0] == 1
+        assert "analysis_segments" not in saved
+        facts = db.conn.execute("SELECT filepath, start_time, end_time, manual_label FROM human_reviews").fetchall()
+        assert [dict(fact) for fact in facts] == [review]
+        assert not db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
         if mode == "render_only":
             assert saved["file_duration"] == 9.4 and saved["processing_fingerprint"] == "historical"
-            assert db.conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 1
+            saved_segments = db.get_segments_for_file(source)
+            assert len(saved_segments) == 1 and saved_segments[0]["duration"] == 9.4
+            assert saved_segments[0]["state"] == "DYNAMIC" and "manual_label" not in saved_segments[0]
         else:
             assert saved["file_duration"] == 20 and saved["file_end_time"] == "20260829000020"
             assert saved["duration_verified"] == 0 and saved["processing_fingerprint"] is None

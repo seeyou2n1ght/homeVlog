@@ -44,15 +44,18 @@ hardware:
 pipeline:
   render_start_delay: 2
   prescreen_gpu_policy: "qsv_only"
-  render_gpu_policy: "heterogeneous"
+  render_gpu_policy: "heterogeneous"  # Use cpu_only for software decode and encode.
+  cost_priority: true
 
 scheduler:
-  watermark_high: 6
-  watermark_low: 3
+  auto_tune: true
+  watermark_high: 2
+  watermark_low: 0
   nvdec_cooperative: true
-  max_nv_decoders: 2
+  max_nv_decoders: 1
+  heavy_file_duration_s: 1200.0
+  heavy_nvdec_wait_s: 120.0
   cold_start_burst: true
-  vram_watermark_mb: 6200
   cooperative_during_render: true
 
 recovery:
@@ -92,6 +95,7 @@ detection:
 audio_vad:
   enabled: true
   sample_rate: 16000
+  prescreen_audio_gate: true
 
 segment:
   apply_smoothing: true
@@ -107,7 +111,7 @@ yolo:
   target_classes: [0, 15, 16]     # 0:person, 15:cat, 16:dog
   confidence: 0.3
   sample_fps: 2
-  batch_size: 4
+  batch_size: 16
   max_frames_per_file: 512
 
 # ---------------------------------------------------------------------------
@@ -117,6 +121,7 @@ render:
   static_mode: "hybrid_keyframe"
   batch_max_files: 1
   max_concurrency: 3
+  nv_tail_concurrency: 3
   max_qsv_dynamic_duration_s: 420.0
   virtual_concat_enabled: true
   virtual_concat_mixed_enabled: true
@@ -139,18 +144,13 @@ output:
   naming: "DailyVlog_{date}_{mac}.mp4"
   resolution: "1920x1080"
   fps: 20
-  gop: 120
   nv:
     codec: "hevc_nvenc"
-    preset: "p4"
+    preset: "p1"
     cq: 28
     maxrate: "4M"
     bufsize: "8M"
     gop: 120
-    rc_lookahead: 32
-    spatial_aq: 1
-    temporal_aq: 1
-    aq_strength: 8
     pix_fmt: "nv12"
   qsv:
     codec: "hevc_qsv"

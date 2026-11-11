@@ -4,7 +4,6 @@ import os
 import subprocess
 import threading
 import time
-import math
 from pathlib import Path
 
 import av
@@ -19,7 +18,7 @@ from src.hardware.ffmpeg import (
 )
 
 # 时空滤波 / 背景建模 / 音频 VAD 算法统一由 src.algorithms.filters 提供（单一实现，防漂移）。
-# 此处 re-export 以保持 `from src.detector import ...` 的历史导入路径兼容。
+# 此处 re-export 以提供时空滤波与背景建模核心算法接口。
 from src.algorithms.filters import (
     AudioEnergyVAD,
     EmaBackgroundModel,
@@ -422,6 +421,17 @@ class MotionDetector:
         返回 (grayscale_frames, yolo_buffer, audio_samples, metadata)。
         """
         effective_fps = self._resolve_effective_fps(file_duration)
+        audio_thread = None
+        audio_holder = []
+        if getattr(self, "audio_vad_enabled", False) and getattr(self, "has_audio_detected", 1) != 0:
+            def _async_audio():
+                try:
+                    audio_holder.append(self._decode_audio_pipe(filepath, file_duration))
+                except Exception as exc:
+                    audio_holder.append(exc)
+            audio_thread = threading.Thread(target=_async_audio, daemon=True)
+            audio_thread.start()
+
         try:
             frames, yolo_buffer, meta = self._decode_file_pipe(
                 filepath, file_duration, effective_fps
@@ -429,14 +439,28 @@ class MotionDetector:
             if meta.get("aborted"):
                 return [], {}, np.array([], dtype=np.float32), meta
             if frames and meta.get("complete", False):
-                try:
-                    full_audio = self._decode_audio_pipe(filepath, file_duration)
-                except MediaTerminationUnconfirmed:
-                    raise
-                except Exception as exc:
-                    logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, exc)
-                    from src.algorithms.audio_features import AudioFeatures
-                    full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
+                full_audio = None
+                if audio_thread is not None:
+                    audio_thread.join(timeout=30.0)
+                    if audio_holder:
+                        res = audio_holder[0]
+                        if isinstance(res, MediaTerminationUnconfirmed):
+                            raise res
+                        elif isinstance(res, Exception):
+                            logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, res)
+                            from src.algorithms.audio_features import AudioFeatures
+                            full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
+                        else:
+                            full_audio = res
+                if full_audio is None:
+                    try:
+                        full_audio = self._decode_audio_pipe(filepath, file_duration)
+                    except MediaTerminationUnconfirmed:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, exc)
+                        from src.algorithms.audio_features import AudioFeatures
+                        full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
                 meta["has_audio"] = int(bool(full_audio.size) or bool(getattr(self, "has_audio_detected", 0)))
                 try:
                     self.has_audio_detected = meta["has_audio"]
@@ -458,6 +482,9 @@ class MotionDetector:
                 "pipe decode failed for %s: %s; falling back to PyAV",
                 Path(filepath).name, e,
             )
+        finally:
+            if audio_thread is not None and audio_thread.is_alive():
+                audio_thread.join(timeout=2.0)
         return self._decode_file_pyav(filepath, file_duration)
 
     def _decode_file_pipe(
@@ -472,14 +499,19 @@ class MotionDetector:
         FFmpegProcessRegistry.reap_cleanups()
         from src.hardware.frame_pool import FramePool
         from src.algorithms.motion_trace import MotionTrace
-        decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)), visual_sample_stride=max(1, math.ceil(file_duration * effective_fps / 2048))) if getattr(self, "_stream_motion", False)
+        decoded_frames = (MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0))) if getattr(self, "_stream_motion", False)
                           else FramePool(self.buffer_limit // 2))
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
         w, h = self.width, self.height
         frame_size = w * h  # 单通道灰度直通，IPC 管道数据量降低 66.7%
 
-        if self.decode_gpu == "qsv":
+        if self.decode_gpu == "cpu":
+            from src.hardware.scheduler import get_disk_semaphore
+            io_sem = get_disk_semaphore()
+            hw_args = []
+            vf = f"fps={effective_fps:.3f},scale={w}:{h}"
+        elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore
             io_sem = VideoLease(get_qsv_semaphore())
             hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
@@ -530,7 +562,7 @@ class MotionDetector:
         try:
             with open(err_log, "wb") as f_err:
                 try:
-                    proc = FFmpegProcessRegistry.start(pipe_key,cmd,stdout=subprocess.PIPE,stderr=f_err)
+                    proc = FFmpegProcessRegistry.start(pipe_key,cmd,stdout=subprocess.PIPE,stderr=f_err,bufsize=1024*1024)
                 except MediaStartTerminationUnconfirmed as error:
                     proc, pipe_key = error.process, error.process_key
                     raise
@@ -559,9 +591,7 @@ class MotionDetector:
                     gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
 
                     if getattr(self, "yolo_enabled", False) and total_frames % yolo_sample_interval == 0:
-                        bgr_tmp = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                        ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        item = buf_jpg if ok_enc else bgr_tmp
+                        item = gray.copy()
                         jpeg_bytes += item.nbytes
                         if jpeg_bytes > self.buffer_limit // 4:
                             raise MemoryError("YOLO candidate budget exceeded")
@@ -684,7 +714,11 @@ class MotionDetector:
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
 
-        if self.decode_gpu == "qsv":
+        if self.decode_gpu == "cpu":
+            from src.hardware.scheduler import get_disk_semaphore
+            io_sem = get_disk_semaphore()
+            hw_name = None
+        elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore
             io_sem = VideoLease(get_qsv_semaphore())
             hw_name = "qsv"
@@ -731,11 +765,12 @@ class MotionDetector:
         t_decode_start = time.monotonic()
         try:
             hw = None
-            try:
-                from av.codec.hwaccel import HWAccel
-                hw = HWAccel(hw_name)
-            except Exception as e:
-                logger.debug(f"PyAV HWAccel init failed for {hw_name}: {e}")
+            if hw_name is not None:
+                try:
+                    from av.codec.hwaccel import HWAccel
+                    hw = HWAccel(hw_name)
+                except Exception as e:
+                    logger.debug(f"PyAV HWAccel init failed for {hw_name}: {e}")
 
             kwargs = {}
             if hw:
@@ -782,7 +817,7 @@ class MotionDetector:
                 effective_fps = video_fps / frame_step
                 if getattr(self, "_stream_motion", False):
                     from src.algorithms.motion_trace import MotionTrace
-                    decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)), visual_sample_stride=max(1, math.ceil(file_duration * effective_fps / 2048)))
+                    decoded_frames = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0)))
 
                 # YOLO 抽样间隔必须以实际解码 effective_fps 为基准，
                 # 保证 yolo_buffer 帧键与分析阶段时间轴严格对齐
@@ -847,8 +882,7 @@ class MotionDetector:
                                     interpolation=cv2.INTER_LINEAR,
                                 )
                                 bgr_tmp = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
-                        ok_enc, buf_jpg = cv2.imencode(".jpg", bgr_tmp, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        item = buf_jpg if ok_enc else bgr_tmp
+                        item = bgr_tmp
                         jpeg_bytes += item.nbytes
                         if jpeg_bytes > self.buffer_limit // 4:
                             raise MemoryError("YOLO candidate budget exceeded")
@@ -944,13 +978,6 @@ class MotionDetector:
         - labels: [{'time', 'is_motion', 'state', 'energy', 'is_audio_active'}, ...]
         - yolo_buffer: {frame_index: np.ndarray} 供 YOLO 流式验证复用的零拷贝帧池
         """
-        self.visual_samples = []
-        self.visual_source = None
-        try:
-            from src.core.visual_index import source_identity
-            visual_source_before = source_identity(filepath)
-        except OSError:
-            visual_source_before = None
         self._analysis_start_offset = start_offset
         if declared_duration is not None and duration_verified:
             file_duration = max(file_duration, declared_duration)
@@ -1016,22 +1043,6 @@ class MotionDetector:
             file_duration = actual_dur
             self.file_duration_detected = actual_dur
 
-        visual_started = time.monotonic()
-        try:
-            from src.core.visual_index import frame_signature
-            if visual_source_before and source_identity(filepath) == visual_source_before:
-                # Additional memory is bounded; never retain a second full frame pool.
-                from src.algorithms.motion_trace import MotionTrace
-                if isinstance(decoded_frames, MotionTrace):
-                    self.visual_samples = decoded_frames.visual_samples
-                else:
-                    indices = np.linspace(0,len(decoded_frames)-1,min(2048,len(decoded_frames)),dtype=int)
-                    self.visual_samples = [(int(i)/effective_fps,frame_signature(decoded_frames[i])) for i in indices]
-                self.visual_source = visual_source_before
-        except Exception as exc:
-            logger.warning("Visual samples unavailable for %s: %s", filepath, exc)
-        visual_time = time.monotonic()-visual_started + getattr(decoded_frames, "visual_index_s", 0.0)
-
         # One continuous background model per file; the outer worker pool bounds CPU concurrency.
         results, frames_meta = self.analyze_frames(
             decoded_frames, start_offset=start_offset, file_duration=file_duration,
@@ -1051,8 +1062,6 @@ class MotionDetector:
             "motion_ratio": round(motion_count / len(results), 3) if results else 0,
             "early_term": early_term_any,
             "effective_fps": effective_fps,
-            "visual_index_s": round(visual_time,6),
-            "visual_samples": len(self.visual_samples),
             "has_audio": has_audio,
             "audio_events": len(audio_events),
             "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),

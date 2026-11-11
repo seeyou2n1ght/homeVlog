@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from src.database import VlogDatabase
-from src.scanner import parse_filename, scan_directory, get_date_cam_groups
+from src.core.database import VlogDatabase
+from src.stages.scanner import parse_filename, scan_directory, get_date_cam_groups
 
 
 class TestFilenameParsingAndScanner:
@@ -39,7 +39,7 @@ class TestFilenameParsingAndScanner:
         assert parse_filename("") is None
 
     def test_parse_camera_dir(self):
-        from src.scanner import parse_camera_dir
+        from src.stages.scanner import parse_camera_dir
         assert parse_camera_dir(r"\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD") == {
             "cam_id": "01",
             "mac": "B888805AA3CD",
@@ -52,7 +52,7 @@ class TestFilenameParsingAndScanner:
         assert parse_camera_dir("") == {}
 
     def test_resolve_camera_identity_three_tier_fallback(self):
-        from src.scanner import resolve_camera_identity
+        from src.stages.scanner import resolve_camera_identity
         mock_cfg = {"cameras": {"B888805AA3CD": "baby_room"}}
 
         # Tier 1: MAC 匹配且配置了别名
@@ -76,7 +76,7 @@ class TestFilenameParsingAndScanner:
         assert fid == "cam3"
 
     def test_camera_ui_name_priority(self):
-        from src.scanner import resolve_camera_ui_name
+        from src.stages.scanner import resolve_camera_ui_name
 
         path = "XiaomiCamera_01_B888805AA3CD"
         assert resolve_camera_ui_name(path, 0, {"cameras": {"B888805AA3CD": "育儿房"}}) == "育儿房"
@@ -88,7 +88,7 @@ class TestFilenameParsingAndScanner:
         assert resolve_camera_ui_name(Path("Camera_B888805AA3CD"), 0, {"cameras": {}}) == "B888805AA3CD"
 
     def test_resolve_output_filename_custom_templates(self):
-        from src.scanner import resolve_output_filename
+        from src.stages.scanner import resolve_output_filename
         mock_cfg = {"cameras": {"B888805AA3CD": "baby_room"}}
         sample_path = r"\\192.168.5.8\LyuShare\XiaomiCamera_01_B888805AA3CD\00_20260402000000_20260402000500.mp4"
 
@@ -114,7 +114,7 @@ class TestFilenameParsingAndScanner:
         assert name5 == "DailyVlog_20260402_cam1.mp4"
 
     def test_get_input_dirs_polymorphic(self):
-        from src.utils import get_input_dirs
+        from src.core.utils import get_input_dirs
         # 1. 列表格式
         cfg1 = {"paths": {"input_dirs": ["/nas/cam1", "/nas/cam2"]}}
         assert get_input_dirs(cfg1) == ["/nas/cam1", "/nas/cam2"]
@@ -413,9 +413,9 @@ class TestVlogDatabaseLifecycle:
 class TestSegmentsTableLifecycle:
     """测试 segments 关系表规范化读写、人工审核打标与时间轴反向纠偏生效"""
 
-    def test_segments_table_lifecycle_and_review(self, tmp_path):
-        from src.timeline import build_timeline
-        from src.segment import Segment
+    def test_segments_table_relational_lifecycle(self, tmp_path):
+        from src.stages.timeline import build_timeline
+        from src.algorithms.segment import Segment
 
         db_path = tmp_path / "test_segments.db"
         db = VlogDatabase(db_path=db_path)
@@ -431,39 +431,37 @@ class TestSegmentsTableLifecycle:
             ]
             db.set_analysis_result(fp, "ANALYZED", sample_segments)
 
-            # 1. 验证 segments 表展开入库
+            # 1. 验证 segments 关系表规范化查询 (JOIN 动态计算 duration 与关联字段)
             segs = db.get_segments_for_file(fp)
             assert len(segs) == 3
             assert segs[0]["state"] == "STATIC"
             assert segs[1]["state"] == "DYNAMIC"
             assert segs[1]["max_energy"] == 5.5
+            assert segs[1]["duration"] == 30.0
+            assert segs[1]["filepath"] == fp
+            assert segs[1]["date"] == "20260901"
+            assert segs[1]["cam_index"] == 0
 
-            # 2. 验证主动疑难排查召回 (Active Learning)
-            anomalies = db.get_anomaly_segments(date="20260901", cam_index=0)
-            assert len(anomalies) >= 2
-            anomaly_states = [a["state"] for a in anomalies]
-            assert "DYNAMIC" in anomaly_states
-            assert "STATIC" in anomaly_states
+            # 2. 验证按日期聚合查询
+            date_segs = db.get_all_segments_for_date("20260901", 0)
+            assert len(date_segs) == 3
+            assert date_segs[1]["duration"] == 30.0
+            assert date_segs[1]["filepath"] == fp
 
-            # 3. 模拟人工审核打标: 将 segs[1] 标记为 FALSE_ALARM (误判，实际为静止)
-            dynamic_seg_id = segs[1]["id"]
-            assert db.update_segment_review(dynamic_seg_id, "FALSE_ALARM", notes="窗帘被风吹动")
+            # 3. 验证极速短路动态性判定原语
+            assert db.has_dynamic_segments_for_file(fp) is True
+            assert db.get_dynamic_duration_for_file(fp) == 30.0
 
-            updated_segs = db.get_segments_for_file(fp)
-            dyn_updated = next(s for s in updated_segs if s["id"] == dynamic_seg_id)
-            assert dyn_updated["manual_label"] == "FALSE_ALARM"
-            assert dyn_updated["review_notes"] == "窗帘被风吹动"
-            assert dyn_updated["reviewed_at"] is not None
-
-            # 4. 验证反向纠偏: build_timeline 自动将打标后的 FALSE_ALARM 降级为 STATIC
+            # 4. 验证时间轴生成消费
             timeline = build_timeline(db, "20260901", 0)
             dynamic_timeline_segs = [t for t in timeline if t.state == "DYNAMIC"]
-            assert len(dynamic_timeline_segs) == 0
+            assert len(dynamic_timeline_segs) == 1
+            assert dynamic_timeline_segs[0].duration == 30.0
         finally:
             db.close()
 
     def test_empty_analysis_replaces_old_segments_and_bad_json_fails(self, tmp_path):
-        from src.segment import Segment
+        from src.algorithms.segment import Segment
 
         db = VlogDatabase(tmp_path / "replace.sqlite")
         fp = "clip.mp4"
@@ -483,55 +481,6 @@ class TestSegmentsTableLifecycle:
             db.add_file_task(fp, 0, "20260901", f"20260901000{index}00", f"20260901000{index}59", 59)
         rows = db.get_all_file_tasks_for_date("20260901", 0, filepaths=["clip_1.mp4"])
         assert [row["filepath"] for row in rows] == ["clip_1.mp4"]
-        db.close()
-
-    def test_gold_candidates_clustering_and_batch_review(self, tmp_path):
-        from src.segment import Segment
-
-        db = VlogDatabase(tmp_path / "gold.sqlite")
-        fp = "sample_video.mp4"
-        db.add_file_task(fp, 0, "20260901", "20260901120000", "20260901123000", 1800)
-
-        # 构造模拟切片:
-        # 1. 连续 5 个树影晃动切片 (同文件、同类型 high_energy_no_target、相邻时间 < 300s)
-        # 2. 1 个置信度摇摆切片 (borderline_confidence)
-        # 3. 1 个微动临界切片 (fn_suspect)
-        segs = [
-            Segment(10.0, 15.0, "DYNAMIC", fp, max_energy=18.0, avg_confidence=0.0),
-            Segment(20.0, 25.0, "DYNAMIC", fp, max_energy=22.0, avg_confidence=0.0),
-            Segment(30.0, 35.0, "DYNAMIC", fp, max_energy=15.0, avg_confidence=0.0),
-            Segment(40.0, 45.0, "DYNAMIC", fp, max_energy=12.0, avg_confidence=0.0),
-            Segment(50.0, 55.0, "DYNAMIC", fp, max_energy=19.0, avg_confidence=0.0),
-            Segment(600.0, 605.0, "DYNAMIC", fp, max_energy=5.0, avg_confidence=0.28),
-            Segment(800.0, 810.0, "STATIC", fp, max_energy=2.5, avg_confidence=0.0),
-        ]
-        db.set_analysis_result(fp, segs)
-
-        # 召回主动学习黄金候选集
-        candidates = db.get_anomaly_segments(category="gold_candidates", date="20260901", cam_index=0, limit=10)
-        assert len(candidates) >= 3
-
-        # 验证聚类聚合生效: 5 个连续树影应被聚合成 1 个代表切片
-        high_energy_reps = [c for c in candidates if c["anomaly_type"] == "high_energy_no_target"]
-        assert len(high_energy_reps) == 1
-        rep = high_energy_reps[0]
-        assert rep["cluster_count"] == 5
-        assert len(rep["cluster_ids"]) == 5
-        assert rep["max_energy"] == 22.0  # 代表切片应当选能量/得分最高的一个
-
-        # 验证多样性
-        types = {c["anomaly_type"] for c in candidates}
-        assert "borderline_confidence" in types
-        assert "fn_suspect" in types
-
-        # 验证批量更新
-        updated_count = db.batch_update_segment_review(rep["cluster_ids"], "FALSE_ALARM", notes="树影晃动聚类一键纠偏")
-        assert updated_count == 5
-
-        # 再次获取候选集，已被标记的 5 个切片不应再出现
-        next_candidates = db.get_anomaly_segments(category="gold_candidates", date="20260901", cam_index=0)
-        assert not any(c["anomaly_type"] == "high_energy_no_target" for c in next_candidates)
-
         db.close()
 
 

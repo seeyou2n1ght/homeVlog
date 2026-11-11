@@ -34,6 +34,7 @@ from src.stages.companion import (
 from src.core.config import (
     load_config,
     OUTPUT_DIR,
+    uses_software_pipeline,
 )
 from src.hardware.scheduler import (
     WorkStealingManager,
@@ -41,13 +42,14 @@ from src.hardware.scheduler import (
     DualEndedBatchQueue,
 )
 from src.hardware.ffmpeg import FFmpegProcessRegistry
+from src.hardware.lifecycle import cleanup_resources
 from src.core.utils import (
-    cleanup_resources,
     check_disk_space,
     register_dashboard,
     unregister_dashboard,
 )
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from src.hardware.monitor import get_monitor, get_perf, PerfRecord
 
 logger = logging.getLogger("homevlog")
@@ -67,7 +69,7 @@ class PipelineTask:
     prescreen_status: str = "PENDING"
     prescreen_result: str = ""
     analysis_status: str = "PENDING"
-    analysis_segments: str = ""
+    segments: list = field(default_factory=list)
     id: int | None = None
     is_audio_gated_static: bool = False
     audio_events: list = field(default_factory=list)
@@ -99,7 +101,7 @@ class PipelineTask:
             prescreen_status=str(data.get("prescreen_status", "PENDING")),
             prescreen_result=str(data.get("prescreen_result") or ""),
             analysis_status=str(data.get("analysis_status", "PENDING")),
-            analysis_segments=str(data.get("analysis_segments", "")),
+            segments=list(data.get("segments") or []),
             id=data.get("id"),
             is_audio_gated_static=bool(data.get("is_audio_gated_static", False)),
             audio_events=list(data.get("audio_events") or []),
@@ -108,12 +110,10 @@ class PipelineTask:
 
 
 class AnalysisQueue(queue.Queue):
-    """Priority queue for detailed analysis.
+    """Dual-ended priority queue for detailed analysis.
 
-    Single-file render batches no longer depend on chronological analysis
-    completion. Short clips are admitted first (Shortest Job First / SJF)
-    to immediately produce render batches and eliminate early-stage NVENC starvation.
-    Multi-file batches retain chronological order for compatibility.
+    Supports CUDA analysis worker consuming heaviest tasks first (LPT),
+    while QSV analysis workers consume lightest tasks first (SJF / SPT).
     """
     def _init(self, maxsize):
         self.queue = []
@@ -122,9 +122,10 @@ class AnalysisQueue(queue.Queue):
 
     def _put(self, task):
         import heapq
+        dur = float(task.get("file_duration") or 0.0)
         if self.cost_priority:
             # SJF: 短作业优先（时长升序），让 300s 标准切片以秒级出清迅速喂饱渲染编队
-            priority = (float(task.get("file_duration") or 0.0), task.get("file_start_time") or "")
+            priority = (dur, task.get("file_start_time") or "")
         else:
             priority = (0.0, task.get("file_start_time") or "")
         heapq.heappush(self.queue, (priority, self.sequence, task))
@@ -133,6 +134,45 @@ class AnalysisQueue(queue.Queue):
     def _get(self):
         import heapq
         return heapq.heappop(self.queue)[2]
+
+    def _get_heavy(self, min_duration=600.0):
+        import heapq
+        if not self.queue:
+            raise queue.Empty
+        heavy_idx = None
+        max_dur = -1.0
+        for i, (_prio, _seq, task) in enumerate(self.queue):
+            dur = float(task.get("file_duration") or 0.0)
+            if dur >= min_duration and dur > max_dur:
+                max_dur = dur
+                heavy_idx = i
+        if heavy_idx is not None:
+            _, _, task = self.queue.pop(heavy_idx)
+            heapq.heapify(self.queue)
+            return task
+        # 当队列中已无重文件时，Worker 0 协助出清最短轻文件
+        return heapq.heappop(self.queue)[2]
+
+    def get_heavy(self, block=True, timeout=None, min_duration=600.0):
+        with self.not_empty:
+            if not block:
+                if not self._qsize():
+                    raise queue.Empty
+                return self._get_heavy(min_duration)
+            elif timeout is None:
+                while not self._qsize():
+                    self.not_empty.wait()
+                return self._get_heavy(min_duration)
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time.monotonic() + timeout
+                while not self._qsize():
+                    remaining = endtime - time.monotonic()
+                    if remaining <= 0.0:
+                        raise queue.Empty
+                    self.not_empty.wait(remaining)
+                return self._get_heavy(min_duration)
 
 
 class RenderMessageQueue(queue.Queue):
@@ -174,6 +214,10 @@ class StreamingOrchestrator:
         # 队列定义
         self.prescreen_queue = queue.Queue()
         self.analysis_queue = AnalysisQueue()
+        pipe_cfg = config.get("pipeline", {})
+        render_cfg = config.get("render", {})
+        if pipe_cfg.get("cost_priority", True) and render_cfg.get("batch_max_files", 1) == 1:
+            self.analysis_queue.cost_priority = True
         self.render_batch_queue = RenderMessageQueue()
 
         # 配置提取
@@ -211,6 +255,9 @@ class StreamingOrchestrator:
         # 状态控制
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
+        # Only successful completion of both upstream queues opens tail capacity.
+        # stop_event alone also represents failures and cancellation.
+        self.upstream_drained = threading.Event()
         self._render_interruption_reason: str | None = None
         self._media_cleanup_failure: str | None = None
         self.render_finished_event = threading.Event()
@@ -296,7 +343,7 @@ class StreamingOrchestrator:
 
     def _lookahead_prefetch_worker(self):
         """后台异步 I/O Worker：超前拉取即将压制的源文件至本地 SSD，消除 GPU 串行 I/O 等待气泡。"""
-        from src.algorithms.segment import ACTIVE_STATES
+        from src.algorithms.segment import ACTIVE_STATES, SegmentState
         from src.stages.renderer import _stage_source_for_render
         from src.stages.timeline import build_timeline_from_rows
 
@@ -318,7 +365,8 @@ class StreamingOrchestrator:
                     ) if rows else []
                 except Exception:
                     timeline = []
-                if timeline and all(segment.state in ACTIVE_STATES for segment in timeline):
+                pure_dynamic = (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO, "DYNAMIC", "DYNAMIC_AUDIO")
+                if timeline and all(segment.state in pure_dynamic for segment in timeline):
                     continue
                 _stage_source_for_render(fp, needed=lambda: self._needs_prefetch(fp))
             except Exception:
@@ -348,7 +396,7 @@ class StreamingOrchestrator:
                 continue
 
             filepath = task["filepath"]
-            duration = task.get("file_duration") or 300.0
+            duration = float(task.get("file_duration") or 0.0)
             t0 = time.monotonic()
 
             try:
@@ -412,7 +460,7 @@ class StreamingOrchestrator:
                 if prescreen_has_audio is not None:
                     task["has_audio"] = int(prescreen_has_audio)
                 if res["status"] in ("STATIC", "SUSPICIOUS"):
-                    from src.hardware.render_cache import processing_fingerprint
+                    from src.core.identity import processing_fingerprint
                     self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
                 with self._prescreen_results_condition:
                     self._prescreen_results[filepath] = res["status"]
@@ -450,7 +498,7 @@ class StreamingOrchestrator:
                             task["audio_events"] = []
                     self._queue_analysis_task(task)
                     if not self._analysis_warmup_event.is_set():
-                        if self.analysis_queue.qsize() >= 2 or self.prescreen_queue.empty():
+                        if self.analysis_queue.qsize() >= 10 or self.prescreen_queue.empty():
                             self._analysis_warmup_event.set()
                     if self.dashboard is not None:
                         self.dashboard.update_analysis(
@@ -530,7 +578,7 @@ class StreamingOrchestrator:
         t0: float,
         worker_id: str = "",
     ):
-        from src.algorithms.segment import build_segments, segments_to_json
+        from src.algorithms.segment import build_segments
 
         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
             return
@@ -566,7 +614,12 @@ class StreamingOrchestrator:
         if is_audio_gated and audio_events:
             from src.algorithms.segment import build_audio_gated_segments
             seg_cfg = self.config.get("segment", {})
-            file_dur = float(task.get("file_duration") or 300.0)
+            file_dur = float(task.get("file_duration") or 0.0)
+            if file_dur <= 0.0:
+                from src.stages.prescreen import get_duration
+                actual_dur = get_duration(filepath)
+                if actual_dur and actual_dur > 0:
+                    file_dur = actual_dur
             segments = build_audio_gated_segments(
                 filepath=filepath,
                 file_duration=file_dur,
@@ -576,9 +629,8 @@ class StreamingOrchestrator:
                 post_roll=seg_cfg.get("post_roll", 1.5),
                 gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
             )
-            js = segments_to_json(segments)
-            self.db.set_analysis_result(filepath, "ANALYZED", js)
-            from src.hardware.render_cache import processing_fingerprint
+            self.db.set_analysis_result(filepath, "ANALYZED", segments)
+            from src.core.identity import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
             t_ana_done = time.monotonic()
             perf.add(
@@ -628,7 +680,7 @@ class StreamingOrchestrator:
         labels, yolo_buffer = detector.analyze(
             filepath,
             start_offset=file_start_offset,
-            file_duration=float(task.get("file_duration") or 300.0),
+            file_duration=float(task.get("file_duration") or 0.0),
             has_audio=task.get("has_audio"),
             duration_verified=bool(task.get("duration_verified")),
             declared_duration=previous_extent.get("declared_duration_s"),
@@ -663,7 +715,7 @@ class StreamingOrchestrator:
             yolo_telemetry = {}
             if yolo_verifier:
                 is_yolo_active = True
-                yolo_device = self.config.get("hardware", {}).get("device", "cpu")
+                yolo_device = "cpu" if gpu == "cpu" else self.config.get("hardware", {}).get("device", "cpu")
                 # yolo_buffer 帧键以解码实际 effective_fps 为基准，禁止使用固定的 detector.fps
                 effective_fps = getattr(detector, "last_perf", {}).get("effective_fps") or detector.fps
                 segments = yolo_verifier.verify(
@@ -689,25 +741,8 @@ class StreamingOrchestrator:
             segments = refine_activity_segments(segments, labels, self.config)
             yolo_after = len(segments)
 
-            from src.stages.archiver import FrameArchiver
-            rate = detector.last_perf.get("effective_fps", detector.fps)
-            for seg in segments:
-                if not seg.needs_review or not yolo_buffer:
-                    continue
-                midpoint = (seg.start_time + seg.end_time) / 2 - seg.file_start_offset
-                key = min(yolo_buffer, key=lambda k: abs(k / rate - midpoint))
-                payload = yolo_buffer[key]
-                if getattr(payload, "ndim", 0) == 1:
-                    FrameArchiver.remember(filepath, key / rate, payload)
-            js = segments_to_json(segments)
-            self.db.set_analysis_result(filepath, "ANALYZED", js)
-            if getattr(detector,"visual_source",None) and getattr(detector,"visual_samples",None):
-                try:
-                    from src.core.visual_index import store_samples
-                    store_samples(self.db,filepath,detector.visual_source,detector.visual_samples,origin="single_pass_analysis")
-                except Exception as exc:
-                    logger.warning("Derived visual index unavailable for %s: %s",filepath,exc)
-            from src.hardware.render_cache import processing_fingerprint
+            self.db.set_analysis_result(filepath, "ANALYZED", segments)
+            from src.core.identity import processing_fingerprint
             self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
 
             t_ana_done = time.monotonic()
@@ -813,7 +848,7 @@ class StreamingOrchestrator:
             task_el = max(0.1, time.monotonic() - t0)
             frames_done = getattr(detector, "last_perf", {}).get("frames", 0)
             fps_val = frames_done / task_el if frames_done else 0.0
-            hw_label = "核显" if gpu == "qsv" else "独显"
+            hw_label = {"qsv": "核显", "cpu": "CPU"}.get(gpu, "独显")
             speed_str = f"{fps_val:.1f} 帧/秒（{hw_label}解码）" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
             self.dashboard.update_analysis(
                 completed=n_done,
@@ -824,9 +859,8 @@ class StreamingOrchestrator:
 
     def _analysis_worker(self, fixed_gpu: str | None = None, worker_id: str = ""):
         """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
-        detectors: dict[str, MotionDetector] = {
-            "qsv": MotionDetector(self.config, decode_gpu="qsv"),
-        }
+        default_gpu = "cpu" if fixed_gpu == "cpu" else "qsv"
+        default_detector = MotionDetector(self.config, decode_gpu=default_gpu)
         detector_cuda: MotionDetector | None = None
         
         # [性能极限] 在线程生命周期内复用验证器实例，避免重复初始化开销
@@ -835,7 +869,10 @@ class StreamingOrchestrator:
         if yolo_cfg.get("enabled", False) and yolo_cfg.get("streaming_verify", True):
             from src.algorithms.yolo_verifier import YoloVerifier
             try:
-                yolo_verifier = YoloVerifier(self.config)
+                if fixed_gpu == "cpu":
+                    yolo_verifier = YoloVerifier(self.config, device="cpu")
+                else:
+                    yolo_verifier = YoloVerifier(self.config)
             except Exception as exc:
                 # Keep consuming the queue; absence of semantics must not strand unfinished tasks.
                 logger.warning("YOLO initialization failed; retaining visual/audio motion: %s", exc)
@@ -847,13 +884,27 @@ class StreamingOrchestrator:
         if not self._analysis_warmup_event.is_set():
             self._analysis_warmup_event.wait(timeout=2.0)
 
+        is_cuda_heavy_worker = fixed_gpu != "cpu" and worker_id == "ana_0"
+        heavy_dur = float(self.config.get("scheduler", {}).get("heavy_file_duration_s", 600.0))
         while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
             try:
-                task = self.analysis_queue.get(timeout=0.5)
+                if is_cuda_heavy_worker and hasattr(self.analysis_queue, "get_heavy"):
+                    task = self.analysis_queue.get_heavy(timeout=0.5, min_duration=heavy_dur)
+                else:
+                    task = self.analysis_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
             filepath = task["filepath"]
+            file_dur = float(task.get("file_duration") or 0.0)
+            if fixed_gpu != "cpu" and not is_cuda_heavy_worker and file_dur >= heavy_dur and self.config.get("pipeline", {}).get("cost_priority", False):
+                # 杜绝 QSV Worker 误领 55 分钟夜间长文件导致慢速爬行 850 秒 (14 分钟) 瘫痪核显编队；
+                # 若预筛仍在产出短文件或重任务 Worker 0 正在运行，将该重任务放回队列专供 Worker 0 在 CUDA NVDEC 上全速出清
+                if not self.prescreen_queue.empty() or not self.stop_event.is_set():
+                    self.analysis_queue.put(task)
+                    self.analysis_queue.task_done()
+                    time.sleep(0.2)
+                    continue
             t0 = time.monotonic()
             analysis_queue_wait = max(
                 0.0, t0 - float(task.get("_analysis_queued_at") or t0)
@@ -874,15 +925,35 @@ class StreamingOrchestrator:
                             detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
                         detector = detector_cuda
                     else:
-                        detector = detectors["qsv"]
+                        detector = default_detector
                     self._execute_analysis_task(
                         task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0, worker_id=worker_id
                     )
+                elif is_cuda_heavy_worker and float(task.get("file_duration") or 0.0) >= heavy_dur:
+                    if detector_cuda is None:
+                        detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
+                    detector = detector_cuda
+                    file_dur = float(task.get("file_duration") or 0.0)
+                    detector.device_lease = lambda dur=file_dur: self.work_stealing.lease_device(
+                        self.analysis_queue.qsize(),
+                        prescreen_idle=False,
+                        file_duration=dur,
+                    )
+                    self._execute_analysis_task(
+                        task, filepath, file_start_offset, detector, yolo_verifier, "cuda", perf, t0, worker_id=worker_id
+                    )
                 else:
-                    q_size = self.analysis_queue.qsize()
-                    prescreen_idle = self.prescreen_queue.empty() and q_size <= self.work_stealing.watermark_low
-                    detector = detectors["qsv"]
-                    detector.device_lease = lambda: self.work_stealing.lease_device(q_size, prescreen_idle=prescreen_idle)
+                    detector = default_detector
+                    file_dur = float(task.get("file_duration") or 0.0)
+                    if file_dur <= 0.0:
+                        row = self.db.get_file_task(filepath)
+                        if row and row.get("file_duration"):
+                            file_dur = float(row["file_duration"])
+                    detector.device_lease = lambda dur=file_dur: self.work_stealing.lease_device(
+                        self.analysis_queue.qsize(),
+                        prescreen_idle=(self.prescreen_queue.empty() and self.analysis_queue.qsize() <= self.work_stealing.watermark_low),
+                        file_duration=dur,
+                    )
                     self._execute_analysis_task(
                         task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id
                     )
@@ -933,6 +1004,8 @@ class StreamingOrchestrator:
         render_cfg = self.config.get("render", {})
         render_hw_policy = self.config.get("pipeline", {}).get("render_gpu_policy", "heterogeneous")
         max_qsv_dynamic_s = float(render_cfg.get("max_qsv_dynamic_duration_s", 420.0))
+        nv_budget = int(self.config.get("hardware", {}).get("max_nv_concurrency", 2))
+        nv_tail_budget = int(render_cfg.get("nv_tail_concurrency", nv_budget))
 
         # ---- In-Order Sliding Window：按物理录制时间严格保序的批次调度 ----
         # 乱序到达的完成消息（STATIC/ANALYZED/FAILED）经滑动窗口重排：
@@ -946,18 +1019,33 @@ class StreamingOrchestrator:
         order_index = {filepath: idx for idx, filepath in enumerate(ordered_files)}
         ready_heavy: dict[str, bool] = {}
         dynamic_duration_by_file: dict[str, float] = {}
+        active_states = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"}
+
+        def _is_seg_dynamic(s) -> bool:
+            if isinstance(s, dict):
+                return s.get("state") in active_states
+            return getattr(s, "state", "") in active_states or bool(getattr(s, "is_dynamic", False))
+
         for r in all_rows:
             fp = r["filepath"]
-            raw_segs = r.get("analysis_segments")
-            if raw_segs:
+            segs = r.get("segments")
+            if segs:
                 try:
-                    from src.algorithms.segment import segments_from_json
-                    segs = segments_from_json(raw_segs)
-                    dyn_dur = sum((s.end_time - s.start_time) for s in segs if getattr(s, "is_dynamic", False))
+                    dyn_dur = sum(
+                        float(s.get("end_time", 0.0) - s.get("start_time", 0.0))
+                        if isinstance(s, dict)
+                        else float(s.end_time - s.start_time)
+                        for s in segs
+                        if _is_seg_dynamic(s)
+                    )
                     dynamic_duration_by_file[fp] = dyn_dur
                     ready_heavy[fp] = (dyn_dur > 0)
                 except Exception:
                     dynamic_duration_by_file[fp] = 0.0
+            elif hasattr(self.db, "get_dynamic_duration_for_file") and r.get("prescreen_status") != "STATIC":
+                dyn_dur = float(self.db.get_dynamic_duration_for_file(fp))
+                dynamic_duration_by_file[fp] = dyn_dur
+                ready_heavy[fp] = (dyn_dur > 0)
             else:
                 dynamic_duration_by_file[fp] = 0.0
                 if r.get("prescreen_status") == "STATIC":
@@ -991,6 +1079,7 @@ class StreamingOrchestrator:
             if files_to_batch and all(fp in ready_heavy for fp in files_to_batch):
                 return any(ready_heavy[fp] for fp in files_to_batch)
             try:
+                active_states = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"}
                 for fp in files_to_batch:
                     if fp in ready_heavy:
                         if ready_heavy[fp]:
@@ -1000,14 +1089,21 @@ class StreamingOrchestrator:
                     if not r:
                         continue
                     if r.get("prescreen_status") == "SUSPICIOUS":
-                        raw_segs = r.get("analysis_segments")
-                        if raw_segs:
-                            from src.algorithms.segment import segments_from_json
-                            active = sum(s.duration for s in segments_from_json(raw_segs) if s.is_dynamic)
-                            dynamic_duration_by_file[fp] = active
-                            ready_heavy[fp] = active > 0
-                            if active > 0:
-                                return True
+                        active = 0.0
+                        if hasattr(self.db, "get_dynamic_duration_for_file"):
+                            active = float(self.db.get_dynamic_duration_for_file(fp))
+                        elif r.get("segments"):
+                            active = sum(
+                                float(s.get("end_time", 0.0) - s.get("start_time", 0.0))
+                                if isinstance(s, dict)
+                                else float(s.end_time - s.start_time)
+                                for s in r["segments"]
+                                if _is_seg_dynamic(s)
+                            )
+                        dynamic_duration_by_file[fp] = active
+                        ready_heavy[fp] = (active > 0)
+                        if active > 0:
+                            return True
                     ready_heavy[fp] = False
             except Exception:
                 pass
@@ -1100,8 +1196,10 @@ class StreamingOrchestrator:
                                         # remaining work. Reuse this thread on NV within its existing
                                         # configured lease budget; keep every remaining encoder NV.
                                         if (all_dispatched_event.is_set()
+                                                and self.upstream_drained.is_set()
                                                 and render_gpus.count("nv") == 2
-                                                and int(self.config.get("hardware", {}).get("max_nv_concurrency", 2)) >= 3
+                                                and nv_tail_budget >= 3
+                                                and nv_budget >= 2
                                                 and lightest is not None
                                                 and lightest > min(max_qsv_dynamic_s, 180.0)
                                                 and self.work_stealing.has_vram_headroom()):
@@ -1149,7 +1247,7 @@ class StreamingOrchestrator:
                         with self.batch_lock:
                             self._active_nv_renders += 1
                         self.work_stealing.register_render_start()
-                    else:
+                    elif gpu == "qsv":
                         with self.batch_lock:
                             self._active_qsv_renders += 1
                     try:
@@ -1180,6 +1278,20 @@ class StreamingOrchestrator:
                             from src.stages.timeline import TimelineSegment
                             rows_by_path = {r["filepath"]: r for r in all_rows}
 
+                            # 辅助函数：精准判定行记录是否包含活跃动态切片
+                            active_states = {"DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE", "NIGHT_STATIONARY", "MICRO_MOTION"}
+                            def _row_has_dynamic(r: dict, fp: str) -> bool:
+                                segs = r.get("segments")
+                                if segs is not None:
+                                    return any(
+                                        (s.get("state") in active_states) if isinstance(s, dict)
+                                        else (getattr(s, "state", "") in active_states or getattr(s, "is_dynamic", False))
+                                        for s in segs
+                                    )
+                                if hasattr(self.db, "has_dynamic_segments_for_file"):
+                                    return self.db.has_dynamic_segments_for_file(fp)
+                                return False
+
                             # 检查批次文件是否已被宏观折叠（Macro-collapse）或分析确认无需画面输出
                             is_all_collapsed_or_skipped = True
                             for filepath in files_to_batch:
@@ -1189,9 +1301,10 @@ class StreamingOrchestrator:
                                     break
                                 ana_status = row.get("analysis_status")
                                 pre_status = row.get("prescreen_status")
-                                if pre_status == "STATIC" or ana_status in ("ANALYZED", "COMPLETED"):
-                                    raw_segs = row.get("analysis_segments") or ""
-                                    if "DYNAMIC" not in raw_segs and "DYNAMIC_AUDIO" not in raw_segs:
+                                if pre_status == "STATIC":
+                                    continue
+                                if ana_status in ("ANALYZED", "COMPLETED"):
+                                    if not _row_has_dynamic(row, filepath):
                                         continue
                                 is_all_collapsed_or_skipped = False
                                 break
@@ -1215,8 +1328,7 @@ class StreamingOrchestrator:
                                 duration = float(row.get("file_duration") or 0.0)
                                 if duration <= 0:
                                     continue
-                                raw_segs = row.get("analysis_segments") or ""
-                                has_dynamic = ("DYNAMIC" in raw_segs or "DYNAMIC_AUDIO" in raw_segs)
+                                has_dynamic = _row_has_dynamic(row, filepath)
                                 state = "DYNAMIC" if has_dynamic else "STATIC"
                                 batch_segs.append(TimelineSegment(
                                     filepath=filepath, input_index=fallback_idx,
@@ -1384,7 +1496,7 @@ class StreamingOrchestrator:
                             with self.batch_lock:
                                 self._active_nv_renders = max(0, self._active_nv_renders - 1)
                             self.work_stealing.register_render_end()
-                        else:
+                        elif gpu == "qsv":
                             with self.batch_lock:
                                 self._active_qsv_renders = max(0, self._active_qsv_renders - 1)
             finally:
@@ -1409,22 +1521,35 @@ class StreamingOrchestrator:
                         "handoff_to_nv": handoff_to_nv,
                     }
             if handoff_to_nv and not self.abort_event.is_set():
-                logger.info("QSV worker %s finished its eligible queue; reusing thread as NV tail worker", worker_name)
-                _render_worker("nv", "nv_tail_0")
+                from src.hardware.scheduler import nv_tail_capacity
+                # The shared NV budget is unchanged until all recognition work
+                # has completed. Revocation must not free an unconfirmed reader.
+                capacity = nv_tail_capacity() if nv_budget == 2 else nullcontext(True)
+                with capacity as admitted:
+                    if admitted and not self.abort_event.is_set():
+                        logger.info("QSV worker %s finished its eligible queue; reusing thread as NV tail worker (upstream drained)", worker_name)
+                        _render_worker("nv", "nv_tail_0")
+                    else:
+                        with self.batch_lock:
+                            self.render_worker_stats[worker_name]["handoff_to_nv"] = False
 
         # 启动渲染编队：异构模式下采用 2 NVENC + 1 QSV 三路并行
         render_threads = []
-        if render_hw_policy == "nv_only":
+        if uses_software_pipeline(self.config):
+            render_gpus = ["cpu"] * self.render_workers
+        elif render_hw_policy == "nv_only":
             render_gpus = ["nv"] * self.render_workers
         elif render_hw_policy == "qsv_only":
             render_gpus = ["qsv"] * self.render_workers
         else:
+            nv_count = min(nv_budget, max(1, self.render_workers - 1))
             logger.info(
                 "Streaming: render_gpu_policy='heterogeneous' active with %d workers: deploying "
-                "2 NVENC + 1 QSV with in-band parameter set injection (-bsf:v dump_extra).",
+                "%d NVENC + 1 QSV with in-band parameter set injection (-bsf:v dump_extra).",
                 self.render_workers,
+                nv_count,
             )
-            render_gpus = ["nv"] if self.render_workers == 1 else ["nv"] * min(2, self.render_workers - 1) + ["qsv"]
+            render_gpus = ["nv"] if self.render_workers == 1 else ["nv"] * nv_count + ["qsv"]
         qsv_workers_alive = render_gpus.count("qsv")
         worker_counts: dict[str, int] = {}
         for gpu in render_gpus:
@@ -1612,10 +1737,13 @@ class StreamingOrchestrator:
                 "prescreen_parallel reduced from %d to %d to reserve I/O slots for analysis",
                 requested_prescreen_parallel, prescreen_parallel,
             )
+        software_pipeline = uses_software_pipeline(self.config)
         prescreen_gpu_policy = self.config.get("pipeline", {}).get("prescreen_gpu_policy", "qsv_only")
         for i in range(prescreen_parallel):
             gpu = "qsv"
-            if prescreen_gpu_policy == "alternating":
+            if software_pipeline:
+                gpu = "cpu"
+            elif prescreen_gpu_policy == "alternating":
                 gpu = "qsv" if i % 2 == 0 else "cuda"
             elif prescreen_gpu_policy == "cuda_only":
                 gpu = "cuda"
@@ -1625,9 +1753,10 @@ class StreamingOrchestrator:
             threads.append(t)
 
         analysis_max_workers = self.analysis_workers
+        analysis_device = "cpu" if software_pipeline else None
         for i in range(analysis_max_workers):
             w_id = f"ana_{i}"
-            t = threading.Thread(target=self._guard_worker, args=(self._analysis_worker, None, w_id), daemon=True)
+            t = threading.Thread(target=self._guard_worker, args=(self._analysis_worker, analysis_device, w_id), daemon=True)
             t.start()
             threads.append(t)
 
@@ -1650,6 +1779,8 @@ class StreamingOrchestrator:
                 _wait_queue_interruptible(self.prescreen_queue)
                 self._analysis_warmup_event.set()
                 _wait_queue_interruptible(self.analysis_queue)
+            if not self.abort_event.is_set():
+                self.upstream_drained.set()
             if self.render_enabled:
                 with monitor.stage(f"render_tail_{self.date}_cam{self.cam_index}", include_in_total=False):
                     _wait_queue_interruptible(self.render_batch_queue)
@@ -1731,7 +1862,7 @@ def process_date_cam(
     skip_render: bool = False, dashboard_enabled: bool = True,
     force_render: bool = False, config: dict | None = None,
 ) -> bool:
-    from src.core.delivery_recovery import pending_transactions,recover_output,reject_legacy_recovery
+    from src.stages.delivery_recovery import pending_transactions,recover_output,reject_legacy_recovery
     context={'role':'pipeline','date':date,'cam_index':cam_index}
     if not force_render and db.is_render_completed(date,cam_index) and not pending_transactions(OUTPUT_DIR,context=context):
         with db._lock:
@@ -1794,13 +1925,22 @@ def _process_date_cam_owned(
     db.reset_failed_tasks(date, cam_index)
     all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
     total_files = len(all_tasks)
-    total_input_dur = sum(float(t["file_duration"]) if t.get("file_duration") is not None else 300.0
+    total_input_dur = sum(float(t["file_duration"]) if t.get("file_duration") is not None else 0.0
                           for t in all_tasks)
     analysis_snapshot = [
-        {key: row.get(key) for key in (
-            "filepath", "file_duration", "duration_verified", "prescreen_status",
-            "analysis_status", "analysis_segments", "human_reviews",
-        )}
+        {
+            "filepath": row.get("filepath"),
+            "file_duration": row.get("file_duration"),
+            "duration_verified": row.get("duration_verified"),
+            "prescreen_status": row.get("prescreen_status"),
+            "analysis_status": row.get("analysis_status"),
+            "segments": [
+                (float(s["start_time"]), float(s["end_time"]), str(s["state"]))
+                if isinstance(s, dict)
+                else (float(s.start_time), float(s.end_time), str(s.state))
+                for s in row.get("segments", [])
+            ],
+        }
         for row in all_tasks
     ]
     run_context = {
@@ -1845,6 +1985,7 @@ def _process_date_cam_owned(
         total_duration_s=total_input_dur,
         output_path=str(OUTPUT_DIR / output_name),
         cam_name=cam_display,
+        device_info="CPU（预筛、精析与渲染）" if uses_software_pipeline(config) else None,
     )
     logger.info("=== STREAMING pipeline %s cam%d start: %d files, %.1fs ===", date, cam_index, total_files, total_input_dur)
     output_path = OUTPUT_DIR / output_name
@@ -1852,7 +1993,21 @@ def _process_date_cam_owned(
     from src.hardware.render_cache import render_fingerprint, save_manifest
     def final_fingerprint():
         rows = db.get_all_file_tasks_for_date(date, cam_index)
-        decisions = [{k: r.get(k) for k in ("filepath", "file_duration", "prescreen_status", "analysis_segments", "human_reviews")} for r in rows]
+        decisions = [
+            {
+                "filepath": r.get("filepath"),
+                "file_duration": r.get("file_duration"),
+                "prescreen_status": r.get("prescreen_status"),
+                "analysis_status": r.get("analysis_status"),
+                "segments": [
+                    (float(s["start_time"]), float(s["end_time"]), str(s["state"]))
+                    if isinstance(s, dict)
+                    else (float(s.start_time), float(s.end_time), str(s.state))
+                    for s in r.get("segments", [])
+                ],
+            }
+            for r in rows
+        ]
         return render_fingerprint([r["filepath"] for r in rows], json.dumps(decisions, sort_keys=True),
                                   "final", out_cfg.get("fps", 20), out_cfg, out_cfg.get("audio", {}), config)
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render,
@@ -1900,14 +2055,14 @@ def _process_date_cam_owned(
     # Lazy probing/decoding can replace nominal durations during this run.
     # Delivery metrics and the completion card must use the reconciled values,
     # including a known zero, rather than the pre-analysis startup estimate.
-    total_input_dur = sum(float(row["file_duration"]) if row.get("file_duration") is not None else 300.0
+    total_input_dur = sum(float(row["file_duration"]) if row.get("file_duration") is not None else 0.0
                           for row in task_rows)
     total_files = len(task_rows)
     incomplete = [
         row for row in task_rows
         if row.get("prescreen_status") not in ("STATIC", "SUSPICIOUS", "SKIPPED_EMPTY", "SKIPPED_EXCLUDED")
         or (row.get("prescreen_status") == "SUSPICIOUS"
-            and row.get("analysis_status") not in ("ANALYZED", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"))
+            and row.get("analysis_status") not in ("ANALYZED", "COMPLETED", "SKIPPED_EXCLUDED", "SKIPPED_CORRUPT"))
     ]
     if skip_render:
         if run_errors or incomplete:
@@ -2095,6 +2250,7 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
             date_range=(dates[0], dates[-1]),
             cameras=cam_labels,
             output_dir=str(OUTPUT_DIR),
+            device_info="CPU（预筛、精析与渲染）" if uses_software_pipeline(config or load_config()) else None,
         )
 
         ok, failed, skipped = 0, 0, 0

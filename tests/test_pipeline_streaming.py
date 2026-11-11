@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock, call
 
 import pytest
 
-from src.database import VlogDatabase
+from src.core.database import VlogDatabase
 from src.pipeline import StreamingOrchestrator, process_date_cam
 from src.pipeline import AnalysisQueue
 
@@ -27,7 +27,7 @@ from src.pipeline import AnalysisQueue
 def test_unconfirmed_source_reader_stops_day_before_next_source(delivery_workspace, monkeypatch, stage, render_enabled, persist_failure):
     import sqlite3
     from src.hardware.ffmpeg import FFmpegProcessRegistry,MediaTerminationUnconfirmed
-    from src.hardware.render_cache import processing_fingerprint
+    from src.core.identity import processing_fingerprint
     w=delivery_workspace
     w.config.update(pipeline={'render_start_delay':0,'prescreen_gpu_policy':'qsv_only','analysis_gpu_policy':'qsv_only'},
         detection={'prescreen_parallel':1,'analysis_max_workers':1},yolo={'enabled':False},
@@ -68,6 +68,7 @@ def test_unconfirmed_source_reader_stops_day_before_next_source(delivery_workspa
         stop.assert_called()
     assert calls==[str(w.source)]
     assert objects[0].abort_event.is_set() and objects[0].stop_event.is_set() and objects[0]._media_cleanup_failure
+    assert not objects[0].upstream_drained.is_set()
     concat.assert_not_called()
     if render_enabled:
         assert w.db.conn.execute('SELECT status FROM render_tasks').fetchone()[0]=='FAILED'
@@ -138,8 +139,8 @@ def test_unconfirmed_stop_prevents_delivery_commit(delivery_workspace, monkeypat
 
 @pytest.mark.parametrize("outcome", ["failed", "exception", "cancelled"])
 def test_final_concat_failure_and_cancellation_are_measured(tmp_path, outcome):
-    from src.monitor import PerfCollector
-    from src.render_cache import processing_fingerprint
+    from src.hardware.monitor import PerfCollector
+    from src.core.identity import processing_fingerprint
     config = {"output": {"naming": "DailyVlog_{date}_cam{index}.mp4"}}
     db = VlogDatabase(tmp_path / "finalize.db")
     source = tmp_path / "source.mp4"
@@ -220,7 +221,7 @@ def test_prefetch_skips_timeline_without_static_segments(tmp_path):
 @pytest.mark.parametrize("with_labels", [False, True])
 def test_analysis_result_survives_queue_metrics(tmp_path, with_labels):
     from types import SimpleNamespace
-    from src.monitor import PerfCollector
+    from src.hardware.monitor import PerfCollector
     db = VlogDatabase(tmp_path / "analysis.db")
     try:
         db.add_file_task("clip.mp4", 0, "20260901", "20260901000000", "20260901000010", 10)
@@ -238,39 +239,11 @@ def test_analysis_result_survives_queue_metrics(tmp_path, with_labels):
         db.close()
 
 
-@pytest.mark.parametrize("audio_fast_path", [False, True])
-def test_derived_visual_index_published_only_after_current_source_decode(tmp_path, audio_fast_path):
-    import numpy as np
-    from src.core.visual_index import source_identity, frame_signature
-    from src.monitor import PerfCollector
-    source = tmp_path / "clip.mp4"
-    source.write_bytes(b"source")
-    filepath = str(source)
-    db = VlogDatabase(tmp_path / "visual.db")
-    try:
-        db.add_file_task(filepath, 0, "20260901", "20260901000000", "20260901000010", 10)
-        orch = StreamingOrchestrator(db, "20260901", 0, {}, render_enabled=False, dashboard_enabled=False)
-        labels = [{"time": float(t), "state": "DYNAMIC", "energy": 8, "raw_energy": 8} for t in range(11)]
-        detector = SimpleNamespace(analyze=lambda *a, **k: (labels, {}), decode_gpu="cpu", last_perf={}, fps=1,
-                                   visual_source=source_identity(filepath),
-                                   visual_samples=[(5, frame_signature(np.zeros((16,16),np.uint8)))])
-        task = {"file_duration": 10}
-        if audio_fast_path:
-            task.update(is_audio_gated_static=True, audio_events=[(2, 8)])
-        orch._execute_analysis_task(task, filepath, 0, detector, None, "cpu", PerfCollector(), time.monotonic())
-        rows = db.conn.execute("SELECT * FROM visual_features").fetchall()
-        if audio_fast_path:
-            assert rows == []  # Reused detector must not leak its previous source samples.
-        else:
-            assert len(rows) == 1 and rows[0]["origin"] == "single_pass_analysis"
-            assert rows[0]["filepath"] == filepath
-    finally:
-        db.close()
 
 
 def test_cancelled_analysis_keeps_task_pending(tmp_path):
     from types import SimpleNamespace
-    from src.monitor import PerfCollector
+    from src.hardware.monitor import PerfCollector
 
     db = VlogDatabase(tmp_path / "cancelled_analysis.db")
     try:
@@ -326,7 +299,7 @@ def test_analysis_queue_prioritizes_short_files_when_enabled():
 
 def test_companions_use_normalized_timeline_without_database_writes(tmp_path):
     import json
-    from src.segment import Segment
+    from src.algorithms.segment import Segment
     from src.pipeline import _save_vlog_companion_assets
     db = VlogDatabase(tmp_path / "companion.db")
     try:
@@ -573,7 +546,7 @@ class TestProcessDateCamPipeline:
             "output": {"naming": "DailyVlog_{date}_cam{index}.mp4", "fps": 20},
             "segment": {},
         }
-        from src.render_cache import processing_fingerprint
+        from src.core.identity import processing_fingerprint
         db.set_processing_fingerprint(fname, processing_fingerprint(fname, cfg_patch))
         try:
             with patch("src.pipeline.StreamingOrchestrator", return_value=mock_orch), \
@@ -674,7 +647,7 @@ class TestProcessDateCamPipeline:
         orch.stop_event.set()
 
         # 用 spy 捕获每个批次实际派发的目标文件集合（来自 build_timeline_from_rows 的 target_files）
-        from src.timeline import build_timeline_from_rows as _real_build
+        from src.stages.timeline import build_timeline_from_rows as _real_build
         dispatched_targets: list[list[str]] = []
 
         def _spy_build(rows, date, target_files=None, config=None, **kwargs):
@@ -684,7 +657,7 @@ class TestProcessDateCamPipeline:
             return _real_build(rows, date, target_files=target_files, config=config, **kwargs)
 
         try:
-            with patch("src.timeline.build_timeline_from_rows", side_effect=_spy_build):
+            with patch("src.stages.timeline.build_timeline_from_rows", side_effect=_spy_build):
                 with patch(
                     "src.pipeline.build_batch_render",
                     side_effect=lambda segs, bi, *args, **kwargs: f"mock_batch_{bi}.mp4",
@@ -770,7 +743,7 @@ class TestProcessDateCamPipeline:
 
         try:
             # 模拟 build_timeline_from_rows 因宏观折叠返回空列表
-            with patch("src.timeline.build_timeline_from_rows", return_value=[]):
+            with patch("src.stages.timeline.build_timeline_from_rows", return_value=[]):
                 orch.render_batch_queue.put({"filepath": fname, "status": "ANALYZED"})
                 t = threading.Thread(target=orch._render_manager)
                 t.start()
@@ -1036,7 +1009,7 @@ def test_prescreen_prior_classification_independent_of_completion_order(tmp_path
     threads = []
     try:
         with patch('src.pipeline.prescreen_file', side_effect=sample), \
-             patch('src.hardware.render_cache.processing_fingerprint', return_value='controlled'), \
+             patch('src.core.identity.processing_fingerprint', return_value='controlled'), \
              patch('src.pipeline.FFmpegProcessRegistry.is_interrupted', return_value=False):
             orch.prescreen_queue.put({'filepath': 'prior.mp4', 'file_duration': 60})
             if prior_slow:
@@ -1087,7 +1060,8 @@ def test_prescreen_prior_resume_and_cancellation(tmp_path):
 
 
 def test_ordered_prescreen_cache_revision_invalidates_only_requested_day(tmp_path):
-    from src.hardware.render_cache import processing_fingerprint, render_fingerprint
+    from src.core.identity import processing_fingerprint
+    from src.hardware.render_cache import render_fingerprint
     db = VlogDatabase(tmp_path / 'prior_cache.db')
     config = {'detection': {'prescreen_diff_threshold': 8.5}}
     selected = {key: config.get(key, {}) for key in
@@ -1396,7 +1370,7 @@ def test_delivery_rollback_failure_retains_previous_files_and_recovery_map(deliv
 
 @pytest.mark.parametrize('phase', ['prepared', 'saved', 'promoted', 'committed'])
 def test_metadata_only_delivery_transaction_preserves_other_assets(delivery_workspace, phase):
-    from src.core.delivery_recovery import prepare_transaction, commit_transaction, recover_transaction, recover_output
+    from src.stages.delivery_recovery import prepare_transaction, commit_transaction, recover_transaction, recover_output
     from src.hardware.render_cache import _manifest_path
     w = delivery_workspace
     metadata = w.output.with_suffix('.meta.json')
@@ -1431,7 +1405,7 @@ def test_metadata_only_delivery_transaction_preserves_other_assets(delivery_work
 
 @pytest.mark.parametrize('phase',[1,2,3,4,5,6,'database','committed'])
 def test_actual_process_asset_interrupt_recovers_or_retains_committed(delivery_workspace,interrupted_delivery_owner,phase):
-    from src.core.delivery_recovery import recover_transaction,pending_transactions
+    from src.stages.delivery_recovery import recover_transaction,pending_transactions
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
     candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
@@ -1453,7 +1427,7 @@ def test_actual_process_asset_interrupt_recovers_or_retains_committed(delivery_w
 
 
 def test_recovery_preflight_preserves_external_changes(delivery_workspace,interrupted_delivery_owner):
-    from src.core.delivery_recovery import recover_transaction,DeliveryRecoveryError
+    from src.stages.delivery_recovery import recover_transaction,DeliveryRecoveryError
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
     candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
@@ -1466,7 +1440,7 @@ def test_recovery_preflight_preserves_external_changes(delivery_workspace,interr
 
 
 def test_asset_recovery_resumes_after_partial_restore_and_db_failure(delivery_workspace,interrupted_delivery_owner,monkeypatch):
-    from src.core import delivery_recovery
+    from src.stages import delivery_recovery
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
     candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
@@ -1504,7 +1478,7 @@ def test_completed_record_cannot_bypass_interrupted_package(delivery_workspace,i
 def test_real_av_package_restores_after_process_death(delivery_workspace,interrupted_delivery_owner):
     from src.hardware.ffmpeg import run_ffmpeg
     from src.hardware.render_cache import save_manifest
-    from src.core.delivery_recovery import recover_transaction
+    from src.stages.delivery_recovery import recover_transaction
     from src.core.replay_evidence import content_sha256
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
@@ -1528,7 +1502,7 @@ def test_real_av_package_restores_after_process_death(delivery_workspace,interru
 
 
 def test_committed_review_history_finalizes_after_process_death(delivery_workspace,interrupted_delivery_owner):
-    from src.core.delivery_recovery import recover_output
+    from src.stages.delivery_recovery import recover_output
     import json
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
@@ -1545,7 +1519,7 @@ def test_committed_review_history_finalizes_after_process_death(delivery_workspa
 
 
 def test_changed_previous_asset_blocks_recovery_before_writes(delivery_workspace,interrupted_delivery_owner):
-    from src.core.delivery_recovery import recover_transaction,DeliveryRecoveryError
+    from src.stages.delivery_recovery import recover_transaction,DeliveryRecoveryError
     w=delivery_workspace
     candidate=w.output.with_name(w.output.stem+'.pending.mp4')
     candidate.write_bytes(b'candidate video');candidate.with_suffix('.meta.json').write_text('{}')
@@ -1605,9 +1579,10 @@ def test_real_software_delivery_commits_media_subtitles_and_manifest(tmp_path, m
     import av
     import json
     from src import pipeline
-    from src.segment import Segment
+    from src.algorithms.segment import Segment
     from src.hardware.ffmpeg import run_ffmpeg
-    from src.hardware.render_cache import processing_fingerprint, file_identity, _manifest_path, valid_video
+    from src.core.identity import file_identity, processing_fingerprint
+    from src.hardware.render_cache import _manifest_path, valid_video
     cfg = {"render": {"generate_subtitles": True},
            "output": {"fps": 20, "naming": "DailyVlog_{date}_cam{index}.mp4", "audio": {"codec": "aac"}}}
     db = VlogDatabase(tmp_path / "media.db")
@@ -1677,7 +1652,7 @@ def pending_pipeline_reader(monkeypatch, request):
     import os
     import subprocess
     import sys
-    from src.core.visual_index import reader_process_state
+    from src.hardware.ffmpeg import reader_process_state
     from src.hardware import scheduler
     from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
     if os.name != 'nt':
@@ -1949,7 +1924,7 @@ def test_companion_media_probe_failure_is_typed_instead_of_false(delivery_worksp
 @pytest.mark.parametrize("kind", ["matching", "unrelated", "history", "corrupt", "missing_output"])
 def test_completed_delivery_checks_legacy_packages_without_mutation(delivery_workspace, monkeypatch, kind):
     import json
-    from src.core.delivery_recovery import DeliveryRecoveryError
+    from src.stages.delivery_recovery import DeliveryRecoveryError
     w = delivery_workspace
     w.db.set_render_status("20260901", 0, "COMPLETED", output_file="" if kind == "missing_output" else str(w.output))
     backup = w.output.parent / ".delivery_backup_legacy"
@@ -1975,7 +1950,7 @@ def test_completed_delivery_checks_legacy_packages_without_mutation(delivery_wor
 
 @pytest.mark.parametrize('failure', ['hash', 'rename'])
 def test_delivery_preparation_failure_does_not_create_recovery_blocker(delivery_workspace, monkeypatch, failure):
-    from src.core import delivery_recovery
+    from src.stages import delivery_recovery
     from src.stages.companion import promote_vlog_assets
     w = delivery_workspace
     candidate = w.output.with_name('candidate.mp4')
@@ -2005,7 +1980,7 @@ def test_delivery_preparation_failure_does_not_create_recovery_blocker(delivery_
 def test_actual_process_exit_during_delivery_preparation_preserves_output(delivery_workspace):
     import subprocess
     import sys
-    from src.core.delivery_recovery import recover_output
+    from src.stages.delivery_recovery import recover_output
     from src.stages.companion import promote_vlog_assets
     w = delivery_workspace
     candidate = w.output.with_name('preparation-crash.mp4')
@@ -2014,7 +1989,7 @@ def test_actual_process_exit_during_delivery_preparation_preserves_output(delive
     code = '''
 import os, sys
 from pathlib import Path
-from src.core import delivery_recovery
+from src.stages import delivery_recovery
 from src.stages.companion import promote_vlog_assets
 delivery_recovery._identity = lambda path: os._exit(37)
 with promote_vlog_assets(Path(sys.argv[1]), Path(sys.argv[2]), {'render': {'generate_subtitles': False}}):
@@ -2127,22 +2102,77 @@ def test_heterogeneous_tail_guard_leaves_last_heavy_batch_for_active_nv(tmp_path
         db.close()
 
 
-@pytest.mark.parametrize("mode", ["handoff", "budget", "eligible", "undispatched", "last", "cancel", "failure", "pressure", "unknown", "recovery"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_upstream_barrier_waits_for_inflight_analysis(tmp_path, monkeypatch, cancel):
+    db = VlogDatabase(tmp_path / "upstream_barrier.db")
+    db.add_file_task("source.mp4", 0, "20260901", "20260901000000", "20260901000100", 60)
+    db.set_prescreen_result("source.mp4", "SUSPICIOUS")
+    orch = StreamingOrchestrator(db, "20260901", 0,
+        {"detection": {"analysis_max_workers": 1, "prescreen_parallel": 1}},
+        render_enabled=False, dashboard_enabled=False)
+    entered, finish = threading.Event(), threading.Event()
+    errors = []
+
+    def analyze(*_args):
+        orch.analysis_queue.get(timeout=5)
+        entered.set()
+        try:
+            assert finish.wait(5)
+        finally:
+            orch.analysis_queue.task_done()
+
+    def run():
+        try:
+            orch.run()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(orch, "_analysis_worker", analyze)
+    monkeypatch.setattr(orch, "_prescreen_worker", lambda *_args: None)
+    thread = threading.Thread(target=run, daemon=True)
+    try:
+        thread.start()
+        assert entered.wait(5)
+        assert orch.analysis_queue.empty()
+        assert orch.analysis_queue.unfinished_tasks == 1
+        assert not orch.upstream_drained.is_set()
+        if cancel:
+            orch.abort_event.set()
+        finish.set()
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+        assert orch.upstream_drained.is_set() is (not cancel)
+    finally:
+        finish.set()
+        orch.abort_event.set()
+        thread.join(5)
+        db.close()
+
+
+@pytest.mark.parametrize("mode", ["handoff", "budget", "eligible", "undispatched", "upstream", "last", "cancel", "failure", "pressure", "unknown", "recovery", "scoped"])
 def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, monkeypatch, mode):
     import src.pipeline as pipeline
+    from src.hardware import scheduler
     from src.hardware.scheduler import DualEndedBatchQueue
     db = VlogDatabase(tmp_path / "tail_handoff.db")
     cfg = {
         "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
-        "hardware": {"max_nv_concurrency": 2 if mode == "budget" else 3},
+        "hardware": {"max_nv_concurrency": 2 if mode in ("budget", "scoped") else 3},
         "render": {"batch_max_files": 1, "max_concurrency": 3, "local_staging_enabled": False},
     }
+    if mode == "scoped":
+        cfg["render"]["nv_tail_concurrency"] = 3
+    monkeypatch.setattr(scheduler, "load_config", lambda: cfg)
+    scheduler.reset_semaphores()
+    nv_hardware = scheduler.get_nvenc_semaphore()
     count = 3 if mode == "last" else 6
     for index in range(count):
         source = f"tail{index}.mp4"
         db.add_file_task(source, 0, "20260901", f"20260901000{index}00", f"20260901000{index+1}00", 60)
         db.set_prescreen_result(source, "STATIC")
     orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+    if mode != "upstream":
+        orch.upstream_drained.set()
     probes = []
 
     def vram_probe():
@@ -2178,7 +2208,7 @@ def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, mon
             return super().pop_heaviest(*args, **kwargs)
 
         def lightest_dynamic_duration(self):
-            if mode == "budget":
+            if mode in ("budget", "upstream"):
                 release.set()
             if mode == "undispatched" and not dispatched.is_set():
                 early_checked.set()
@@ -2198,6 +2228,8 @@ def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, mon
 
     def render(_segments, batch, gpu, *_args, **_kwargs):
         nonlocal running, peak
+        if gpu == "nv":
+            assert nv_hardware.acquire(timeout=5)
         with lock:
             calls.append((gpu, batch))
             if gpu == "nv":
@@ -2222,6 +2254,7 @@ def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, mon
             if gpu == "nv":
                 with lock:
                     running -= 1
+                nv_hardware.release()
 
     monkeypatch.setattr(pipeline, "DualEndedBatchQueue", HeavyQueue)
     monkeypatch.setattr(pipeline.queue, "Queue", make_queue)
@@ -2245,8 +2278,12 @@ def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, mon
             orch.stop_event.set()
         thread.join(10)
         assert not thread.is_alive()
+        permits = int(cfg["hardware"]["max_nv_concurrency"])
+        assert all(nv_hardware.acquire(blocking=False) for _ in range(permits))
+        assert not nv_hardware.acquire(blocking=False)
+        nv_hardware.release(permits)
         assert orch._active_nv_renders == orch._active_qsv_renders == 0
-        handoff = mode in ("handoff", "undispatched", "cancel", "failure", "recovery")
+        handoff = mode in ("handoff", "undispatched", "cancel", "failure", "recovery", "scoped")
         assert orch.render_worker_stats["qsv_0"]["handoff_to_nv"] is handoff
         assert ("nv_tail_0" in orch.render_worker_stats) is handoff
         assert peak == (3 if handoff else 2)

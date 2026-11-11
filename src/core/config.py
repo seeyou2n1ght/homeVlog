@@ -1,6 +1,7 @@
 """Fail early for settings that would strand workers or produce invalid frames."""
 import math
 import threading
+from collections.abc import Callable
 from pathlib import Path
 import yaml
 
@@ -18,10 +19,20 @@ CONFIG_PATH = DEFAULT_CONFIG_PATH
 
 SETTINGS: dict = {}
 _config_lock = threading.RLock()
+SOFTWARE_RENDER_POLICIES = {"cpu_only", "software"}
 
 
-def load_config(config_path: str | Path | None = None, reload: bool = False) -> dict:
-    """Thread-safe configuration loader with validation and required directory creation."""
+def uses_software_pipeline(config: dict) -> bool:
+    return config.get("pipeline", {}).get("render_gpu_policy") in SOFTWARE_RENDER_POLICIES
+
+
+def load_config(
+    config_path: str | Path | None = None,
+    reload: bool = False,
+    *,
+    prepare: Callable[[dict], dict] | None = None,
+) -> dict:
+    """Load, optionally prepare, and validate settings before publishing them."""
     global SETTINGS, CONFIG_PATH
     with _config_lock:
         if config_path is not None:
@@ -35,6 +46,8 @@ def load_config(config_path: str | Path | None = None, reload: bool = False) -> 
             candidate = yaml.safe_load(f) or {}
         from src.core.profiles import resolve_profile_config
         candidate = resolve_profile_config(candidate)
+        if prepare is not None:
+            candidate = prepare(candidate)
         validate_config(candidate)
         SETTINGS = candidate
 
@@ -95,14 +108,21 @@ def validate_config(config):
     modes = {
         ("detection", "prescreen_mode"): {"keyframes", "auto", "stream_fps", "legacy_seek"},
         ("pipeline", "prescreen_gpu_policy"): {"qsv_only", "cuda_only", "alternating"},
-        ("pipeline", "render_gpu_policy"): {"heterogeneous", "nv_only", "qsv_only"},
+        ("pipeline", "render_gpu_policy"): {"heterogeneous", "nv_only", "qsv_only"} | SOFTWARE_RENDER_POLICIES,
     }
     for (section, key), allowed in modes.items():
         value = config.get(section, {}).get(key)
         if value is not None and value not in allowed:
             raise ValueError(f"Unsupported {section}.{key}: {value}")
     render_policy = config.get("pipeline", {}).get("render_gpu_policy")
+    tail_concurrency = config.get("render", {}).get("nv_tail_concurrency")
+    if "nv_tail_concurrency" in config.get("render", {}) and (
+        isinstance(tail_concurrency, bool) or tail_concurrency not in (2, 3)
+    ):
+        raise ValueError("render.nv_tail_concurrency must be 2 or 3")
     render_conc = config.get("render", {}).get("max_concurrency")
+    if uses_software_pipeline(config) and render_conc is not None and float(render_conc) < 1:
+        raise ValueError("software rendering requires render.max_concurrency >= 1")
     if render_policy == "heterogeneous" and render_conc is not None:
         if int(render_conc) < 2:
             raise ValueError("pipeline.render_gpu_policy 'heterogeneous' requires render.max_concurrency >= 2")

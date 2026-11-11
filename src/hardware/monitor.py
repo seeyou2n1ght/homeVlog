@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any
 
 import logging
 import psutil
@@ -17,13 +18,20 @@ class StageStats:
     start_ts: float
     end_ts: float = 0.0
     include_in_total: bool = True
+    # O(1) streaming scalar accumulators
+    count: int = 0
+    sum_cpu: float = 0.0
+    peak_cpu: float = 0.0
+    sum_ram: float = 0.0
+    peak_ram: float = 0.0
+    gpu_stats: list[dict[str, Any]] = field(default_factory=list)
+    # Backward-compatibility fallback fields
     cpu_pct: list[float] = field(default_factory=list)
-    # Per-GPU metrics: list of lists, one per GPU
+    ram_pct: list[float] = field(default_factory=list)
     gpu_load: list[list[int]] = field(default_factory=list)
     gpu_mem: list[list[int]] = field(default_factory=list)
     gpu_enc_load: list[list[int]] = field(default_factory=list)
     gpu_dec_load: list[list[int]] = field(default_factory=list)
-    ram_pct: list[float] = field(default_factory=list)
     # Intel iGPU engine utilization: {"3D": [...], "Video Decode": [...], ...}
     igpu_engine: dict[str, list[float]] = field(default_factory=dict)
 
@@ -33,27 +41,89 @@ class StageStats:
 
     @property
     def avg_cpu(self) -> float:
-        return sum(self.cpu_pct) / len(self.cpu_pct) if self.cpu_pct else 0.0
+        if self.count > 0:
+            return round(self.sum_cpu / self.count, 1)
+        if self.cpu_pct:
+            return round(sum(self.cpu_pct) / len(self.cpu_pct), 1)
+        return 0.0
 
     @property
     def avg_ram(self) -> float:
-        return sum(self.ram_pct) / len(self.ram_pct) if self.ram_pct else 0.0
+        if self.count > 0:
+            return round(self.sum_ram / self.count, 1)
+        if self.ram_pct:
+            return round(sum(self.ram_pct) / len(self.ram_pct), 1)
+        return 0.0
+
+    def record_sample(
+        self,
+        cpu: float = 0.0,
+        ram: float = 0.0,
+        loads: list[int] | None = None,
+        mems: list[int] | None = None,
+        encs: list[int] | None = None,
+        decs: list[int] | None = None,
+        igpu: dict[str, float] | None = None,
+    ) -> None:
+        """Stream a single hardware sample in O(1) time and memory."""
+        self.count += 1
+        self.sum_cpu += cpu
+        if cpu > self.peak_cpu:
+            self.peak_cpu = cpu
+        self.sum_ram += ram
+        if ram > self.peak_ram:
+            self.peak_ram = ram
+        if loads:
+            while len(self.gpu_stats) < len(loads):
+                self.gpu_stats.append({
+                    "count": 0, "sum_load": 0.0, "peak_mem_mb": 0, "sum_enc": 0.0, "sum_dec": 0.0
+                })
+            for i, load in enumerate(loads):
+                g = self.gpu_stats[i]
+                g["count"] += 1
+                g["sum_load"] += load
+                if mems and i < len(mems) and mems[i] > g["peak_mem_mb"]:
+                    g["peak_mem_mb"] = mems[i]
+                if encs and i < len(encs):
+                    g["sum_enc"] += encs[i]
+                if decs and i < len(decs):
+                    g["sum_dec"] += decs[i]
+        if igpu:
+            for eng, val in igpu.items():
+                self.igpu_engine.setdefault(eng, []).append(val)
 
     def gpu_summary(self, gpu_idx: int = 0) -> dict:
-        """Summary for a specific GPU."""
-        loads = self.gpu_load[gpu_idx] if gpu_idx < len(self.gpu_load) else []
-        mems = self.gpu_mem[gpu_idx] if gpu_idx < len(self.gpu_mem) else []
-        enc = self.gpu_enc_load[gpu_idx] if gpu_idx < len(self.gpu_enc_load) else []
-        dec = self.gpu_dec_load[gpu_idx] if gpu_idx < len(self.gpu_dec_load) else []
+        """Summary for a specific GPU with zero-division protection."""
+        if gpu_idx < len(self.gpu_stats):
+            g = self.gpu_stats[gpu_idx]
+            cnt = g.get("count", 0)
+            if cnt > 0:
+                return {
+                    "avg_load": round(g["sum_load"] / cnt, 1),
+                    "peak_mem_mb": int(g["peak_mem_mb"]),
+                    "avg_enc": round(g["sum_enc"] / cnt, 1),
+                    "avg_dec": round(g["sum_dec"] / cnt, 1),
+                }
+        if gpu_idx < len(self.gpu_load) and self.gpu_load[gpu_idx]:
+            loads = self.gpu_load[gpu_idx]
+            mems = self.gpu_mem[gpu_idx] if gpu_idx < len(self.gpu_mem) else []
+            enc = self.gpu_enc_load[gpu_idx] if gpu_idx < len(self.gpu_enc_load) else []
+            dec = self.gpu_dec_load[gpu_idx] if gpu_idx < len(self.gpu_dec_load) else []
+            return {
+                "avg_load": round(sum(loads) / len(loads), 1) if loads else 0.0,
+                "peak_mem_mb": int(max(mems)) if mems else 0,
+                "avg_enc": round(sum(enc) / len(enc), 1) if enc else 0.0,
+                "avg_dec": round(sum(dec) / len(dec), 1) if dec else 0.0,
+            }
         return {
-            "avg_load": sum(loads) / len(loads) if loads else 0.0,
-            "peak_mem_mb": max(mems) if mems else 0,
-            "avg_enc": sum(enc) / len(enc) if enc else 0.0,
-            "avg_dec": sum(dec) / len(dec) if dec else 0.0,
+            "avg_load": 0.0,
+            "peak_mem_mb": 0,
+            "avg_enc": 0.0,
+            "avg_dec": 0.0,
         }
 
     def igpu_summary(self) -> dict:
-        """Summary for Intel iGPU engines."""
+        """Summary for Intel iGPU engines with zero-division protection."""
         result = {}
         for engine, samples in self.igpu_engine.items():
             if samples:
@@ -100,20 +170,12 @@ class Monitor:
             self._gpu_handles = []
         self._num_gpus = len(self._gpu_handles)
 
-        # Intel iGPU 采样: 通过 Windows Performance Counter 获取引擎利用率
+        # Intel iGPU 采样: 消除同步 PowerShell / typeperf 探测开销 (<2ms 极速初始化)
         self._igpu_counters: dict[str, str] = {}  # {"Video Decode": counter_path, ...}
         self._igpu_available = False
-        try:
-            self._igpu_counters = _discover_intel_gpu_counters()
-            if self._igpu_counters:
-                self._igpu_available = True
-                engines = ", ".join(self._igpu_counters.keys())
-                logger.info("Intel iGPU monitor: discovered engines [%s]", engines)
-        except Exception as e:
-            logger.debug("Intel iGPU counter discovery failed: %s", e)
 
     def _sample(self):
-        cpu = psutil.cpu_percent(interval=0.1)
+        cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
         per_gpu_load: list[int] = []
         per_gpu_mem: list[int] = []
@@ -141,85 +203,19 @@ class Monitor:
         return cpu, ram, per_gpu_load, per_gpu_mem, per_gpu_enc, per_gpu_dec
 
     def _sample_igpu(self) -> dict[str, float]:
-        """采样 Intel iGPU 各引擎利用率 (%)，通过 Windows typeperf 单次读取。
-
-        counter 路径为通配符形式（新版 Windows 无 pid_0 聚合实例），
-        输出列与进程实例一一对应。同一物理引擎会因不同进程产生多个
-        实例，Windows 已为每个实例给出引擎忙碌百分比；这里取最大值，
-        避免把共享引擎的进程实例相加后生成超过 100% 的伪指标。
-        """
-        if not self._igpu_available:
-            return {}
-        try:
-            counters = list(self._igpu_counters.values())
-            cmd = ["typeperf"] + counters + ["-sc", "1", "-y"]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            if result.returncode != 0:
-                return {}
-            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-
-            # 列头行: 含 "GPU Engine" 实例路径；数据行: 以日期时间戳开头
-            header_line = None
-            data_line = None
-            for line in lines:
-                if "GPU Engine" in line:
-                    header_line = line
-                elif line.startswith('"') and not line.startswith('"\\\\'):
-                    data_line = line
-            if not header_line or not data_line:
-                return {}
-
-            headers = [p.strip().strip('"') for p in header_line.split('","')]
-            values = [p.strip().strip('"') for p in data_line.split('","')]
-            # headers[0]/values[0] 为 (PDH-CSV 版本/时间戳)，数据列从 1 开始
-            engtype_pat = re.compile(r"engtype_(\w+)\)")
-            result_dict: dict[str, float] = {}
-            for i, col in enumerate(headers[1:], start=1):
-                m = engtype_pat.search(col)
-                if not m or i >= len(values):
-                    continue
-                eng = m.group(1)
-                # 由显示名映射表反查：engtype → display name
-                disp = _IGPU_ENG_DISPLAY.get(eng, eng)
-                try:
-                    val = max(0.0, float(values[i]))
-                except (ValueError, TypeError):
-                    continue
-                result_dict[disp] = max(result_dict.get(disp, 0.0), min(100.0, val))
-            return result_dict
-        except Exception:
-            return {}
+        """Intel iGPU 采样已下线，直接返回空字典以根除高频 typeperf.exe 子进程派生。"""
+        return {}
 
     def _ensure_gpu_lists(self, s: StageStats):
-        """Ensure per-GPU lists have correct length."""
-        while len(s.gpu_load) < self._num_gpus:
-            s.gpu_load.append([])
-        while len(s.gpu_mem) < self._num_gpus:
-            s.gpu_mem.append([])
-        while len(s.gpu_enc_load) < self._num_gpus:
-            s.gpu_enc_load.append([])
-        while len(s.gpu_dec_load) < self._num_gpus:
-            s.gpu_dec_load.append([])
+        """Deprecated compatibility no-op; GPU stats are now dynamically sized in O(1)."""
+        pass
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
             cpu, ram, loads, mems, encs, decs = self._sample()
-            igpu_data = self._sample_igpu()
             with self._active_lock:
                 for s in self._active_stages:
-                    s.cpu_pct.append(cpu)
-                    s.ram_pct.append(ram)
-                    self._ensure_gpu_lists(s)
-                    for i in range(self._num_gpus):
-                        s.gpu_load[i].append(loads[i])
-                        s.gpu_mem[i].append(mems[i])
-                        s.gpu_enc_load[i].append(encs[i])
-                        s.gpu_dec_load[i].append(decs[i])
-                    for engine, val in igpu_data.items():
-                        s.igpu_engine.setdefault(engine, []).append(val)
+                    s.record_sample(cpu=cpu, ram=ram, loads=loads, mems=mems, encs=encs, decs=decs)
             self._stop_event.wait(self.interval)
 
     def start(self):
@@ -448,116 +444,10 @@ def get_perf() -> PerfCollector:
 
 
 # ---------------------------------------------------------------------------
-# Intel iGPU Performance Counter Discovery (Windows only)
+# Intel iGPU Performance Counter Discovery (Windows only) - Deprecated
 # ---------------------------------------------------------------------------
-
-# Windows GPU Engine counter 格式:
-# \GPU Engine(pid_0_luid_0x00000000_0xXXXX_phys_0_eng_N_engtype_XXX)\Utilization Percentage
-# 其中 engtype 为 3D / VideoDecode / VideoEncode / Copy 等
-_ENGTYPE_PATTERN = re.compile(r"engtype_(\w+)")
-_LUID_PATTERN = re.compile(r"luid_0x[0-9a-fA-F]+_0x([0-9a-fA-F]+)")
-
-# iGPU 引擎类型 → 显示名映射（发现与采样共用）
-_IGPU_ENG_DISPLAY = {
-    "3D": "3D",
-    "VideoDecode": "Video Decode",
-    "VideoEncode": "Video Encode",
-    "Compute": "Compute",
-}
 
 
 def _discover_intel_gpu_counters() -> dict[str, str]:
-    """通过 typeperf 枚举 Windows GPU Engine counter，识别 Intel iGPU 的引擎。
-
-    返回 {"Video Decode": "\\\\GPU Engine(...)\\\\Utilization Percentage", ...}
-    """
-    import sys
-    if sys.platform != "win32":
-        return {}
-
-    # 第一步: 获取 GPU 适配器描述，找到 Intel 设备的 LUID
-    intel_luids: set[str] = set()
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_VideoController | Select-Object Name, PNPDeviceID | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            import json as _json
-            adapters = _json.loads(result.stdout)
-            if isinstance(adapters, dict):
-                adapters = [adapters]
-            for a in adapters:
-                name = (a.get("Name") or "").lower()
-                if "intel" in name:
-                    # 记录找到了 Intel 适配器
-                    intel_luids.add("intel_found")
-    except Exception:
-        pass
-
-    if not intel_luids:
-        return {}
-
-    # 第二步: 枚举 GPU Engine counter。
-    # 注意: 新版 Windows 已不提供 pid_0 系统级聚合实例（本机实测仅有按进程实例），
-    # 因此按 (luid, engtype) 全量分组，采样时用通配符路径动态聚合。
-    try:
-        result = subprocess.run(
-            ["typeperf", "-qx", "GPU Engine"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-        )
-        if result.returncode != 0:
-            return {}
-    except Exception:
-        return {}
-
-    # 按 LUID 分组收集引擎类型全集（不限 pid）
-    luid_engines: dict[str, set[str]] = {}
-    luid_full: dict[str, str] = {}  # short_luid -> 完整 luid_..._phys_N 段
-    full_pat = re.compile(r"(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+_phys_\d+)")
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line or "Utilization Percentage" not in line:
-            continue
-        luid_match = _LUID_PATTERN.search(line)
-        eng_match = _ENGTYPE_PATTERN.search(line)
-        full_match = full_pat.search(line)
-        if not luid_match or not eng_match or not full_match:
-            continue
-        luid = luid_match.group(1).lower()
-        luid_engines.setdefault(luid, set()).add(eng_match.group(1))
-        luid_full[luid] = full_match.group(1)
-
-    if not luid_engines:
-        return {}
-
-    # 第三步: 识别 Intel LUID——排除带 NVIDIA 特征引擎 (OFA 光流/VR) 的 LUID，
-    # 在剩余候选中优先选含 VideoDecode 且引擎类型最多者
-    nvidia_markers = ("OFA", "VR")
-    candidates = [
-        (luid, engs) for luid, engs in luid_engines.items()
-        if not any(any(e.startswith(m) for m in nvidia_markers) for e in engs)
-    ] or list(luid_engines.items())
-    candidates.sort(key=lambda x: ("VideoDecode" in x[1], len(x[1])), reverse=True)
-    target_luid = candidates[0][0]
-
-    # 生成通配符 counter 路径（采样时按进程实例动态求和）
-    full_seg = luid_full[target_luid]
-    name_map = {
-        "3D": "3D",
-        "VideoDecode": "Video Decode",
-        "VideoEncode": "Video Encode",
-        "Compute": "Compute",
-    }
-    result_counters: dict[str, str] = {}
-    for engtype, display_name in name_map.items():
-        if engtype in luid_engines[target_luid]:
-            result_counters[display_name] = (
-                f"\\GPU Engine(pid_*_{full_seg}_eng_*_engtype_{engtype})"
-                "\\Utilization Percentage"
-            )
-
-    return result_counters
+    """Deprecated: Intel iGPU counter discovery removed to eliminate startup delay."""
+    return {}

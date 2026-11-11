@@ -6,6 +6,7 @@ Run hardware measurements sequentially. A completed run is not an A/B gain.
 """
 import argparse
 from datetime import datetime
+from inspect import signature
 import json
 import logging
 from pathlib import Path
@@ -13,6 +14,16 @@ import shutil
 import sys
 import time
 import uuid
+
+
+# Frozen workloads can predate the relational schema cleanup.
+RETIRED_WORKLOAD_COLUMNS = {
+    "file_tasks": {"analysis_segments"},
+    "segments": {
+        "filepath", "cam_index", "date", "duration", "needs_review", "review_reason",
+        "manual_label", "review_notes", "reviewed_at", "archived_frame_path",
+    },
+}
 
 
 def seed_workload(db, workload, mode):
@@ -27,7 +38,8 @@ def seed_workload(db, workload, mode):
         for table, rows in tables.items():
             allowed = {row["name"] for row in db.conn.execute(f"PRAGMA table_info({table})")}
             for original in rows:
-                row = dict(original)
+                retired = RETIRED_WORKLOAD_COLUMNS.get(table, ())
+                row = {key: value for key, value in original.items() if key not in retired}
                 if table == "file_tasks" and mode == "full":
                     start, end = row["file_start_time"], row["file_end_time"]
                     # Use scanner placement from the actual filename, not the
@@ -40,7 +52,7 @@ def seed_workload(db, workload, mode):
                     row.update(file_start_time=start, file_end_time=end,
                                file_duration=(datetime.strptime(end, "%Y%m%d%H%M%S") - datetime.strptime(start, "%Y%m%d%H%M%S")).total_seconds(),
                                prescreen_status="PENDING", prescreen_result=None,
-                               analysis_status="PENDING", analysis_segments=None,
+                               analysis_status="PENDING",
                                retry_count=0, error_msg=None, has_audio=0,
                                duration_verified=0, processing_fingerprint=None, decode_completion=None)
                 if not set(row).issubset(allowed):
@@ -50,12 +62,22 @@ def seed_workload(db, workload, mode):
                                 [row[column] for column in columns])
 
 
+def captured_analysis_digest(db, date, camera, digest):
+    return digest([
+        db.get_all_file_tasks_for_date(date, camera),
+        db.get_all_segments_for_date(date, camera),
+        [dict(row) for row in db.conn.execute("SELECT * FROM human_reviews ORDER BY id")],
+    ])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", required=True, type=Path)
     parser.add_argument("--code-root", required=True, type=Path)
     parser.add_argument("--mode", required=True, choices=("render_only", "full"))
     parser.add_argument("--store-dir", required=True, type=Path)
+    parser.add_argument("--allow-code-drift", action="store_true",
+                        help="Allow a different code snapshot; all other frozen checks still apply")
     args = parser.parse_args()
     code_root = args.code_root.resolve()
     sys.path.insert(0, str(code_root))
@@ -69,7 +91,9 @@ def main():
         raise ValueError("Workload must contain unique sources from exactly one date/camera")
     from src.core.replay_journal import run_lease, ReplayJournal, atomic_json, digest
     from src.core.replay_evidence import production_code_sha256, content_sha256, runtime_identity, model_path
-    if production_code_sha256(code_root) != workload["code_sha256"] or runtime_identity() != workload["runtime"]:
+    code_sha256 = production_code_sha256(code_root)
+    code_drift = code_sha256 != workload["code_sha256"]
+    if (code_drift and not args.allow_code_drift) or runtime_identity() != workload["runtime"]:
         raise ValueError("Frozen code/runtime changed")
     config_path = code_root / "config/settings.yaml"
     if content_sha256(config_path) != workload["config_file_sha256"]:
@@ -79,6 +103,8 @@ def main():
     shutil.copy2(__file__, run / "harness.py")
     logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(run / "run.log", encoding="utf-8"), logging.StreamHandler()])
     logging.info("Isolated day benchmark: %s (%s)", run, args.mode)
+    if code_drift:
+        logging.info("Replay uses a different code snapshot than the frozen workload")
     import src.core.config as core
     replacements = {"PROJECT_ROOT": Path(workload["source_project_root"]),
                     "OUTPUT_DIR": run / "output", "TEMP_DIR": run / "temp",
@@ -89,7 +115,14 @@ def main():
             for name, path in replacements.items():
                 if hasattr(module, name):
                     setattr(module, name, path)
-    config = core.load_config(config_path)
+    if "prepare" in signature(core.load_config).parameters:
+        from src.hardware.autotune import apply_auto_tune
+        from src.hardware.lifecycle import cleanup_resources
+        config = core.load_config(config_path, prepare=apply_auto_tune)
+    else:
+        # Older frozen snapshots own any automatic tuning inside their loader.
+        from src.core.utils import cleanup_resources
+        config = core.load_config(config_path)
     from src.core.profiles import resolve_camera_config
     effective = resolve_camera_config(config, cam_index=camera, filepath=tasks[0]["filepath"])
     if effective != workload["historical_effective_config"]:
@@ -97,21 +130,17 @@ def main():
     model = model_path(config)
     if content_sha256(model) != workload["model_sha256"]:
         raise ValueError("Frozen model changed")
-    from src.stages import archiver
-    archiver.DEFAULT_ARCHIVE_DIR = run / "data/feedback_archive"
-    archiver.DEFAULT_IMAGES_DIR = archiver.DEFAULT_ARCHIVE_DIR / "images"
-    archiver.DEFAULT_MANIFEST = archiver.DEFAULT_ARCHIVE_DIR / "manifest.jsonl"
-    archiver.CACHE_DIR = run / "temp/audit_cache"
     from src.core.database import VlogDatabase
     from src.pipeline import process_date_cam
     from src.hardware.monitor import get_monitor, get_perf
-    from src.core.utils import cleanup_resources, cleanup_staging_files
-    from src.hardware.render_cache import processing_fingerprint
+    from src.core.utils import cleanup_staging_files
+    from src.core.identity import processing_fingerprint
     historical_stats = {item["filepath"]: item for item in workload["historical_source_stats"]}
     with run_lease(run):
         journal = ReplayJournal(run, {"workload_sha256": content_sha256(args.workload),
                                      "harness_sha256": content_sha256(__file__), "mode": args.mode,
-                                     "code_sha256": workload["code_sha256"], "code_root": str(code_root),
+                                     "code_sha256": code_sha256, "code_root": str(code_root),
+                                     "frozen_code_sha256": workload["code_sha256"],
                                      "runtime": workload["runtime"]})
         atomic_json(run / "workload.json", workload)
         sources = []
@@ -132,7 +161,7 @@ def main():
             seed_workload(db, workload, args.mode)
             if args.mode == "render_only" and any(task["processing_fingerprint"] != processing_fingerprint(task["filepath"], effective) for task in tasks):
                 raise ValueError("Captured analysis fingerprint changed")
-            before = digest([db.get_all_file_tasks_for_date(date, camera), db.get_all_segments_for_date(date, camera)])
+            before = captured_analysis_digest(db, date, camera, digest)
             get_perf().reset()
             monitor.start()
             started = time.monotonic()
@@ -140,14 +169,14 @@ def main():
             status.update(pipeline_call_wall_s=time.monotonic() - started, pipeline_success=bool(success))
             if not success:
                 raise RuntimeError("Day pipeline failed; diagnostics and valid batches retained")
-            after = digest([db.get_all_file_tasks_for_date(date, camera), db.get_all_segments_for_date(date, camera)])
+            after = captured_analysis_digest(db, date, camera, digest)
             if args.mode == "render_only" and before != after:
                 raise ValueError("Render-only measurement changed the captured analysis/reviews")
             for source in sources:
                 stat = Path(source["filepath"]).stat()
                 if (stat.st_size, stat.st_mtime_ns) != (source["size"], source["mtime_ns"]):
                     raise ValueError("Source changed during day measurement")
-            if (production_code_sha256(code_root) != workload["code_sha256"]
+            if (production_code_sha256(code_root) != code_sha256
                     or content_sha256(config_path) != workload["config_file_sha256"]
                     or content_sha256(args.workload) != journal.value["identity"]["workload_sha256"]
                     or content_sha256(__file__) != journal.value["identity"]["harness_sha256"]

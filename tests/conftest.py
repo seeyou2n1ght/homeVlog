@@ -8,9 +8,9 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from src.database import VlogDatabase
-from src.segment import Segment
-from src.utils import reset_semaphores
+from src.core.database import VlogDatabase
+from src.algorithms.segment import Segment
+from src.hardware.scheduler import reset_semaphores
 
 
 @pytest.fixture(autouse=True)
@@ -22,17 +22,14 @@ def isolate_runtime_outputs(tmp_path, monkeypatch):
         "OUTPUT_DIR": workspace / "output", "TEMP_DIR": workspace / "temp",
         "TEMP_STAGING_DIR": workspace / "temp/staging", "TEMP_BATCHES_DIR": workspace / "temp/batches",
         "TEMP_SCRIPTS_DIR": workspace / "temp/scripts", "LOGS_DIR": workspace / "logs",
-        "DB_PATH": workspace / "data/vlog.db", "CACHE_DIR": workspace / "temp/audit_cache",
-        "ARCHIVE_DIR": workspace / "data/feedback_archive", "DEFAULT_ARCHIVE_DIR": workspace / "data/feedback_archive",
-        "DEFAULT_IMAGES_DIR": workspace / "data/feedback_archive/images",
-        "DEFAULT_MANIFEST": workspace / "data/feedback_archive/manifest.jsonl",
+        "DB_PATH": workspace / "data/vlog.db",
     }
     for name, value in replacements.items():
-        (value.parent if name in ("DB_PATH", "DEFAULT_MANIFEST") else value).mkdir(parents=True, exist_ok=True)
+        (value.parent if name == "DB_PATH" else value).mkdir(parents=True, exist_ok=True)
     # Compatibility facades and eager package imports retain path snapshots.
     # Patch every already-loaded consumer; later imports inherit core paths.
     for module_name, module in list(sys.modules.items()):
-        if module_name.startswith(("src.", "scripts.audit_tool.")):
+        if module_name.startswith("src."):
             for name, value in replacements.items():
                 if hasattr(module, name):
                     monkeypatch.setattr(module, name, value)
@@ -52,7 +49,7 @@ def isolate_runtime_outputs(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def clean_semaphores():
     """Reset hardware semaphores and registry interruption before and after each test for test isolation."""
-    from src.renderer import FFmpegProcessRegistry
+    from src.stages.renderer import FFmpegProcessRegistry
     reset_semaphores()
     FFmpegProcessRegistry.reset_interrupted()
     yield
@@ -64,7 +61,7 @@ def clean_semaphores():
 def reset_global_config_state():
     """Reset global config path and settings singleton before and after each test for test isolation."""
     import src.core.config as core
-    import src.utils as legacy
+    import src.core.utils as legacy
     core.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
     core.SETTINGS = {}
     legacy.CONFIG_PATH = core.DEFAULT_CONFIG_PATH
@@ -207,7 +204,8 @@ def delivery_workspace(tmp_path, monkeypatch):
     """Isolate delivery orchestration while keeping real SQLite/assets/rollback."""
     from types import SimpleNamespace
     from src import pipeline
-    from src.hardware.render_cache import processing_fingerprint, _manifest_path
+    from src.core.identity import processing_fingerprint
+    from src.hardware.render_cache import _manifest_path
     config = {"output": {"naming": "DailyVlog_{date}_cam{index}.mp4"},
               "render": {"generate_subtitles": False}}
     out_dir = tmp_path / "output"
@@ -304,7 +302,7 @@ def blocked_source_reader(tmp_path):
     worker = tmp_path / 'blocked_reader.py'
     worker.write_text('''import json, os, sys
 from pathlib import Path
-from src.core.visual_index import source_identity
+from src.core.identity import source_identity
 filepath=json.loads(sys.stdin.buffer.readline())
 if sys.argv[1]=='sampling':
     print(json.dumps(['identity',source_identity(filepath)]),flush=True)
@@ -387,9 +385,9 @@ def interrupted_delivery_owner(tmp_path):
     script.write_text('''import sys
 from pathlib import Path
 from src.stages.companion import promote_vlog_assets
-from src.core import delivery_recovery
+from src.stages import delivery_recovery
 from src.hardware.render_cache import save_manifest
-from src.database import VlogDatabase
+from src.core.database import VlogDatabase
 candidate,output=map(Path,sys.argv[1:3]);phase=sys.argv[3]
 replace=Path.replace;counter=0
 def pause():

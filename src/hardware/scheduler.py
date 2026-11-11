@@ -174,6 +174,79 @@ def acquire_with_retry(
 _nvenc_semaphore = None
 _nvdec_semaphore = None
 
+class _NvTailCapacity:
+    """Own one temporary slot; closing never releases an active media lease."""
+
+    def __init__(self, budget):
+        self._budget = budget
+
+    def close(self):
+        self._budget._retire_tail_capacity(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+class NvencSemaphore(threading.Semaphore):
+    """Keep normal admission unchanged and lend one slot to a drained tail.
+
+    Callers must establish that upstream work is finished before borrowing.
+    Retirement debt preserves outstanding leases, including Registry-owned
+    deferred cleanup, without blocking scope exit or leaking capacity next day.
+    """
+
+    def __init__(self, value=2):
+        super().__init__(value)
+        self._base_capacity = value
+        self._tail_owner = None
+        self._retirement_debt = 0
+
+    def try_tail_capacity(self, target=3):
+        with self._cond:
+            if (self._base_capacity != 2 or target != 3
+                    or self._tail_owner is not None or self._retirement_debt):
+                return None
+            owner = _NvTailCapacity(self)
+            self._tail_owner = owner
+            self._value += 1
+            self._cond.notify()
+            return owner
+
+    def _retire_tail_capacity(self, owner):
+        with self._cond:
+            if self._tail_owner is not owner:
+                return
+            self._tail_owner = None
+            if self._value:
+                self._value -= 1
+            else:
+                self._retirement_debt = 1
+
+    def release(self, n=1):
+        if n < 1:
+            raise ValueError('n must be one or more')
+        with self._cond:
+            retired = min(n, self._retirement_debt)
+            self._retirement_debt -= retired
+            available = n - retired
+            self._value += available
+            self._cond.notify(available)
+
+
+@contextmanager
+def nv_tail_capacity(enabled=True):
+    """Temporarily lend a third NV slot after the caller's upstream barrier."""
+    owner = get_nvenc_semaphore().try_tail_capacity() if enabled else None
+    try:
+        yield owner is not None
+    finally:
+        if owner is not None:
+            owner.close()
+
+
 def reset_semaphores() -> None:
     """重置缓存的信号量，支持热重载配置或单元测试隔离。"""
     global _disk_semaphore, _nv_semaphore, _nvenc_semaphore, _nvdec_semaphore, _qsv_semaphore, _qsv_render_semaphore
@@ -206,7 +279,7 @@ def get_nvenc_semaphore() -> threading.Semaphore:
             if _nvenc_semaphore is None:
                 config = load_config()
                 limit = config.get("hardware", {}).get("max_nv_concurrency", 2)
-                _nvenc_semaphore = threading.Semaphore(limit)
+                _nvenc_semaphore = NvencSemaphore(limit)
                 _nvenc_semaphore.resource_name = "NVENC hardware"
     return _nvenc_semaphore
 
@@ -288,6 +361,8 @@ class WorkStealingManager:
             "max_nv_decoders",
             hw_cfg.get("max_nv_decoders", 1),
         )
+        self.heavy_duration_s: float = float(sched_cfg.get("heavy_file_duration_s", 600.0))
+        self.heavy_nvdec_wait_s: float = float(sched_cfg.get("heavy_nvdec_wait_s", 0.0))
         self.device: str = hw_cfg.get("device", "cuda:0")
         self.cold_start_burst: bool = sched_cfg.get("cold_start_burst", False)
         self.cooperative_during_render: bool = sched_cfg.get("cooperative_during_render", False)
@@ -299,6 +374,7 @@ class WorkStealingManager:
         self._last_vram_warn_time = 0.0
 
         self._lock = threading.Lock()
+        self._slot_condition = threading.Condition(self._lock)
         self._render_active_count = 0
         self._active_nv_decoders = 0
         self._state = "NORMAL_DECOUPLED"
@@ -387,9 +463,15 @@ class WorkStealingManager:
         with self._lock:
             return self._active_nv_decoders
 
-    def get_analysis_device(self, queue_size: int, is_render_active: bool | None = None, prescreen_idle: bool = False) -> str:
+    def get_analysis_device(
+        self,
+        queue_size: int,
+        is_render_active: bool | None = None,
+        prescreen_idle: bool = False,
+        file_duration: float = 0.0,
+    ) -> str:
         """
-        根据队列水位与渲染状态决策当前分析任务的解码硬件设备。
+        根据队列水位、渲染状态与任务负载成本 (file_duration) 决策当前分析任务的解码硬件设备。
         
         返回值: "qsv" | "cuda"
         """
@@ -398,7 +480,9 @@ class WorkStealingManager:
                 is_render_active if is_render_active is not None else (self._render_active_count > 0)
             )
 
-            if prescreen_idle:
+            is_heavy = (file_duration >= self.heavy_duration_s)
+
+            if prescreen_idle and not is_heavy:
                 self._state = "NORMAL_DECOUPLED"
                 return "qsv"
 
@@ -411,15 +495,33 @@ class WorkStealingManager:
                 self._state = "VRAM_PRESSURE_YIELD"
                 return "qsv"
 
-            # 渲染进行中分支：开启协同且显存安全且队列积压时，允许借调 NVDEC 槽位
-            if render_active:
-                if (
-                    self.cooperative_during_render
-                    and queue_size >= self.watermark_high
-                    and self._active_nv_decoders < self.max_nv_decoders
-                ):
-                    self._state = "COOPERATIVE_RENDER_COEXIST"
+            # 重型文件成本感知优先路由 (ADR0080):
+            # 55分钟夜间巨型文件在 NVDEC 上快 5.35x (94s vs QSV 505s)，优先派往 CUDA 释放 QSV
+            if is_heavy:
+                if self._active_nv_decoders < self.max_nv_decoders:
+                    self._state = "COOPERATIVE_BURST" if not render_active else "COOPERATIVE_RENDER_COEXIST"
                     return "cuda"
+                if render_active and not self.cooperative_during_render:
+                    self._state = "RENDER_PREEMPTION_YIELD"
+                    return "qsv"
+                return "cuda"
+
+            # 在 cost_priority 模式下，NVDEC 专供 LPT 重型长文件消费，6 个 QSV Worker 专供 SJF 轻型短切片
+            # 杜绝轻切片抢占 NVDEC 槽位导致 55 分钟巨型文件被反向错配至 QSV 爬行 800 秒
+            if self.config.get("pipeline", {}).get("cost_priority", False):
+                self._state = "NORMAL_DECOUPLED"
+                return "qsv"
+
+            # 渲染进行中分支：开启协同且显存安全时，采用滞回控制 (Hysteresis) 借调 NVDEC 槽位，避免频繁让步抖动
+            if render_active:
+                if self.cooperative_during_render:
+                    in_coop = (self._state == "COOPERATIVE_RENDER_COEXIST")
+                    should_coop = (queue_size >= self.watermark_high) or (in_coop and queue_size > self.watermark_low)
+                    if should_coop:
+                        self._state = "COOPERATIVE_RENDER_COEXIST"
+                        if self._active_nv_decoders < self.max_nv_decoders:
+                            return "cuda"
+                        return "qsv"
                 self._state = "RENDER_PREEMPTION_YIELD"
                 return "qsv"
 
@@ -445,31 +547,51 @@ class WorkStealingManager:
                     return "cuda"
                 return "qsv"
 
-    def acquire_nvdec_slot(self) -> bool:
-        """尝试占用一个 NVDEC 解码协同槽位。"""
-        with self._lock:
-            if self._render_active_count > 0 and not self.cooperative_during_render:
-                return False
-            if self.is_vram_under_pressure():
-                self._state = "VRAM_PRESSURE_YIELD"
-                return False
-            if self._active_nv_decoders < self.max_nv_decoders:
-                self._active_nv_decoders += 1
-                return True
-            return False
+    def acquire_nvdec_slot(self, timeout: float = 0.0) -> bool:
+        """尝试占用一个 NVDEC 解码协同槽位。若 timeout > 0，在槽位满时等待释放。"""
+        deadline = time.monotonic() + timeout if timeout > 0 else 0.0
+        with self._slot_condition:
+            while True:
+                if self._render_active_count > 0 and not self.cooperative_during_render:
+                    return False
+                if self.is_vram_under_pressure():
+                    self._state = "VRAM_PRESSURE_YIELD"
+                    return False
+                if self._active_nv_decoders < self.max_nv_decoders:
+                    self._active_nv_decoders += 1
+                    return True
+                if timeout <= 0:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._slot_condition.wait(timeout=min(remaining, 1.0))
 
     def release_nvdec_slot(self) -> None:
         """释放 NVDEC 解码协同槽位。"""
-        with self._lock:
+        with self._slot_condition:
             self._active_nv_decoders = max(0, self._active_nv_decoders - 1)
+            self._slot_condition.notify_all()
 
     @contextmanager
-    def lease_device(self, queue_size: int, prescreen_idle: bool = False):
+    def lease_device(
+        self,
+        queue_size: int,
+        prescreen_idle: bool = False,
+        file_duration: float = 0.0,
+    ):
         """上下文管理器：自动决策解码设备并在使用 CUDA 时安全管理 NVDEC 槽位生命周期。"""
-        device = self.get_analysis_device(queue_size, prescreen_idle=prescreen_idle)
+        is_heavy = (file_duration >= self.heavy_duration_s)
+        # 重型文件等待 NVDEC 槽位释放（NVDEC 100s 远快于 QSV 800s）；轻型文件不等待即刻让步 QSV
+        timeout = float(getattr(self, "heavy_nvdec_wait_s", 120.0)) if is_heavy else 0.0
+        device = self.get_analysis_device(
+            queue_size,
+            prescreen_idle=prescreen_idle,
+            file_duration=file_duration,
+        )
         acquired_slot = False
         if device == "cuda":
-            if self.acquire_nvdec_slot():
+            if self.acquire_nvdec_slot(timeout=timeout):
                 acquired_slot = True
             else:
                 device = "qsv"

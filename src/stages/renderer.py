@@ -19,7 +19,7 @@ from src.hardware.ffmpeg import (
 from src.stages.timeline import build_concat_filter, compute_display_plans, display_plan_options, normalize_file_timeline as _normalize_file_timeline
 from src.hardware.monitor import get_perf, PerfRecord
 
-from src.algorithms.segment import ACTIVE_STATES
+from src.algorithms.segment import ACTIVE_STATES, SegmentState
 
 logger = logging.getLogger("homevlog")
 
@@ -375,6 +375,22 @@ def _get_stage_lock(digest: str) -> threading.Lock:
         return _staging_locks[digest]
 
 
+def get_staged_source(source: str | Path) -> Path | None:
+    """Return local staged path if source was pre-staged and intact, else None."""
+    source_path = Path(source)
+    try:
+        source_stat = source_path.stat()
+    except OSError:
+        return None
+    stage_dir = TEMP_DIR / "staging"
+    identity = f"{source_path.resolve()}:{source_stat.st_size}:{source_stat.st_mtime_ns}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    staged = stage_dir / f"{digest}{source_path.suffix}"
+    if staged.exists() and staged.stat().st_size == source_stat.st_size:
+        return staged
+    return None
+
+
 def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
     """Sequentially stage one NAS clip for low-latency local EDL seeks."""
     source_path = Path(source)
@@ -559,6 +575,13 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             # inpoints can drop AAC priming packets and shorten short motion
             # islands even when video packet metadata is exact.
             input_args += ["-i", files[0]]
+    elif render_cfg.get("local_staging_enabled", True) and len(files) == 1 and not (batch_copy and all(s.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO, "DYNAMIC", "DYNAMIC_AUDIO") for s in batch_copy)):
+        def _prepare_direct_input():
+            nonlocal staged_source
+            staged_source = _stage_source_for_render(files[0])
+            return True
+
+        prepare_input = _prepare_direct_input
 
     filter_timeline = list(plan.mapped_timeline) if plan and plan.mapped_timeline else batch_copy
     source_timeline = list(plan.source_timeline) if plan and plan.source_timeline else batch_copy
@@ -818,8 +841,10 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
     if audio_plan is not None and encoder == "nv" and input_args is None and len(input_files) == 1 and int(audio_cfg.get("channels", 1)) == 1:
         started = time.monotonic()
         try:
+            staged = get_staged_source(input_files[0])
+            audio_source = str(staged) if staged is not None else input_files[0]
             grouped_audio = _prepare_grouped_audio(
-                input_files[0], audio_plan, pcm_path,
+                audio_source, audio_plan, pcm_path,
                 output_path.with_name(output_path.stem + ".audio.filter.txt"))
         except (MediaTerminationUnconfirmed, RenderInterrupted):
             raise
@@ -845,7 +870,9 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
                 hwaccel_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             elif encoder == "qsv":
                 hwaccel_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-            hwaccel_args += ["-i", str(fp)]
+            staged = get_staged_source(fp)
+            input_fp = str(staged) if staged is not None else str(fp)
+            hwaccel_args += ["-i", input_fp]
 
     if grouped_audio:
         hwaccel_args += ["-f", "f32le", "-ar", str(audio_plan.sample_rate), "-ac", "1", "-i", str(pcm_path)]
@@ -871,12 +898,35 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
     cmd += enc_args
     tmp_output_path.unlink(missing_ok=True)
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
-    cmd += ["-tag:v", "hev1", "-movflags", "+faststart"]
+    if encoder in ("cpu", "software"):
+        cmd += ["-movflags", "+faststart"]
+    else:
+        cmd += ["-tag:v", "hev1", "-movflags", "+faststart"]
     cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
         from src.hardware.scheduler import get_qsv_render_semaphore
         io_sem = VideoLease(get_qsv_render_semaphore(), 1 if input_args is not None else len(input_files))
+    elif encoder in ("cpu", "software"):
+        from src.hardware.scheduler import get_disk_semaphore
+
+        class _CpuVideoLease:
+            def __init__(self, inputs=1):
+                self.disk = None
+                self.inputs = max(1, inputs)
+                self.resource_name = f"input I/O ({self.inputs} files)"
+
+            def acquire(self, timeout=30.0):
+                self.disk = get_disk_semaphore()
+                return self.disk.acquire(timeout=timeout, weight=self.inputs)
+
+            def release(self):
+                if self.disk is not None:
+                    d = self.disk
+                    self.disk = None
+                    d.release(weight=self.inputs)
+
+        io_sem = _CpuVideoLease(1 if input_args is not None else len(input_files) + int(grouped_audio))
     else:
         from src.hardware.scheduler import get_nvenc_semaphore
         io_sem = VideoLease(get_nvenc_semaphore(), 1 if input_args is not None else len(input_files) + int(grouped_audio))
@@ -1273,7 +1323,15 @@ def concat_output_files(
             temporary.unlink(missing_ok=True)
 
 def _build_enc_args(encoder, out_cfg):
-    if encoder == "qsv":
+    if encoder in ("cpu", "software"):
+        return [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "26",
+            "-g", str(out_cfg.get("gop", 60)),
+            "-pix_fmt", "yuv420p",
+        ]
+    elif encoder == "qsv":
         qsv = out_cfg.get("qsv", {})
         if qsv.get("maxrate") or qsv.get("bufsize"):
             raise ValueError("QSV ICQ uses global_quality; remove maxrate/bufsize to avoid CQP fallback")

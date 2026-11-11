@@ -31,7 +31,7 @@ def test_increasing_sensitivity_does_not_raise_adaptive_noise_threshold():
         active.append(sum(item["is_motion"] for item in labels))
     assert active == [60, 60]
 
-from src.detector import (
+from src.stages.detector import (
     SpatialGridMotionFilter,
     EmaBackgroundModel,
     MotionDetector,
@@ -331,47 +331,7 @@ def test_visual_features_reuse_one_decode_and_clear_after_incomplete_source(tmp_
     monkeypatch.setattr(detector,"analyze_frames",lambda *args,**kwargs:(labels,{}))
     actual,_=detector.analyze(str(path),file_duration=2,has_audio=0,duration_verified=True)
     assert actual==labels and len(calls)==1
-    assert len(detector.visual_samples)==2048
-    assert detector.visual_source[1]==len(b"controlled source")
-    assert detector.last_perf["visual_index_s"]>=0
     meta["complete"]=False
     actual,_=detector.analyze(str(path),file_duration=2,has_audio=0,duration_verified=True)
-    assert actual==[] and detector.visual_samples==[] and detector.visual_source is None
+    assert actual == []
     assert len(calls)==2
-
-
-def test_visual_features_collect_in_real_streaming_trace(tmp_path, monkeypatch, mock_config):
-    from src.algorithms.motion_trace import MotionTrace
-    from src.core.visual_index import frame_signature
-    path = tmp_path / "stream.mp4"
-    path.write_bytes(b"controlled source")
-    detector = MotionDetector(mock_config, decode_gpu="cpu")
-    plain = MotionTrace(detector, 5)
-    traced = MotionTrace(detector, 5, visual_sample_stride=2)
-    frame = np.zeros((detector.height, detector.width), np.uint8)
-    for i in range(12):
-        frame[:, i:i + 1] = 255
-        plain.append(frame)
-        traced.append(frame)
-    assert list(traced.energies) == list(plain.energies)
-    assert list(traced.confidences) == list(plain.confidences)
-    assert [value[0] for value in traced.visual_samples] == pytest.approx([i / 5 for i in range(0, 12, 2)])
-    assert traced.visual_samples[0][1] != frame_signature(frame)
-    meta = {"has_audio": 0, "effective_fps": 5, "frames": 12, "complete": True, "decode_time": 0}
-    monkeypatch.setattr(detector, "_decode_file", lambda *args: (traced, {}, np.array([], np.float32), meta))
-    detector.analyze(str(path), file_duration=2.4, has_audio=0, duration_verified=True)
-    assert detector.visual_samples == traced.visual_samples
-    assert detector.visual_source is not None
-    meta["complete"] = False
-    detector.analyze(str(path), file_duration=2.4, has_audio=0, duration_verified=True)
-    assert detector.visual_samples == [] and detector.visual_source is None
-
-
-def test_streaming_visual_features_have_fixed_memory_cap(mock_config):
-    from src.algorithms.motion_trace import MotionTrace
-    detector = MotionDetector(mock_config)
-    detector.width = detector.height = 16
-    trace = MotionTrace(detector, 5, visual_sample_stride=1)
-    for _ in range(2050):
-        trace.append(np.zeros((16, 16), np.uint8))
-    assert len(trace) == 2050 and len(trace.visual_samples) == 2048

@@ -1,4 +1,4 @@
-"""Shared identities and display measurements for delivery, review and isolated runs."""
+"""Shared content, environment and model identities for delivery and isolated runs."""
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -43,23 +43,3 @@ def production_code_sha256(root=None):
 def model_path(config):
     path = Path(config.get("yolo", {}).get("model_path", "models/yolo11m.pt"))
     return path if path.is_absolute() else core.PROJECT_ROOT / path
-
-
-def interval_display_details(config, timeline, start, end, offset):
-    """Shared proportional display contribution; not a fractional-frame oracle."""
-    from src.stages.timeline import compute_display_plans, display_plan_options
-    plans = compute_display_plans(timeline, **display_plan_options(config))
-    portions = []
-    for segment, (display, _) in zip(timeline, plans):
-        lower, upper = offset + segment.start_in_file, offset + segment.end_in_file
-        overlap = max(0., min(end, upper) - max(start, lower))
-        if overlap:
-            portions.append({"start_time": max(start, lower), "end_time": min(end, upper),
-                             "state": segment.state, "source_s": overlap,
-                             "display_s": display * overlap / segment.duration,
-                             "speed": segment.duration / display})
-    return {"normal_or_presence": any(p["state"] in ("DYNAMIC", "DYNAMIC_AUDIO", "PRESENCE") for p in portions),
-            "portions": portions, "source_s": end-start,
-            "display_s": sum(p["display_s"] for p in portions),
-            "normal_source_s": sum(p["source_s"] for p in portions if p["state"] in ("DYNAMIC", "DYNAMIC_AUDIO")),
-            "retained_source_s": sum(p["source_s"] for p in portions if p["state"] != "STATIC")}

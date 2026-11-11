@@ -261,6 +261,22 @@ def print_doctor_report(console: Console = None) -> bool:
         all_passed = False
         table.add_row("YOLO 视觉模型", "[bold red]✖ 缺失[/bold red]", f"模型文件不存在: {md_data['model_path']}")
 
+    # 6. 自适应硬件调度推导 (Auto-Tuner)
+    try:
+        from src.hardware.autotune import probe_hardware, compute_optimal_concurrency
+        snap = probe_hardware()
+        opt = compute_optimal_concurrency(snap)
+        r_con = opt["render"].get("max_concurrency", 3)
+        nv_enc = opt["hardware"].get("max_nv_concurrency", 2)
+        qsv_enc = opt["hardware"].get("max_qsv_render_concurrency", 1)
+        a_wok = opt["detection"].get("analysis_max_workers", 7)
+        nv_dec = opt["scheduler"].get("max_nv_decoders", 2)
+        vram_wm = opt["scheduler"].get("vram_watermark_mb", 6200)
+        tune_desc = f"渲染: {r_con} 路 ({nv_enc} NVENC + {qsv_enc} QSV) | 分析: {a_wok} 路 (NVDEC借调上限 {nv_dec}) | 显存水线: {vram_wm} MB"
+        table.add_row("自适应算力推荐", "[bold green]✔ 动态推导[/bold green]", tune_desc)
+    except Exception as e:
+        table.add_row("自适应算力推荐", "[yellow]⚠ 默认[/yellow]", f"推导探针跳过: {e}")
+
     title_color = "green" if all_passed else "yellow"
     panel_title = f"[bold {title_color}]🩺 HomeVlog 系统就绪体检报告[/bold {title_color}]"
     panel_sub = "[bold green]✨ 全部核心环境已就绪，可执行高速异构浓缩流水线[/bold green]" if all_passed else "[bold yellow]⚠ 检测到潜在环境风险，请根据上述提示排查[/bold yellow]"

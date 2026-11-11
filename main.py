@@ -29,12 +29,15 @@ if __name__ == "__main__":
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.utils import setup_logging, load_config, reset_semaphores, cleanup_resources, cleanup_temp_artifacts, get_input_dirs, check_disk_space
+from src.core.utils import setup_logging, load_config, cleanup_temp_artifacts, get_input_dirs, check_disk_space
+from src.hardware.lifecycle import cleanup_resources
+from src.hardware.scheduler import reset_semaphores
 from src.pipeline import run_pipeline, process_date_cam
+from src.hardware.autotune import apply_auto_tune
 from src.hardware.ffmpeg import FFmpegProcessRegistry, MediaTerminationUnconfirmed
 from src.stages.companion import build_batch_summary_item
-from src.database import VlogDatabase
-from src.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name
+from src.core.database import VlogDatabase
+from src.stages.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name
 from src.ui import (
     build_arg_parser,
     resolve_cli_dates,
@@ -64,11 +67,11 @@ def main():
     if args.debug:
         setup_logging(level_override=logging.DEBUG)
 
+    # Startup logging can load settings before CLI composition.
+    config = load_config(args.config, reload=True, prepare=apply_auto_tune)
     if args.config:
-        load_config(args.config, reload=True)
         reset_semaphores()
 
-    config = load_config()
     if getattr(args, "skip_corrupt", False):
         config.setdefault("recovery", {})["skip_corrupt"] = True
     log_path = next((h.baseFilename for h in logger.handlers
@@ -135,15 +138,21 @@ def main():
                         for d, cam in groups:
                             db.conn.execute(
                                 """UPDATE file_tasks SET prescreen_status='PENDING', prescreen_result=NULL,
-                                   analysis_status='PENDING', analysis_segments=NULL, processing_fingerprint=NULL,
+                                   analysis_status='PENDING', processing_fingerprint=NULL,
                                    retry_count=0, error_msg=NULL WHERE date=? AND cam_index=?""", (d, cam),
                             )
-                            db.conn.execute("DELETE FROM segments WHERE date=? AND cam_index=?", (d, cam))
+                            db.conn.execute(
+                                """DELETE FROM segments
+                                   WHERE file_id IN (
+                                       SELECT id FROM file_tasks WHERE date=? AND cam_index=?
+                                   )""",
+                                (d, cam),
+                            )
                         db.conn.commit()
                     except BaseException:
                         db.conn.rollback()
                         raise
-            console.print(f"[bold cyan]ℹ 已重置所选 {len(groups)} 个日期机位组的分析缓存；人工审核保留。[/bold cyan]")
+            console.print(f"[bold cyan]ℹ 已重置所选 {len(groups)} 个日期机位组的分析缓存。[/bold cyan]")
         finally:
             db.close()
 
@@ -227,8 +236,8 @@ def main():
                     console.print("[yellow]未在任务库中找到所选日期/机位对应的监控切片。[/yellow]")
                     return
 
-                from src.monitor import get_monitor
-                from src.config import OUTPUT_DIR
+                from src.hardware.monitor import get_monitor
+                from src.core.config import OUTPUT_DIR, uses_software_pipeline
                 monitor = get_monitor()
                 monitor.start()
 
@@ -245,6 +254,7 @@ def main():
                         date_range=(dates_sorted[0], dates_sorted[-1]),
                         cameras=cams_sorted,
                         output_dir=str(OUTPUT_DIR),
+                        device_info="CPU（预筛、精析与渲染）" if uses_software_pipeline(config) else None,
                     )
 
                 batch_summary_list = []

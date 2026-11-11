@@ -12,13 +12,13 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from src.segment import Segment
-from src.yolo_verifier import YoloVerifier
-from src.filters import SpatialGridMotionFilter, AudioEnergyVAD
+from src.algorithms.segment import Segment
+from src.algorithms.yolo_verifier import YoloVerifier
+from src.algorithms.filters import SpatialGridMotionFilter, AudioEnergyVAD
 
 
 def test_temporal_events_survive_smoothing_yolo_rejection_and_audio_overlap():
-    from src.segment import refine_activity_segments
+    from src.algorithms.segment import refine_activity_segments
 
     labels = [{"time": float(t), "energy": 0.2, "raw_energy": 0.2,
                "is_audio_active": False} for t in range(101)]
@@ -174,7 +174,7 @@ def test_audio_vad_effective_min_dbfs():
 
 def test_min_motion_threshold_floor():
     """验证传感器低底噪或纯静止夜视场景下，运动检测自适应阈值严格受限不低于 min_motion_threshold。"""
-    from src.detector import MotionDetector
+    from src.stages.detector import MotionDetector
 
     config = {
         "detection": {
@@ -262,77 +262,13 @@ def test_yolo_verifies_dynamic_audio():
     # Off-screen sound remains at normal speed and is queued for review.
     assert len(verified) == 3
     assert verified[1].start_time == 10.0 and verified[1].end_time == 20.0
-    assert verified[1].needs_review
-    assert "MULTIMODAL_AUDIO_NO_TARGET" in verified[1].review_reason
     assert verified[2].state == "STATIC" and verified[2].start_time == 20.0
 
 
-def test_ambiguous_scenarios_recording_and_db(tmp_path):
-    """验证典型无法判定场景（边缘置信度、高能无目标光影）的时间戳记录与数据库主动召回。"""
-    from src.database import VlogDatabase
-    from src.segment import Segment
+def test_split_segments_preserves_confidence_and_energy():
+    """验证物理跨文件切分时，切片的 avg_confidence 与 max_energy 100% 留存。"""
+    from src.algorithms.segment import Segment, split_segments_at_file_boundaries
 
-    db_file = tmp_path / "test_ambiguous.db"
-    db = VlogDatabase(db_file)
-
-    # 创建任务
-    db.add_file_task(
-        filepath="cam0_borderline.mp4",
-        cam_index=0,
-        date="20260321",
-        file_start_time="20260321120000",
-        file_end_time="20260321120500",
-        file_duration=300.0,
-    )
-
-    # 构建含有无法判定的典型场景切片
-    segs = [
-        # 1. 边缘置信度切片
-        Segment(
-            start_time=10.0, end_time=25.0, state="DYNAMIC", source_file="cam0_borderline.mp4",
-            max_energy=4.5, avg_confidence=0.22, needs_review=True,
-            review_reason="BORDERLINE_CONFIDENCE: 目标边缘置信度(conf=0.22)，疑似微弱/遮挡目标"
-        ),
-        # 2. 高能无目标剧烈光影切片
-        Segment(
-            start_time=50.0, end_time=80.0, state="STATIC", source_file="cam0_borderline.mp4",
-            max_energy=22.5, avg_confidence=0.0, needs_review=True,
-            review_reason="HIGH_ENERGY_NO_TARGET: 高能剧烈光影(energy=22.5)无目标确认"
-        ),
-        # 3. 普通正常静态切片 (无需复核)
-        Segment(
-            start_time=80.0, end_time=300.0, state="STATIC", source_file="cam0_borderline.mp4",
-            max_energy=0.8, avg_confidence=0.0, needs_review=False
-        ),
-    ]
-
-    # 持久化分析结果入库
-    db.set_analysis_result("cam0_borderline.mp4", segs)
-
-    # 1. 主动召回所有待审疑难切片
-    review_queue = db.get_anomaly_segments(category="needs_review", date="20260321", cam_index=0)
-    assert len(review_queue) == 2
-
-    # 验证第一条：边缘置信度
-    item1 = next(it for it in review_queue if "BORDERLINE_CONFIDENCE" in it["review_reason"])
-    assert item1["state"] == "DYNAMIC"
-    assert item1["avg_confidence"] == 0.22
-    assert item1["anomaly_type"] == "borderline_confidence"
-
-    # 验证第二条：高能光影
-    item2 = next(it for it in review_queue if "HIGH_ENERGY_NO_TARGET" in it["review_reason"])
-    assert item2["state"] == "STATIC"
-    assert item2["max_energy"] == 22.5
-    assert item2["anomaly_type"] == "high_energy_no_target"
-
-    db.close()
-
-
-def test_split_segments_preserves_review_flags():
-    """验证物理跨文件切分时，切片的 avg_confidence、needs_review 与 review_reason 100% 留存。"""
-    from src.segment import Segment, split_segments_at_file_boundaries
-
-    # 构造一个跨越两个物理文件的待审切片
     long_seg = Segment(
         start_time=10.0,
         end_time=50.0,
@@ -341,8 +277,6 @@ def test_split_segments_preserves_review_flags():
         file_start_offset=0.0,
         max_energy=18.5,
         avg_confidence=0.88,
-        needs_review=True,
-        review_reason="BORDERLINE_CONFIDENCE: 目标边缘置信度",
     )
 
     files_info = [
@@ -358,89 +292,19 @@ def test_split_segments_preserves_review_flags():
     assert split_segs[0].start_time == 10.0
     assert split_segs[0].end_time == 30.0
     assert split_segs[0].avg_confidence == 0.88
-    assert split_segs[0].needs_review is True
-    assert split_segs[0].review_reason == "BORDERLINE_CONFIDENCE: 目标边缘置信度"
+    assert split_segs[0].max_energy == 18.5
 
     # 第二段：30.0 ~ 50.0s
     assert split_segs[1].source_file == "cam0_part2.mp4"
     assert split_segs[1].start_time == 30.0
     assert split_segs[1].end_time == 50.0
     assert split_segs[1].avg_confidence == 0.88
-    assert split_segs[1].needs_review is True
-    assert split_segs[1].review_reason == "BORDERLINE_CONFIDENCE: 目标边缘置信度"
-
-
-def test_timeline_human_label_short_codes():
-    """验证时间轴重建时 human_label / manual_label 短码 (FP/FN/TP/TN) 具有最高优先级 (AGENTS.md 铁律)。"""
-    from src.timeline import build_timeline_from_rows
-
-    rows = [
-        {
-            "filepath": "cam0_f1.mp4",
-            "file_start_time": "20260321000000",
-            "file_end_time": "20260321001000",
-            "file_duration": 600.0,
-            "prescreen_status": "SUSPICIOUS",
-            "segments": [
-                # 算法原本判定 DYNAMIC，人工标记 FP (误报) -> 必须强制转为 STATIC
-                {
-                    "start_time": 0.0,
-                    "end_time": 100.0,
-                    "state": "DYNAMIC",
-                    "manual_label": "FP",
-                },
-                # 算法原本判定 STATIC，人工标记 FN (漏报) -> 必须强制转为 DYNAMIC
-                {
-                    "start_time": 100.0,
-                    "end_time": 200.0,
-                    "state": "STATIC",
-                    "human_label": "FN",
-                },
-                # 算法原本判定 STATIC，人工确认 TN -> 保持 STATIC
-                {
-                    "start_time": 200.0,
-                    "end_time": 400.0,
-                    "state": "STATIC",
-                    "manual_label": "TN",
-                },
-                # 算法原本判定 DYNAMIC，人工标记 TP -> 保持 DYNAMIC
-                {
-                    "start_time": 400.0,
-                    "end_time": 600.0,
-                    "state": "DYNAMIC",
-                    "human_label": "TP",
-                },
-            ],
-        }
-    ]
-
-    timeline = build_timeline_from_rows(rows, date="20260321")
-    assert len(timeline) >= 4
-
-    # 切片 1: 原 DYNAMIC 经 FP 修正后变为 STATIC
-    assert timeline[0].start_in_file == 0.0
-    assert timeline[0].end_in_file == 100.0
-    assert timeline[0].state == "STATIC"
-
-    # 切片 2: 原 STATIC 经 FN 修正后变为 DYNAMIC
-    assert timeline[1].start_in_file == 100.0
-    assert timeline[1].end_in_file == 200.0
-    assert timeline[1].state == "DYNAMIC"
-
-    # 切片 3: 原 STATIC 经 TN 确认为 STATIC
-    assert timeline[2].start_in_file == 200.0
-    assert timeline[2].end_in_file == 400.0
-    assert timeline[2].state == "STATIC"
-
-    # 切片 4: 原 DYNAMIC 经 TP 确认为 DYNAMIC
-    assert timeline[3].start_in_file == 400.0
-    assert timeline[3].end_in_file == 600.0
-    assert timeline[3].state == "DYNAMIC"
+    assert split_segs[1].max_energy == 18.5
 
 
 def test_config_settings_consumption_closed_loop():
     """验证 config/settings.yaml 中的关键配置项均有明确代码消费，且无隐式未定义键。"""
-    from src.utils import load_config
+    from src.core.utils import load_config
 
     cfg = load_config(reload=True)
 
@@ -457,7 +321,7 @@ def test_config_settings_consumption_closed_loop():
 
 def test_build_audio_gated_segments():
     """验证视觉静态音频闸门快速切片构建算法：正确生成 DYNAMIC_AUDIO 与 STATIC，并保持时间轴闭环。"""
-    from src.segment import build_audio_gated_segments
+    from src.algorithms.segment import build_audio_gated_segments
 
     # 场景 1: 单一音频事件 (10.0 ~ 15.0s, pre_roll=1.0, post_roll=1.5)
     segs = build_audio_gated_segments(
@@ -498,7 +362,7 @@ def test_build_audio_gated_segments():
 
 def test_coalesce_micro_motion_segments():
     """验证相邻微动切片粘合算法：当两个 MICRO_MOTION 之间静态间隙 <= gap_tolerance 时平滑吸收合并。"""
-    from src.segment import coalesce_micro_motion_segments
+    from src.algorithms.segment import coalesce_micro_motion_segments
 
     # 准备 3 个切片：MICRO (0~10s) -> STATIC (10~13.4s, 3.4s间隙) -> MICRO (13.4~25s)
     segs = [
@@ -527,7 +391,7 @@ def test_coalesce_micro_motion_segments():
 
 def test_sync_timeline_segments_to_db(tmp_path):
     """验证全局时间线向数据库 segments 表的状态同步回写机制。"""
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
     from src.stages.timeline import TimelineSegment
 
     db = VlogDatabase(db_path=tmp_path / "sync_test.db")
@@ -538,9 +402,9 @@ def test_sync_timeline_segments_to_db(tmp_path):
 
     # 初始化数据库中的切片（原始判定为 STATIC）
     db.conn.execute("""
-        INSERT INTO segments (file_id, filepath, cam_index, date, start_time, end_time, duration, state, file_start_offset)
-        VALUES (?, ?, 0, '20260320', 10.0, 50.0, 40.0, 'STATIC', 0.0)
-    """, (file_id, fp))
+        INSERT INTO segments (file_id, start_time, end_time, state, file_start_offset)
+        VALUES (?, 10.0, 50.0, 'STATIC', 0.0)
+    """, (file_id,))
     db.conn.commit()
 
     # 模拟时间线因果链升级为 PRESENCE
@@ -550,7 +414,7 @@ def test_sync_timeline_segments_to_db(tmp_path):
 
     db.sync_timeline_segments("20260320", 0, timeline)
 
-    updated_row = db.conn.execute("SELECT state FROM segments WHERE filepath=?", (fp,)).fetchone()
+    updated_row = db.conn.execute("SELECT state FROM segments WHERE file_id=?", (file_id,)).fetchone()
     assert updated_row[0] == "PRESENCE"
     db.close()
 
@@ -570,7 +434,7 @@ def test_false_negatives_and_false_positives_isolation():
        - 新逻辑通过 action_coalesce_gap=2.0s 精准断开，静止期间无缝落入 PRESENCE (4x 快进)；
        - 断言 1.0x 常速总时长严格受控在真实动作时间内 (占比 <= 25%)，且单段常速时长绝不超过单个动作的缓冲窗口。
     """
-    from src.segment import refine_activity_segments
+    from src.algorithms.segment import refine_activity_segments
 
     # ---------------- 场景 1: 漏检测试 (Zero False Negatives) ----------------
     labels_fn = [
@@ -661,7 +525,7 @@ def test_false_negatives_and_false_positives_isolation():
 
 def test_multi_feature_hysteresis_activity_decision():
     """验证多特征空间网格聚类触发与迟滞状态机维持逻辑。"""
-    from src.segment import Segment, refine_activity_segments
+    from src.algorithms.segment import Segment, refine_activity_segments
 
     # 100 秒序列：
     # 0~19s: 平稳静止 (raw_energy 0.5) -> PRESENCE
@@ -729,7 +593,7 @@ def test_multi_feature_hysteresis_activity_decision():
 # =========================================================================
 
 def _make_detector_closure(mock_config):
-    from src.detector import MotionDetector
+    from src.stages.detector import MotionDetector
     cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
     det = cfg["detection"]
     det["analysis_early_term_enabled"] = False  # 排除早停路径干扰
@@ -787,7 +651,7 @@ class TestAdaptiveFpsUltraLongTier:
     """ultra_long 档位生效回归。"""
 
     def test_ultra_long_tier_selected(self, mock_config, tmp_path):
-        from src.detector import MotionDetector
+        from src.stages.detector import MotionDetector
         cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
         cfg["detection"]["analysis_fps_tiers"] = {
             "short": 5, "medium": 3, "long": 1, "ultra_long": 0.5,
@@ -802,7 +666,7 @@ class TestAdaptiveFpsUltraLongTier:
         assert meta["effective_fps"] == pytest.approx(0.5)
 
     def test_long_tier_boundary_unchanged(self, mock_config, tmp_path):
-        from src.detector import MotionDetector
+        from src.stages.detector import MotionDetector
         cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
         cfg["detection"]["analysis_fps_tiers"] = {
             "short": 5, "medium": 3, "long": 1, "ultra_long": 0.5,
@@ -821,8 +685,8 @@ class TestYoloFpsAlignment:
     """YOLO 验证帧索引 fps 对齐回归。"""
 
     def test_verify_uses_effective_fps_for_frame_lookup(self):
-        from src.yolo_verifier import YoloVerifier
-        from src.segment import Segment
+        from src.algorithms.yolo_verifier import YoloVerifier
+        from src.algorithms.segment import Segment
 
         verifier = YoloVerifier.__new__(YoloVerifier)
         verifier.enabled = False

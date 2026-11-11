@@ -37,7 +37,7 @@ if sys.platform == "win32":
 
 console = Console()
 
-DEFAULT_DEVICE_INFO = "核显 UHD 770（解码+粗筛）＋ 独显 RTX 3060Ti（AI 分析+渲染）"
+# DEFAULT_DEVICE_INFO removed in favor of dynamic hardware summary
 
 
 def is_interactive_terminal() -> bool:
@@ -63,10 +63,10 @@ def print_batch_startup_banner(
     date_range: Tuple[str, str],
     cameras: List[str],
     output_dir: str = "output",
-    device_info: str = DEFAULT_DEVICE_INFO,
+    device_info: str | None = None,
 ) -> None:
     """在多天批量浓缩任务启动时，打印宏观全局规划 Banner。"""
-    if device_info == DEFAULT_DEVICE_INFO:
+    if not device_info:
         device_info = get_hardware_summary_string()
 
     table = Table.grid(padding=(0, 2))
@@ -97,13 +97,13 @@ def print_startup_banner(
     cam_index: int,
     total_files: int,
     total_duration_s: float,
-    device_info: str = DEFAULT_DEVICE_INFO,
+    device_info: str | None = None,
     output_path: Optional[str] = None,
     cam_name: Optional[str] = None,
     batch_progress: Optional[str] = None,
 ) -> None:
     """以高质感 Rich 面板展示流水线启动配置与硬件就绪状态。"""
-    if device_info == DEFAULT_DEVICE_INFO:
+    if not device_info:
         device_info = get_hardware_summary_string()
 
     hours = total_duration_s / 3600.0

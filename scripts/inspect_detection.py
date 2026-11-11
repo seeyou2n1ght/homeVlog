@@ -19,10 +19,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.detector import MotionDetector
-from src.segment import build_segments
-from src.ffmpeg import get_duration, run_ffmpeg
-from src.utils import load_config
+from src.stages.detector import MotionDetector
+from src.algorithms.segment import build_segments
+from src.hardware.autotune import apply_auto_tune
+from src.hardware.ffmpeg import get_duration, run_ffmpeg
+from src.core.utils import load_config
 
 
 def extract_frame(filepath: str, timestamp: float, output: Path, width: int = 640, height: int = 360) -> bool:
@@ -60,7 +61,7 @@ def main():
     outdir = Path(args.outdir) if args.outdir else Path("./inspect_out")
     outdir.mkdir(parents=True, exist_ok=True)
 
-    config = load_config()
+    config = load_config(reload=True, prepare=apply_auto_tune)
 
     file_dur = get_duration(str(filepath))
     print(f"Analyzing: {filepath.name}")
@@ -84,7 +85,7 @@ def main():
 
     # Build segments to see the final output (Before YOLO)
     seg_cfg = config.get("segment", {})
-    from src.segment import _filter_short
+    from src.algorithms.segment import _filter_short
     
     segments_raw = build_segments(
         labels,
@@ -110,7 +111,7 @@ def main():
     print()
     
     # Run YOLO Verifier
-    from src.yolo_verifier import YoloVerifier
+    from src.algorithms.yolo_verifier import YoloVerifier
     yolo_verifier = YoloVerifier(config)
     segments_yolo = yolo_verifier.verify(str(filepath), segments_raw, gpu="cuda")
     

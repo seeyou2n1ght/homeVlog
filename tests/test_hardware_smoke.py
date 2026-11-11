@@ -6,10 +6,10 @@ import av
 import numpy as np
 import pytest
 
-from src.detector import MotionDetector
-from src.renderer import build_batch_render
-from src.render_cache import valid_video
-from src.timeline import TimelineSegment
+from src.stages.detector import MotionDetector
+from src.stages.renderer import build_batch_render
+from src.hardware.render_cache import valid_video
+from src.stages.timeline import TimelineSegment
 
 pytestmark = pytest.mark.skipif(os.environ.get("HOMEVLOG_HARDWARE_TESTS") != "1",
                                 reason="Set HOMEVLOG_HARDWARE_TESTS=1 on QSV + NVIDIA host")
@@ -33,9 +33,9 @@ def test_real_hardware_decode_render(tmp_path, monkeypatch, gpu, kind):
     config = {"detection": {"analysis_resolution": "128x128", "analysis_fps_adaptive": False,
                             "analysis_fps": 2}, "audio_vad": {"enabled": False},
               "render": {"speed_ramping_enabled": False}}
-    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
-    monkeypatch.setattr("src.utils.TEMP_DIR", tmp_path)
-    monkeypatch.setattr("src.utils.load_config", lambda: config)
+    monkeypatch.setattr("src.stages.renderer.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.core.utils.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.core.utils.load_config", lambda: config)
     detector = MotionDetector(config, decode_gpu="qsv" if gpu == "qsv" else "cuda")
     duration = 120 if kind == "static" else 6
     frames, _, meta = detector._decode_file_pipe(str(source), duration, 2)
@@ -50,9 +50,9 @@ def test_real_hardware_decode_render(tmp_path, monkeypatch, gpu, kind):
 
 
 def test_real_yolo_microbatch():
-    from src.utils import PROJECT_ROOT
-    from src.yolo_verifier import YoloVerifier
-    from src.segment import Segment
+    from src.core.utils import PROJECT_ROOT
+    from src.algorithms.yolo_verifier import YoloVerifier
+    from src.algorithms.segment import Segment
     model = PROJECT_ROOT / "models" / "yolo11m.pt"
     if not model.exists():
         pytest.skip("Local weights are required; hardware smoke never downloads weights")
@@ -66,8 +66,8 @@ def test_real_yolo_microbatch():
 
 def test_real_mixed_encoder_concat_preserves_every_frame(tmp_path, monkeypatch):
     import hashlib
-    from src.renderer import concat_output_files
-    from src.utils import load_config
+    from src.stages.renderer import concat_output_files
+    from src.core.utils import load_config
     source = tmp_path / "source.mp4"
     with av.open(str(source), "w") as container:
         stream = container.add_stream("libx264", rate=20)
@@ -79,7 +79,7 @@ def test_real_mixed_encoder_concat_preserves_every_frame(tmp_path, monkeypatch):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
-    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.stages.renderer.TEMP_DIR", tmp_path)
     out_cfg = load_config()["output"]
     clips = []
     for i, gpu in enumerate(["nv", "qsv"]):

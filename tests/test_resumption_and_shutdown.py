@@ -6,15 +6,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.database import VlogDatabase
+from src.core.database import VlogDatabase
 from src.pipeline import StreamingOrchestrator
-from src.renderer import build_batch_render, FFmpegProcessRegistry
-from src.timeline import TimelineSegment
-from src.utils import cleanup_temp_artifacts, TEMP_DIR
+from src.stages.renderer import build_batch_render, FFmpegProcessRegistry
+from src.stages.timeline import TimelineSegment
+from src.core.utils import cleanup_temp_artifacts, TEMP_DIR
 
 
 def test_cleanup_continues_after_cuda_failure_and_checkpoints_database():
-    from src.utils import cleanup_resources
+    from src.hardware.lifecycle import cleanup_resources
     db = MagicMock()
     with patch("torch.cuda.is_available", return_value=True), \
          patch("torch.cuda.empty_cache", side_effect=RuntimeError("device unavailable")), \
@@ -25,7 +25,7 @@ def test_cleanup_continues_after_cuda_failure_and_checkpoints_database():
 
 
 def test_cleanup_temp_artifacts_preserves_valid_batches(tmp_path):
-    with patch("src.utils.TEMP_DIR", tmp_path):
+    with patch("src.core.utils.TEMP_DIR", tmp_path):
         b1 = tmp_path / '_batch0_test.mp4'
         b1.write_bytes(b'x' * 1024)
         tmp_b = tmp_path / '_batch1_test.tmp.mp4'
@@ -62,7 +62,7 @@ def test_pure_static_files_marked_for_skip_frame(tmp_path):
         ),
     ]
 
-    with patch('src.renderer._run_batch_render') as mock_run:
+    with patch('src.stages.renderer._run_batch_render') as mock_run:
         mock_run.return_value = 'mock_batch0.mp4'
         build_batch_render(
             segs,
@@ -160,7 +160,7 @@ def test_closed_database_safe_returns_without_error(tmp_path, caplog):
 
 
 def test_ffmpeg_process_registry_interruption_and_error_clean():
-    from src.renderer import _clean_ffmpeg_error
+    from src.stages.renderer import _clean_ffmpeg_error
 
     FFmpegProcessRegistry.reset_interrupted()
     assert not FFmpegProcessRegistry.is_interrupted()
@@ -207,7 +207,7 @@ def test_batch_render_suppresses_progress_error_on_interruption(tmp_path, caplog
         mock_proc = MagicMock()
         mock_proc.returncode = 1  # Windows 下 kill 产生的典型退出码
 
-        with patch("subprocess.Popen") as mock_popen, patch("src.renderer._build_enc_args", return_value=[]):
+        with patch("subprocess.Popen") as mock_popen, patch("src.stages.renderer._build_enc_args", return_value=[]):
             mock_popen.return_value = mock_proc
             with caplog.at_level("INFO"):
                 res = build_batch_render(
@@ -235,7 +235,7 @@ def test_batch_render_suppresses_progress_error_on_interruption(tmp_path, caplog
 @pytest.mark.parametrize("code", [3221225786, -1073741510, 255, 1])
 def test_windows_console_exit_with_nonempty_stderr(tmp_path, monkeypatch, caplog, code):
     FFmpegProcessRegistry.reset_interrupted()
-    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.stages.renderer.TEMP_DIR", tmp_path)
     proc = MagicMock()
     proc.returncode = code
     stderr = (b"Stream #0:0: Video: hevc\nStarting second pass: moving the moov atom\n"
@@ -247,8 +247,8 @@ def test_windows_console_exit_with_nonempty_stderr(tmp_path, monkeypatch, caplog
         kwargs["stderr"].flush()
         return proc
     with patch("subprocess.Popen", side_effect=spawn), \
-         patch("src.renderer._build_enc_args", return_value=[]), caplog.at_level("INFO"):
-        from src.renderer import RenderInterrupted
+         patch("src.stages.renderer._build_enc_args", return_value=[]), caplog.at_level("INFO"):
+        from src.stages.renderer import RenderInterrupted
         def render():
             return build_batch_render(
                 [TimelineSegment(str(tmp_path / "source.mp4"), 0, 0, 5, "STATIC", 5)],
@@ -270,13 +270,13 @@ def test_windows_console_exit_with_nonempty_stderr(tmp_path, monkeypatch, caplog
 
 
 def test_external_interrupt_does_not_retry_virtual_render(tmp_path, monkeypatch):
-    from src.renderer import RenderInterrupted
+    from src.stages.renderer import RenderInterrupted
     FFmpegProcessRegistry.reset_interrupted()
-    monkeypatch.setattr("src.renderer.TEMP_DIR", tmp_path)
+    monkeypatch.setattr("src.stages.renderer.TEMP_DIR", tmp_path)
     monkeypatch.setattr("src.core.config.load_config", lambda: {
         "render": {"virtual_concat_enabled": True, "local_staging_enabled": False},
     })
-    with patch("src.renderer._run_batch_render", side_effect=RenderInterrupted("external signal")) as render:
+    with patch("src.stages.renderer._run_batch_render", side_effect=RenderInterrupted("external signal")) as render:
         with pytest.raises(RenderInterrupted):
             build_batch_render(
                 [TimelineSegment(str(tmp_path / "source.mp4"), 0, 0, 60, "STATIC", 60)],
@@ -288,9 +288,9 @@ def test_external_interrupt_does_not_retry_virtual_render(tmp_path, monkeypatch)
 
 @pytest.mark.parametrize("policy", ["nv_only", "qsv_only", "heterogeneous"])
 def test_render_interrupt_propagates_to_run_and_preserves_batches(tmp_path, policy, caplog):
-    from src.renderer import RenderInterrupted
+    from src.stages.renderer import RenderInterrupted
     from src.pipeline import StreamingOrchestrator
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
     db = VlogDatabase(tmp_path / "interrupted.db")
     fp = str(tmp_path / "source.mp4")
     db.add_file_task(fp, 0, "20260901", "20260901000000", "20260901000100", 60)

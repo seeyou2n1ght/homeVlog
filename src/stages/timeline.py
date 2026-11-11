@@ -12,7 +12,6 @@ from src.algorithms.segment import (
     Segment,
     SegmentState,
     merge_cross_file,
-    segments_from_json,
     split_segments_at_file_boundaries,
 )
 from src.core.config import load_config
@@ -568,34 +567,19 @@ def _parse_row_segments(row: dict, default_offset: float) -> tuple[list[Segment]
     if row.get("prescreen_status") == "STATIC":
         return [], True
     if row.get("segments"):
-        segs = []
-        for s_rec in row["segments"]:
-            # 人工审核绝对优先 (AGENTS.md 铁律): human_label 严格高于 algo_status
-            manual = str(s_rec.get("manual_label") or s_rec.get("human_label") or "").strip().upper()
-            is_human = False
-            if manual in ("CONFIRMED_MOTION", "MISSED_MOTION", "VERIFIED_MOTION", "FN", "TP", "DYNAMIC"):
-                eff_state = "DYNAMIC"
-                is_human = True
-            elif manual in ("FALSE_ALARM", "CONFIRMED_STATIC", "FP", "TN", "STATIC"):
-                eff_state = "STATIC"
-                is_human = True
-            else:
-                eff_state = s_rec.get("state", "STATIC")
-
-            segs.append(Segment(
+        return [
+            Segment(
                 start_time=float(s_rec["start_time"]),
                 end_time=float(s_rec["end_time"]),
-                state=eff_state,
+                state=s_rec.get("state", "STATIC"),
                 source_file=row["filepath"],
                 file_start_offset=float(s_rec.get("file_start_offset", default_offset)),
                 max_energy=float(s_rec.get("max_energy", 0.0) or 0.0),
                 avg_confidence=float(s_rec.get("avg_confidence", 0.0) or 0.0),
-                is_human_reviewed=is_human,
-            ))
-        return segs, True
-    if row.get("analysis_segments"):
-        return segments_from_json(row["analysis_segments"]), True
-    return [], False
+            )
+            for s_rec in row["segments"]
+        ], True
+    return [], row.get("analysis_status") == "ANALYZED"
 
 
 def normalize_file_timeline(timeline):
@@ -736,8 +720,7 @@ def build_timeline_from_rows(
         )
 
     # 长静止段宏观折叠（Macro-collapsing）：夜间/长时间无人静止段下采样，避免生成无意义长视频
-    reviews = [r for row in rows for r in row.get("human_reviews", [])]
-    macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True) and not reviews
+    macro_collapse_enabled = seg_cfg.get("macro_collapse_static", True)
     if macro_collapse_enabled:
         collapsed_filtered = []
         for s in filtered:
@@ -764,8 +747,6 @@ def build_timeline_from_rows(
 
     # 严格按物理文件边界切分，防止跨文件批次渲染时超出物理文件时长
     split_segs = split_segments_at_file_boundaries(filtered, files_meta)
-    from src.stages.feedback import overlay_reviews
-    split_segs = overlay_reviews(split_segs, reviews)
 
     # 若指定 target_files，则快速局部过滤出目标文件的切片
     target_set = set(target_files) if target_files is not None else None

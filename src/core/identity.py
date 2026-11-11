@@ -1,5 +1,9 @@
 """Camera and media identity extraction utilities."""
+from functools import lru_cache
+import hashlib
+import json
 import logging
+import os
 from pathlib import Path, PureWindowsPath
 import re
 import time
@@ -63,3 +67,52 @@ def parse_filename(filename: str) -> dict | None:
         "start_ts": start_ts,
         "end_ts": end_ts,
     }
+
+
+def source_identity(filepath: str | Path) -> list:
+    """Extract canonical path, file size, and modification timestamp as a stable identity triple."""
+    path = Path(filepath)
+    stat = path.stat()
+    if not path.is_file() or stat.st_size <= 0:
+        raise OSError("Visual source is not a nonempty file")
+    return [os.path.normcase(str(path.resolve())), stat.st_size, stat.st_mtime_ns]
+
+
+@lru_cache(maxsize=2048)
+def _resolve_canonical_path(p_str: str) -> Path:
+    return Path(p_str).resolve()
+
+
+def file_identity(path: str | Path) -> list:
+    """Extract canonical path, file size, and modification timestamp without throwing on missing file."""
+    p = _resolve_canonical_path(str(path))
+    try:
+        stat = p.stat()
+        return [str(p), stat.st_size, stat.st_mtime_ns]
+    except OSError:
+        return [str(p), None, None]
+
+
+def processing_fingerprint(filepath: str | Path, config: dict) -> str:
+    """Deterministic hashing of media file identity and analysis configuration parameters."""
+    from src.core.config import PROJECT_ROOT
+
+    selected = {
+        key: config.get(key, {})
+        for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")
+    }
+    model = Path((selected.get("yolo") or {}).get("model_path", "models/yolo11m.pt"))
+    if not model.is_absolute():
+        model = PROJECT_ROOT / model
+    payload = [
+        2,
+        [file_identity(filepath)],
+        "analysis-v5-ordered-prescreen-prior",
+        "analysis",
+        0,
+        {},
+        {},
+        selected,
+        file_identity(model),
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()

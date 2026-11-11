@@ -7,21 +7,7 @@ from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 
-from functools import lru_cache
-
-
-@lru_cache(maxsize=2048)
-def _resolve_canonical_path(p_str: str) -> Path:
-    return Path(p_str).resolve()
-
-
-def file_identity(path):
-    p = _resolve_canonical_path(str(path))
-    try:
-        stat = p.stat()
-        return [str(p), stat.st_size, stat.st_mtime_ns]
-    except OSError:
-        return [str(p), None, None]
+from src.core.identity import file_identity, processing_fingerprint
 
 
 def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config):
@@ -32,11 +18,6 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
     payload = [2 if encoder == "analysis" else 3, [file_identity(p) for p in inputs], filtergraph, encoder, fps,
                output, audio, config, file_identity(model)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-
-def processing_fingerprint(filepath, config):
-    selected = {key: config.get(key, {}) for key in ("detection", "yolo", "audio_vad", "segment", "presence", "micro_motion")}
-    return render_fingerprint([filepath], "analysis-v5-ordered-prescreen-prior", "analysis", 0, {}, {}, selected)
 
 
 def _window_is_continuous(container, stream, boundary: float, duration: float, *, diagnostics=None) -> bool:

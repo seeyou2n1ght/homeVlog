@@ -10,7 +10,7 @@
 import math
 import pytest
 
-from src.segment import (
+from src.algorithms.segment import (
     Segment,
     build_segments,
     split_segments_at_file_boundaries,
@@ -18,7 +18,7 @@ from src.segment import (
     segments_to_json,
     segments_from_json,
 )
-from src.timeline import (
+from src.stages.timeline import (
     TimelineSegment,
     calculate_speed_ramping_curve,
     build_timecode_drawtext_filter,
@@ -79,13 +79,15 @@ class TestSegmentClusteringAndSmoothing:
 
     @pytest.mark.parametrize("ramping", [False, True])
     def test_streaming_plan_is_independent_of_neighbors_and_batch_size(self, ramping):
-        from src.timeline import build_timeline_from_rows
+        from src.stages.timeline import build_timeline_from_rows
         rows = []
         for i, state in enumerate(["DYNAMIC", "STATIC", "DYNAMIC"]):
             rows.append({"filepath": f"{i}.mp4", "file_start_time": f"202609010000{i}0",
                          "file_end_time": f"202609010000{i+1}0", "file_duration": 10,
-                         "prescreen_status": "SUSPICIOUS", "analysis_segments": segments_to_json([
-                             Segment(i*10, (i+1)*10, state, f"{i}.mp4", i*10, avg_confidence=.9)])})
+                         "prescreen_status": "SUSPICIOUS", "analysis_status": "ANALYZED",
+                         "segments": [{"start_time": i * 10, "end_time": (i + 1) * 10,
+                                       "state": state, "file_start_offset": i * 10,
+                                       "avg_confidence": .9}]})
         cfg = {"presence": {"enabled": True}, "segment": {"macro_collapse_static": False}}
         whole = build_timeline_from_rows(rows, "20260901", config=cfg, resolve_presence=False)
         parts = [s for row in rows for s in build_timeline_from_rows([row], "20260901", config=cfg, resolve_presence=False)]
@@ -125,7 +127,7 @@ class TestSegmentClusteringAndSmoothing:
         assert len(dyn) == 0
 
     def test_energy_gated_static_absorption(self):
-        from src.segment import _filter_short
+        from src.algorithms.segment import _filter_short
         # Case A: 强动作 (energy=35.0)，中间短静止 (5s < min_static=8.0s) 被吸收成一个连贯大动态
         segs_strong = [
             Segment(0.0, 10.0, "DYNAMIC", source_file="clip.mp4", max_energy=35.0),
@@ -340,7 +342,7 @@ class TestPresenceAndMicroMotionPlans:
 
     def test_resolve_presence_segments_logic(self):
         """两段确认有人动态之间的静态停顿应升级为 PRESENCE。"""
-        from src.segment import Segment, resolve_presence_segments
+        from src.algorithms.segment import Segment, resolve_presence_segments
         segs = [
             Segment(0.0, 10.0, "DYNAMIC", "f1.mp4", avg_confidence=0.85),
             Segment(10.0, 46.0, "STATIC", "f1.mp4"),  # 36s 停顿 (<=120s)
@@ -353,7 +355,7 @@ class TestPresenceAndMicroMotionPlans:
 
     def test_resolve_presence_segments_skip_large_gap(self):
         """停顿超过 120s 时不自动升级为 PRESENCE。"""
-        from src.segment import Segment, resolve_presence_segments
+        from src.algorithms.segment import Segment, resolve_presence_segments
         segs = [
             Segment(0.0, 10.0, "DYNAMIC", "f1.mp4", avg_confidence=0.85),
             Segment(10.0, 200.0, "STATIC", "f1.mp4"),  # 190s 停顿 (>120s)

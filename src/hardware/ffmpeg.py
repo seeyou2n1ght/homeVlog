@@ -537,6 +537,13 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
     Cleanup waits separately; unconfirmed termination retains ownership and the
     I/O permit rather than admitting another reader over a potentially live one.
     """
+    from src.hardware.scheduler import acquire_with_retry, get_disk_semaphore
+    io_sem = get_disk_semaphore()
+    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
+    if not acquire_with_retry(io_sem):
+        logger.warning("run_ffprobe: io semaphore acquire timeout for %s", filepath)
+        return None
+
     import json
     FFmpegProcessRegistry.reap_cleanups()
     if timeout is None:
@@ -547,13 +554,6 @@ def run_ffprobe(filepath: str, timeout: float | None = None) -> dict | None:
         "-show_format", "-show_streams",
         str(filepath),
     ]
-    
-    from src.hardware.scheduler import acquire_with_retry, get_disk_semaphore
-    io_sem = get_disk_semaphore()
-    # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
-    if not acquire_with_retry(io_sem):
-        logger.warning("run_ffprobe: io semaphore acquire timeout for %s", filepath)
-        return None
     proc = None
     key = f"ffprobe:{id(cmd)}:{_time.monotonic()}"
     completed = False
@@ -618,8 +618,11 @@ def build_hw_decode_args(
     vframes: int | None = None,
     gpu: str = "qsv",
 ) -> list[str]:
-    """Build hardware decode args for light prescreen pass."""
-    if gpu == "qsv":
+    """Build decode args for a prescreen frame sample."""
+    if gpu == "cpu":
+        args = []
+        vf_parts = [f"scale={width}:{height}"]
+    elif gpu == "qsv":
         args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
         vf_parts = [f"scale_qsv=w={width}:h={height}", "hwdownload", "format=nv12"]
     else:
@@ -639,3 +642,58 @@ def build_hw_decode_args(
         args += ["-vframes", str(vframes)]
     args += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     return args
+
+
+def reader_process_state(pid: int, *, handle: int | None = None) -> dict:
+    """Read only: identify a process instance and verify kernel termination."""
+    if os.name != "nt":
+        import psutil
+
+        try:
+            process = psutil.Process(pid)
+            return {
+                "pid": pid,
+                "created": repr(process.create_time()),
+                "platform": os.name,
+                "kernel_ended": process.status() == psutil.STATUS_ZOMBIE,
+            }
+        except psutil.NoSuchProcess:
+            return {"pid": pid, "missing": True}
+
+    import ctypes
+    import _winapi
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    api.GetProcessTimes.restype = wintypes.BOOL
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+
+    owns = handle is None
+    if owns:
+        handle = api.OpenProcess(0x100000 | 0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return {"pid": pid, "missing": True}
+            raise ctypes.WinError(error)
+
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not api.GetProcessTimes(int(handle), *(ctypes.byref(value) for value in times)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        result = _winapi.WaitForSingleObject(int(handle), 0)
+        if result not in (_winapi.WAIT_OBJECT_0, _winapi.WAIT_TIMEOUT):
+            raise RuntimeError(f"Cannot inspect reader kernel state: {result}")
+        return {
+            "pid": pid,
+            "created": str(times[0].dwLowDateTime | (times[0].dwHighDateTime << 32)),
+            "platform": os.name,
+            "kernel_ended": result == _winapi.WAIT_OBJECT_0,
+        }
+    finally:
+        if owns and not api.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())

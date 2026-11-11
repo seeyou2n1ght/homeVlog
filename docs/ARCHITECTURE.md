@@ -18,7 +18,7 @@ docs/DECISIONS.md
 docs/TESTING.md
 ```
 
-当前交付状态与已知问题记录于（性能实测统一见BENCHMARK，交付检查见ACCEPTANCE）：
+当前交付状态与已知问题记录于（性能实测统一见BENCHMARK，验证策略见TESTING）：
 
 ```text
 docs/PROGRESS.md
@@ -46,7 +46,7 @@ HomeVlog 面向长时间家庭监控素材，将全天录像分析、筛选并�
 
 当前候选帧采用 JPEG bytes 形式保存在受限内存池中，并直接供后续 YOLO 批推理消费。
 
-除最终产物、持久化审核代表帧及事务性渲染批次外，不应依赖零碎临时图片作为流水线阶段间接口。
+分析候选帧在内存中流转，渲染阶段仅持久化事务性媒体批次和最终产物。
 
 ---
 
@@ -124,17 +124,13 @@ flowchart TD
     L --> M
 
     M --> N[NVENC Workers]
-    M --> O[QSV Worker]
+    M --> O[QSV / CPU Software Workers]
 
     N --> P[Atomic Render Batches]
     O --> P
 
     P --> Q[Batch Reconciliation]
     Q --> R[Final Vlog]
-
-    J -.-> S[Review / Active Learning]
-    S -.-> K
-    S -.-> T[Training Dataset]
 ```
 
 整个流程可以划分为五个逻辑阶段：
@@ -144,6 +140,18 @@ flowchart TD
 3. Analysis
 4. Timeline Planning
 5. Rendering & Finalization
+
+### 2.1 Subsystem Layering & Directed Acyclic Graph (DAG)
+
+系统严格遵循 4 层单向无环依赖架构，彻底杜绝下层向上层逆向依赖，并已移除 `src/*.py` 根目录下的历史向后兼容门面（Shims）：
+
+- **CLI / Entrypoint**: `main.py`（系统入口、参数解析与启动诊断）
+- **Stages Layer (`src/stages/`)**: 业务流程编排（`scanner.py`, `prescreen.py`, `detector.py`, `timeline.py`, `renderer.py`, `companion.py`, `delivery_recovery.py`）
+- **Algorithms Layer (`src/algorithms/`)**: 纯算法无状态实现（`filters.py`, `motion_trace.py`, `segment.py`, `yolo_verifier.py`, `audio_features.py`）
+- **Hardware Layer (`src/hardware/`)**: 硬件资源与子进程管理（`ffmpeg.py`, `frame_pool.py`, `monitor.py`, `render_cache.py`, `scheduler.py`, `autotune.py`, `lifecycle.py`）
+- **Core Layer (`src/core/`)**: 核心基础库与单一事实源（`database.py`, `config.py`, `identity.py`, `utils.py`, `process_lock.py`）
+
+流水线主协调器 `src/pipeline.py` 位于顶层，直接协调上述模块，层间依赖遵循严格自顶向下调用契约。
 
 启动在加载运行环境前输出提示，初始化后显示本次运行日志路径。扫描目录开始、结束及每 10 秒等待心跳可见于控制台和文件日志；心跳标识当前目录检查、枚举、属性读取或入库操作。仅进度报告在线程中运行，NAS/SQLite 工作仍同步执行；报告线程在扫描成功、异常或取消时收尾。它不为系统调用提供超时或取消保证。
 
@@ -183,7 +191,7 @@ SQLite 运行于 WAL 模式，并配置连接与锁等待策略以支持多 Work
 
 Scanner 只负责低成本文件发现与可直接从路径或文件系统获得的信息。
 
-`src/scanner.py` 不负责昂贵的媒体探测。
+`src/stages/scanner.py` 不负责昂贵的媒体探测。
 
 媒体时长等需要解码或媒体解析才能获得的信息，应在后续分析阶段懒加载并持久化。
 
@@ -193,16 +201,22 @@ Scanner 只负责低成本文件发现与可直接从路径或文件系统获得
 
 记录源媒体内部的时间区间及其语义。
 
-典型字段包括：
+`segments` 表已收敛为纯粹的 9 字段关系表，`duration` 动态通过 SQL `(end_time - start_time)` 计算，外键约束级联生效：
 
-```text
-start_time
-end_time
-state
-max_energy
-avg_confidence
-manual_label
-review_reason
+```sql
+CREATE TABLE segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES file_tasks(id) ON DELETE CASCADE,
+    start_time REAL NOT NULL,
+    end_time REAL NOT NULL,
+    state TEXT NOT NULL,
+    max_energy REAL,
+    avg_confidence REAL,
+    file_start_offset REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_segments_file_id_state ON segments(file_id, state);
+CREATE INDEX idx_segments_file_id ON segments(file_id);
 ```
 
 核心状态包括：
@@ -211,23 +225,20 @@ review_reason
 STATIC
 DYNAMIC
 DYNAMIC_AUDIO
+PRESENCE
+MICRO_MOTION
+NIGHT_STATIONARY
 ```
 
 Timeline 层消费 `segments`，而不是重新执行运动分析。
 
 ---
 
-## 3.3 Human Review State
+## 3.3 Elimination of Review Overrides and Schema Simplification
 
-人工判断属于独立持久事实，不应因为算法重新分析而丢失。
+根据 ADR0082，人工标注与重渲工作台、主动学习反馈和 `visual_features` 已退役。`human_reviews` 是独立历史事实表，仅供历史基准导入及核对。生产分析和时间轴不读取此表，数据库也不再通过触发器维护它。
 
-算法结果可以失效和重新生成，但人工反馈必须跨重新分析保留。
-
-Timeline 重建时：
-
-```text
-human decision > algorithmic decision
-```
+新库以 5 张业务表初始化。旧库不做自动迁移，切换时先保留旧数据库和交付资产的备份，再在隔离目录初始化新库并重新扫描。
 
 ---
 
@@ -264,7 +275,7 @@ Fingerprint 应覆盖会影响分析语义的输入，例如：
 
 Fingerprint 改变时，可以失效算法生成的数据。
 
-人工事实不得被自动失效。
+`processing_fingerprint` 与 `file_identity` 统一收敛至基础层 `src/core/identity.py`，确保基础层对硬件层零依赖。`src/hardware/render_cache.py` 仅 re-export 该函数以维持向后兼容性。
 
 ---
 
@@ -509,7 +520,34 @@ Scheduler 可以根据：
 
 ---
 
+## 8.5 Hardware Auto-Tuning & Dynamic Provisioning (ADR0078)
+
+系统在 `src/hardware/autotune.py` 中实现了硬件自适应画像探测与并发参数推导：
+- **硬件探测**：获取 CPU 逻辑/物理核心数、RAM 总量、CUDA GPU 设备名称与显存总量、NVML 驱动版本，以及 FFmpeg 对 `hevc_nvenc` 与 `hevc_qsv` 的硬件支持；
+- **数学推导**：基于 Little's Law 流水线平衡与显存安全上界（VRAM <= 85%），推导计算出推荐并发向量 $(N_{\text{nv\_enc}}, N_{\text{qsv\_enc}}, N_{\text{nv\_dec}}, N_{\text{qsv\_dec}})$；
+- **分层保全**：当启用 `scheduler.auto_tune: true` 时，仅对缺失的缺省并发参数进行自适应补全，用户专家级显式配置始终享有最高覆盖优先级。
+
+## 8.6 Hysteresis Control in Cooperative Decoding (ADR0079)
+
+在主渲染阶段进行中，`WorkStealingManager.get_analysis_device` 采用滞回比较器（Hysteresis Controller）：
+- 当队列积压达到 `watermark_high` 且显存与槽位安全时，状态跃迁至 `COOPERATIVE_RENDER_COEXIST` 并分配 `cuda`（NVDEC）解码；
+- 跃迁后，只要队列未完全排空至 `watermark_low` 以下，持续保持双轨借调，避免微小队列波动造成的频繁让步抖动；
+- 该机制有效平衡了 QSV 与 NVDEC 的负载，使双 GPU 解码吞吐达到 48~50x 实时速度。
+
+## 8.7 Cost-Aware Heavy Task NVDEC Prioritization & Dual-Ended Scheduling (ADR0080 & ADR0081)
+
+为彻底解决 55 分钟夜间 4K 巨型文件落入慢速 QSV 形成 14 分钟单片长尾阻塞的“算力倒挂”缺陷：
+1. **物理硬件特性对齐**：RTX 3060 Ti (GA104) 物理上仅有 1 个 NVDEC 硬件解码单元。将 `max_nv_decoders` 严格收敛为 1，杜绝多线程竞争单硬件引擎导致的上下文切换与显存带宽争用。
+2. **双端非对称出队（Dual-Ended Scheduling: LPT / SJF）**：
+   - **Worker 0 的 CUDA NVDEC 长作业通道（LPT）**：通过 `get_heavy()` 优先领取时长达到 `scheduler.heavy_file_duration_s` 的文件，长任务出清后协助普通队列。
+   - **Workers 1~6 专职 QSV 短作业收割编队（SJF）**：6 路 Intel UHD 770 QSV 并发消费 3~5 分钟短切片（15s/个），5 分钟内出清全天 125 个短文件；
+   - **QSV 让步**：启用成本优先且队列中仅剩达到重任务阈值的文件时，普通 worker 让出这些任务给 NVDEC。
+3. **单文件批次 NVMe SSD 预暂存直通**：
+   - 扩展 `src/stages/renderer.py`，全天所有文件（包括非 virtual 的单文件长批次）在压制前均通过后台 Prefetch 线程提前拷至本地 NVMe SSD，以 500~680 MB/s 极速读入，彻底消除千兆 SMB NAS 跨网络多区间 Seek 造成的 I/O 气泡与 400 秒长耗时。
+
 ## 8.4 Tail Guard & Dynamic Steal Balancing
+
+实验候选`render.nv_tail_concurrency=3`可在默认NV预算2下借用一个尾段许可；省略该键仍保持原预算。只有预筛/分析队列的unfinished_tasks全部归零、未取消、全部渲染输入派发完毕且原QSV准入/显存检查通过，才允许借用。NV semaphore仍为同一实例，作用域结束撤销空闲额外许可；若全部在用则登记撤销债务，由后续真实租约归还偿还，不提前释放未确认停止的媒体许可。债务未清不允许再次借用。适用于现有按日/机位串行入口，不承诺多个并行Orchestrator间的上游隔离。候选尚未通过单日性能验收，生产默认配置未启用。
 
 临近任务结束时，应避免较慢 Worker 接手可能形成长尾的任务，同时杜绝过早退出导致尾部饥饿。
 
@@ -599,11 +637,11 @@ Timeline 不负责重新分析视频内容。
 
 ## 10.1 Display Plan as Single Source of Truth
 
-`TimelineSegment` 保留分析侧的 `max_energy` 与 `avg_confidence`，供高光元数据消费；它们不参与展示时钟或滤镜选择。裁剪后合并相邻同状态段时，能量取最大值，置信度按保留区间时长加权。人工审核产生的状态不应伪造模型置信度。
+`TimelineSegment` 保留分析侧的 `max_energy` 与 `avg_confidence`，供高光元数据消费。裁剪后合并相邻同状态段时，能量取最大值，置信度按保留区间时长加权。
 
 展示计划显式接收输出帧率，每段目标向上量化到整数帧。视频 `trim=end_frame` 与音频目标同钟；字幕、高光、批次校验均传入相同 fps。每段最多增加不足一帧的尾部展示时间，避免音视频 concat 按较长轨道推进产生未计入计划的累积偏差。
 
-合法源区间不因短于 0.1 秒而扩展，也不把人工审核边界延伸到 EOF 之外。最小输出帧数属于展示计划；视频采样至少一帧的保护不修改源时间映射（ADR 0035）。
+合法源区间不因短于 0.1 秒而扩展，也不会越过 EOF。最小输出帧数属于展示计划，视频采样至少一帧的保护不修改源时间映射。
 
 音频按目标样本数 `atrim=end_sample` 闭合，不能仅按源 PTS 时长截断后重排时间戳，否则摄像机重叠 PTS 会留下多余样本。最终 ffconcat 使用每批视频 duration；视频保持 stream copy，音频重新对齐 PTS 后编码，避免 AAC 延迟/尾部填充制造视频接缝空洞与音频 DTS 回退。
 
@@ -625,27 +663,15 @@ Wall-clock mapping
 
 不得分别实现自己的展示时长计算。
 
-流式批次与伴随资产均使用 `build_timeline_from_rows(..., resolve_presence=False)`：按文件独立构造，保留人工纠正，不重新进行跨文件 presence 分类/合并。伴随资产生成只读数据库。重叠区间归一化由 timeline 共用实现按文件独立处理；变速过渡不跨源文件边界，避免批次大小影响展示计划。
+流式批次与伴随资产均使用 `build_timeline_from_rows(..., resolve_presence=False)`：按文件独立构造，不重新进行跨文件 presence 分类/合并。伴随资产生成只读数据库。重叠区间归一化由 timeline 共用实现按文件独立处理；变速过渡不跨源文件边界，避免批次大小影响展示计划。
 
 成片映射绑定计划fps而非容器平均fps：复用disk预算遍历视频访问单元，PTS排序处理B帧，数量必须等于计划帧数，所有PTS必须落在计划整数帧网格（最多一个time_base tick舍入、原点最多一帧）。媒体大小/mtime验证前后不变才发布身份；mapping.fps与media_identity.fps相等。该过程只读取封装包，不解码画面，不替代完整A/V/画质验收；无法对应一包一帧的封装布局拒绝绑定。旧交付查询可返回不可用映射；新交付必须AVAILABLE才生成字幕/元数据，否则沿已有失败路径阻止正式发布及COMPLETED，保留旧资产及有效批次（ADR0054）。
 
 ---
 
-## 10.2 Human Override
+## 10.2 Deterministic Algorithmic Condensation
 
-时间轴生成时，人工标签优先于算法判定。
-
-例如：
-
-```text
-FP
-→ force static
-
-FN
-→ force dynamic
-```
-
-人工纠正必须能够在重新运行 Timeline 时稳定复现。
+时间轴生成完全遵循确定性算法规则与传感器客观特征（运动能量、VAD、YOLO 目标置信度及微动粘合）。系统不再维护任何人工标签优先覆盖分支，实现全自动无人值守浓缩。
 
 ---
 
@@ -756,7 +782,7 @@ tpad → fps → trim=end_frame={planned_frames} → setpts=PTS-STARTPTS
 
 # 11. Rendering Architecture
 
-审核计划对比独立记录非静态事件保留和播放诊断：MICRO_MOTION/NIGHT_STATIONARY属于加速保留，不能一律算作整段遗漏。区间展示计量来自共享计划，部分重叠按比例分摊；清晰度仍须实片验证。审核标签库存不等于重放混淆矩阵，代表帧不自动认证整段或目标框真值（ADR0043）。
+MICRO_MOTION 和 NIGHT_STATIONARY 属于加速保留。区间展示时长来自共享计划，播放清晰度仍须实片验证。
 
 Rendering Pipeline 使用流式异构 Worker，而不是等待全天分析完全结束后再统一启动。
 
@@ -985,79 +1011,21 @@ QSV 以 `global_quality` 使用 ICQ，不混用 `maxrate/bufsize`。渲染接管
 
 ---
 
-# 17. Human Event Review
+# 17. Headless Execution Contract (Audit Workbench Retired)
 
-当前闭环为分析 → 人工事件复核 → 持久区间覆盖 → 重渲/日常观看。训练、人工目标框、智能体目标建议、交互调参和基准管理已经退役（ADR0076）。模型检测仍属于生产分析，事件标签不自动变成目标框真值。
-
-## 17.1 Review Data and Override Contract
-
-人工审核结果必须保存在独立持久字段（如 `segments.manual_label` 与 `human_reviews` 表），而不是直接覆盖算法原始特征分析值。
-
-撤销审核在同一数据库事务中清除当前切片投影并撤销其源区间内的持久标签。重分析改变边界后，交叉审核区间只移除交集，区间外标签/备注/归档引用保留；已存在的精确区间记录不被拆分记录覆盖。已归档图片不自动删除（ADR 0035）。
-
-系统同时保留：
-```text
-algorithm predicted (algo_status, energy, confidence)
-human corrected (manual_label, notes, review_timestamp)
-```
-
-时间轴重构时，遵循最高优先级覆盖法则：
-- **`FALSE_ALARM` (FP) / `CONFIRMED_STATIC` (TN)**：在成片中强制降级为纯静态抽帧段，彻底滤除光影假阳性；
-- **`MISSED_MOTION` (FN) / `CONFIRMED_MOTION` (TP)**：在成片中强制提升为常速动态段，挽救关键家庭瞬间。
+HomeVlog operates strictly as a headless CLI pipeline. The web audit workbench (`scripts/audit_tool/`), frame archival (`src/stages/archiver.py`), and manual review endpoints are retired per ADR0082. All timeline and segment outputs are generated algorithmically.
 
 ---
-
-## 17.2 Frame Archival
-
-统一FrameArchiver保留审核代表帧与来源清单。优先源媒体，失败可使用当前区间内可追溯内存样本，须诊断；归档失败不应使事件审核丢失。归档不再提供训练或目标框导出。
-
-## 17.5 Audit Service API Contract
-
-审核工作台后台提供轻量 RESTful API 契约（`scripts/audit_tool/app.py`）：
-
-- **`GET /api/overview`**：获取已审进度与显式标签库存；未指定独立生产重放时 Precision / Recall / F1 为 null。
-- **`GET /api/anomalies`**：获取按类别（`fp_suspect`, `fn_suspect`, `jitter`, `reviewed`）过滤及能量排序的争议切片队列。
-- **`GET /api/review_queue`**：读取完整segments库存及服务端范围计数，支持日期、机位（含0）、状态、显式场景、字面搜索、隐藏已审、limit≤200及offset分页；all为完整范围，旧anomalies语义保留。计数和页项处于同一只读事务，已有事务不提交。精选按同源5分钟/状态/场景分组，优先争议/能量代表并跨日期机位轮询；代表数量不提供隐藏成员ID，裁决仅影响实际复核项，不认证视觉相似。random按seed/id的BLAKE2b排序；同库存/范围/种子复现，变化后需重新记录页身份。未审全库不是独立负例真值。
-- **`GET /api/delivery_comparison` / `GET /api/delivery_stream`**：按segment_id读取交付自带的全部状态/整数帧映射及已提交审核历史，返回覆盖源审核区间的完整展示分段，包含上下文；不按比例伪算源窗口帧范围。元数据绑定大小/mtime及已核验帧数/FPS，读取与播放分别验证；播放使用已打开文件句柄，版本变更返回409。旧交付无映射则不可定位，不能由当前审核/配置反推旧版本。
-- **`GET /api/file_segments`**：获取单视频全量时序切片元数据及审核状态。
-- **`GET /api/review_context`**：按已登记segment_id在只读事务中读取完整源分析/审核行，返回当前全局与机位解析值、全局显式值标记、场景/备注及共享展示计划上的分析/人工覆盖对比；不把计划当作渲染或准确度实测。已有调用方事务保留。
-- **`GET /api/frame`**：单帧提取接口，支持 `w=640` 缩略图与 `w=1920` 超高清原画；源不可访问或抽取失败返回错误，不用占位图冒充源帧。
-- **`POST /api/yolo_detect`**：按需对指定峰值时刻运行目标检测并返回边界框与置信度。
-- **`POST /api/review`**：提交人工裁决，合法标签：`CONFIRMED_MOTION` (TP) | `FALSE_ALARM` (FP) | `MISSED_MOTION` (FN) | `CONFIRMED_STATIC` (TN)。
-- **`GET /api/export`**：导出带 UTF-8 BOM 的分析报表（CSV / JSON 格式）。
-- **`GET /api/rerender_plan`**：只读捕获日期/机位审核与有效配置快照，复用实际批次计划及缓存媒体校验，报告主路径预计展示时长、源文件、审核覆盖和可复用批次；不启动编码、不暂存原片、不覆盖已有EDL。
-- **`POST /api/rerender` / `GET /api/rerender_status`**：异步重建日期/机位成片；可提交预览的expected_snapshot，审核/配置变化则拒绝启动。状态包含捕获的snapshot_sha256及实际逐批缓存决策、备用路径尝试和完成状态。
-- **`GET /api/video_stream`**：基于 HTTP 206 Partial Content (Range Requests) 的流媒体成片在线预览分发。
-
-服务仅接受 loopback Host 与同源 Origin。页面首次加载取得随机 `HttpOnly`、`SameSite=Strict` 令牌 cookie，所有写请求必须携带该令牌；媒体参数只允许数据库已登记路径或 `OUTPUT_DIR` 下的已渲染视频，并严格限制请求体及数值范围。
-
-预览缓存绑定规范化完整源路径、大小、mtime_ns与实际FFmpeg寻道/分辨率参数；使用唯一临时文件，仅在成功、非空且源身份未变化后原子发布。旧缓存不删除、不复用；大小/mtime检查不宣称能识别保留同一stat的内容替换。动态帧/动图响应no-store，重新加载队列清除前端预取集合。短动图最多6秒、无声，不扩张短区间；完整复核入口使用队列明确的文件内区间，播放原片及声音，到区间终点附近暂停（受浏览器事件延迟影响，非逐帧裁剪）。关闭或切换审核项释放视频源；J/K仍切换审核项，播放器打开时禁止盲打标签，避免旧视频与新裁决错配。
-
-审核重渲染要求全部必需源文件可访问；SKIPPED_EMPTY / SKIPPED_EXCLUDED / SKIPPED_CORRUPT 终态复用统一排除规则，不再探测或渲染，仍记录于伴随资产。未知源大小用 null，只有确认零字节才用 0。使用只读逐文件 timeline 与实际渲染行快照生成伴随资产。单任务取消只设置本任务令牌，不得触发全局 FFmpeg 中断。
-
-审核行集合在数据库锁内的只读事务中捕获，已有调用方事务不被提交或回滚；分析行、审核行及伴随资产均使用捕获集合。预览是主路径当前可复用性，不保证执行期间源/缓存未变化或不会触发备用路径；实际执行再次校验，指纹还包含编码器/源stat/模型/完整配置，不能从审核条数推断失效原因。build_batch_render的inspect_only模式仅返回计划路径（不是完成媒体），cache_observer读取共享运行路径的决策；默认执行语义、租约及FFmpeg生命周期不变。当前审核仍使用既有配置编码器（默认NV），不会自动采用旧QSV批次的设备分配。
-
-取消请求进入CANCELLING，当前批次结束后才进入CANCELLED；终态已写但旧线程仍存活时也拒绝同键新任务。提交资产和成功终态共用取消锁，提交完成后不再接受取消。状态返回深复制，前端读取错误不当作任务结束；只读预览及执行结果使用no-store。同进程线程保护沿用ADR0044；主流程与工作台的跨进程数据库/临时目录/输出认领见ADR0052，不能据此声明多资产断电原子性。
-
-
-
-参数窗从当前配置初始化，只提交用户实际修改的全局字段，明确展示机位覆盖可能使值不变；不将初始值解释为推荐。expected_sha256校验预览配置版本。是否可复用同配置预测，要比较所有参考机位的完整有效配置，不能只比较展开后的全局字典；显式填入与全局默认相同的数值仍可能改变机位继承。ProductionReplayStore.measure在同一次收据校验中返回保留、展示详情与身份，避免为详情重复读取模型/源stat；两侧代码/模型/运行库/完整源集合身份不同则UNAVAILABLE。sample_changes报告每条冻结参考的保留、状态与比例展示贡献，并附两侧收据hash；缺失详情标为未测，不回填旧摘要。
-
-解码完成必须有正常 EOF 或已确认的媒体解码错误后可用前缀；85%/完整帧覆盖不能覆盖非零进程退出、超时、中断、I/O或内存错误。PyAV只有 InvalidDataError/EOFError 可进入前缀保留路径。采样误差允许2个采样周期，超过则记录提前EOF。file_tasks.decode_completion 保留声明/可用时长、采样周期、完成原因和失败上下文，重析复用声明范围；伴随资产 unavailable_source_ranges 明确标识未交付尾段，其范围依据是媒体声明时长，不宣称这些时段曾实际录制。正常媒体不因不足一个采样周期而收缩源时间轴。
-
-已知启发式生成的历史标签不能冒充人工覆盖；旧定向隔离工具已随基准管理退役。既有隔离记录和人工事实保持，本轮不执行数据修补或标签迁移。
-
-伴随资产 source_duration_by_state_s 按全部时间轴状态统计源时长；完成卡分别显示动态、声音、有人驻留、微动、静态与夜间驻留，不能把仅动态/静态两项之和称为完整内容分布。
-
----
-
-审核概览由get_review_inventory统计显式人工标签，Precision/Recall/F1保持null；不依赖调参模块。配置与归因只读显示有效配置和共享计划对比，人工审核持久化仍保留原合同。
 
 # 18. Configuration Contract
 
 `config/settings.yaml` 是用户可配置运行行为的入口之一。
 
-配置路径与缓存由 `src.core.config` 单独持有。`src.utils` / `src.core.utils` 的旧名称动态读取核心状态，不保留缓存快照；旧入口的显式 `SETTINGS` / `CONFIG_PATH` 赋值在下一次旧入口加载时作为覆盖消费。覆盖应用与加载共用可重入锁，核心重载不会被旧快照回写。非法配置不替换有效缓存，显式和 wildcard 导入保持兼容（ADR 0033）。
+配置路径与缓存由 `src.core.config` 持有。非法配置不替换有效缓存。生产调用方使用分层模块的规范入口。
+
+CLI、单源诊断和隔离基准在加载配置时提供硬件调优函数。调优补全未声明的值，配置层在发布缓存前验证结果。
+
+`pipeline.render_gpu_policy: cpu_only`（别名 `software`）为预筛、分析和渲染选用软件路径。此模式跳过硬件自动调优，使用 `render.max_concurrency` 配置 CPU 渲染线程数量，并继续计入共享 I/O 预算。
 
 配置必须满足：
 
@@ -1084,8 +1052,6 @@ runtime branch with undocumented configuration semantics
 Preset / tier 等枚举配置必须具有明确的代码消费逻辑。
 
 展开后的 ResolvedConfig 仍是字典，并携带未序列化的原始显式配置及展开快照；重新解析机位/预设时从显式来源重建默认值，保留展开后 CLI 等运行覆盖。优先级为机位 overrides > 全局专家显式值 > 经灵敏度缩放的机位预设。调用方把有效机位配置显式传给批次渲染、滤镜、校验指纹、字幕和元数据；不能在内部重新加载全局配置取代它。
-
-工作台配置变更持有核心配置加载锁覆盖读/改/备份/原子替换/加载，使用唯一临时文件与不可覆盖备份；失败加载恢复旧文件和缓存。预览内容哈希改变时拒绝写回（HTTP409）。回滚使用同一边界。另按规范化配置路径持有同目录内核写者锁，覆盖读取、预览SHA校验、提交、加载及失败回滚；竞争请求返回ConfigurationConflict/HTTP409。锁文件残留不是占用，不在运行中删除。仅约束使用这些入口的本地主机写者，不保护绕过API的编辑器（ADR0069）。
 
 ---
 
@@ -1151,7 +1117,7 @@ HomeVlog 的性能调优与资源限额锚定在标准生产硬件拓扑：
 - hardware concurrency ownership 变化；
 - render batch transaction semantics 变化；
 - retry / recovery semantics 变化；
-- human feedback precedence 变化；
+- algorithmic condensation rules or speed tier contract 变化；
 - cross-hardware concat strategy 变化。
 
 发生这些变化时：
@@ -1193,13 +1159,13 @@ HomeVlog 的性能调优与资源限额锚定在标准生产硬件拓扑：
 ### Timeline
 
 - Display Plan 是否仍然只有一个来源？
-- 人工标签是否仍优先？
+- 时间轴是否保持确定性纯算法推导且无人工分支？
 - Source / Display 时间映射是否保持一致？
 - 时间轴末端是否完整闭合？
 
 ### Persistence
 
-- 算法失效是否错误清除了人工事实？
+- 数据库 Schema 是否严格保持 9 字段且外键级联有效？
 - Config 与代码是否存在失配？
 - 是否引入只存在于运行时内存中的关键跨会话状态？
 
@@ -1230,49 +1196,3 @@ docs/TESTING.md
 ```
 
 测试策略、验证命令、硬件测试规范与质量验收基线。
-
-
-交付映射与审核历史（ADR0047）：companion按partition_timeline_by_batches、normalize_file_timeline及compute_display_plans生成全部状态的连续整数帧范围，与实际容器帧数/FPS不符时仅映射UNAVAILABLE。审核promote_vlog_assets显式keep_previous=True，在成功提交后发布review_history.json，保留已迁移的旧包；失败/取消仍走原回滚，索引发布失败保留恢复目录并报告错误。历史不自动清理，普通流水线默认keep_previous=False。媒体大小/mtime身份不等于完整内容hash；不保证同stat替换或进程骤停/断电时的多文件原子性。
-
-
-视觉索引与来源（ADR0048）：visual_features是独立于人工标签的可重建派生表，绑定segment_id及源路径/分段边界/offset、大小/mtime、时刻、描述子与采集方式；重分析删除旧派生行。正常MotionDetector复用现有gray帧，最多2,048个描述子，按分析采样时钟选择区间内代表，特征失败诊断后不改变分类结果。历史index_source只稀疏寻道，不另跑整片分析；单CPU线程与现有disk准入、源前后身份/分段布局核对、事务/savepoint发布，有效完整索引不再解码。历史补建的独立源读者生命周期及截止预算见ADR0051；正常分析、扫描和查询的直接NAS访问不因此获得硬截止保证。
-
-review_queue新增visual类别和reference_id：256位灰度dHash距离占0.75、16档量化亮度分布L1距离占0.25，结果按距离/id排序；这是整体像素近似，不是人物识别、事件等价或置信概率。captured_index_items为范围内有效描述子捕获量，indexed_items为本筛选匹配量，页项再核对当前源身份；未知/失效项不补成负例。索引本身不写人工标签，不提供相似成员裁决ID。POST /api/index_visual_source限定已登记segment所属单源，复用当前索引或受控补建；批量补建经显式CLI范围和报告。
-
-归档清单v2绑定源身份/图SHA/请求位置/时刻类型。唯一临时图只在成功非空且源未变时发布；不再按文件名借用任意磁盘缓存。内存兜底只选当前区间内已有解码样本，保留分析采样时刻，不能冒充当前源身份或原片逐帧PTS。v1图片/事件标签不自动成为可信图像或目标框真值。
-
-
-流式`MotionTrace`不支持帧下标；正常分析的视觉描述子在消费灰度帧时按源预计采样量稀疏收集，最多2,048项，保持原运动标量计算和单次解码。只有当前源完成、源身份匹配并持久化最终分段后才发布派生索引；音频快速路径不使用复用detector的旧视觉样本。描述子仍为分析采样时钟，不能代替逐帧PTS或事件真值。
-
-
-库存补建CLI（ADR0048/0051）：报告读取/原子保存由同目录内核写者锁保护并绑定数据库；历史完成须当前完整派生行可复用，缺帧记PARTIAL，错误记FAILED并非零退出。新源优先，已知同身份未完成显式重试；source-file限定原片，source-budget-s限定独立读者启动、源元数据及采样的累计壁钟。父进程持有现有disk准入，Windows Job在读者开始源I/O前绑定，父进程消失后终止读者；Linux使用父死亡信号（当前Windows验收，Linux未实测）。内存JSON只传描述子，读者不打开数据库或调用方应用入口。父进程超时/取消终止并等待读者，无法确认停止时终止整轮；发布前及事务结束前检查取消，失败回滚旧派生行。初始I/O准入和SQLite发布不计入源读取预算。RUNNING/active_source先持久化；骤停遗留RUNNING不证明进程仍活跃。目录锁不替代生产跨进程认领或另一报告目录写者保护。
-
-独立读者管道收尾：后台stdout/stderr线程持有自己的Windows线程句柄；父进程关闭缓冲流前先请求取消这些线程的同步读取，并在共享2秒预算内等待。线程仍存活时抛出VisualReaderStopError并终止整轮，避免主线程等待缓冲流锁；子进程退出本身不证明读取线程已退出。该边界不保证所有NAS驱动请求立即取消，也不覆盖正常分析、扫描或工作台直接读取。
-
-Windows终止确认另使用真实进程句柄等待内核结束信号（最多5秒），不依赖已缓存的Popen退出码/wait返回值。实际NAS源读取曾出现退出码0、进程对象未结束且原生read仍未收尾；无法确认内核结束时抛出VisualReaderStopError，整轮停止，不扩展新源。源预算不包含这5秒终止确认及2秒管道收尾预算；硬截止失败不代表驱动请求已经取消，后续恢复先核查旧读者终态。
-
-同报告跨轮恢复在数据库打开前检查历史active_reader：源读者绑定Job后、发送原片路径前持久化PID与创建身份。匹配实例仍未结束时拒绝新的源准入；不存在、已结束或PID创建身份变化可继续，并在新尝试记录只读核查结果，不删除旧尝试。检查点发布失败先停止读者，不进行源读取。旧READER_STOP_FAILED缺身份拒绝自动猜测；遗留RUNNING本身不证明活跃。该门禁只覆盖同报告/本地主机，不替代跨报告/跨主机总预算、生产认领或正常分析/其他读者管理。
-
-跨进程认领（ADR0052）：公开process_date_cam（含仅分析/force）及审核实际线程，持有数据库路径/日期/机位、整个TEMP_DIR与具体交付路径的内核锁直至收尾。共享临时目录的不同日期也互斥，以保护无日期隔离的暂存清理和进程内硬件预算；不同实验工作区仍须遵守已有测量并发约束。普通历史COMPLETED只读跳过保持。重析先认领工作区和全部所选数据库组，冲突零业务修改；临时清理认领同一工作区。固定顺序非阻塞取得，冲突显式失败，部分取得回收，进程骤停内核释放；锁文件残留不是状态。工作台取得锁后重新核对输入快照。多资产中断恢复遵循ADR0053；物理断电一致性仍未认证。
-
-交付包恢复（ADR0053）：替换前transaction.json绑定输出/入口/日期机位、完整旧/新内容身份与manifest指纹；调用方manifest和状态提交后写COMMITTED。持有现有数据库/工作区/输出认领时，PREPARED包先全量校验，保留中断候选再原子复制旧资产；身份漂移、路径越界/链接、多个中断包或旧无内容身份包拒绝猜测。主流程恢复后写PENDING再RECOVERED，COMPLETED不能绕过未提交包；恢复期间再次中断可重复进入。已提交审核包历史标记缺失在下一次写入入口补建，读接口保持只读。恢复包不自动删除，完整hash/复制受现有I/O预算控制。当前只有实际进程骤停验收，物理断电和SQLite NORMAL持久性不由此保证。
-
-维护入口边界：历史COMPLETED快捷返回前，以数据库保存的交付路径检查旧仅路径恢复包；相关包或无法解析的旧映射拒绝跳过，保留业务行与资产。正常离线交付仍可跳过，成功审核历史不误判为中断包（ADR0053）。诊断截帧复用run_ffmpeg与I/O准入，执行预算15秒、准入3秒；未确认停止原样传播，预算不涵盖外部文件系统调用。旧音频修复入口仅只读统计，旧阈值CLI不接受配置应用；不从局部事件阴性推断完整文件无活动。
-
-补充ADR0069：显式源排除先认领同一数据库日期/机位，活动任务冲突时零修改并返回HTTP409。粗筛/分析写回以SQL条件保护SKIPPED_EXCLUDED，迟到分析不替换旧分段/视觉索引；最终时间轴仍跳过排除源。交付准备在.delivery_preparing_*中完成内容身份和完整transaction.json，再同目录重命名为.delivery_backup_*，此后才允许移动资产。准备异常清理当前目录；准备中骤停遗留目录不参与恢复，也不自动全局清理。已有旧恢复包的保守拒绝保持。
-
-补充ADR0070与ADR0071：时间轴滤镜生成末端统一使用整数样本时钟（`asettb=1/<sr>,asetpts=N`），消除浮点PTS在一采样点上的舍入偏差；高分段批次通过`GroupedAudioPlan`以48段有界分组直接读取源输入，解除复杂滤镜图引起的CPU与GPU编码器空转争用。Pass 1.5 解码耗时通过独立非侵入工具度量，确立GPU显存内直接下采样的性能契约；交付流采用原子重命名，常规交付无物理大文件拷贝。
-
-
-
-### 日常观看导出（ADR0075，选择依据由ADR0076收敛）
-
-`scripts/audit_tool/watch_export.py`只消费已交付帧序列和冻结分析，不进入分析、重渲替换或训练流程。来源关联使用规范化完整路径及文件内区间重叠；analysis的start/end减file_start_offset，人工审核保留其文件内区间。每个父映射段保存完整去向和全部相交证据，混合人工负/正不提升为整段阳性。普通候选按半小时墙钟组轮询，优先项超预算返回BUDGET_CONFLICT。
-
-preview/start绑定父媒体stat/帧钟原点、映射SHA、冻结分析/审核内容摘要、源stat及实际载入的exporter/FFmpeg实现SHA。源身份只代表路径、大小和mtime，不能检测保留相同stat的内容替换。父成片非零原点参与精确解码裁剪；每段视频整数帧闭合，音频48k整数样本时钟，临时段使用PCM，最终仅一次AAC编码。逐段包帧钟和最终完整AV解码均通过后，独立pending目录原子改名为不可变版本。
-
-worker复用day_task_lease、VideoLease、受管FFmpeg；完整AV验证使用disk准入并finally归还。run_ffmpeg的可选cancel_event只终止该次调用拥有的进程树，不设置全局中断；未知停止仍沿原MediaTerminationUnconfirmed保留租约。日期任务/共享workspace/具体导出目标锁防止旁路硬件任务；不改render_tasks。取消/失败保留独立尝试目录，无完成发布。
-
-工作台懒初始化受锁保护；清单完整分页、身份核验后Range流播放。冻结清单只读，不使用旧segment_id写裁决。原片回看使用冻结的通用源区间并核对绑定源stat，失联或变化拒绝；无历史实验附件适配。
-
-日常选择policy为whole-delivery-segments-round-robin-v2，优先级仅来自当前持久human_reviews；不读取scratch、不复用固定实验案例、不新增历史观察库存。capture/manager接口没有scratch参数。当前实现SHA进入快照，旧快照不得作为新生成版本身份。共享replay_evidence/replay_journal仍提供交付恢复、哈希、原子JSON、租约和完整负载测量工具，不随调参入口删除。

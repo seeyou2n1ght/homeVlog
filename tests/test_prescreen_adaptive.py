@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from src.prescreen import (
+from src.stages.prescreen import (
     _calc_dynamic_threshold,
     _calc_spatial_concentration,
     _prescreen_keyframes,
@@ -39,6 +39,7 @@ def test_stream_fps_native_unconfirmed_stop_retains_original_lease(monkeypatch, 
     monkeypatch.setattr(scheduler, 'get_qsv_semaphore', lambda: hardware)
     started = []
     real_start = registry.start
+    real_wait_for_exit = registry.wait_for_exit
     report = {'scope': 'local Python/CPU only, injected stop no-op and wait timeout'}
 
     def start(key, command, **kwargs):
@@ -60,6 +61,10 @@ def test_stream_fps_native_unconfirmed_stop_retains_original_lease(monkeypatch, 
         return proc
 
     monkeypatch.setattr(registry, 'start', start)
+    # Exercise the real kernel wait with a short test budget. The child is
+    # deliberately kept alive until the test confirms that its lease is retained.
+    monkeypatch.setattr(registry, 'wait_for_exit',
+                        lambda proc, timeout=5: real_wait_for_exit(proc, timeout=min(timeout, 0.05)))
     began = time.monotonic()
     try:
         error = None
@@ -95,7 +100,7 @@ def test_stream_fps_native_unconfirmed_stop_retains_original_lease(monkeypatch, 
             if not registry.has_exited(proc):
                 kill()  # The vulnerable baseline may already have detached this key.
             registry.terminate(key)
-            registry.wait_for_exit(proc, timeout=5)
+            real_wait_for_exit(proc, timeout=5)
             close()
             if key in registry._deferred:
                 for reader in registry._deferred[key]['readers']:

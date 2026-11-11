@@ -150,7 +150,7 @@ def test_detector_unknown_stop_retains_reader_and_blocks_fallback(tmp_path, monk
     from unittest.mock import MagicMock
     from src.hardware.ffmpeg import FFmpegProcessRegistry as registry, MediaTerminationUnconfirmed
     from src.hardware.scheduler import FileBudget
-    from src.core.visual_index import reader_process_state
+    from src.hardware.ffmpeg import reader_process_state
     from src.stages.detector import MotionDetector
     from src.hardware import scheduler
     monkeypatch.setattr(registry,'_processes',{})
@@ -232,7 +232,7 @@ def test_detector_watchdog_stops_cached_zero_process_with_stdout_still_open(tmp_
     import threading
     import time
     import _winapi
-    from src.core.visual_index import reader_process_state
+    from src.hardware.ffmpeg import reader_process_state
     from src.hardware import scheduler
     from src.hardware.ffmpeg import FFmpegProcessRegistry as registry
     from src.stages import detector as detector_module

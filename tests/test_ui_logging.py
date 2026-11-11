@@ -12,7 +12,7 @@ from src.ui import (
     print_error_summary,
     print_scan_results,
 )
-from src.utils import (
+from src.core.utils import (
     setup_logging,
     get_logger,
     register_dashboard,
@@ -338,7 +338,7 @@ def test_batch_summary_table_and_status_table(tmp_path, capsys, monkeypatch):
     from src.ui import print_batch_summary_table, print_status_table
     from src.ui import console
     monkeypatch.setattr(console, "width", 220)
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
 
     # 1. 批量全景表
     mock_batch = [
@@ -418,7 +418,7 @@ def test_plain_progress_tracker(capsys):
 def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
     from unittest.mock import MagicMock
     import main as cli
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
 
     db = VlogDatabase(tmp_path / "cli.db")
     db.add_file_task("clip.mp4", 0, "20260320", "20260320000000", "20260320000100", 60)
@@ -428,8 +428,8 @@ def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
     monkeypatch.setattr(cli, "process_date_cam", lambda *a, **k: success)
     monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
     monkeypatch.setattr(cli, "check_disk_space", lambda *_a: True)
-    monkeypatch.setattr("src.monitor.get_monitor", lambda: MagicMock())
-    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr("src.hardware.monitor.get_monitor", lambda: MagicMock())
+    monkeypatch.setattr("src.core.config.OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
     if success:
         cli.main()
@@ -446,7 +446,7 @@ def test_cli_reports_actual_run_outcome(tmp_path, monkeypatch, capsys, success):
 def test_cli_disk_stop_is_not_success(tmp_path, monkeypatch, capsys, selected):
     from unittest.mock import MagicMock
     import main as cli
-    from src.database import VlogDatabase
+    from src.core.database import VlogDatabase
     db = VlogDatabase(tmp_path / "disk_cli.db")
     db.add_file_task("clip.mp4", 0, "20260320", "20260320000000", "20260320000100", 60)
     monkeypatch.setattr("sys.argv", ["main.py", "--no-tui"] + (["--date", "20260320"] if selected else []))
@@ -458,8 +458,8 @@ def test_cli_disk_stop_is_not_success(tmp_path, monkeypatch, capsys, selected):
     monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
     monkeypatch.setattr(cli, "run_pipeline", lambda **_k: {"total": 1, "ok": 0, "failed": 0,
                           "remaining": 1, "stopped_reason": "LOW_DISK_SPACE"})
-    monkeypatch.setattr("src.monitor.get_monitor", MagicMock())
-    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr("src.hardware.monitor.get_monitor", MagicMock())
+    monkeypatch.setattr("src.core.config.OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
     try:
         with pytest.raises(SystemExit) as caught:
@@ -479,8 +479,8 @@ def cli_workspace(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
     import main as cli
-    from src.database import VlogDatabase
-    from src.segment import Segment
+    from src.core.database import VlogDatabase
+    from src.algorithms.segment import Segment
     db = VlogDatabase(tmp_path / "selection.db")
     original_close = db.close
     for date in ("20260901", "20260902"):
@@ -489,8 +489,11 @@ def cli_workspace(tmp_path, monkeypatch):
             db.add_file_task(source, cam, date, date + "000000", date + "000100", 60)
             db.set_prescreen_result(source, "SUSPICIOUS")
             db.set_analysis_result(source, [Segment(0, 60, "STATIC", source)])
-            seg_id = db.get_segments_for_file(source)[0]["id"]
-            db.update_segment_review(seg_id, "FN")
+            db.conn.execute(
+                "INSERT OR REPLACE INTO human_reviews (filepath, start_time, end_time, manual_label, reviewed_at) VALUES (?, 0.0, 60.0, 'FN', datetime('now', 'localtime'))",
+                (source,),
+            )
+            db.conn.commit()
     processor = MagicMock(return_value=True)
     cleanup = MagicMock()
     monitor = MagicMock()
@@ -502,8 +505,8 @@ def cli_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "cleanup_resources", lambda: None)
     monkeypatch.setattr(cli, "cleanup_temp_artifacts", cleanup)
     monkeypatch.setattr(cli, "check_disk_space", lambda *_a: True)
-    monkeypatch.setattr("src.monitor.get_monitor", lambda: monitor)
-    monkeypatch.setattr("src.config.OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr("src.hardware.monitor.get_monitor", lambda: monitor)
+    monkeypatch.setattr("src.core.config.OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
     try:
         yield SimpleNamespace(cli=cli, db=db, processor=processor, cleanup=cleanup, monitor=monitor)
