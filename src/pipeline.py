@@ -688,6 +688,9 @@ class StreamingOrchestrator:
                     )
                     has_dynamic = active_source_duration > 0
                     effective_dyn_dur = normal_speed_duration if normal_speed_duration > 0 else (min(60.0, active_source_duration) if has_dynamic else 0.0)
+                    task_file_dur = float(task.get("file_duration") or 0.0)
+                    if task_file_dur >= 1800.0 and active_source_duration >= 1200.0:
+                        effective_dyn_dur += 0.25 * max(0.0, active_source_duration - normal_speed_duration)
                     self.render_batch_queue.put(
                         {
                             "filepath": filepath,
@@ -1337,9 +1340,13 @@ class StreamingOrchestrator:
                                     self.dashboard.render_batch_finished(len(files_to_batch))
                                 continue
 
-                        # 异构长尾保护：QSV 仅消费中轻量动态任务，若真实切片包含超过门限的 DYNAMIC 动作则交还 NVENC
+                        # 异构长尾保护：QSV 仅消费中轻量动态任务，若真实切片包含超过门限的 DYNAMIC 动作或超长 4K 活动流则交还 NVENC
                         if gpu == "qsv" and render_hw_policy == "heterogeneous":
                             dynamic_dur = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
+                            active_dur = sum(s.duration for s in batch_segs if s.state != "STATIC")
+                            src_dur = sum(float(r.get("file_duration") or 0.0) for r in all_rows)
+                            if src_dur >= 1800.0 and active_dur >= 1200.0:
+                                dynamic_dur += 0.25 * max(0.0, active_dur - dynamic_dur)
                             if is_stolen and dynamic_dur > qsv_admission_limit:
                                 logger.info(
                                     "render batch %d on qsv contains %.1fs dynamic motion (exceeds %.1fs), offloading to nv heavy queue",
@@ -2234,8 +2241,14 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0, "remaining": 0, "stopped_reason": None}
 
         # Rich 批量任务启动 Banner
-        dates = sorted(d for d, _ in groups)
-        cam_labels = sorted({f"Cam {c}" for _, c in groups})
+        dates = sorted(set(d for d, _ in groups))
+        from src.stages.scanner import resolve_camera_ui_name
+        cam_names = set()
+        for d, c in groups:
+            t_list = db.get_all_file_tasks_for_date(d, c)
+            s_dir = str(Path(t_list[0]["filepath"]).parent) if t_list else ""
+            cam_names.add(resolve_camera_ui_name(s_dir, cam_index=c, config=config or load_config()))
+        cam_labels = sorted(cam_names)
         print_batch_startup_banner(
             total_groups=len(groups),
             date_range=(dates[0], dates[-1]),

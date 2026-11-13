@@ -1905,7 +1905,7 @@ class MotionDetector:
 
         # 8. Tier 2 Awakened Window Fine Decoding
         if "_decode_file_window" not in self.__dict__ and len(windows) > 1:
-            coalesce_gap = 45.0 if file_duration > 1200.0 else 12.0
+            coalesce_gap = 60.0 if file_duration >= 1800.0 else (45.0 if file_duration > 1200.0 else 12.0)
             coalesced: list[tuple[float, float]] = [windows[0]]
             for w_s, w_e in windows[1:]:
                 prev_s, prev_e = coalesced[-1]

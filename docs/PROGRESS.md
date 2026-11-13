@@ -1,5 +1,24 @@
 # 项目状态
 
+## 2026-11-13 交付加固 + 调度/识别精度优化 + 20260326 零缓存冷启动实测验收（2,234.62 秒 / 37分14秒，38.66× 实时）
+
+围绕生产交付审查与硬件利用/识别准确度进一步优化，完成 4 项生产交付加固与 3 项性能/算法精度改进，并通过 **`20260326 / cam0`（130 个 4K 切片，24.00 小时 / 86,387.0s，含 9 个 44.3m ~ 69.0m 跨时段巨型长切片）零缓存冷启动端到端实测**（`logs/perf/perf_20260326_cam0_20261113_211526.json`）：
+
+1. **生产交付加固（4 项）**：
+   - 移除冗余 `.github/workflows/ci.yml`（项目依赖本地 NVIDIA NVDEC/NVENC + Intel QSV 异构硬件与 NAS 媒体源）；
+   - 开启 `render.cleanup_batches_on_success: true`（成片校验通过后自动清理 `temp/batches/` 中 5~6.5GB 的 `_batch*.mp4` 中间文件），显式配置 `recovery.skip_corrupt: false` 与 `logging.retention_days: 7`，并在 `main.py` 非 `--auto` 入口补齐 `cleanup_temp_artifacts()` 残留清理；
+   - `src/stages/scanner.py` 新增基于文件名时间戳的零 `stat()` 跨午夜写盘保护（距当前时间 `< 120s` 自动冻结），并将 `freeze_minutes > 0` 与 `skip_today` 解耦；
+   - `src/core/utils.py` 在 `cleanup_stale_logs()` 中排除 `logs/perf/` 基准遥测目录，并在 `src/pipeline.py` 启动横幅中解析语义机位名（`baby_room` / `living_room`）。
+2. **异构调度防饥饿与识别准确度优化（3 项）**：
+   - **QSV 超长 4K 切片渲染防阻塞（`src/pipeline.py`）**：针对 `>= 1800s`（30~69 分钟）且含大量加速活跃段（`NIGHT_STATIONARY` / `PRESENCE` / `MICRO_MOTION`）的巨型夜间文件，在渲染队列成本与 `_render_worker` QSV 准入判定中计入 `0.25 * max(0.0, active_dur - dynamic_dur)` 折算负载，防止 `qsv_0` 误窃取 55~69 分钟 4K 巨型夜间批次导致核显单批卡死 749 秒；
+   - **粗扫门控提升与长文件窗口聚合（`config/settings.yaml`, `src/stages/detector.py`）**：将 `iframe_min_file_duration` 提升至 `1800.0s`（避免 20~26 分钟中高活跃傍晚/清晨切片浪费粗扫回退开销），并对 `>= 1800s` 超长切片将 Tier 2 窗口合并间隔提升至 `60.0s`；
+   - **红外暗光局部反光抗干扰与短时交互保真（`src/algorithms/yolo_verifier.py`）**：直接在二维灰度帧上以 `min(mean, median)` 计算房间暗度（避免婴儿床栏杆/被子局部红外高光掩盖暗光降阈 `0.15`），为 `is_stationary_human` 增加 `seg.duration >= 8.0 and len(p_boxes) >= 3` 门控（保护 2~7 秒短时护理动作维持 `1x DYNAMIC`），并将 `MICRO_MOTION` 兜底阈值与 `min_motion_threshold` 联动。
+3. **20260326 / cam0 零缓存冷启动实测证据 (`logs/perf/perf_20260326_cam0_20261113_211526.json`)**：
+   - **端到端总耗时**: **`2,234.62 秒`（37 分 14 秒，38.66× 实时）**，流式阶段（预筛 + 精析 + 渲染）仅 **`2,131.17 秒`（35 分 31 秒）**，最终拼接与 129 接缝校验 `90.20s`；
+   - **7 路精析 Worker 齐步收尾**: `ana_0` ~ `ana_6` 完成时刻落在 **`1,683.4s ~ 1,739.7s`（极差仅 `56.3s`）**；
+   - **3 路异构渲染器零故障均衡收尾**: `qsv_0` 渲染 50 批（7 轻量 + 43 窃取，**0 失败 / 0 拒单**，单批最大耗时仅 `122.5s`，利用率 `94.2%`，完成于 `2,087.6s`），`nv_1` 渲染 39 批（利用率 `94.7%`，完成于 `2,113.9s`），`nv_0` 渲染 41 批（利用率 `92.4%`，完成于 `2,130.1s`），整场平均 GPU 解码器利用率高达 **`93.9%`**（渲染尾段达 **`99.0%`**）；
+   - **成片质量与清理验证 (`scripts/verify_cold_run_audit.py 20260326`)**: 成片 `output/DailyVlog_20260326_B888805AA3CD.mp4`（`4,851.36 MiB`，`243分59秒`，`5.9×` 浓缩），捕获 `MICRO_MOTION` `10,771.0s`、`PRESENCE` `5,615.0s`、`DYNAMIC` `8,343.2s`；292,786 个媒体包时钟漂移 $\le 1\text{ tick}$，834 个关键活动事件零遗漏，129 个批次接缝 0 断裂，且交付后 `temp/batches/` 中间文件已 100% 自动清空。
+
 ## 2026-11-13 第二轮深度提速优化 + 0 缓存冷跑突破 2,193.52 秒（36分33秒，40.73× 实时）
 
 在第一轮（`2,399.36s`）基础上，通过逐文件/逐 Worker 遥测深挖并落地三项关键优化，再次完成 `20260320 / cam0`（142 个 4K 切片，24.82 小时）**0 缓存纯冷跑验证**（`logs/perf/perf_20260320_cam0_20261113_183031.json`）：

@@ -148,13 +148,16 @@ class YoloVerifier:
                     try:
                         if isinstance(raw, (bytes, bytearray)) or getattr(raw, "ndim", 0) == 1:
                             img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            luma_src = img
                         elif getattr(raw, "ndim", 0) == 2:
                             img = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+                            luma_src = raw
                         else:
                             img = raw
+                            luma_src = img
                         if img is None:
                             continue
-                        luma = float(np.mean(img))
+                        luma = float(np.minimum(np.mean(luma_src), np.median(luma_src)))
                         threshold = min(self.confidence, 0.15 if luma < 50 else 0.20 if luma < 100 else self.confidence)
                         if segments[i].max_energy >= 3.5:
                             threshold = min(threshold, 0.20)
@@ -255,7 +258,7 @@ class YoloVerifier:
                 # 判定为静坐/静卧陪伴 (PRESENCE 或 NIGHT_STATIONARY)，避免膨胀为 1x DYNAMIC
                 p_boxes = person_boxes_by_seg.get(i, [])
                 is_stationary_human = False
-                if len(p_boxes) >= 2 and seg.state != "DYNAMIC_AUDIO" and seg.max_energy < 25.0:
+                if seg.duration >= 8.0 and len(p_boxes) >= 3 and seg.state != "DYNAMIC_AUDIO" and seg.max_energy < 25.0:
                     disps = []
                     ious = []
                     for b1, b2 in zip(p_boxes[:-1], p_boxes[1:]):
@@ -293,7 +296,13 @@ class YoloVerifier:
                 seg.review_reason = "MULTIMODAL_AUDIO_NO_TARGET"
             else:
                 cfg = getattr(self, "config", None) or {}
-                micro_thresh = float(cfg.get("micro_motion", {}).get("energy_threshold", 6.0))
+                micro_cfg = cfg.get("micro_motion", {})
+                if "energy_threshold" in micro_cfg:
+                    micro_thresh = float(micro_cfg["energy_threshold"])
+                elif "min_motion_threshold" in cfg.get("detection", {}):
+                    micro_thresh = max(5.0, float(cfg["detection"]["min_motion_threshold"]) * 2.6)
+                else:
+                    micro_thresh = 6.0
                 # 若差分能量显著 (>= micro_thresh)，表明存在真实的物理运动 (如夜间睡眠翻身、遮挡动作)，
                 # 严禁将其作为纯静态抽帧丢弃！保全为 MICRO_MOTION 事件状态，防漏检
                 if seg.max_energy >= micro_thresh:

@@ -163,15 +163,18 @@ def get_logger(subsystem: str = "core") -> logging.LoggerAdapter:
 
 
 def cleanup_stale_logs(retention_days: int = 7) -> int:
-    """清理 logs/ 各子目录下超过 retention_days 天的历史日志文件，防止磁盘无限膨胀。"""
+    """清理 logs/ 运行子目录下超过 retention_days 天的历史日志文件（保留 logs/perf 基准遥测）。"""
     if not LOGS_DIR.exists():
         return 0
     now = time.time()
     cutoff = now - (retention_days * 86400)
     removed = 0
+    perf_dir = (LOGS_DIR / "perf").resolve()
     for path_item in LOGS_DIR.rglob("*"):
         if path_item.is_file() and path_item.suffix in {".log", ".jsonl", ".json"}:
             try:
+                if perf_dir in path_item.resolve().parents:
+                    continue
                 if path_item.stat().st_mtime < cutoff:
                     path_item.unlink()
                     removed += 1

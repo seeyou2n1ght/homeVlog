@@ -202,11 +202,19 @@ def validate_config(config):
                      "max_qsv_render_concurrency", "max_io_concurrency"),
         "detection": ("prescreen_parallel", "analysis_max_workers"),
         "render": ("batch_max_files", "max_concurrency"),
+        "logging": ("retention_days",),
     }
     for section, keys in integer_keys.items():
         for key in keys:
-            if key in config.get(section, {}) and int(config[section][key]) != float(config[section][key]):
-                raise ValueError(f"{section}.{key} must be an integer")
+            if key in config.get(section, {}):
+                val = config[section][key]
+                if isinstance(val, bool) or int(val) != float(val):
+                    raise ValueError(f"{section}.{key} must be an integer")
+                if section == "logging" and int(val) < 1:
+                    raise ValueError(f"{section}.{key} must be a positive integer")
+    for section, key in (("recovery", "skip_corrupt"), ("render", "cleanup_batches_on_success")):
+        if key in config.get(section, {}) and not isinstance(config[section][key], bool):
+            raise ValueError(f"{section}.{key} must be a boolean")
     if render_policy == "heterogeneous" and render_conc is not None and int(render_conc) > 3:
         raise ValueError("heterogeneous rendering supports at most 3 workers (2 NVENC + 1 QSV)")
     seg_cfg = config.get("segment", {})

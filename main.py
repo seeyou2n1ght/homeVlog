@@ -227,6 +227,7 @@ def main():
 
         # 7. 指定日期或日期范围批处理 (--date, --date-range, --days)
         if target_dates or args.cam is not None:
+            cleanup_temp_artifacts()
             db = VlogDatabase()
             monitor = None
             try:

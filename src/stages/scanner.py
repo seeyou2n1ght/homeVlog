@@ -192,8 +192,14 @@ def scan_directory(
                                 total_skipped += 1
                                 continue
 
-                            # 如果启用了 skip_today 或 freeze_minutes <= 0，则不再执行基于 age 的 "忽略最新素材" (freeze) 逻辑
-                            if not skip_today and freeze_minutes > 0:
+                            # 跨零点切片保护：日期归属为昨日但结束时刻落入今日且距当前不足 120s 时暂缓入库（零 stat 开销）
+                            if skip_today and info["file_end_time"][:8] == current_date and (time.time() - info["end_ts"]) < 120.0:
+                                logger.debug("freeze cross-midnight file near completion: %s", entry.name)
+                                total_frozen += 1
+                                continue
+
+                            # 若显式配置了 freeze_minutes > 0，执行基于 mtime 的最新文件稳定期保护
+                            if freeze_minutes > 0:
                                 progress.update(f"读取文件属性 {entry.path}", total_added + total_skipped + total_frozen)
                                 stat = entry.stat()
                                 age_min = (time.time() - stat.st_mtime) / 60.0

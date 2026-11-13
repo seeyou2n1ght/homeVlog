@@ -12,7 +12,7 @@ uv run python -m compileall main.py src scripts tests
 uv run python -m pytest tests/ -v --durations=10
 ```
 
-`tests/conftest.py` 将数据库、成片、批次和日志放在测试临时目录。真实媒体测试依赖 FFmpeg。合成流程通过 `pipeline.render_gpu_policy: cpu_only` 在普通 CI 主机运行。GPU 专项须显式开启 `HOMEVLOG_HARDWARE_TESTS`。
+`tests/conftest.py` 将数据库、成片、批次和日志放在测试临时目录。真实媒体测试依赖 FFmpeg。合成流程通过 `pipeline.render_gpu_policy: cpu_only` 在无 GPU 环境运行。GPU 专项须显式开启 `HOMEVLOG_HARDWARE_TESTS`。
 
 | 范围 | 验证行为 |
 | --- | --- |
