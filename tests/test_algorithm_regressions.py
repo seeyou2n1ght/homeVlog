@@ -589,3 +589,61 @@ def test_static_audio_gate_keeps_audio_events_conservative(monkeypatch):
     monkeypatch.setattr("src.stages.detector.MotionDetector", FakeDetector)
     events, _ = detect_audio_activity("ignored", 2, cfg)
     assert events
+
+
+def test_iframe_zero_decode_fast_path_and_strict_timeline_closure():
+    """验证纯静态原片命中 Zero-Decode 极速路径，零次精析解码且时间轴严格闭合。"""
+    from unittest.mock import patch
+    from src.stages.detector import MotionDetector
+    from src.algorithms.segment import build_segments
+
+    config = {
+        "detection": {
+            "iframe_prescreen_enabled": True,
+            "analysis_fps": 5.0,
+            "motion_sensitivity": 1.0,
+        },
+        "audio_vad": {"enabled": True},
+    }
+    detector = MotionDetector(config)
+
+    file_duration = 1800.0  # 30 分钟文件
+    start_offset = 2400.0   # 跨时间轴偏移量
+    keyframes_count = int(file_duration / 3.0)  # 600 个关键帧
+    keyframes = [(float(i * 3.0), 0.15, 0.3) for i in range(keyframes_count)]
+
+    with patch.object(detector, "_scan_keyframes_coarse", return_value=(keyframes, {"keyframes": len(keyframes)})), \
+         patch.object(detector, "_decode_audio_pipe", return_value=np.zeros(16000, dtype=np.float32)), \
+         patch.object(detector.vad, "detect_events", return_value=([], {})), \
+         patch.object(detector, "_decode_file") as mock_full_decode, \
+         patch.object(detector, "_decode_file_window") as mock_window_decode:
+
+        labels, yolo_buf = detector.analyze(
+            "night_pure_static.mp4",
+            start_offset=start_offset,
+            file_duration=file_duration,
+            duration_verified=True,
+        )
+
+    # 铁律 1: 零精析解码调用
+    mock_full_decode.assert_not_called()
+    mock_window_decode.assert_not_called()
+    assert yolo_buf == {}
+
+    # 铁律 2: 标签全部为 STATIC，且连续单调递增
+    assert len(labels) > 0
+    assert all(lbl["state"] == "STATIC" for lbl in labels)
+    assert all(lbl["is_motion"] is False for lbl in labels)
+    assert all(lbl["is_audio_active"] is False for lbl in labels)
+
+    # 铁律 3: 时间轴首尾与跨文件偏移绝对一致
+    assert abs(labels[0]["time"] - start_offset) < 1e-3
+    assert abs(labels[-1]["time"] - (start_offset + file_duration)) < 1e-2
+
+    # 铁律 4: 交付给下游 build_segments 时产出单一闭合切片，0 tick 时钟漂移
+    segments = build_segments(labels, "night_pure_static.mp4", file_offset=start_offset)
+    assert len(segments) == 1
+    assert segments[0].state == "STATIC"
+    assert abs(segments[0].start_time - start_offset) < 1e-3
+    assert abs(segments[0].end_time - (start_offset + file_duration)) < 1e-3
+    assert abs(segments[0].duration - file_duration) < 1e-3

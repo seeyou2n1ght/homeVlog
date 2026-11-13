@@ -60,6 +60,68 @@ def load_config(
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a mapping")
+    # R1: I 帧关键帧跳帧预筛选治理规则
+    det_cfg = config.get("detection", {})
+    if isinstance(det_cfg, dict):
+        if "iframe_prescreen_enabled" in det_cfg:
+            val = det_cfg["iframe_prescreen_enabled"]
+            if not isinstance(val, bool):
+                raise ValueError("detection.iframe_prescreen_enabled must be a boolean")
+
+        if "iframe_min_file_duration" in det_cfg:
+            val = det_cfg["iframe_min_file_duration"]
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)) or float(val) < 0.0:
+                raise ValueError("detection.iframe_min_file_duration must be a non-negative finite number")
+
+        iframe_floats = [
+            ("iframe_energy_margin", 0.10, 1.00),
+            ("iframe_burst_ratio", 1.00, 5.00),
+            ("iframe_window_padding", 1.0, 10.0),
+            ("iframe_window_gap_merge", 1.0, 20.0),
+            ("iframe_fallback_active_ratio", 0.20, 0.90),
+        ]
+        for key, min_val, max_val in iframe_floats:
+            if key in det_cfg:
+                val = det_cfg[key]
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)) or not (min_val <= float(val) <= max_val):
+                    raise ValueError(f"detection.{key} must be between {min_val} and {max_val}")
+
+        if "iframe_max_isolated_windows" in det_cfg:
+            val = det_cfg["iframe_max_isolated_windows"]
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) != float(val) or not (1 <= int(val) <= 32):
+                raise ValueError("detection.iframe_max_isolated_windows must be an integer between 1 and 32")
+
+    # R2: 尾段自适应工作窃取 (Work Stealing) 配置治理规则
+    sched_cfg = config.get("scheduler", {})
+    if isinstance(sched_cfg, dict):
+        if "work_stealing_enabled" in sched_cfg:
+            val = sched_cfg["work_stealing_enabled"]
+            if not isinstance(val, bool):
+                raise ValueError("scheduler.work_stealing_enabled must be a boolean")
+        if "steal_enabled" in sched_cfg:
+            val = sched_cfg["steal_enabled"]
+            if not isinstance(val, bool):
+                raise ValueError("scheduler.steal_enabled must be a boolean")
+        if "steal_backlog_threshold" in sched_cfg:
+            val = sched_cfg["steal_backlog_threshold"]
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) != float(val) or int(val) < 1:
+                raise ValueError("scheduler.steal_backlog_threshold must be a positive integer")
+        if "steal_vram_margin_mb" in sched_cfg:
+            val = sched_cfg["steal_vram_margin_mb"]
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) != float(val) or int(val) <= 0:
+                raise ValueError("scheduler.steal_vram_margin_mb must be a positive integer")
+        min_dur = sched_cfg.get("steal_sublongest_min_duration")
+        max_dur = sched_cfg.get("steal_sublongest_max_duration")
+        if min_dur is not None:
+            if isinstance(min_dur, bool) or not isinstance(min_dur, (int, float)) or not math.isfinite(float(min_dur)) or float(min_dur) <= 0:
+                raise ValueError("scheduler.steal_sublongest_min_duration must be positive and finite")
+        if max_dur is not None:
+            if isinstance(max_dur, bool) or not isinstance(max_dur, (int, float)) or not math.isfinite(float(max_dur)) or float(max_dur) <= 0:
+                raise ValueError("scheduler.steal_sublongest_max_duration must be positive and finite")
+        if min_dur is not None and max_dur is not None:
+            if float(min_dur) >= float(max_dur):
+                raise ValueError("scheduler.steal_sublongest_min_duration cannot be greater than or equal to steal_sublongest_max_duration")
+
     qsv = config.get("output", {}).get("qsv", {})
     if qsv.get("maxrate") or qsv.get("bufsize"):
         raise ValueError("QSV ICQ uses global_quality; remove maxrate/bufsize to avoid CQP fallback")

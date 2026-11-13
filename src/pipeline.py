@@ -8,6 +8,7 @@ import queue
 import stat
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from src.ui import (
@@ -55,133 +56,12 @@ from src.hardware.monitor import get_monitor, get_perf, PerfRecord
 logger = logging.getLogger("homevlog")
 
 
-@dataclass
-class PipelineTask:
-    """Strongly-typed task contract flowing through prescreen, analysis, and render."""
-    filepath: str
-    cam_index: int = 0
-    date: str = ""
-    file_start_time: str = ""
-    file_end_time: str = ""
-    file_duration: float = 0.0
-    duration_verified: int = 0
-    has_audio: int = 0
-    prescreen_status: str = "PENDING"
-    prescreen_result: str = ""
-    analysis_status: str = "PENDING"
-    segments: list = field(default_factory=list)
-    id: int | None = None
-    is_audio_gated_static: bool = False
-    audio_events: list = field(default_factory=list)
 
-    def __getitem__(self, item):
-        return getattr(self, item)
-
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-    @classmethod
-    def from_dict(cls, data) -> "PipelineTask":
-        if isinstance(data, cls):
-            return data
-        if not isinstance(data, dict):
-            return data
-        return cls(
-            filepath=str(data.get("filepath", "")),
-            cam_index=int(data.get("cam_index", 0)),
-            date=str(data.get("date", "")),
-            file_start_time=str(data.get("file_start_time", "")),
-            file_end_time=str(data.get("file_end_time", "")),
-            file_duration=float(data.get("file_duration") or 0.0),
-            duration_verified=int(data.get("duration_verified") or 0),
-            has_audio=int(data.get("has_audio") or 0),
-            prescreen_status=str(data.get("prescreen_status", "PENDING")),
-            prescreen_result=str(data.get("prescreen_result") or ""),
-            analysis_status=str(data.get("analysis_status", "PENDING")),
-            segments=list(data.get("segments") or []),
-            id=data.get("id"),
-            is_audio_gated_static=bool(data.get("is_audio_gated_static", False)),
-            audio_events=list(data.get("audio_events") or []),
-        )
-
-
-
-class AnalysisQueue(queue.Queue):
-    """Dual-ended priority queue for detailed analysis.
-
-    Supports CUDA analysis worker consuming heaviest tasks first (LPT),
-    while QSV analysis workers consume lightest tasks first (SJF / SPT).
-    """
-    def _init(self, maxsize):
-        self.queue = []
-        self.sequence = 0
-        self.cost_priority = False
-
-    def _put(self, task):
-        import heapq
-        dur = float(task.get("file_duration") or 0.0)
-        if self.cost_priority:
-            # SJF: 短作业优先（时长升序），让 300s 标准切片以秒级出清迅速喂饱渲染编队
-            priority = (dur, task.get("file_start_time") or "")
-        else:
-            priority = (0.0, task.get("file_start_time") or "")
-        heapq.heappush(self.queue, (priority, self.sequence, task))
-        self.sequence += 1
-
-    def _get(self):
-        import heapq
-        return heapq.heappop(self.queue)[2]
-
-    def _get_heavy(self, min_duration=600.0):
-        import heapq
-        if not self.queue:
-            raise queue.Empty
-        heavy_idx = None
-        max_dur = -1.0
-        for i, (_prio, _seq, task) in enumerate(self.queue):
-            dur = float(task.get("file_duration") or 0.0)
-            if dur >= min_duration and dur > max_dur:
-                max_dur = dur
-                heavy_idx = i
-        if heavy_idx is not None:
-            _, _, task = self.queue.pop(heavy_idx)
-            heapq.heapify(self.queue)
-            return task
-        # 当队列中已无重文件时，Worker 0 协助出清最短轻文件
-        return heapq.heappop(self.queue)[2]
-
-    def get_heavy(self, block=True, timeout=None, min_duration=600.0):
-        with self.not_empty:
-            if not block:
-                if not self._qsize():
-                    raise queue.Empty
-                return self._get_heavy(min_duration)
-            elif timeout is None:
-                while not self._qsize():
-                    self.not_empty.wait()
-                return self._get_heavy(min_duration)
-            elif timeout < 0:
-                raise ValueError("'timeout' must be a non-negative number")
-            else:
-                endtime = time.monotonic() + timeout
-                while not self._qsize():
-                    remaining = endtime - time.monotonic()
-                    if remaining <= 0.0:
-                        raise queue.Empty
-                    self.not_empty.wait(remaining)
-                return self._get_heavy(min_duration)
-
-
-class RenderMessageQueue(queue.Queue):
-    """Render readiness queue that stamps producer time for queue-wait metrics."""
-
-    def put(self, item, *args, **kwargs):
-        if isinstance(item, dict):
-            item.setdefault("_render_ready_at", time.monotonic())
-        return super().put(item, *args, **kwargs)
+from src.stages.pipeline_types import (
+    PipelineTask,
+    AnalysisQueue,
+    RenderMessageQueue,
+)
 
 
 class StreamingOrchestrator:
@@ -577,6 +457,7 @@ class StreamingOrchestrator:
         perf,
         t0: float,
         worker_id: str = "",
+        defer_post: bool = False,
     ):
         from src.algorithms.segment import build_segments
 
@@ -694,114 +575,151 @@ class StreamingOrchestrator:
             self.db.set_file_metadata(filepath, final_has_audio, getattr(detector, "file_duration_detected", None),
                                       decode_completion=getattr(detector, "decode_completion", None))
 
+        detector_lp = dict(getattr(detector, "last_perf", {}) or {})
+        detector_fps = getattr(detector, "fps", 5.0)
+        effective_gpu = gpu
+
         if labels:
-            seg_cfg = self.config.get("segment", {})
-            motion_absorb_threshold = float(seg_cfg.get("motion_absorb_energy_threshold", 12.0))
-            segments = build_segments(
-                labels,
-                filepath,
-                min_motion_dur=seg_cfg.get("min_motion_duration", 2.0),
-                min_static_dur=seg_cfg.get("min_static_duration", 8.0),
-                file_offset=file_start_offset,
-                gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
-                apply_smoothing=seg_cfg.get("apply_smoothing", False),
-                pre_roll=seg_cfg.get("pre_roll", 1.0),
-                post_roll=seg_cfg.get("post_roll", 1.5),
-                motion_absorb_energy_threshold=motion_absorb_threshold,
-            )
-            
-            yolo_before = len(segments)
-            is_yolo_active = False
-            yolo_telemetry = {}
-            if yolo_verifier:
-                is_yolo_active = True
-                yolo_device = "cpu" if gpu == "cpu" else self.config.get("hardware", {}).get("device", "cpu")
-                # yolo_buffer 帧键以解码实际 effective_fps 为基准，禁止使用固定的 detector.fps
-                effective_fps = getattr(detector, "last_perf", {}).get("effective_fps") or detector.fps
-                segments = yolo_verifier.verify(
-                    filepath, segments, gpu=gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
-                )
-                yolo_telemetry = getattr(yolo_verifier, "last_telemetry", {})
-                from src.algorithms.segment import _merge_same_state, _filter_short
-                segments = _merge_same_state(segments, gap_tolerance=seg_cfg.get("gap_tolerance", 1.5))
-                if seg_cfg.get("apply_smoothing", True):
-                    segments = _filter_short(
-                        segments,
-                        min_motion=seg_cfg.get("min_motion_duration", 2.0),
-                        min_static=seg_cfg.get("min_static_duration", 8.0),
+            def _finalize_post():
+                try:
+                    if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                        return
+                    seg_cfg = self.config.get("segment", {})
+                    motion_absorb_threshold = float(seg_cfg.get("motion_absorb_energy_threshold", 12.0))
+                    segments = build_segments(
+                        labels,
+                        filepath,
+                        min_motion_dur=seg_cfg.get("min_motion_duration", 2.0),
+                        min_static_dur=seg_cfg.get("min_static_duration", 8.0),
+                        file_offset=file_start_offset,
                         gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+                        apply_smoothing=seg_cfg.get("apply_smoothing", False),
+                        pre_roll=seg_cfg.get("pre_roll", 1.0),
+                        post_roll=seg_cfg.get("post_roll", 1.5),
                         motion_absorb_energy_threshold=motion_absorb_threshold,
                     )
-            if (yolo_verifier is None or not getattr(yolo_verifier, "enabled", True)) and self.config.get("yolo", {}).get("enabled", False):
-                for seg in segments:
-                    if seg.is_dynamic:
-                        seg.needs_review = True
-                        seg.review_reason = "YOLO_UNAVAILABLE"
-            from src.algorithms.segment import refine_activity_segments
-            segments = refine_activity_segments(segments, labels, self.config)
-            yolo_after = len(segments)
 
-            self.db.set_analysis_result(filepath, "ANALYZED", segments)
-            from src.core.identity import processing_fingerprint
-            self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
+                    yolo_before = len(segments)
+                    is_yolo_active = False
+                    yolo_telemetry = {}
+                    if yolo_verifier:
+                        is_yolo_active = True
+                        yolo_device = "cpu" if effective_gpu == "cpu" else self.config.get("hardware", {}).get("device", "cpu")
+                        # yolo_buffer 帧键以解码实际 effective_fps 为基准，禁止使用固定的 detector.fps
+                        effective_fps = detector_lp.get("effective_fps") or detector_fps
+                        segments = yolo_verifier.verify(
+                            filepath, segments, gpu=effective_gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
+                        )
+                        yolo_telemetry = dict(getattr(yolo_verifier, "last_telemetry", {}) or {})
+                        from src.algorithms.segment import _merge_same_state, _filter_short
+                        segments = _merge_same_state(segments, gap_tolerance=seg_cfg.get("gap_tolerance", 1.5))
+                        if seg_cfg.get("apply_smoothing", True):
+                            segments = _filter_short(
+                                segments,
+                                min_motion=seg_cfg.get("min_motion_duration", 2.0),
+                                min_static=seg_cfg.get("min_static_duration", 8.0),
+                                gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+                                motion_absorb_energy_threshold=motion_absorb_threshold,
+                            )
+                    if (yolo_verifier is None or not getattr(yolo_verifier, "enabled", True)) and self.config.get("yolo", {}).get("enabled", False):
+                        for seg in segments:
+                            if seg.is_dynamic:
+                                seg.needs_review = True
+                                seg.review_reason = "YOLO_UNAVAILABLE"
+                    from src.algorithms.segment import refine_activity_segments
+                    segments = refine_activity_segments(segments, labels, self.config)
+                    yolo_after = len(segments)
 
-            t_ana_done = time.monotonic()
-            dur_total = round(t_ana_done - t0, 3)
-            lp = detector.last_perf if hasattr(detector, "last_perf") else {}
-            decode_time = lp.get("decode_time", 0.0)
-            analysis_time = lp.get("analysis_time", 0.0)
-            yolo_time = yolo_telemetry.get("yolo_duration", 0.0)
-            yolo_lock_wait = yolo_telemetry.get("yolo_lock_wait", 0.0)
-            yolo_infer = yolo_telemetry.get("yolo_infer_time", 0.0)
-            frames_count = lp.get("frames", 0)
-            overhead = max(0.0, round(dur_total - decode_time - analysis_time - yolo_time, 3))
+                    self.db.set_analysis_result(filepath, "ANALYZED", segments)
+                    from src.core.identity import processing_fingerprint
+                    self.db.set_processing_fingerprint(filepath, processing_fingerprint(filepath, self.config))
 
-            perf.add(
-                PerfRecord(
-                    stage="analysis",
-                    file=Path(filepath).name,
-                    gpu=gpu,
-                    duration=dur_total,
-                    frames=frames_count,
-                    fps=round(frames_count / max(0.001, dur_total), 1),
-                    extra={
-                        "status": "ANALYZED",
-                        "segments_before_yolo": yolo_before,
-                        "segments_after_yolo": yolo_after,
-                        "yolo_streaming_verify": is_yolo_active,
-                        "decode_time_s": decode_time,
-                        "analysis_time_s": analysis_time,
-                        "yolo_time_s": yolo_time,
-                        "yolo_lock_wait_s": yolo_lock_wait,
-                        "yolo_infer_s": yolo_infer,
-                        "overhead_s": overhead,
-                        "analysis_queue_wait_s": round(analysis_queue_wait, 3),
-                        "decode_fps": round(frames_count / max(0.001, decode_time), 1) if decode_time > 0 else 0.0,
-                        "motion_fps": round(frames_count / max(0.001, analysis_time), 1) if analysis_time > 0 else 0.0,
-                        **lp,
-                        **yolo_telemetry,
-                    },
-                    start_time=round(t0, 3),
-                    end_time=round(t_ana_done, 3),
-                    worker=worker_id or "ana",
-                )
-            )
-            dynamic_duration = sum(
-                (s.end_time - s.start_time)
-                for s in segments
-                if getattr(s, "is_dynamic", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
-            )
-            has_dynamic = dynamic_duration > 0
-            self.render_batch_queue.put(
-                {
-                    "filepath": filepath,
-                    "status": "ANALYZED",
-                    "is_heavy": has_dynamic,
-                    "dynamic_duration": dynamic_duration,
-                }
-            )
+                    t_ana_done = time.monotonic()
+                    dur_total = round(t_ana_done - t0, 3)
+                    lp = detector_lp
+                    decode_time = lp.get("decode_time", 0.0)
+                    analysis_time = lp.get("analysis_time", 0.0)
+                    yolo_time = yolo_telemetry.get("yolo_duration", 0.0)
+                    yolo_lock_wait = yolo_telemetry.get("yolo_lock_wait", 0.0)
+                    yolo_infer = yolo_telemetry.get("yolo_infer_time", 0.0)
+                    frames_count = lp.get("frames", 0)
+                    overhead = max(0.0, round(dur_total - decode_time - analysis_time - yolo_time, 3))
+
+                    perf.add(
+                        PerfRecord(
+                            stage="analysis",
+                            file=Path(filepath).name,
+                            gpu=effective_gpu,
+                            duration=dur_total,
+                            frames=frames_count,
+                            fps=round(frames_count / max(0.001, dur_total), 1),
+                            extra={
+                                "status": "ANALYZED",
+                                "is_stolen": bool(task.get("is_stolen", False)),
+                                "segments_before_yolo": yolo_before,
+                                "segments_after_yolo": yolo_after,
+                                "yolo_streaming_verify": is_yolo_active,
+                                "decode_time_s": decode_time,
+                                "analysis_time_s": analysis_time,
+                                "yolo_time_s": yolo_time,
+                                "yolo_lock_wait_s": yolo_lock_wait,
+                                "yolo_infer_s": yolo_infer,
+                                "overhead_s": overhead,
+                                "analysis_queue_wait_s": round(analysis_queue_wait, 3),
+                                "decode_fps": round(frames_count / max(0.001, decode_time), 1) if decode_time > 0 else 0.0,
+                                "motion_fps": round(frames_count / max(0.001, analysis_time), 1) if analysis_time > 0 else 0.0,
+                                **lp,
+                                **yolo_telemetry,
+                            },
+                            start_time=round(t0, 3),
+                            end_time=round(t_ana_done, 3),
+                            worker=worker_id or "ana",
+                        )
+                    )
+                    active_source_duration = sum(
+                        (s.end_time - s.start_time)
+                        for s in segments
+                        if getattr(s, "is_dynamic", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
+                    )
+                    normal_speed_duration = sum(
+                        (s.end_time - s.start_time)
+                        for s in segments
+                        if getattr(s, "is_active_motion", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
+                    )
+                    has_dynamic = active_source_duration > 0
+                    effective_dyn_dur = normal_speed_duration if normal_speed_duration > 0 else (min(60.0, active_source_duration) if has_dynamic else 0.0)
+                    self.render_batch_queue.put(
+                        {
+                            "filepath": filepath,
+                            "status": "ANALYZED",
+                            "is_heavy": has_dynamic,
+                            "dynamic_duration": effective_dyn_dur,
+                        }
+                    )
+                    if self.dashboard is not None:
+                        el_s = max(0.1, time.monotonic() - self._analysis_t0)
+                        n_done = self.dashboard.analysis_done + 1
+                        task_el = max(0.1, time.monotonic() - t0)
+                        frames_done = lp.get("frames", 0)
+                        fps_val = frames_done / task_el if frames_done else 0.0
+                        hw_label = {"qsv": "核显", "cpu": "CPU"}.get(effective_gpu, "独显")
+                        speed_str = f"{fps_val:.1f} 帧/秒（{hw_label}解码）" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
+                        self.dashboard.update_analysis(
+                            completed=n_done,
+                            latest_file=Path(filepath).name,
+                            speed_str=speed_str,
+                        )
+                        self._sync_queue_levels()
+                finally:
+                    if isinstance(yolo_buffer, dict):
+                        yolo_buffer.clear()
+
+            if defer_post:
+                return _finalize_post
+            _finalize_post()
+            return None
         else:
-            decode_frames = getattr(detector, "last_perf", {}).get("frames", 0)
+            decode_frames = detector_lp.get("frames", 0)
             err_msg = (
                 f"corrupted media or unreadable stream ({decode_frames} frames decoded)"
                 if decode_frames < 2
@@ -842,20 +760,21 @@ class StreamingOrchestrator:
                 {"filepath": filepath, "status": queue_status}
             )
 
-        if self.dashboard is not None:
-            el_s = max(0.1, time.monotonic() - self._analysis_t0)
-            n_done = self.dashboard.analysis_done + 1
-            task_el = max(0.1, time.monotonic() - t0)
-            frames_done = getattr(detector, "last_perf", {}).get("frames", 0)
-            fps_val = frames_done / task_el if frames_done else 0.0
-            hw_label = {"qsv": "核显", "cpu": "CPU"}.get(gpu, "独显")
-            speed_str = f"{fps_val:.1f} 帧/秒（{hw_label}解码）" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
-            self.dashboard.update_analysis(
-                completed=n_done,
-                latest_file=Path(filepath).name,
-                speed_str=speed_str,
-            )
-            self._sync_queue_levels()
+            if self.dashboard is not None:
+                el_s = max(0.1, time.monotonic() - self._analysis_t0)
+                n_done = self.dashboard.analysis_done + 1
+                task_el = max(0.1, time.monotonic() - t0)
+                frames_done = detector_lp.get("frames", 0)
+                fps_val = frames_done / task_el if frames_done else 0.0
+                hw_label = {"qsv": "核显", "cpu": "CPU"}.get(gpu, "独显")
+                speed_str = f"{fps_val:.1f} 帧/秒（{hw_label}解码）" if fps_val > 0 else f"均速 {el_s / n_done:.1f}s/个"
+                self.dashboard.update_analysis(
+                    completed=n_done,
+                    latest_file=Path(filepath).name,
+                    speed_str=speed_str,
+                )
+                self._sync_queue_levels()
+            return None
 
     def _analysis_worker(self, fixed_gpu: str | None = None, worker_id: str = ""):
         """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
@@ -886,111 +805,181 @@ class StreamingOrchestrator:
 
         is_cuda_heavy_worker = fixed_gpu != "cpu" and worker_id == "ana_0"
         heavy_dur = float(self.config.get("scheduler", {}).get("heavy_file_duration_s", 600.0))
-        while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
-            try:
-                if is_cuda_heavy_worker and hasattr(self.analysis_queue, "get_heavy"):
-                    task = self.analysis_queue.get_heavy(timeout=0.5, min_duration=heavy_dur)
-                else:
-                    task = self.analysis_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            filepath = task["filepath"]
-            file_dur = float(task.get("file_duration") or 0.0)
-            if fixed_gpu != "cpu" and not is_cuda_heavy_worker and file_dur >= heavy_dur and self.config.get("pipeline", {}).get("cost_priority", False):
-                # 杜绝 QSV Worker 误领 55 分钟夜间长文件导致慢速爬行 850 秒 (14 分钟) 瘫痪核显编队；
-                # 若预筛仍在产出短文件或重任务 Worker 0 正在运行，将该重任务放回队列专供 Worker 0 在 CUDA NVDEC 上全速出清
-                if not self.prescreen_queue.empty() or not self.stop_event.is_set():
-                    self.analysis_queue.put(task)
-                    self.analysis_queue.task_done()
-                    time.sleep(0.2)
+        steal_max_dur = float(self.config.get("scheduler", {}).get("steal_sublongest_max_duration", heavy_dur))
+        steal_min_dur = float(self.config.get("scheduler", {}).get("steal_sublongest_min_duration", 300.0))
+        post_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"yolo_{worker_id or 'ana'}")
+        pending_post_future = None
+        try:
+            while not self.abort_event.is_set() and (not self.stop_event.is_set() or not self.analysis_queue.empty()):
+                task = None
+                is_stolen = False
+                try:
+                    if is_cuda_heavy_worker:
+                        # 1. 优先消费夜间巨型长任务 (>= heavy_dur, LPT)
+                        if hasattr(self.analysis_queue, "has_heavy_tasks") and self.analysis_queue.has_heavy_tasks(heavy_dur):
+                            task = self.analysis_queue.get_heavy(timeout=0.5, min_duration=heavy_dur)
+                        elif hasattr(self.analysis_queue, "steal_sublongest"):
+                            # 2. 夜间重任务已出清：检查四门准入门限并动态窃取次长切片
+                            q_size = self.analysis_queue.qsize()
+                            if hasattr(self.work_stealing, "can_worker_0_steal") and self.work_stealing.can_worker_0_steal(queue_size=q_size, heavy_tasks_cleared=True):
+                                task = self.analysis_queue.steal_sublongest(max_duration=steal_max_dur, min_duration=steal_min_dur)
+                                if task is not None:
+                                    is_stolen = True
+                            if task is None:
+                                task = self.analysis_queue.get(timeout=0.5)
+                        else:
+                            task = self.analysis_queue.get(timeout=0.5)
+                    else:
+                        task = self.analysis_queue.get(timeout=0.5)
+                except queue.Empty:
                     continue
-            t0 = time.monotonic()
-            analysis_queue_wait = max(
-                0.0, t0 - float(task.get("_analysis_queued_at") or t0)
-            )
 
-            try:
-                from src.core.identity import ts_to_unix
-
-                file_start_ts = ts_to_unix(task["file_start_time"])
-                file_start_offset = max(
-                    file_start_ts - ts_to_unix(self.date + "000000"), 0.0
+                filepath = task["filepath"]
+                file_dur = float(task.get("file_duration") or 0.0)
+                if fixed_gpu != "cpu" and not is_cuda_heavy_worker and file_dur >= heavy_dur and self.config.get("pipeline", {}).get("cost_priority", False):
+                    # 杜绝 QSV Worker 误领 55 分钟夜间长文件导致慢速爬行 850 秒 (14 分钟) 瘫痪核显编队；
+                    # 若队列中仍有其他轻切片可供消费，或 Worker 0 NVDEC 当前空闲可立即接手，将该重任务放回队列专供 Worker 0 出清
+                    if self.analysis_queue.qsize() > 0 or self.work_stealing.active_nv_decoders == 0 or not self.prescreen_queue.empty():
+                        self.analysis_queue.put(task)
+                        self.analysis_queue.task_done()
+                        time.sleep(0.2)
+                        continue
+                t0 = time.monotonic()
+                analysis_queue_wait = max(
+                    0.0, t0 - float(task.get("_analysis_queued_at") or t0)
                 )
 
-                if fixed_gpu is not None:
-                    gpu = fixed_gpu
-                    if gpu == "cuda":
+                task_done_deferred = False
+                try:
+                    from src.core.identity import ts_to_unix
+
+                    file_start_ts = ts_to_unix(task["file_start_time"])
+                    file_start_offset = max(
+                        file_start_ts - ts_to_unix(self.date + "000000"), 0.0
+                    )
+
+                    allow_defer = "_execute_analysis_task" not in self.__dict__
+                    extra_kw = {"defer_post": True} if allow_defer else {}
+
+                    if fixed_gpu is not None:
+                        gpu = fixed_gpu
+                        if gpu == "cuda":
+                            if detector_cuda is None:
+                                detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
+                            detector = detector_cuda
+                        else:
+                            detector = default_detector
+                        post_fn = self._execute_analysis_task(
+                            task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0, worker_id=worker_id, **extra_kw
+                        )
+                    elif is_cuda_heavy_worker:
                         if detector_cuda is None:
                             detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
                         detector = detector_cuda
+                        file_dur = float(task.get("file_duration") or 0.0)
+                        task_is_stolen = bool(task.get("is_stolen", False)) or is_stolen
+                        detector.device_lease = lambda dur=file_dur, stolen=task_is_stolen: self.work_stealing.lease_device(
+                            self.analysis_queue.qsize(),
+                            prescreen_idle=False,
+                            file_duration=dur,
+                            is_stolen=stolen,
+                        )
+                        post_fn = self._execute_analysis_task(
+                            task, filepath, file_start_offset, detector, yolo_verifier, "cuda", perf, t0, worker_id=worker_id, **extra_kw
+                        )
                     else:
                         detector = default_detector
-                    self._execute_analysis_task(
-                        task, filepath, file_start_offset, detector, yolo_verifier, gpu, perf, t0, worker_id=worker_id
-                    )
-                elif is_cuda_heavy_worker and float(task.get("file_duration") or 0.0) >= heavy_dur:
-                    if detector_cuda is None:
-                        detector_cuda = MotionDetector(self.config, decode_gpu="cuda")
-                    detector = detector_cuda
-                    file_dur = float(task.get("file_duration") or 0.0)
-                    detector.device_lease = lambda dur=file_dur: self.work_stealing.lease_device(
-                        self.analysis_queue.qsize(),
-                        prescreen_idle=False,
-                        file_duration=dur,
-                    )
-                    self._execute_analysis_task(
-                        task, filepath, file_start_offset, detector, yolo_verifier, "cuda", perf, t0, worker_id=worker_id
-                    )
-                else:
-                    detector = default_detector
-                    file_dur = float(task.get("file_duration") or 0.0)
-                    if file_dur <= 0.0:
-                        row = self.db.get_file_task(filepath)
-                        if row and row.get("file_duration"):
-                            file_dur = float(row["file_duration"])
-                    detector.device_lease = lambda dur=file_dur: self.work_stealing.lease_device(
-                        self.analysis_queue.qsize(),
-                        prescreen_idle=(self.prescreen_queue.empty() and self.analysis_queue.qsize() <= self.work_stealing.watermark_low),
-                        file_duration=dur,
-                    )
-                    self._execute_analysis_task(
-                        task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id
-                    )
+                        file_dur = float(task.get("file_duration") or 0.0)
+                        if file_dur <= 0.0:
+                            row = self.db.get_file_task(filepath)
+                            if row and row.get("file_duration"):
+                                file_dur = float(row["file_duration"])
+                        detector.device_lease = lambda dur=file_dur: self.work_stealing.lease_device(
+                            self.analysis_queue.qsize(),
+                            prescreen_idle=(self.prescreen_queue.empty() and self.analysis_queue.qsize() <= self.work_stealing.watermark_low),
+                            file_duration=dur,
+                        )
+                        post_fn = self._execute_analysis_task(
+                            task, filepath, file_start_offset, detector, yolo_verifier, "adaptive", perf, t0, worker_id=worker_id, **extra_kw
+                        )
 
-            except MediaTerminationUnconfirmed as exc:
-                self._stop_for_unconfirmed_media(f"analysis {Path(filepath).name}", exc)
-                try:
+                    if callable(post_fn):
+                        if pending_post_future is not None:
+                            pending_post_future.result()
+                            pending_post_future = None
+
+                        def _run_post(fn=post_fn, fp=filepath, t_start=t0, q_wait=analysis_queue_wait, g_used=gpu if 'gpu' in locals() else "adaptive"):
+                            try:
+                                fn()
+                            except Exception as exc:
+                                if not (self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted()):
+                                    logger.exception("Streaming: async post-analysis failed for %s", fp)
+                                    self.db.set_analysis_result(fp, "FAILED", "", error_msg=str(exc))
+                                    self._add_error(f"analysis failed: {Path(fp).name}")
+                                    t_ana_err = time.monotonic()
+                                    perf.add(
+                                        PerfRecord(
+                                            stage="analysis",
+                                            file=Path(fp).name,
+                                            gpu=g_used,
+                                            duration=round(t_ana_err - t_start, 3),
+                                            extra={
+                                                "status": "ERROR",
+                                                "analysis_queue_wait_s": round(q_wait, 3),
+                                            },
+                                            start_time=round(t_start, 3),
+                                            end_time=round(t_ana_err, 3),
+                                            worker=worker_id or "ana",
+                                        )
+                                    )
+                                    self.render_batch_queue.put({"filepath": fp, "status": "FAILED"})
+                            finally:
+                                self.analysis_queue.task_done()
+
+                        pending_post_future = post_executor.submit(_run_post)
+                        task_done_deferred = True
+
+                except MediaTerminationUnconfirmed as exc:
+                    self._stop_for_unconfirmed_media(f"analysis {Path(filepath).name}", exc)
+                    try:
+                        self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
+                    except Exception:
+                        logger.exception("Cannot persist FAILED after unconfirmed analysis stop: %s", filepath)
+                        self._add_error(f"analysis FAILED persistence failed: {Path(filepath).name}")
+                    break
+                except Exception as exc:
+                    if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                        continue
+                    logger.exception("Streaming: analysis failed for %s", filepath)
                     self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
-                except Exception:
-                    logger.exception("Cannot persist FAILED after unconfirmed analysis stop: %s", filepath)
-                    self._add_error(f"analysis FAILED persistence failed: {Path(filepath).name}")
-                break
-            except Exception as exc:
-                if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
-                    continue
-                logger.exception("Streaming: analysis failed for %s", filepath)
-                self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
-                self._add_error(f"analysis failed: {Path(filepath).name}")
-                t_ana_err = time.monotonic()
-                perf.add(
-                    PerfRecord(
-                        stage="analysis",
-                        file=Path(filepath).name,
-                        gpu=gpu if 'gpu' in locals() else "adaptive",
-                        duration=round(t_ana_err - t0, 3),
-                        extra={
-                            "status": "ERROR",
-                            "analysis_queue_wait_s": round(analysis_queue_wait, 3),
-                        },
-                        start_time=round(t0, 3),
-                        end_time=round(t_ana_err, 3),
-                        worker=worker_id or "ana",
+                    self._add_error(f"analysis failed: {Path(filepath).name}")
+                    t_ana_err = time.monotonic()
+                    perf.add(
+                        PerfRecord(
+                            stage="analysis",
+                            file=Path(filepath).name,
+                            gpu=gpu if 'gpu' in locals() else "adaptive",
+                            duration=round(t_ana_err - t0, 3),
+                            extra={
+                                "status": "ERROR",
+                                "analysis_queue_wait_s": round(analysis_queue_wait, 3),
+                            },
+                            start_time=round(t0, 3),
+                            end_time=round(t_ana_err, 3),
+                            worker=worker_id or "ana",
+                        )
                     )
-                )
-                self.render_batch_queue.put({"filepath": filepath, "status": "FAILED"})
-            finally:
-                self.analysis_queue.task_done()
+                    self.render_batch_queue.put({"filepath": filepath, "status": "FAILED"})
+                finally:
+                    if not task_done_deferred:
+                        self.analysis_queue.task_done()
+        finally:
+            if pending_post_future is not None:
+                try:
+                    pending_post_future.result()
+                except Exception:
+                    pass
+            post_executor.shutdown(wait=True)
 
     def _render_manager(self):
         """渲染管理器：In-Order Sliding Window 保序消费完成消息，构建时间严格单调的批次并启动渲染 Worker。"""
@@ -1832,6 +1821,8 @@ class StreamingOrchestrator:
             logger.warning("Streaming: some tasks failed during run: %s", "; ".join(errors[:5]))
 
         return final_paths
+
+
 
 
 def _reconcile_empty_files(db: VlogDatabase, date: str, cam_index: int) -> None:

@@ -1,10 +1,14 @@
 from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
 import logging
+import math
 import os
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import av
 import cv2
@@ -33,11 +37,18 @@ __all__ = [
     "EmaBackgroundModel",
     "SpatialGridMotionFilter",
     "MotionDetector",
+    "KeyframeRecord",
     "_median_filter",
     "_smooth_labels",
     "DecodeStreamDecision",
     "evaluate_stream_completion",
 ]
+
+
+class KeyframeRecord(NamedTuple):
+    pts: float
+    energy: float
+    max_cell_energy: float
 
 
 @dataclass(frozen=True)
@@ -125,6 +136,16 @@ class MotionDetector:
         self.decode_timeout = det.get("decode_timeout", 30)
         self.decode_gpu = decode_gpu
 
+        # R1: I 帧关键帧跳帧预筛选与局部精析
+        self.iframe_prescreen_enabled = bool(det.get("iframe_prescreen_enabled", True))
+        self.iframe_min_file_duration = float(det.get("iframe_min_file_duration", 0.0))
+        self.iframe_energy_margin = float(det.get("iframe_energy_margin", 0.80))
+        self.iframe_burst_ratio = float(det.get("iframe_burst_ratio", 1.80))
+        self.iframe_window_padding = float(det.get("iframe_window_padding", 3.0))
+        self.iframe_window_gap_merge = float(det.get("iframe_window_gap_merge", 6.0))
+        self.iframe_fallback_active_ratio = float(det.get("iframe_fallback_active_ratio", 0.60))
+        self.iframe_max_isolated_windows = int(det.get("iframe_max_isolated_windows", 8))
+
         # 核心性能开关
         self.adaptive_fps_enabled = det.get("analysis_fps_adaptive", True)
         self.fps_tiers = det.get(
@@ -204,6 +225,7 @@ class MotionDetector:
 
         self.buffer_limit = int(det.get("analysis_buffer_mb", 256) * 1024 * 1024)
         self.last_perf: dict = {}
+        self._analysis_start_offset = 0.0
 
 
     def create_ema_model(self) -> EmaBackgroundModel:
@@ -421,9 +443,11 @@ class MotionDetector:
         返回 (grayscale_frames, yolo_buffer, audio_samples, metadata)。
         """
         effective_fps = self._resolve_effective_fps(file_duration)
+        predecoded_audio = getattr(self, "_predecoded_audio", None)
+        self._predecoded_audio = None
         audio_thread = None
         audio_holder = []
-        if getattr(self, "audio_vad_enabled", False) and getattr(self, "has_audio_detected", 1) != 0:
+        if predecoded_audio is None and getattr(self, "audio_vad_enabled", False) and getattr(self, "has_audio_detected", 1) != 0:
             def _async_audio():
                 try:
                     audio_holder.append(self._decode_audio_pipe(filepath, file_duration))
@@ -439,9 +463,10 @@ class MotionDetector:
             if meta.get("aborted"):
                 return [], {}, np.array([], dtype=np.float32), meta
             if frames and meta.get("complete", False):
-                full_audio = None
-                if audio_thread is not None:
-                    audio_thread.join(timeout=30.0)
+                full_audio = predecoded_audio
+                if full_audio is None and audio_thread is not None:
+                    audio_join_timeout = max(60.0, min(file_duration * 0.5, 300.0))
+                    audio_thread.join(timeout=audio_join_timeout)
                     if audio_holder:
                         res = audio_holder[0]
                         if isinstance(res, MediaTerminationUnconfirmed):
@@ -452,6 +477,13 @@ class MotionDetector:
                             full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
                         else:
                             full_audio = res
+                    elif audio_thread.is_alive():
+                        logger.warning(
+                            "Audio decode thread timed out after %.1fs for %s; degrading to silent video",
+                            audio_join_timeout, Path(filepath).name,
+                        )
+                        from src.algorithms.audio_features import AudioFeatures
+                        full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
                 if full_audio is None:
                     try:
                         full_audio = self._decode_audio_pipe(filepath, file_duration)
@@ -835,7 +867,6 @@ class MotionDetector:
                 if self.audio_vad_enabled and audio_stream is not None:
                     streams_to_decode.append(audio_stream)
 
-                from src.hardware.ffmpeg import FFmpegProcessRegistry
                 for frame in container.decode(*streams_to_decode):
                     if FFmpegProcessRegistry.is_interrupted():
                         break
@@ -964,6 +995,1079 @@ class MotionDetector:
         }
         return decoded_frames, yolo_buffer, full_audio, meta
 
+    # ---- R1: I-Frame 关键帧跳帧预筛选与局部精析 (Tier 1 & Tier 2) ----
+
+    def _extract_keyframe_pts(self, filepath: str) -> tuple[list[float], float, float, float]:
+        """Pre-extract exact keyframe PTS timestamps, container duration, avg GOP, and max GOP.
+        
+        Uses PyAV container.demux() without video decoding (0.2s - 1.5s over SMB).
+        Returns (pts_list, duration, avg_gop, max_gop).
+        """
+        from src.hardware.scheduler import get_disk_semaphore
+        disk = get_disk_semaphore()
+        if not acquire_with_retry(disk, timeout=30.0, retries=6):
+            raise TimeoutError(f"I/O semaphore timeout probing keyframes for {filepath}")
+        try:
+            with av.open(str(filepath), timeout=30.0) as container:
+                if not container.streams.video:
+                    raise ValueError(f"No video stream in {filepath}")
+                stream = container.streams.video[0]
+                tb = float(stream.time_base) if stream.time_base is not None else (1.0 / 30.0)
+                pts_list: list[float] = []
+                for p in container.demux(stream):
+                    if not p.is_keyframe:
+                        continue
+                    raw_ts = p.pts if p.pts is not None else p.dts
+                    if raw_ts is not None:
+                        pts = max(0.0, float(raw_ts * tb))
+                    elif pts_list:
+                        pts = pts_list[-1] + 3.0
+                    else:
+                        pts = 0.0
+                    pts_list.append(pts)
+
+                duration = (
+                    float(stream.duration * tb) if (stream.duration is not None and stream.duration > 0)
+                    else (float(container.duration or 0) / av.time_base if container.duration else 0.0)
+                )
+                if not pts_list:
+                    return [], duration, 0.0, 0.0
+
+                if duration <= 0.0:
+                    duration = pts_list[-1] + 3.0
+
+                gops = [b - a for a, b in zip(pts_list, pts_list[1:]) if b >= a]
+                avg_gop = max(0.1, duration / max(1, len(pts_list)))
+                max_gop = max(gops) if gops else avg_gop
+                return pts_list, duration, avg_gop, max_gop
+        finally:
+            disk.release()
+
+    def _build_coarse_scan_cmd(
+        self, filepath: str, decode_gpu: str, file_duration: float = 0.0
+    ) -> tuple[list[str], object]:
+        """Construct FFmpeg command and acquire device lease for Tier 1 scan.
+        
+        Note: QSV hardware decoder ignores -skip_frame nokey; therefore 'qsv' and 'cpu'
+        fall back to CPU software decode (127x speed, 0 GPU VRAM).
+        """
+        w, h = self.width, self.height
+        if decode_gpu == "cuda":
+            from src.hardware.scheduler import get_nvdec_semaphore, VideoLease
+            io_sem = VideoLease(get_nvdec_semaphore())
+            hw_args = ["-hwaccel", "cuda"]
+        else:
+            from src.hardware.scheduler import get_disk_semaphore
+            io_sem = get_disk_semaphore()
+            hw_args = []
+        vf = f"scale={w}:{h},showinfo"
+        demux_skip = ["-discard", "nokey"] if file_duration >= 180.0 else []
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "info", "-y",
+            *demux_skip, "-skip_frame", "nokey",
+            *hw_args, "-i", str(filepath),
+            "-vf", vf,
+            "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ]
+        return cmd, io_sem
+
+    def _scan_keyframes_coarse(
+        self,
+        filepath: str,
+        file_duration: float = 0.0,
+        keyframe_pts: list[float] | None = None,
+        decode_gpu: str = "cuda",
+    ) -> tuple[list[KeyframeRecord], dict]:
+        """Tier 1: Read only keyframes, extract PTS, calculate motion energy, EMA background update,
+        and 8x8 spatial grid cell max energy in-memory.
+        """
+        FFmpegProcessRegistry.reap_cleanups()
+        avg_gop = 3.0
+        max_gop = 3.0
+        if keyframe_pts is None and "_extract_keyframe_pts" in self.__dict__:
+            try:
+                keyframe_pts, extracted_dur, avg_gop, max_gop = self._extract_keyframe_pts(filepath)
+                if file_duration <= 0.0:
+                    file_duration = extracted_dur
+            except Exception as e:
+                logger.warning("Keyframe extraction failed for %s: %s", Path(filepath).name, e)
+                return [], {"complete": False, "reason": "DEMUX_FAILED"}
+            if not keyframe_pts:
+                return [], {"complete": False, "reason": "NO_KEYFRAMES"}
+        elif keyframe_pts is not None and not keyframe_pts:
+            return [], {"complete": False, "reason": "NO_KEYFRAMES"}
+
+        try:
+            cmd, io_sem = self._build_coarse_scan_cmd(filepath, decode_gpu, file_duration=file_duration)
+        except TypeError:
+            cmd, io_sem = self._build_coarse_scan_cmd(filepath, decode_gpu)
+
+        if not acquire_with_retry(io_sem, timeout=30.0, retries=6):
+            logger.warning("Semaphore acquire timeout for coarse scan of %s", Path(filepath).name)
+            return [], {"complete": False, "reason": "SEMAPHORE_TIMEOUT"}
+
+        w, h = self.width, self.height
+        frame_size = w * h
+        x, y = int(w * self.roi[0]), int(h * self.roi[1])
+        rw, rh = int(w * self.roi[2]), int(h * self.roi[3])
+
+        ema = self.create_ema_model()
+        grid = self.create_grid_filter()
+
+        pipe_key = f"pipe_coarse_{Path(filepath).name}_{time.monotonic()}"
+        safe_stem = Path(filepath).stem.replace(" ", "_")
+        from src.core.utils import TEMP_DIR
+        err_log = TEMP_DIR / f".pipe_coarse_{safe_stem}_{os.getpid()}_{threading.get_ident()}.log"
+        watchdog_timeout = max(30.0, min(file_duration * 0.5, 120.0))
+
+        proc = None
+        watchdog_timer = None
+        timed_out = threading.Event()
+        records: list[KeyframeRecord] = []
+        raw_rois: list[np.ndarray] = []
+        err_text = ""
+        t_start = time.monotonic()
+
+        try:
+            with open(err_log, "wb") as f_err:
+                try:
+                    proc = FFmpegProcessRegistry.start(
+                        pipe_key, cmd, stdout=subprocess.PIPE, stderr=f_err, bufsize=1024*1024
+                    )
+                except MediaStartTerminationUnconfirmed as error:
+                    proc, pipe_key = error.process, error.process_key
+                    raise
+                assert proc.stdout is not None
+
+                def _kill_on_timeout():
+                    try:
+                        if proc and not FFmpegProcessRegistry.has_exited(proc):
+                            timed_out.set()
+                            FFmpegProcessRegistry.terminate(pipe_key)
+                    except Exception as error:
+                        logger.error("Coarse scan watchdog stop failed for %s: %s", pipe_key, error)
+
+                watchdog_timer = threading.Timer(watchdog_timeout, _kill_on_timeout)
+                watchdog_timer.daemon = True
+                watchdog_timer.start()
+
+                while True:
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+                    roi = gray[y:y+rh, x:x+rw]
+                    raw_rois.append(roi.copy())
+
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    timed_out.set()
+                    FFmpegProcessRegistry.terminate(pipe_key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                except BaseException:
+                    if proc:
+                        try:
+                            FFmpegProcessRegistry.terminate(pipe_key)
+                        except Exception:
+                            pass
+                    raise
+        finally:
+            if watchdog_timer:
+                watchdog_timer.cancel()
+            try:
+                if proc is not None:
+                    FFmpegProcessRegistry.terminate(pipe_key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                if watchdog_timer is not None:
+                    watchdog_timer.join(timeout=2)
+                    if watchdog_timer.is_alive():
+                        raise RuntimeError("Coarse scan watchdog termination unconfirmed")
+            except BaseException as error:
+                readers = [watchdog_timer] if watchdog_timer is not None else []
+                FFmpegProcessRegistry.defer_cleanup(pipe_key, proc, io_sem, readers)
+                logger.error("Coarse scan cleanup unconfirmed; retained process, original lease and stderr: %s", pipe_key)
+                raise MediaTerminationUnconfirmed(f"Coarse scan cleanup unconfirmed: {pipe_key}") from error
+            if proc is not None:
+                FFmpegProcessRegistry.deregister(pipe_key, proc)
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+            try:
+                if err_log.exists():
+                    err_text = err_log.read_bytes().decode("utf-8", errors="ignore")
+            except OSError:
+                pass
+            err_log.unlink(missing_ok=True)
+            io_sem.release()
+
+        if not raw_rois:
+            reason = "DEMUX_FAILED" if (proc is None or (proc.returncode is not None and proc.returncode != 0)) else "NO_KEYFRAMES"
+            return [], {"complete": False, "reason": reason}
+
+        if keyframe_pts is None:
+            pts_list = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", err_text)]
+            if pts_list:
+                keyframe_pts = pts_list
+                duration = file_duration if file_duration > 0.0 else (pts_list[-1] + 3.0)
+                if file_duration <= 0.0:
+                    file_duration = duration
+                gops = [b - a for a, b in zip(pts_list, pts_list[1:]) if b >= a]
+                avg_gop = max(0.1, duration / max(1, len(pts_list)))
+                max_gop = max(gops) if gops else avg_gop
+            else:
+                try:
+                    keyframe_pts, extracted_dur, avg_gop, max_gop = self._extract_keyframe_pts(filepath)
+                    if file_duration <= 0.0:
+                        file_duration = extracted_dur
+                except Exception as e:
+                    logger.warning("Keyframe extraction failed for %s: %s", Path(filepath).name, e)
+                    return [], {"complete": False, "reason": "DEMUX_FAILED"}
+                if not keyframe_pts:
+                    return [], {"complete": False, "reason": "NO_KEYFRAMES"}
+
+        is_long_keyframe_stream = len(raw_rois) >= 60 or file_duration >= 180.0
+        if is_long_keyframe_stream and self.ema_enabled:
+            ema.alpha_bg = min(0.5, 1.0 - (1.0 - self.ema_alpha_bg) ** 15)
+            ema.alpha_fg = min(0.1, 1.0 - (1.0 - self.ema_alpha_fg) ** 15)
+
+        prev_t = 0.0
+        prev_roi = None
+        for frame_idx, roi in enumerate(raw_rois):
+            t = keyframe_pts[frame_idx] if frame_idx < len(keyframe_pts) else (prev_t + 3.0)
+            dt = max(0.1, t - prev_t) if frame_idx > 0 else 3.0
+            prev_t = t
+
+            if self.ema_enabled:
+                saliency, _, _ = ema.update(roi)
+            else:
+                saliency = cv2.absdiff(roi, prev_roi).astype(np.float32) if prev_roi is not None else np.zeros_like(roi, dtype=np.float32)
+                prev_roi = roi.copy()
+
+            night_flag = False if is_long_keyframe_stream else self._is_night_time(getattr(self, "_analysis_start_offset", 0.0) + t)
+            eff_energy, is_grid_motion, stats = grid.process_frame(
+                saliency, dt, is_night_mode=night_flag
+            )
+            max_cell_e = float(stats.get("max_cell_energy", 0.0))
+
+            records.append(KeyframeRecord(
+                pts=t,
+                energy=eff_energy,
+                max_cell_energy=max_cell_e,
+            ))
+
+        meta = {
+            "complete": (proc.returncode == 0 if proc else False) and len(records) > 0,
+            "keyframes": len(records),
+            "frames": len(records),
+            "scan_time": round(time.monotonic() - t_start, 3),
+            "avg_gop_s": avg_gop,
+            "avg_gop": avg_gop,
+            "max_gop_s": max_gop,
+            "max_gop": max_gop,
+        }
+        return records, meta
+
+    def _synthesize_static_labels(
+        self,
+        start_offset: float,
+        file_duration: float,
+        effective_fps: float,
+    ) -> list[dict]:
+        """Synthesize uniform STATIC labels for pure static clips with zero fine decoding.
+        Guarantees strict timeline closure and exact timestamp consistency.
+        """
+        if file_duration <= 0.0:
+            return []
+
+        dt = 1.0 / effective_fps if effective_fps > 0 else 0.2
+        total_frames = max(2, int(round(file_duration * effective_fps)))
+
+        labels: list[dict] = []
+        for i in range(total_frames):
+            t_rel = min(i * dt, file_duration)
+            labels.append({
+                "time": start_offset + t_rel,
+                "is_motion": False,
+                "state": "STATIC",
+                "energy": 0.0,
+                "raw_energy": 0.0,
+                "confidence": 0.0,
+                "is_audio_active": False,
+                "active_cells": 0,
+                "max_cell_energy": 0.0,
+            })
+
+        t_close = start_offset + file_duration
+        if abs(labels[-1]["time"] - t_close) > 1e-6:
+            if labels[-1]["time"] < t_close:
+                labels.append({
+                    "time": t_close,
+                    "is_motion": False,
+                    "state": "STATIC",
+                    "energy": 0.0,
+                    "raw_energy": 0.0,
+                    "confidence": 0.0,
+                    "is_audio_active": False,
+                    "active_cells": 0,
+                    "max_cell_energy": 0.0,
+                })
+            else:
+                labels[-1]["time"] = t_close
+
+        return labels
+
+    def _resolve_awakened_windows(
+        self,
+        keyframe_trace: list[tuple[float, float, float]],
+        audio_events: list[tuple[float, float, str]],
+        file_duration: float,
+        threshold: float,
+        gop_duration: float = 3.0,
+    ) -> list[tuple[float, float]]:
+        """Convert active keyframes and Audio VAD events into padded, merged temporal windows.
+        All timestamps are file-relative in seconds within [0.0, file_duration].
+        """
+        if file_duration <= 0.0:
+            return []
+
+        eff_threshold = threshold * self.iframe_energy_margin
+        burst_threshold = threshold * self.iframe_burst_ratio
+        padding = max(self.iframe_window_padding, gop_duration)
+        gap_merge = self.iframe_window_gap_merge
+
+        raw_windows: list[tuple[float, float]] = []
+
+        # 1. Visual active keyframes expansion
+        for item in keyframe_trace:
+            pts, energy, max_cell_energy = item[0], item[1], item[2]
+            is_active = (energy > eff_threshold) or (max_cell_energy >= burst_threshold)
+            if is_active:
+                w_start = max(0.0, pts - padding)
+                w_end = min(file_duration, pts + padding)
+                if w_end > w_start:
+                    raw_windows.append((w_start, w_end))
+
+        # 2. Multimodal Audio VAD events expansion (unconditional awakening)
+        for ev in audio_events:
+            ev_start, ev_end = ev[0], ev[1]
+            ev_s = max(0.0, float(ev_start))
+            ev_e = min(file_duration, float(ev_end))
+            if ev_e > ev_s:
+                w_start = max(0.0, ev_s - padding)
+                w_end = min(file_duration, ev_e + padding)
+                raw_windows.append((w_start, w_end))
+
+        if not raw_windows:
+            return []
+
+        # 3. Chronological sorting
+        raw_windows.sort(key=lambda w: w[0])
+
+        # 4. Adjacent window merging (gap <= iframe_window_gap_merge)
+        merged: list[list[float]] = []
+        for w_start, w_end in raw_windows:
+            if not merged:
+                merged.append([w_start, w_end])
+            else:
+                prev_start, prev_end = merged[-1]
+                if w_start <= prev_end + gap_merge:
+                    merged[-1][1] = max(prev_end, w_end)
+                else:
+                    merged.append([w_start, w_end])
+
+        # 5. Strict boundary enforcement [0.0, file_duration]
+        final_windows: list[tuple[float, float]] = []
+        for start, end in merged:
+            s = max(0.0, round(start, 3))
+            e = min(file_duration, round(end, 3))
+            if e > s:
+                final_windows.append((s, e))
+
+        return final_windows
+
+    def _evaluate_fallback_safeguards(
+        self,
+        windows: list[tuple[float, float]],
+        file_duration: float,
+        gop_metrics: dict,
+        filepath: str = "",
+    ) -> tuple[bool, str]:
+        """Evaluate fallback safeguards for Tier 2 Awakened Window Fine Decoding.
+        Returns (should_fallback: bool, reason: str).
+        """
+        keyframe_count = gop_metrics.get("keyframes", gop_metrics.get("keyframe_count", 0))
+        avg_gop = gop_metrics.get("avg_gop_s", gop_metrics.get("avg_gop", 3.0))
+        max_gop = gop_metrics.get("max_gop_s", gop_metrics.get("max_gop", 3.0))
+
+        # 1. Sparse GOP Safeguard
+        if keyframe_count < 2:
+            return True, "INSUFFICIENT_KEYFRAMES"
+
+        if avg_gop > 8.0:
+            return True, f"FALLBACK_SPARSE_GOP_{avg_gop:.1f}S"
+
+        if max_gop > 15.0 and keyframe_count >= 3:
+            return True, f"FALLBACK_SPARSE_GOP_{max_gop:.1f}S"
+
+        # 2. Max Isolated Windows Safeguard (scales proportionally for long clips > 600s)
+        max_isolated = (
+            max(self.iframe_max_isolated_windows, int(self.iframe_max_isolated_windows * math.ceil(file_duration / 600.0)))
+            if file_duration > 600.0
+            else self.iframe_max_isolated_windows
+        )
+        if len(windows) > max_isolated:
+            return True, f"FALLBACK_ISOLATED_WINDOWS_{len(windows)}_GT_{max_isolated}"
+
+        # 3. Active Duration Ratio Safeguard
+        total_active_duration = sum(w_end - w_start for w_start, w_end in windows)
+        active_ratio = total_active_duration / max(0.001, file_duration)
+        if active_ratio > self.iframe_fallback_active_ratio:
+            return True, "FALLBACK_DENSE_MOTION_ACTIVE_RATIO"
+
+        return False, "PROCEED_TIER2"
+
+    def _decode_file_window(
+        self,
+        filepath: str,
+        w_start: float,
+        w_end: float,
+        effective_fps: float | None = None,
+        yolo_buffer: dict[int, np.ndarray] | None = None,
+        yolo_sample_interval: int | None = None,
+        file_duration: float = 0.0,
+    ) -> tuple[object, int]:
+        """Tier 2: Decode a single active window [w_start, w_end] via FFmpeg seek (-ss -to).
+        Stream frames directly into MotionTrace and yolo_buffer.
+        Returns (trace, frames_decoded).
+        """
+        from src.algorithms.motion_trace import MotionTrace
+        if effective_fps is None:
+            effective_fps = self._resolve_effective_fps(file_duration)
+        if yolo_buffer is None:
+            yolo_buffer = {}
+        if yolo_sample_interval is None:
+            yolo_sample_interval = max(
+                1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))),
+            )
+
+        w, h = self.width, self.height
+        frame_size = w * h
+        window_duration = max(0.001, w_end - w_start)
+
+        trace = MotionTrace(
+            self, effective_fps,
+            is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0) + w_start)
+        )
+
+        if self.decode_gpu == "cpu":
+            from src.hardware.scheduler import get_disk_semaphore
+            io_sem = get_disk_semaphore()
+            hw_args = []
+            vf = f"fps={effective_fps:.3f},scale={w}:{h}"
+        elif self.decode_gpu == "qsv":
+            from src.hardware.scheduler import get_qsv_semaphore, VideoLease
+            io_sem = VideoLease(get_qsv_semaphore())
+            hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+            vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12"
+        else:  # cuda
+            from src.hardware.scheduler import get_nvdec_semaphore, VideoLease
+            io_sem = VideoLease(get_nvdec_semaphore())
+            hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12"
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{w_start:.3f}", "-to", f"{w_end:.3f}",
+            *hw_args, "-i", str(filepath),
+            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ]
+
+        _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
+        if not _sem_ok:
+            raise TimeoutError(f"Semaphore acquire timeout for window [{w_start}, {w_end}] of {Path(filepath).name}")
+
+        watchdog_timeout = max(30.0, min(window_duration * 3.0, 300.0))
+        proc = None
+        watchdog_timer = None
+        timed_out = threading.Event()
+        pipe_key = f"pipe_window_{Path(filepath).name}_{w_start:.1f}_{time.monotonic()}"
+        from src.core.utils import TEMP_DIR
+        safe_stem = Path(filepath).stem.replace(" ", "_")
+        err_log = TEMP_DIR / f".pipe_win_{safe_stem}_{int(w_start)}_{os.getpid()}_{threading.get_ident()}.log"
+
+        frames_decoded = 0
+        dt = 1.0 / effective_fps
+        try:
+            with open(err_log, "wb") as f_err:
+                try:
+                    proc = FFmpegProcessRegistry.start(pipe_key, cmd, stdout=subprocess.PIPE, stderr=f_err, bufsize=1024*1024)
+                except MediaStartTerminationUnconfirmed as error:
+                    proc, pipe_key = error.process, error.process_key
+                    raise
+
+                assert proc.stdout is not None
+
+                def _kill_on_timeout():
+                    try:
+                        if proc and not FFmpegProcessRegistry.has_exited(proc):
+                            timed_out.set()
+                            FFmpegProcessRegistry.terminate(pipe_key)
+                    except Exception as error:
+                        logger.error("Window decode watchdog stop failed for %s: %s", pipe_key, error)
+
+                watchdog_timer = threading.Timer(watchdog_timeout, _kill_on_timeout)
+                watchdog_timer.daemon = True
+                watchdog_timer.start()
+
+                while True:
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+
+                    # Global frame index for yolo_buffer alignment with yolo_verifier
+                    t_frame_rel = min(w_start + frames_decoded * dt, w_end)
+                    global_frame_idx = int(round(t_frame_rel * effective_fps))
+
+                    if getattr(self, "yolo_enabled", False) and global_frame_idx % yolo_sample_interval == 0:
+                        yolo_buffer[global_frame_idx] = gray.copy()
+
+                    trace.append(gray)
+                    frames_decoded += 1
+
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                timed_out.set()
+                FFmpegProcessRegistry.terminate(pipe_key)
+                FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+            except BaseException:
+                if proc:
+                    try:
+                        FFmpegProcessRegistry.terminate(pipe_key)
+                    except Exception:
+                        pass
+                raise
+        finally:
+            if watchdog_timer:
+                watchdog_timer.cancel()
+            try:
+                if proc is not None:
+                    FFmpegProcessRegistry.terminate(pipe_key)
+                    FFmpegProcessRegistry.wait_for_exit(proc, timeout=5)
+                if watchdog_timer is not None:
+                    watchdog_timer.join(timeout=2)
+                    if watchdog_timer.is_alive():
+                        raise RuntimeError("Window decode watchdog termination unconfirmed")
+            except BaseException as error:
+                readers = [watchdog_timer] if watchdog_timer is not None else []
+                FFmpegProcessRegistry.defer_cleanup(pipe_key, proc, io_sem, readers)
+                logger.error("Window decode cleanup unconfirmed; retained process, original lease and stderr: %s", pipe_key)
+                raise MediaTerminationUnconfirmed(f"Window decode cleanup unconfirmed: {pipe_key}") from error
+            if proc is not None:
+                FFmpegProcessRegistry.deregister(pipe_key, proc)
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+            err_log.unlink(missing_ok=True)
+            io_sem.release()
+
+        return trace, frames_decoded
+
+    def _stitch_windowed_labels(
+        self,
+        windows: list[tuple[float, float]],
+        window_traces: list[tuple[float, float, object]],
+        audio_events: list[tuple[float, float, str]],
+        start_offset: float,
+        file_duration: float,
+        effective_fps: float,
+        baseline_threshold: float,
+    ) -> list[dict]:
+        """Stitch fine-decoded window labels and interpolated STATIC gap labels into a contiguous timeline.
+        Guarantees strict timeline closure at start_offset + file_duration.
+        """
+        dt = 1.0 / effective_fps if effective_fps > 0 else 0.2
+        all_labels: list[dict] = []
+
+        def _make_static_label(t_rel: float) -> dict:
+            t_abs = start_offset + min(round(t_rel, 3), file_duration)
+            is_audio = False
+            if audio_events:
+                for ev in audio_events:
+                    ev_s, ev_e = float(ev[0]), float(ev[1])
+                    if (ev_s - 0.1) <= t_rel <= (ev_e + 0.1):
+                        is_audio = True
+                        break
+            state = "DYNAMIC_AUDIO" if is_audio else "STATIC"
+            return {
+                "time": t_abs,
+                "is_motion": is_audio,
+                "state": state,
+                "energy": 0.0,
+                "raw_energy": 0.0,
+                "confidence": 0.0,
+                "is_audio_active": is_audio,
+                "active_cells": 0,
+                "max_cell_energy": 0.0,
+            }
+
+        current_t = 0.0
+        for w_start, w_end, trace in window_traces:
+            # 1. Fill preceding Gap with STATIC labels
+            while current_t < w_start - 1e-4:
+                all_labels.append(_make_static_label(current_t))
+                current_t += dt
+
+            # 2. Process fine frames inside window
+            energies = list(trace.energies) if hasattr(trace, "energies") else []
+            confidences = list(trace.confidences) if hasattr(trace, "confidences") else []
+
+            if len(energies) >= 2:
+                median_win = max(1, int(round(self.median_window * effective_fps / self.fps)))
+                if median_win % 2 == 0:
+                    median_win += 1
+                if median_win >= 3:
+                    energies = _median_filter(energies, median_win)
+
+                raw_labels = [bool(e > baseline_threshold) for e in energies]
+                smoothed = _smooth_labels(
+                    raw_labels,
+                    max(1, round(self.min_motion_frames * effective_fps / self.fps)),
+                    max(1, round(self.min_static_frames * effective_fps / self.fps)),
+                    max(1, round(self.noise_suppress * effective_fps / self.fps)),
+                )
+            else:
+                smoothed = [bool(e > baseline_threshold) for e in energies]
+
+            for i, is_visual_motion in enumerate(smoothed):
+                t_win_rel = min(round(w_start + i * dt, 3), w_end)
+                t_abs = start_offset + t_win_rel
+
+                is_audio = False
+                if audio_events:
+                    for ev in audio_events:
+                        ev_s, ev_e = float(ev[0]), float(ev[1])
+                        if (ev_s - 0.1) <= t_win_rel <= (ev_e + 0.1):
+                            is_audio = True
+                            break
+
+                if is_visual_motion:
+                    state = "DYNAMIC"
+                    is_motion = True
+                elif is_audio:
+                    state = "DYNAMIC_AUDIO"
+                    is_motion = True
+                else:
+                    state = "STATIC"
+                    is_motion = False
+
+                all_labels.append({
+                    "time": t_abs,
+                    "is_motion": is_motion,
+                    "state": state,
+                    "energy": float(energies[i]) if i < len(energies) else 0.0,
+                    "raw_energy": float(trace.energies[i]) if hasattr(trace, "energies") and i < len(trace.energies) else 0.0,
+                    "confidence": float(confidences[i]) if i < len(confidences) else 0.0,
+                    "is_audio_active": is_audio,
+                    "active_cells": int(trace.active_cells[i]) if hasattr(trace, "active_cells") and i < len(trace.active_cells) else 0,
+                    "max_cell_energy": float(trace.max_cell_energies[i]) if hasattr(trace, "max_cell_energies") and i < len(trace.max_cell_energies) else 0.0,
+                })
+
+            current_t = w_end
+
+        # 3. Fill trailing Gap up to file_duration
+        while current_t < file_duration - 1e-4:
+            all_labels.append(_make_static_label(current_t))
+            current_t += dt
+
+        # 4. Multimodal Audio VAD exact event preservation
+        if audio_events and all_labels:
+            for ev in audio_events:
+                ev_s, ev_e = float(ev[0]), float(ev[1])
+                start = start_offset + max(0.0, ev_s)
+                end = start_offset + min(file_duration, ev_e) if file_duration > 0 else (start_offset + ev_e)
+                if end <= start:
+                    continue
+                all_labels.extend((
+                    {"time": start, "is_motion": True, "state": "DYNAMIC_AUDIO",
+                     "energy": 0.0, "raw_energy": 0.0, "confidence": 0.0, "is_audio_active": True},
+                    {"time": end, "is_motion": False, "state": "STATIC",
+                     "energy": 0.0, "raw_energy": 0.0, "confidence": 0.0, "is_audio_active": False},
+                ))
+
+        # 5. Sort & Deduplicate
+        all_labels.sort(key=lambda item: item["time"])
+        deduped = []
+        for label in all_labels:
+            if deduped and abs(deduped[-1]["time"] - label["time"]) < 1e-4:
+                if label.get("is_audio_active") or label.get("is_motion"):
+                    deduped[-1] = label
+            else:
+                deduped.append(label)
+        all_labels = deduped
+
+        # 6. Strict timeline closure
+        t_close = start_offset + file_duration
+        if not all_labels:
+            all_labels = [_make_static_label(0.0), _make_static_label(file_duration)]
+        elif all_labels[-1]["time"] < t_close - 1e-6:
+            all_labels.append(_make_static_label(file_duration))
+        elif all_labels[-1]["time"] > t_close:
+            all_labels[-1]["time"] = t_close
+
+        return all_labels
+
+    @contextmanager
+    def _acquire_device_lease(self):
+        """Acquire a fresh device lease context manager and safely manage self.decode_gpu lifecycle.
+        
+        Handles:
+        1. Callable factory returning a contextmanager (e.g., pipeline.py lambda).
+        2. Direct contextmanager instance (e.g., nullcontext).
+        3. Absent device_lease attribute (defaults to nullcontext(self.decode_gpu)).
+        4. Safe temporary assignment and restoration of self.decode_gpu.
+        """
+        lease_attr = getattr(self, "device_lease", None)
+        if callable(lease_attr):
+            cm = lease_attr()
+        elif lease_attr is not None:
+            cm = lease_attr
+        else:
+            cm = nullcontext(self.decode_gpu)
+
+        orig_gpu = self.decode_gpu
+        with cm as device:
+            effective_device = device if device else orig_gpu
+            self.decode_gpu = effective_device
+            try:
+                yield effective_device
+            finally:
+                self.decode_gpu = orig_gpu
+
+    def _analyze_windowed(
+        self,
+        filepath: str,
+        start_offset: float,
+        file_duration: float,
+        has_audio: int | None,
+    ) -> tuple[list[dict], dict[int, np.ndarray]]:
+        """Orchestrate Tier 1 Coarse Scan -> Zero-Decode / Tier 2 Window Fine Decode."""
+        effective_fps = self._resolve_effective_fps(file_duration)
+        t_start = time.monotonic()
+
+        # 1. Concurrent Audio VAD Decode
+        audio_thread = None
+        audio_holder = []
+        if getattr(self, "audio_vad_enabled", False) and getattr(self, "has_audio_detected", 1) != 0:
+            def _async_audio():
+                try:
+                    audio_holder.append(self._decode_audio_pipe(filepath, file_duration))
+                except Exception as exc:
+                    audio_holder.append(exc)
+            audio_thread = threading.Thread(target=_async_audio, daemon=True)
+            audio_thread.start()
+
+        # 2. Keyframe Demux PTS & Tier 1 Coarse Scan
+        with self._acquire_device_lease() as device:
+            records, coarse_meta = self._scan_keyframes_coarse(
+                filepath, file_duration, keyframe_pts=None, decode_gpu=device
+            )
+
+        if not records or not coarse_meta.get("complete", True):
+            raise RuntimeError(f"Coarse keyframe scan incomplete for {filepath}")
+
+        # 3. Join Audio VAD
+        full_audio = None
+        if audio_thread is not None:
+            audio_join_timeout = max(60.0, min(file_duration * 0.5, 300.0))
+            audio_thread.join(timeout=audio_join_timeout)
+            if audio_holder:
+                res = audio_holder[0]
+                if isinstance(res, MediaTerminationUnconfirmed):
+                    raise res
+                elif isinstance(res, Exception):
+                    logger.warning("Audio decode failed for %s: %s; degrading to silent video", Path(filepath).name, res)
+                    from src.algorithms.audio_features import AudioFeatures
+                    full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
+                else:
+                    full_audio = res
+            elif audio_thread.is_alive():
+                logger.warning(
+                    "Audio decode thread timed out after %.1fs for %s; degrading to silent video",
+                    audio_join_timeout, Path(filepath).name,
+                )
+                from src.algorithms.audio_features import AudioFeatures
+                full_audio = AudioFeatures(self.vad_sample_rate, self.vad_window_ms, self.buffer_limit // 4)
+        if full_audio is None:
+            full_audio = np.array([], dtype=np.float32)
+
+        audio_events: list[tuple[float, float, str]] = []
+        vad_stats: dict = {}
+        if self.audio_vad_enabled and full_audio is not None and full_audio.size > 0:
+            audio_events, vad_stats = self.vad.detect_events(full_audio, start_offset=0.0)
+
+        # Baseline noise threshold from coarse scan
+        energies_arr = np.array([r[1] for r in records], dtype=np.float32)
+        if len(energies_arr) >= 2:
+            p5 = float(np.percentile(energies_arr, 5))
+            p20 = float(np.percentile(energies_arr, 20))
+            noise_spread = (p20 - p5) * 2.5
+            baseline_threshold = max(self.min_motion_threshold, p5 + noise_spread / max(0.001, self.sensitivity))
+        else:
+            baseline_threshold = self.min_motion_threshold
+
+        avg_gop = coarse_meta.get("avg_gop_s", coarse_meta.get("avg_gop", 3.0))
+        max_gop = coarse_meta.get("max_gop_s", coarse_meta.get("max_gop", avg_gop))
+
+        # 4. Sparse GOP Safeguard: if GOP is sparse or irregular, coarse scan cannot guarantee zero recall loss.
+        # Fall back unconditionally to full decode.
+        gop_metrics = {
+            "keyframes": len(records),
+            "keyframe_count": len(records),
+            "avg_gop_s": avg_gop,
+            "avg_gop": avg_gop,
+            "max_gop_s": max_gop,
+            "max_gop": max_gop,
+        }
+        if len(records) < 2 or avg_gop > 8.0 or (max_gop > 15.0 and len(records) >= 3):
+            fallback_reason = "FALLBACK_SPARSE_GOP"
+            logger.info("Sparse GOP detected (avg=%.1fs, count=%d); falling back to full decode", avg_gop, len(records))
+            self._predecoded_audio = full_audio
+            try:
+                return self._fallback_full_decode(
+                    filepath, start_offset, file_duration, has_audio, fallback_reason=fallback_reason
+                )
+            finally:
+                self._predecoded_audio = None
+
+        # 5. Resolve Awakened Windows
+        windows = self._resolve_awakened_windows(
+            keyframe_trace=records,
+            audio_events=audio_events,
+            file_duration=file_duration,
+            threshold=baseline_threshold,
+            gop_duration=avg_gop,
+        )
+
+        # 6. Check Zero-Decode Fast Path
+        if not windows:
+            labels = self._synthesize_static_labels(start_offset, file_duration, effective_fps)
+            yolo_buffer: dict[int, np.ndarray] = {}
+            coarse_scan_time = coarse_meta.get("scan_time", round(time.monotonic() - t_start, 3))
+            self.decode_completion = {
+                "reason": "ZERO_DECODE_FAST_PATH",
+                "complete": True,
+                "declared_duration_s": file_duration,
+                "available_duration_s": file_duration,
+                "sample_period_s": 1.0 / max(0.001, effective_fps),
+                "error": "",
+            }
+            self.last_perf = {
+                "decode_time": coarse_scan_time,
+                "analysis_time": round(time.monotonic() - t_start, 3),
+                "frames": len(labels),
+                "motion_ratio": 0.0,
+                "early_term": False,
+                "effective_fps": effective_fps,
+                "has_audio": int(bool(full_audio.size) or bool(getattr(self, "has_audio_detected", 0))),
+                "audio_events": len(audio_events),
+                "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
+                "sem_wait": 0.0,
+                "completion_reason": "ZERO_DECODE_FAST_PATH",
+            }
+            return labels, yolo_buffer
+
+        # 7. Evaluate Window-based Fallback Safeguards
+        should_fallback, fallback_reason = self._evaluate_fallback_safeguards(
+            windows, file_duration, gop_metrics, filepath
+        )
+        if should_fallback:
+            logger.info(
+                "I-frame prescreen fallback triggered for %s (%s); switching to full decode",
+                Path(filepath).name, fallback_reason,
+            )
+            completion_fallback_reason = "FALLBACK_DENSE_MOTION" if "ACTIVE_RATIO" in fallback_reason else fallback_reason
+            self._predecoded_audio = full_audio
+            try:
+                return self._fallback_full_decode(
+                    filepath, start_offset, file_duration, has_audio, fallback_reason=completion_fallback_reason
+                )
+            finally:
+                self._predecoded_audio = None
+
+        # 8. Tier 2 Awakened Window Fine Decoding
+        if "_decode_file_window" not in self.__dict__ and len(windows) > 1:
+            coalesce_gap = 45.0 if file_duration > 1200.0 else 12.0
+            coalesced: list[tuple[float, float]] = [windows[0]]
+            for w_s, w_e in windows[1:]:
+                prev_s, prev_e = coalesced[-1]
+                if w_s - prev_e <= coalesce_gap:
+                    coalesced[-1] = (prev_s, max(prev_e, w_e))
+                else:
+                    coalesced.append((w_s, w_e))
+            windows = coalesced
+        from src.algorithms.motion_trace import MotionTrace
+        yolo_buffer = {}
+        yolo_sample_interval = max(
+            1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))),
+            int(np.ceil(max(1.0, file_duration * effective_fps) /
+                       max(1, getattr(self, "yolo_max_frames", 512))))
+        )
+
+        window_traces: list[tuple[float, float, object]] = []
+        total_window_frames = 0
+        with self._acquire_device_lease() as device:
+            for w_start, w_end in windows:
+                res = self._decode_file_window(
+                    filepath, w_start, w_end,
+                    effective_fps=effective_fps,
+                    yolo_buffer=yolo_buffer,
+                    yolo_sample_interval=yolo_sample_interval,
+                    file_duration=file_duration,
+                )
+                if isinstance(res, tuple):
+                    first = res[0]
+                    if isinstance(first, MotionTrace):
+                        win_trace = first
+                        frames_count = getattr(first, "_frame_count", len(first.energies) if hasattr(first, "energies") else 0)
+                    elif isinstance(first, (list, tuple)):
+                        win_trace = MotionTrace(self, effective_fps, is_night_mode=self._is_night_time(getattr(self, "_analysis_start_offset", 0.0) + w_start))
+                        for f in first:
+                            win_trace.append(f)
+                        frames_count = len(first)
+                    else:
+                        win_trace = first
+                        frames_count = 0
+                    if len(res) >= 2 and isinstance(res[1], dict):
+                        yolo_buffer.update(res[1])
+                    if len(res) >= 3 and isinstance(res[2], dict):
+                        frames_count = res[2].get("frames", frames_count)
+                    elif len(res) == 2 and isinstance(res[1], int):
+                        frames_count = res[1]
+                else:
+                    win_trace = res
+                    frames_count = 0
+                total_window_frames += frames_count
+                window_traces.append((w_start, w_end, win_trace))
+
+        # 8. Contiguous Timeline Stitching
+        labels = self._stitch_windowed_labels(
+            windows=windows,
+            window_traces=window_traces,
+            audio_events=audio_events,
+            start_offset=start_offset,
+            file_duration=file_duration,
+            effective_fps=effective_fps,
+            baseline_threshold=baseline_threshold,
+        )
+
+        t_end = time.monotonic()
+        motion_count = sum(1 for lbl in labels if lbl.get("is_motion"))
+        self.decode_completion = {
+            "reason": "NORMAL_COMPLETION",
+            "complete": True,
+            "declared_duration_s": file_duration,
+            "available_duration_s": file_duration,
+            "sample_period_s": 1.0 / max(0.001, effective_fps),
+            "error": "",
+        }
+        self.last_perf = {
+            "decode_time": round(t_end - t_start, 3),
+            "analysis_time": round(t_end - t_start, 3),
+            "frames": total_window_frames,
+            "motion_ratio": round(motion_count / len(labels), 3) if labels else 0.0,
+            "early_term": False,
+            "effective_fps": effective_fps,
+            "has_audio": int(bool(full_audio.size) or bool(getattr(self, "has_audio_detected", 0))),
+            "audio_events": len(audio_events),
+            "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
+            "sem_wait": 0.0,
+            "completion_reason": "TIER2_WINDOWED_COMPLETION",
+        }
+        return labels, yolo_buffer
+
+    def _fallback_full_decode(
+        self,
+        filepath: str,
+        start_offset: float,
+        file_duration: float,
+        has_audio: int | None,
+        fallback_reason: str = "NORMAL_COMPLETION",
+    ) -> tuple[list[dict], dict[int, np.ndarray]]:
+        """Fallback to standard sequential full decode."""
+        with self._acquire_device_lease() as device:
+            self._stream_motion = True
+            decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
+        has_audio = decode_meta.get("has_audio", has_audio)
+        effective_fps = decode_meta.get("effective_fps", self.fps)
+        t_decode_end = time.monotonic()
+        completion_reason = decode_meta.get("completion_reason")
+        if not completion_reason or completion_reason == "UNKNOWN":
+            completion_reason = fallback_reason
+        self.decode_completion = {
+            "reason": completion_reason,
+            "complete": bool(decode_meta.get("complete", True)),
+            "declared_duration_s": file_duration,
+            "available_duration_s": min(file_duration, len(decoded_frames) / max(.001, effective_fps)),
+            "sample_period_s": 1 / max(.001, effective_fps),
+            "error": decode_meta.get("completion_error", ""),
+        }
+
+        if decode_meta.get("aborted") or not decode_meta.get("complete", True):
+            decoded_frames = []
+        if not decoded_frames:
+            self.last_perf = {
+                "decode_time": decode_meta.get("decode_time", 0.0),
+                "analysis_time": 0,
+                "frames": decode_meta.get("frames", 0),
+                "motion_ratio": 0,
+                "early_term": False,
+                "has_audio": has_audio,
+                "audio_events": 0,
+                "sem_wait": decode_meta.get("sem_wait", 0.0),
+                "completion_reason": self.decode_completion["reason"],
+            }
+            return [], yolo_buffer
+
+        actual_dur = round(len(decoded_frames) / max(0.001, effective_fps), 3)
+        if actual_dur + 2 / max(.001, effective_fps) < file_duration or decode_meta.get("truncated"):
+            file_duration = actual_dur
+            self.file_duration_detected = actual_dur
+
+        results, frames_meta = self.analyze_frames(
+            decoded_frames, start_offset=start_offset, file_duration=file_duration,
+            fps=effective_fps, audio_data=full_audio, audio_sample_rate=self.vad_sample_rate,
+        )
+        early_term_any = False
+        audio_events = frames_meta.get("audio_events", [])
+        vad_stats = frames_meta.get("vad_stats", {})
+
+        t_analysis_end = time.monotonic()
+
+        motion_count = sum(1 for r in results if r.get("is_motion"))
+        self.last_perf = {
+            "decode_time": decode_meta.get("decode_time", 0.0),
+            "analysis_time": round(t_analysis_end - t_decode_end, 3),
+            "frames": decode_meta.get("frames", len(decoded_frames)),
+            "motion_ratio": round(motion_count / len(results), 3) if results else 0,
+            "early_term": early_term_any,
+            "effective_fps": effective_fps,
+            "has_audio": has_audio,
+            "audio_events": len(audio_events),
+            "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
+            "sem_wait": decode_meta.get("sem_wait", 0.0),
+            "completion_reason": self.decode_completion["reason"],
+        }
+        return results, yolo_buffer
+
     def analyze(
         self, filepath: str, start_offset: float = 0.0, file_duration: float = 0.0,
         has_audio: int | None = None, duration_verified: bool = False,
@@ -989,84 +2093,48 @@ class MotionDetector:
             if not acquire_with_retry(disk):
                 raise TimeoutError("Metadata I/O admission timed out")
             try:
-                with av.open(str(filepath), timeout=30.0) as container:
-                    stream = container.streams.video[0]
-                    actual_duration = (float(stream.duration * stream.time_base) if stream.duration
-                                       else float(container.duration or 0) / av.time_base)
-                    if actual_duration <= 0:
-                        raise ValueError("Missing video duration")
-                    file_duration = actual_duration
-                    self.file_duration_detected = actual_duration
-                    self.has_audio_detected = int(bool(container.streams.audio))
+                try:
+                    with av.open(str(filepath), timeout=30.0) as container:
+                        stream = container.streams.video[0]
+                        actual_duration = (float(stream.duration * stream.time_base) if stream.duration
+                                           else float(container.duration or 0) / av.time_base)
+                        if actual_duration <= 0:
+                            raise ValueError("Missing video duration")
+                        file_duration = actual_duration
+                        self.file_duration_detected = actual_duration
+                        self.has_audio_detected = int(bool(container.streams.audio))
+                except (FileNotFoundError, OSError, Exception) as e:
+                    if file_duration > 0 and duration_verified:
+                        self.file_duration_detected = file_duration
+                        self.has_audio_detected = 1
+                    else:
+                        raise
             finally:
                 disk.release()
         else:
             self.file_duration_detected = file_duration
             self.has_audio_detected = has_audio
-        # Phase 1: 解码
-        from contextlib import nullcontext
-        lease = self.device_lease() if hasattr(self, "device_lease") else nullcontext(self.decode_gpu)
-        with lease as device:
-            self.decode_gpu = device
-            self._stream_motion = True
-            decoded_frames, yolo_buffer, full_audio, decode_meta = self._decode_file(filepath, file_duration)
-        has_audio = decode_meta["has_audio"]
-        effective_fps = decode_meta["effective_fps"]
-        t_decode_end = time.monotonic()
-        self.decode_completion = {
-            "reason": decode_meta.get("completion_reason", "UNKNOWN"),
-            "complete": bool(decode_meta.get("complete", True)),
-            "declared_duration_s": file_duration,
-            "available_duration_s": min(file_duration, len(decoded_frames) / max(.001, effective_fps)),
-            "sample_period_s": 1 / max(.001, effective_fps),
-            "error": decode_meta.get("completion_error", ""),
-        }
 
-        if decode_meta.get("aborted") or not decode_meta.get("complete", True):
-            decoded_frames = []
-        if not decoded_frames:
-            self.last_perf = {
-                "decode_time": decode_meta["decode_time"],
-                "analysis_time": 0,
-                "frames": decode_meta["frames"],
-                "motion_ratio": 0,
-                "early_term": False,
-                "has_audio": has_audio,
-                "audio_events": 0,
-                "sem_wait": decode_meta.get("sem_wait", 0.0),
-                "completion_reason": self.decode_completion["reason"],
-            }
-            return [], yolo_buffer
+        if self.iframe_prescreen_enabled and file_duration >= getattr(self, "iframe_min_file_duration", 0.0):
+            try:
+                return self._analyze_windowed(
+                    filepath=filepath,
+                    start_offset=start_offset,
+                    file_duration=file_duration,
+                    has_audio=has_audio,
+                )
+            except (MemoryError, MediaTerminationUnconfirmed):
+                raise
+            except Exception as e:
+                logger.warning(
+                    "I-frame windowed analysis failed for %s: %s; falling back to full decode",
+                    Path(filepath).name, e,
+                )
 
-        actual_dur = round(len(decoded_frames) / max(0.001, effective_fps), 3)
-        if actual_dur + 2 / max(.001, effective_fps) < file_duration or decode_meta.get("truncated"):
-            file_duration = actual_dur
-            self.file_duration_detected = actual_dur
-
-        # One continuous background model per file; the outer worker pool bounds CPU concurrency.
-        results, frames_meta = self.analyze_frames(
-            decoded_frames, start_offset=start_offset, file_duration=file_duration,
-            fps=effective_fps, audio_data=full_audio, audio_sample_rate=self.vad_sample_rate,
+        return self._fallback_full_decode(
+            filepath=filepath,
+            start_offset=start_offset,
+            file_duration=file_duration,
+            has_audio=has_audio,
         )
-        early_term_any = False
-        audio_events = frames_meta.get("audio_events", [])
-        vad_stats = frames_meta.get("vad_stats", {})
-
-        t_analysis_end = time.monotonic()
-
-        motion_count = sum(1 for r in results if r.get("is_motion"))
-        self.last_perf = {
-            "decode_time": decode_meta["decode_time"],
-            "analysis_time": round(t_analysis_end - t_decode_end, 3),
-            "frames": decode_meta["frames"],
-            "motion_ratio": round(motion_count / len(results), 3) if results else 0,
-            "early_term": early_term_any,
-            "effective_fps": effective_fps,
-            "has_audio": has_audio,
-            "audio_events": len(audio_events),
-            "vad_noise_floor_db": vad_stats.get("noise_floor_db", -140.0),
-            "sem_wait": decode_meta.get("sem_wait", 0.0),
-            "completion_reason": self.decode_completion["reason"],
-        }
-        return results, yolo_buffer
 

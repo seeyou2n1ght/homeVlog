@@ -2228,3 +2228,69 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
 `pipeline.render_gpu_policy: cpu_only`（别名 `software`）使用软件预筛、分析和编码，仍通过共享 I/O 调度、FFmpeg 进程注册和事务性交付。它用于无 GPU 环境和合成端到端测试。硬件策略保留既有调度路径。
 
 替代 ADR 0003、0021、0033、0035、0038、0040、0043–0048、0050、0051、0055、0057、0058、0064、0075、0076。
+
+
+---
+
+## ADR0083：I-Frame 关键帧跳帧预筛选与时域窗口精析（2026-11-12）
+
+状态：Accepted。
+
+### 背景与根因
+在 24.8 小时 4K 监控视频中，90% 以上的画面为纯静态无活动场景。原有 `detector.py` 采用全量逐帧解码模式，即使画面毫无变动，依然对 55 分钟文件全量解压缩 66,469 帧，不仅耗费数十 GB 的视频内存带宽，而且在单文件上消耗 100~850 秒的解码时间，使得上游分析耗时卡在 2,305 秒，占到流水线总壁钟的 91.8%。
+
+### 核心决策
+1. **Tier 1 极速扫视（Coarse I-Frame Scan）**：
+   - 引入 FFmpeg `-skip_frame nokey` 参数，在预筛选阶段仅解码关键帧（I 帧）。对于 3.0s GOP 的监控流，解码负载直接削减 60 倍；
+   - 在 CUDA NVDEC 与 QSV 上实现极速扫视，并计算 8×8 空间单元网格能量与 EMA 背景差分。
+2. **Zero-Decode 快速直通**：
+   - 对全片未检测到视觉能量跃迁、微动脉冲且无音频 VAD 触发的切片，判定为全静态，直接在内存中合成 `[0.0, duration]` 的静态区间，彻底免除二次精析解码。
+3. **Tier 2 局部时域窗口精析（Awakened Window Fine Analysis）**：
+   - 仅对被视觉运动或音频 VAD 唤醒的 I 帧展开时域边界扩充（前向/后向 3.0 秒），将 $\le 6.0\text{s}$ 的临近窗口自动融合；
+   - 仅对唤醒区间执行精确 Seek 解码，其余区间自动闭合为静态。
+4. **完备保底退化机制**：
+   - 若唤醒区间累计超过全片 60% 或离散区间数超过 8 个，自动切换为单次完整文件解码，杜绝 SMB 网络 Seek 开销反噬。
+5. **架构不变量守卫**：
+   - 候选帧严格保持在内存压缩池，磁盘 0 临时图片落地；时间轴保证确定性严格闭合。
+
+---
+
+## ADR0084：尾段自适应工作窃取与次长切片双 GPU 负载均衡（2026-11-12）
+
+状态：Accepted。
+
+### 背景与根因
+在流水线调度中，RTX 3060 Ti（Worker 0）依靠 LPT 策略在约 700 秒内极速出清 7 个 55 分钟夜间巨型长任务后，算力陷入闲置；而 10~20 分钟的中型切片（“次长切片”）由于堆顶出队顺序仍被留在 QSV 队列中由慢速核显单线程串行爬行（4.1× 实时，每个需耗时 150~300 秒）。同时，旧有 `RENDER_PREEMPTION_YIELD` 会在渲染并发启动时强制剥夺 CUDA 分析租约，导致 RTX 3060 Ti 坐拥 3.5GB 空闲显存却无法支援 QSV，造成尾段严重失衡与上游排空拖长。
+
+### 核心决策
+1. **四门禁自适应准入控制（Four-Gate Admission Policy）**：
+   - 在 `WorkStealingManager` 中新增 `can_steal_analysis_task`，必须同时满足：① Worker 0 算力未满；② 夜间重任务已出清；③ NVML 物理空闲显存严格 $> 3072\text{ MB}$（3GB 裕度）；④ QSV 队列积压超过阈值。
+2. **次长切片原子提取（Atomic Sub-Longest Stealing）**：
+   - 在 `AnalysisQueue` 中实现 `steal_sublongest`，在互斥锁下从堆中定位并弹出时长在 `[min_duration, heavy_duration)` 区间内的最大任务，并执行 `heapq.heapify` 重建最小堆。
+3. **安全 CUDA NVDEC 租赁授权**：
+   - 明确工作窃取属于协同出清，授予被盗任务使用 CUDA NVDEC 的合法权限，绕过 `RENDER_PREEMPTION_YIELD` 限制。
+4. **严格保全成片接缝与时钟同步**：
+   - NVENC 与 QSV 渲染输出统一采用 nv12、GOP 120、`-bsf:v dump_extra` 规范，确保 141 个切片拼接接缝 100% 平滑连续，时钟漂移控制在 $\le 1$ tick 内。
+
+---
+
+## ADR0085：关键帧粗扫根因校准、异步 YOLO 流水线重叠与双阶段均衡收敛（2026-11-13）
+
+状态：Accepted。
+
+### 背景与根因
+在 ADR0083/0084 初版纯冷跑（`2,768.92s`）的逐文件遥测审计中暴露出三处工程瓶颈：
+1. **Tier 1 粗扫开销反噬与高回退率**：初版 `_extract_keyframe_pts` 对 1.5GB 4K 文件执行了二次 SMB 全包扫描，且 `scale_cuda` 9.23× 下采样最近邻混叠把红外静态噪点放大至 `3.21`（超过 `2.2` 阈值），叠加 108 个日间短切片（`< 1200s`）因高活动占比 100% 触发 `FALLBACK_DENSE_MOTION`，白白消耗了 `1,674.5s` 的预扫开销；
+2. **解码与 YOLO 推理串行等待**：每个分析 Worker 在完成视频解码后必须同步等待 YOLO 推理与数据库持久化完成才能拉取下一文件，导致硬件解码器在文件切换间隙空转；
+3. **尾段重文件边界与 QSV 渲染窃取口径失配**：`heavy_file_duration_s=600.0` 使 Worker 0 在完成 12 个超长文件后仍需独自串行消化 4 个 10~12 分钟中等文件；同时提交给渲染队列的 `dynamic_duration` 误将 `PRESENCE`/`MICRO_MOTION`/`NIGHT_STATIONARY` 计入常速动态时长（达 `510s~691s > 420s`），导致 QSV 渲染器拒收并提前 204 秒退出。
+
+### 核心决策
+1. **单遍 Demuxer 跳包粗扫与短文件直通门控 (`src/stages/detector.py`, `src/core/config.py`)**：
+   - 对 `>= 180s` 文件启用 `-discard nokey -skip_frame nokey` 并在单遍 FFmpeg 管道内通过双线性 `scale=w:h,showinfo` 同时提取抗混叠灰度帧与精确 PTS；
+   - 按关键帧实际步长补偿 EMA 学习率，按文件时长比例扩展 `iframe_max_isolated_windows`，并在超长文件（`> 1200s`）采用 `45.0s` 窗口合并；回退全量解码时通过 `_predecoded_audio` 复用已解码音频；
+   - 引入 `detection.iframe_min_file_duration: 1200.0`（默认 `0.0`），`< 1200s` 日间短片直接走单遍硬件全解，`>= 1200s` 长切片 100% 走窗口精析或零解码直通。
+2. **Per-Worker 异步 YOLO 后处理流水线重叠 (`src/pipeline.py`)**：
+   - `detector.analyze_file(..., defer_post=True)` 在解码结束后返回后处理闭包，由每个分析 Worker 的专属 `ThreadPoolExecutor(max_workers=1)` 异步完成分段构建、YOLO 验证、DB 持久化与渲染入队，主线程立即启动下一文件解码。
+3. **精析与渲染双阶段尾段均衡 (`config/settings.yaml`, `src/pipeline.py`)**：
+   - 将 `heavy_file_duration_s` 与 `steal_sublongest_max_duration` 统一设为 `1200.0s`，使 7 路精析 Worker 在 `1,826.3s ~ 1,912.2s`（极差 `85.9s`）内齐步收尾；
+   - 将渲染入队 `effective_dyn_dur` 对齐为实际 `1x` 常速动态时长（无常速段时取 `min(60.0, active_source_duration)`），使 `qsv_0`、`nv_0`、`nv_1` 三路渲染器在 `2,054.86s ~ 2,060.00s`（极差仅 `5.14s`）内同步收尾，20260320 纯冷跑总耗时降至 **2,193.52 秒（36分33秒，40.73× 实时）**。

@@ -146,7 +146,7 @@ flowchart TD
 系统严格遵循 4 层单向无环依赖架构，彻底杜绝下层向上层逆向依赖，并已移除 `src/*.py` 根目录下的历史向后兼容门面（Shims）：
 
 - **CLI / Entrypoint**: `main.py`（系统入口、参数解析与启动诊断）
-- **Stages Layer (`src/stages/`)**: 业务流程编排（`scanner.py`, `prescreen.py`, `detector.py`, `timeline.py`, `renderer.py`, `companion.py`, `delivery_recovery.py`）
+- **Stages Layer (`src/stages/`)**: 业务流程编排（`scanner.py`, `prescreen.py`, `detector.py`, `timeline.py`, `renderer.py`, `companion.py`, `delivery_recovery.py`, `pipeline_types.py`）
 - **Algorithms Layer (`src/algorithms/`)**: 纯算法无状态实现（`filters.py`, `motion_trace.py`, `segment.py`, `yolo_verifier.py`, `audio_features.py`）
 - **Hardware Layer (`src/hardware/`)**: 硬件资源与子进程管理（`ffmpeg.py`, `frame_pool.py`, `monitor.py`, `render_cache.py`, `scheduler.py`, `autotune.py`, `lifecycle.py`）
 - **Core Layer (`src/core/`)**: 核心基础库与单一事实源（`database.py`, `config.py`, `identity.py`, `utils.py`, `process_lock.py`）
@@ -215,8 +215,9 @@ CREATE TABLE segments (
     file_start_offset REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_segments_file_id_state ON segments(file_id, state);
-CREATE INDEX idx_segments_file_id ON segments(file_id);
+CREATE INDEX idx_segments_file ON segments(file_id);
+CREATE INDEX idx_segments_file_time ON segments(file_id, start_time);
+CREATE INDEX idx_segments_state ON segments(state);
 ```
 
 核心状态包括：
@@ -323,6 +324,25 @@ Prescreen 使用空间能量分布而不仅是全局平均差分判断运动。
 
 ---
 
+## 5.5 Two-Tier I-Frame Skip-Frame Pre-Screening & Windowed Fine Analysis (ADR0083 & ADR0085)
+
+为消除对超长静态/夜间监控素材无意义的逐帧完整解码，同时避免高活动度日间短片承受双重扫描开销，`src/stages/detector.py` 实现了带时长门控的分层预筛选与时域窗口精析机制：
+
+1. **Duration Gate (`detection.iframe_min_file_duration`)**：
+   - 仅当文件时长 $\ge \text{iframe\_min\_file\_duration}$（生产配置 `1200.0s`，默认 `0.0s`）时启用两级窗口化路径；短于该阈值的日间常规切片直接进入单遍硬件解码，规避高频活动场景下的回退重扫开销。
+2. **Tier 1 (极速扫视 / Coarse I-Frame Scan)**：
+   - 对 $\ge 180\text{s}$ 的正式长文件联合启用 Demuxer 级 `-discard nokey` 与解码器级 `-skip_frame nokey`，并在同一单遍管道中挂载双线性下采样与 `showinfo` 滤镜（`scale=w:h,showinfo`），一次性提取无混叠的 8-bit 灰度关键帧与精确 PTS，免除独立 `ffprobe`/`ffmpeg` 全包 PTS 预探测；
+   - 根据关键帧实际平均步长对 EMA 背景学习率（`alpha_bg` / `alpha_fg`）作时间常数补偿，融合全画幅运动能量、8×8 空间网格最大局部单元能量与并发预解码的音频 VAD 事件。
+3. **Zero-Decode Fast Path (静态直通)**：
+   - 若整个切片未检测到任何视觉能量跃迁、微动脉冲且无音频 VAD 唤醒，直接在内存中合成 `[0.0, file_duration]` 的静态时间轴区间，完全跳过二次精析解码（Zero Fine-Decode）。
+4. **Tier 2 (局部精析 / Awakened Window Fine Analysis)**：
+   - 对触发视觉或音频唤醒的关键帧区间扩展安全时域边距（默认 `3.0s` padding），并对超长文件（`> 1200s`）将间隔 $\le 45.0\text{s}$（中短文件 $\le 12.0\text{s}$）的相邻窗口合并，减少 SMB 重复打开与硬件解码器上下文创建次数；
+   - 仅对合并后的活跃窗口通过 FFmpeg 精确 Seek（`-ss start -to end`）解码并提取内存候选帧送入 `MotionTrace` 与 YOLO 验证，未唤醒空隙自动插值闭合为 `STATIC` 或 `NIGHT_STATIONARY`。
+5. **Fallback Safeguards & Audio Reuse (保底退化与音频复用)**：
+   - 对 `> 600s` 长切片按时长比例扩展离散窗口上限（`iframe_max_isolated_windows`），当活跃窗口占比超过 `iframe_max_active_ratio`（`0.60`）或离散窗口数超限时，平滑退化为单次完整文件解码，并通过 `_predecoded_audio` 直接复用 Tier 1 已解码的音频流，杜绝二次音频解码。
+
+---
+
 # 6. Analysis Architecture
 
 需要进一步判断的素材进入 Analysis Pipeline。
@@ -385,6 +405,8 @@ scanner 写入的文件名跨度只是名义时长。只有实际打开媒体容
 4. 不通过中间临时图片文件交换。
 
 验证遍历动态候选区间内全部已缓存采样帧，不再对整个长区间另抽 8 帧。每个局部证据窗口至多包含 8 个缓存候选，按相邻帧时间中点切分，推理 microbatch 仍受 `yolo.batch_size` 限制；总缓存仍受解码器帧数/字节预算约束。这不代表逐帧检测，长文件的降采样间隔仍有盲区。失败、模型不可用或证据不足的动态片段在短段平滑和活动细化后保留保守常速及审核标记（ADR 0030）。
+
+在流式分析 Worker（`src/pipeline.py`）中，当 `detector.analyze_file(..., defer_post=True)` 完成当前文件 $N$ 的视频/音频解码与运动轨迹收集后，会将返回的两阶段回调（`build_segments` $\to$ `yolo_verifier.verify` $\to$ `refine_activity_segments` $\to$ 数据库写入 $\to$ 渲染入队）提交至该 Worker 专属的单线程后台执行器（`ThreadPoolExecutor(max_workers=1)`），主线程随即领取文件 $N+1$ 启动硬件解码，实现 NVDEC/QSV 硬件解码与 CUDA Tensor Core YOLO 推理的跨文件流水线重叠（ADR0085）。
 
 ---
 
@@ -516,7 +538,7 @@ Scheduler 可以根据：
 
 具体阈值属于调优参数，不构成永久架构契约。
 
-当前队列权重是全部活动状态的**源时长**，包括驻留、夜间和微动；缓存恢复与新分析使用同一集合。它仍是代理指标，并非实测渲染成本。render 遥测分别记录 `queue_active_source_duration_s`（入队依据）、`active_source_duration_s`（实际时间轴）、`normal_speed_duration_s`（仅 DYNAMIC/DYNAMIC_AUDIO）和 `source_duration_s`。旧 `dynamic_duration_s` 保持常速时长语义兼容。QSV 的后置常速时长复核仍与入队权重不同，不能据旧字段推算其拒收原因。
+当前入队 `dynamic_duration` 优先采用 `normal_speed_duration`（`DYNAMIC` + `DYNAMIC_AUDIO` 常速动态时长），当无常速段但存在加速活动段（`PRESENCE` / `MICRO_MOTION` / `NIGHT_STATIONARY`）时采用有界代理成本 `min(60.0, active_source_duration)`，与 `_render_worker` 内部的 QSV 窃取准入判定口径严格一致（ADR0085）。render 遥测分别记录 `queue_active_source_duration_s`（入队依据）、`active_source_duration_s`（实际时间轴）、`normal_speed_duration_s`（仅 DYNAMIC/DYNAMIC_AUDIO）和 `source_duration_s`。
 
 ---
 
@@ -563,6 +585,22 @@ makespan
 ```
 
 是否改善收尾由同条件完整墙钟验证，不从局部占用率或成本估计推导同步收尾精度。
+
+## 8.8 Tail Adaptive Work Stealing & Dual-GPU Load Balancing (ADR0084)
+
+在流水线尾段，为避免 RTX 3060 Ti（Worker 0）在极速出清夜间巨型长任务后陷入闲置，同时杜绝慢速核显（QSV Workers 1~6）承揽 10~20 分钟次长切片导致的单侧木桶长尾延误，`src/hardware/scheduler.py` 与 `src/stages/pipeline_types.py` 实现了自适应工作窃取机制：
+
+1. **Four-Gate Admission Criteria (四门禁准入控制)**：
+   - 门禁 1 (算力空闲)：Worker 0 当前未达到最大 NVDEC 解码并发配额 (`_active_nv_decoders < max_nv_decoders`)；
+   - 门禁 2 (重任务出清)：待分析队列中已无持续时间 $\ge heavy\_file\_duration\_s$ 的巨型夜间任务；
+   - 门禁 3 (显存物理裕度)：通过 NVML 查询物理可用显存，严格要求剩余显存 $> 3072\text{ MB}$（3GB 安全裕度）且使用量未达显存警戒水位；
+   - 门禁 4 (积压排队阈值)：QSV 任务积压数量达到或超过配置阈值 (`queue_size >= steal_backlog_threshold`)。
+2. **Atomic Sub-Longest Stealing (次长切片原子窃取)**：
+   - `AnalysisQueue.steal_sublongest(max_duration, min_duration)` 在线程互斥锁保护下扫描优先队列，提取出时长小于 `heavy_file_duration_s` 但最长的中型切片（次长切片）；
+   - 窃取后执行 `heapq.heapify` 恢复最小堆不变量。
+3. **CUDA NVDEC Device Lease Authorization (设备租约授权)**：
+   - 被窃取的任务在执行精析时，由 `WorkStealingManager` 授予 CUDA NVDEC 硬件通道，且不触发 `RENDER_PREEMPTION_YIELD` 误锁；
+   - 严格保持转码编码器参数与滤镜链对齐，保证 141 个切片接缝平滑过渡与 <= 1 tick 时钟漂移。
 
 ---
 

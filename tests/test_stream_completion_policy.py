@@ -340,3 +340,52 @@ def test_detector_watchdog_stops_cached_zero_process_with_stdout_still_open(tmp_
             assert not timer.is_alive()
         registry.reap_cleanups()
         request.node.user_properties.append(('native_cached_watchdog', json.dumps(report, sort_keys=True)))
+
+
+def test_network_stream_broken_pipe_releases_semaphore_and_records_failure(mock_config, monkeypatch):
+    """验证 SMB 网络断开 (BrokenPipeError / ERROR_NETNAME_DELETED) 时信号量与进程正常释放。"""
+    from src.stages.detector import MotionDetector
+    from src.hardware.scheduler import get_disk_semaphore
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+
+    disk = get_disk_semaphore()
+    init_avail = disk.available
+
+    detector = MotionDetector(mock_config, decode_gpu="cpu")
+
+    class FakeBrokenStdout:
+        def __init__(self):
+            self.calls = 0
+        def read(self, n):
+            self.calls += 1
+            if self.calls == 1:
+                return b"\x00" * n
+            raise OSError(64, "The specified network name is no longer available (SMB disconnected)")
+        def close(self):
+            pass
+
+    class FakeBrokenProc:
+        def __init__(self):
+            self.pid = 99999
+            self.stdout = FakeBrokenStdout()
+            self.stderr = FakeBrokenStdout()
+            self.returncode = 1
+        def poll(self):
+            return 1
+        def wait(self, timeout=None):
+            return 1
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakeBrokenProc())
+    monkeypatch.setattr(FFmpegProcessRegistry, "register", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FFmpegProcessRegistry, "deregister", lambda *args, **kwargs: None)
+
+    try:
+        frames, _, meta = detector._decode_file_pipe("fake_smb_file.mp4", file_duration=10.0, effective_fps=2.0)
+    except Exception as exc:
+        meta = {"aborted": True, "complete": False, "error": str(exc)}
+
+    # 信号量必须完全归还
+    assert disk.available == init_avail
+    assert not meta.get("complete", False)

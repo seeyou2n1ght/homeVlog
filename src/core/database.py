@@ -93,6 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_file_tasks_date ON file_tasks(date, cam_index);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_prescreen ON file_tasks(prescreen_status);
 CREATE INDEX IF NOT EXISTS idx_file_tasks_analysis ON file_tasks(analysis_status);
 CREATE INDEX IF NOT EXISTS idx_segments_file ON segments(file_id);
+CREATE INDEX IF NOT EXISTS idx_segments_file_time ON segments(file_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_segments_state ON segments(state);
 CREATE INDEX IF NOT EXISTS idx_render_tasks_status ON render_tasks(status);
 """
@@ -413,6 +414,7 @@ class VlogDatabase:
                 ).fetchall()
                 file_id_by_path = {r["filepath"]: r["id"] for r in file_map_rows}
 
+                updates = []
                 for seg in timeline:
                     st = getattr(seg, "start_in_file", 0.0)
                     et = getattr(seg, "end_in_file", 0.0)
@@ -423,14 +425,17 @@ class VlogDatabase:
                         continue
 
                     if state in ("PRESENCE", "NIGHT_STATIONARY", "DYNAMIC", "DYNAMIC_AUDIO", "MICRO_MOTION"):
-                        self.conn.execute(
-                            """UPDATE segments
-                               SET state = ?
-                               WHERE file_id = ?
-                                 AND (start_time - file_start_offset) >= ? - 0.15
-                                 AND (end_time - file_start_offset) <= ? + 0.15""",
-                            (state, file_id, st, et),
-                        )
+                        updates.append((state, file_id, st, et))
+
+                if updates:
+                    self.conn.executemany(
+                        """UPDATE segments
+                           SET state = ?
+                           WHERE file_id = ?
+                             AND (start_time - file_start_offset) >= ? - 0.15
+                             AND (end_time - file_start_offset) <= ? + 0.15""",
+                        updates,
+                    )
                 self.conn.commit()
             except Exception as e:
                 logger.warning("Failed to sync timeline segments to DB: %s", e)

@@ -57,6 +57,11 @@ scheduler:
   heavy_nvdec_wait_s: 120.0
   cold_start_burst: true
   cooperative_during_render: true
+  work_stealing_enabled: true
+  steal_backlog_threshold: 2
+  steal_vram_margin_mb: 3072
+  steal_sublongest_min_duration: 300.0
+  steal_sublongest_max_duration: 1200.0
 
 recovery:
   skip_today: true
@@ -91,6 +96,14 @@ detection:
     medium_max: 600
     long_max: 1800
   timestamp_margin: 0.5
+  iframe_prescreen_enabled: true
+  iframe_min_file_duration: 1200.0
+  iframe_energy_margin: 0.70
+  iframe_burst_ratio: 2.5
+  iframe_window_padding: 6.0
+  iframe_window_gap_merge: 8.0
+  iframe_fallback_active_ratio: 0.45
+  iframe_max_isolated_windows: 8
 
 audio_vad:
   enabled: true

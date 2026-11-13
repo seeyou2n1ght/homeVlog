@@ -875,3 +875,111 @@ def test_cost_aware_heavy_task_nvdec_priority():
     mgr.set_vram_probe_fn(lambda: 6500)
     assert mgr.get_analysis_device(queue_size=1, file_duration=3300.0) == "qsv"
     assert mgr.state == "VRAM_PRESSURE_YIELD"
+
+
+def test_analysis_queue_has_heavy_tasks_and_steal_sublongest():
+    from src.stages.pipeline_types import AnalysisQueue
+
+    q = AnalysisQueue()
+    q.cost_priority = True
+
+    # 1. Test empty queue
+    assert not q.has_heavy_tasks(1200.0)
+    assert q.steal_sublongest(max_duration=1200.0, min_duration=300.0) is None
+
+    # 2. Enqueue mixed workload
+    q.put({"filepath": "short_180.mp4", "file_duration": 180.0, "file_start_time": "20260320010000"})
+    q.put({"filepath": "short_240.mp4", "file_duration": 240.0, "file_start_time": "20260320020000"})
+    q.put({"filepath": "med_600.mp4", "file_duration": 600.0, "file_start_time": "20260320030000"})
+    q.put({"filepath": "med_900.mp4", "file_duration": 900.0, "file_start_time": "20260320040000"})
+    q.put({"filepath": "heavy_3300.mp4", "file_duration": 3300.0, "file_start_time": "20260320050000"})
+
+    assert q.has_heavy_tasks(1200.0) is True
+
+    # 3. Steal sublongest: should pop med_900 first
+    stolen1 = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert stolen1 is not None
+    assert stolen1["filepath"] == "med_900.mp4"
+    assert stolen1.get("is_stolen") is True
+
+    # 4. Steal sublongest: should pop med_600 next
+    stolen2 = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert stolen2 is not None
+    assert stolen2["filepath"] == "med_600.mp4"
+    assert stolen2.get("is_stolen") is True
+
+    # 5. Steal sublongest: remaining are [180, 240, 3300], none satisfy 300 <= dur < 1200
+    stolen3 = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert stolen3 is None
+
+    # 6. Verify min-heap invariant holds: get() pops root (180.0)
+    assert q.get()["filepath"] == "short_180.mp4"
+
+    # 7. Heavy task still in queue and consumable by get_heavy
+    assert q.has_heavy_tasks(1200.0) is True
+    heavy = q.get_heavy(min_duration=1200.0)
+    assert heavy["filepath"] == "heavy_3300.mp4"
+    assert not q.has_heavy_tasks(1200.0)
+
+    # 8. Remaining is short_240
+    assert q.get()["filepath"] == "short_240.mp4"
+    assert q.empty()
+
+
+def test_analysis_queue_steal_sublongest_tie_breaking():
+    from src.stages.pipeline_types import AnalysisQueue
+
+    q = AnalysisQueue()
+    q.cost_priority = True
+
+    # Three tasks with identical duration = 600.0, different timestamps
+    q.put({"filepath": "med_late.mp4", "file_duration": 600.0, "file_start_time": "20260320140000"})
+    q.put({"filepath": "med_early.mp4", "file_duration": 600.0, "file_start_time": "20260320080000"})
+    q.put({"filepath": "med_mid.mp4", "file_duration": 600.0, "file_start_time": "20260320110000"})
+
+    # Tie-breaking must choose earlier chronological timestamp
+    first = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert first["filepath"] == "med_early.mp4"
+
+    second = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert second["filepath"] == "med_mid.mp4"
+
+    third = q.steal_sublongest(max_duration=1200.0, min_duration=300.0)
+    assert third["filepath"] == "med_late.mp4"
+
+
+def test_scheduler_work_stealing_config_validation():
+    from src.core.config import validate_config
+
+    base = {"output": {"fps": 20}}
+
+    # Valid configurations
+    validate_config({**base, "scheduler": {"work_stealing_enabled": True, "steal_backlog_threshold": 2, "steal_vram_margin_mb": 3072}})
+    validate_config({**base, "scheduler": {"steal_enabled": False, "steal_sublongest_min_duration": 300.0, "steal_sublongest_max_duration": 1200.0}})
+
+    # Invalid work_stealing_enabled
+    with pytest.raises(ValueError, match="scheduler.work_stealing_enabled must be a boolean"):
+        validate_config({**base, "scheduler": {"work_stealing_enabled": "true"}})
+
+    # Invalid steal_enabled
+    with pytest.raises(ValueError, match="scheduler.steal_enabled must be a boolean"):
+        validate_config({**base, "scheduler": {"steal_enabled": 1}})
+
+    # Invalid steal_backlog_threshold
+    with pytest.raises(ValueError, match="scheduler.steal_backlog_threshold must be a positive integer"):
+        validate_config({**base, "scheduler": {"steal_backlog_threshold": 0}})
+    with pytest.raises(ValueError, match="scheduler.steal_backlog_threshold must be a positive integer"):
+        validate_config({**base, "scheduler": {"steal_backlog_threshold": True}})
+
+    # Invalid steal_vram_margin_mb
+    with pytest.raises(ValueError, match="scheduler.steal_vram_margin_mb must be a positive integer"):
+        validate_config({**base, "scheduler": {"steal_vram_margin_mb": -100}})
+    with pytest.raises(ValueError, match="scheduler.steal_vram_margin_mb must be a positive integer"):
+        validate_config({**base, "scheduler": {"steal_vram_margin_mb": "3072"}})
+
+    # Invalid min_dur / max_dur
+    with pytest.raises(ValueError, match="scheduler.steal_sublongest_min_duration must be positive and finite"):
+        validate_config({**base, "scheduler": {"steal_sublongest_min_duration": -1.0}})
+    with pytest.raises(ValueError, match="scheduler.steal_sublongest_min_duration cannot be greater than or equal to steal_sublongest_max_duration"):
+        validate_config({**base, "scheduler": {"steal_sublongest_min_duration": 1200.0, "steal_sublongest_max_duration": 600.0}})
+

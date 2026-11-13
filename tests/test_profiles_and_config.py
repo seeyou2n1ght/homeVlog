@@ -287,3 +287,74 @@ def test_scanner_camera_identity_compatibility():
     assert "living_room" in display_l
     assert identifier_l == "living_room"
     assert resolve_camera_ui_name(dir_living, cam_index=1, config=config) == "living_room"
+
+
+class TestIFramePrescreenConfigGovernance:
+    """验证 M1 (F1): iframe_prescreen_enabled 及其超参数的分层配置治理与边界校验规则。"""
+
+    def test_default_iframe_prescreen_config_passes_validation(self):
+        """验证符合规格的默认配置顺利通过校验。"""
+        valid_cfg = {
+            "output": {"fps": 20},
+            "detection": {
+                "iframe_prescreen_enabled": True,
+                "iframe_energy_margin": 0.80,
+                "iframe_burst_ratio": 1.8,
+                "iframe_window_padding": 3.0,
+                "iframe_window_gap_merge": 6.0,
+                "iframe_fallback_active_ratio": 0.60,
+                "iframe_max_isolated_windows": 8,
+            },
+        }
+        validate_config(valid_cfg)
+
+    @pytest.mark.parametrize("invalid_val", ["true", 1, 0, "yes", None, [True]])
+    def test_iframe_prescreen_enabled_rejects_non_bool(self, invalid_val):
+        """严格校验 iframe_prescreen_enabled 必须为原生 bool 类型，拒绝字符串或整型。"""
+        cfg = {"detection": {"iframe_prescreen_enabled": invalid_val}}
+        with pytest.raises(ValueError, match="detection.iframe_prescreen_enabled must be a boolean"):
+            validate_config(cfg)
+
+    @pytest.mark.parametrize("key,valid_vals,invalid_vals,err_pattern", [
+        ("iframe_energy_margin", [0.10, 0.80, 1.00], [0.05, 1.05, -0.5, "0.8", True], "iframe_energy_margin must be between 0.1 and 1.0"),
+        ("iframe_burst_ratio", [1.0, 1.8, 5.0], [0.8, 5.5, 0.0, -1.0, True], "iframe_burst_ratio must be between 1.0 and 5.0"),
+        ("iframe_window_padding", [1.0, 3.0, 10.0], [0.5, 12.0, 0.0, -2.0, True], "iframe_window_padding must be between 1.0 and 10.0"),
+        ("iframe_window_gap_merge", [1.0, 6.0, 20.0], [0.5, 25.0, 0.0, -5.0, True], "iframe_window_gap_merge must be between 1.0 and 20.0"),
+        ("iframe_fallback_active_ratio", [0.20, 0.60, 0.90], [0.10, 0.95, 0.0, 1.5, True], "iframe_fallback_active_ratio must be between 0.2 and 0.9"),
+    ])
+    def test_iframe_float_parameters_range_and_type_bounds(self, key, valid_vals, invalid_vals, err_pattern):
+        """验证浮点型超参数的区间上下界与类型合法性。"""
+        for v in valid_vals:
+            validate_config({"output": {"fps": 20}, "detection": {key: v}})
+        for inv in invalid_vals:
+            with pytest.raises(ValueError, match=err_pattern):
+                validate_config({"detection": {key: inv}})
+
+    @pytest.mark.parametrize("invalid_val", [0, 33, -1, 8.5, "8", True, False])
+    def test_iframe_max_isolated_windows_integer_and_range_bounds(self, invalid_val):
+        """验证最大独立窗口数必须为 [1, 32] 之间的整数。"""
+        with pytest.raises(ValueError, match="detection.iframe_max_isolated_windows must be an integer between 1 and 32"):
+            validate_config({"detection": {"iframe_max_isolated_windows": invalid_val}})
+
+    def test_motion_detector_parses_iframe_settings(self):
+        """验证 MotionDetector 正确解析并绑定配置参数。"""
+        from src.stages.detector import MotionDetector
+        custom_cfg = {
+            "detection": {
+                "iframe_prescreen_enabled": False,
+                "iframe_energy_margin": 0.75,
+                "iframe_burst_ratio": 2.2,
+                "iframe_window_padding": 4.5,
+                "iframe_window_gap_merge": 8.0,
+                "iframe_fallback_active_ratio": 0.50,
+                "iframe_max_isolated_windows": 12,
+            }
+        }
+        detector = MotionDetector(custom_cfg)
+        assert detector.iframe_prescreen_enabled is False
+        assert detector.iframe_energy_margin == 0.75
+        assert detector.iframe_burst_ratio == 2.2
+        assert detector.iframe_window_padding == 4.5
+        assert detector.iframe_window_gap_merge == 8.0
+        assert detector.iframe_fallback_active_ratio == 0.50
+        assert detector.iframe_max_isolated_windows == 12

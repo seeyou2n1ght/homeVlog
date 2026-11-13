@@ -52,9 +52,16 @@ def probe_hardware() -> HardwareSnapshot:
         if torch.cuda.is_available():
             has_cuda = True
             device_count = torch.cuda.device_count()
+            best_idx = 0
+            best_mem = 0
+            for idx in range(device_count):
+                mem = int(torch.cuda.get_device_properties(idx).total_memory / (1024 * 1024))
+                if mem > best_mem:
+                    best_mem = mem
+                    best_idx = idx
             if device_count > 0:
-                gpu_name = torch.cuda.get_device_name(0)
-                vram_mb = int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+                gpu_name = torch.cuda.get_device_name(best_idx)
+                vram_mb = best_mem
     except Exception:
         pass
 
@@ -138,17 +145,19 @@ def compute_optimal_concurrency(snapshot: HardwareSnapshot) -> dict[str, Any]:
         rec["scheduler"]["max_nv_decoders"] = max_nv_dec
         rec["scheduler"]["vram_watermark_mb"] = vram_watermark
         rec["scheduler"]["cooperative_during_render"] = True
-        rec["scheduler"]["watermark_high"] = 2
-        rec["scheduler"]["watermark_low"] = 0
+        rec["scheduler"]["watermark_high"] = 4 if max_nv_dec >= 2 else 2
+        rec["scheduler"]["watermark_low"] = 1 if max_nv_dec >= 2 else 0
+        rec["scheduler"]["heavy_file_duration_s"] = 1200.0
         rec["render"]["nv_tail_concurrency"] = tail_nv_enc
     else:
         base_nv_enc = 0
-        tail_nv_enc = 2
+        tail_nv_enc = 0
         max_nv_dec = 0
         rec["hardware"]["device"] = "cpu"
         rec["hardware"]["max_nv_concurrency"] = 0
         rec["scheduler"]["nvdec_cooperative"] = False
         rec["scheduler"]["max_nv_decoders"] = 0
+        rec["render"]["nv_tail_concurrency"] = 0
 
     # 2. 核显 QSV 槽位决策
     if snapshot.has_qsv:

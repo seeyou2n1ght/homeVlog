@@ -115,10 +115,11 @@ class VideoLease:
             self.hardware.release()
 
 
-def get_nv_vram_used_mb(gpu_index: int = 0) -> int | None:
-    """获取指定 NVIDIA GPU 当前物理已用显存 (MB)。
+def get_nv_vram_info(gpu_index: int = 0) -> dict[str, int] | None:
+    """获取指定 NVIDIA GPU 当前物理显存信息 (MB)。
 
     返回 None 表示系统无 NVIDIA GPU、驱动未加载或 NVML 探测不可用。
+    成功时返回 {"total_mb": int, "used_mb": int, "free_mb": int}。
     """
     global _nvml_initialized
     try:
@@ -129,9 +130,32 @@ def get_nv_vram_used_mb(gpu_index: int = 0) -> int | None:
                 _nvml_initialized = True
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        return int(mem.used / 1024 / 1024)
+        return {
+            "total_mb": int(mem.total / 1024 / 1024),
+            "used_mb": int(mem.used / 1024 / 1024),
+            "free_mb": int(mem.free / 1024 / 1024),
+        }
     except Exception:
         return None
+
+
+def get_nv_vram_free_mb(gpu_index: int = 0) -> int | None:
+    """获取指定 NVIDIA GPU 当前物理可用空闲显存 (MB)。"""
+    info = get_nv_vram_info(gpu_index)
+    if info is not None:
+        return info["free_mb"]
+    return None
+
+
+def get_nv_vram_used_mb(gpu_index: int = 0) -> int | None:
+    """获取指定 NVIDIA GPU 当前物理已用显存 (MB)。
+
+    返回 None 表示系统无 NVIDIA GPU、驱动未加载或 NVML 探测不可用。
+    """
+    info = get_nv_vram_info(gpu_index)
+    if info is not None:
+        return info["used_mb"]
+    return None
 
 
 def acquire_with_retry(
@@ -373,6 +397,22 @@ class WorkStealingManager:
         self._vram_probe_fn = get_nv_vram_used_mb
         self._last_vram_warn_time = 0.0
 
+        # R2: 尾段自适应工作窃取 (Work Stealing) 配置绑定
+        self.steal_enabled: bool = bool(
+            sched_cfg.get("steal_enabled", sched_cfg.get("work_stealing_enabled", True))
+        )
+        self.steal_backlog_threshold: int = int(sched_cfg.get("steal_backlog_threshold", 2))
+        self.steal_vram_margin_mb: int = int(sched_cfg.get("steal_vram_margin_mb", 3072))
+        self.steal_sublongest_max_duration: float = float(
+            sched_cfg.get("steal_sublongest_max_duration", self.heavy_duration_s)
+        )
+        self.steal_sublongest_min_duration: float = float(
+            sched_cfg.get("steal_sublongest_min_duration", 300.0)
+        )
+        self._vram_info_fn = get_nv_vram_info
+        self._vram_margin_probe_fn = get_nv_vram_free_mb
+        self.heavy_tasks_cleared: bool = True
+
         self._lock = threading.Lock()
         self._slot_condition = threading.Condition(self._lock)
         self._render_active_count = 0
@@ -383,6 +423,16 @@ class WorkStealingManager:
         """设置显存探测函数（支持单元测试注入 Mock）。"""
         with self._lock:
             self._vram_probe_fn = fn
+
+    def set_vram_info_fn(self, fn) -> None:
+        """设置显存信息探测函数（支持单元测试注入 Mock）。"""
+        with self._lock:
+            self._vram_info_fn = fn
+
+    def set_vram_margin_probe_fn(self, fn) -> None:
+        """设置显存裕度探测函数（支持单元测试注入 Mock）。"""
+        with self._lock:
+            self._vram_margin_probe_fn = fn
 
     def is_vram_under_pressure(self) -> bool:
         """检测当前显卡物理显存是否超过安全水位线。"""
@@ -422,6 +472,122 @@ class WorkStealingManager:
         except Exception as exc:
             logger.debug("WorkStealing: extra NV admission probe failed: %s", exc)
             return False
+
+    def has_vram_margin(self, min_margin_mb: int = 3072, gpu_index: int = 0) -> bool:
+        """查询 NVIDIA GPU 物理可用显存裕度是否满足工作窃取准入门限。
+
+        返回 True 当且仅当：
+        1. 物理剩余可用显存 >= min_margin_mb (默认 3072 MB)；
+        2. 当前已用显存 < vram_watermark_mb (默认 6200 MB)；
+        3. 探测采样值有效且非 NaN/Inf。
+        若探测不可用、抛出异常或返回 None，则保守返回 False。
+        """
+        import math
+
+        margin_fn = getattr(self, "_vram_margin_probe_fn", None)
+        used_fn = getattr(self, "_vram_probe_fn", None)
+        info_fn = getattr(self, "_vram_info_fn", None)
+
+        if margin_fn is None and used_fn is None:
+            return False
+
+        free_mb = None
+        used_mb = None
+
+        if margin_fn is not None:
+            try:
+                try:
+                    sample = margin_fn(gpu_index=gpu_index)
+                except TypeError:
+                    sample = margin_fn()
+                if sample is not None:
+                    if isinstance(sample, dict):
+                        free_mb = sample.get("free_mb")
+                        if "used_mb" in sample and used_mb is None:
+                            used_mb = sample.get("used_mb")
+                    elif isinstance(sample, (int, float)):
+                        free_mb = float(sample)
+            except Exception as exc:
+                logger.debug("WorkStealing: VRAM margin probe error: %s", exc)
+                return False
+
+        if free_mb is None and info_fn is not None:
+            try:
+                try:
+                    info = info_fn(gpu_index=gpu_index)
+                except TypeError:
+                    info = info_fn()
+                if info is not None and isinstance(info, dict):
+                    free_mb = info.get("free_mb")
+                    if "used_mb" in info and used_mb is None:
+                        used_mb = info.get("used_mb")
+            except Exception as exc:
+                logger.debug("WorkStealing: VRAM info probe error: %s", exc)
+                return False
+
+        if used_fn is not None:
+            try:
+                try:
+                    u_sample = used_fn(gpu_index=gpu_index)
+                except TypeError:
+                    u_sample = used_fn()
+                if u_sample is not None and isinstance(u_sample, (int, float)):
+                    used_mb = float(u_sample)
+            except Exception as exc:
+                logger.debug("WorkStealing: VRAM used probe error: %s", exc)
+                return False
+
+        if free_mb is None and used_mb is not None:
+            total_mb = getattr(self, "vram_total_mb", 8192)
+            free_mb = total_mb - used_mb
+
+        if free_mb is None or not math.isfinite(free_mb):
+            return False
+
+        if free_mb < min_margin_mb:
+            return False
+
+        if used_mb is not None:
+            if not math.isfinite(used_mb):
+                return False
+            if used_mb >= self.vram_watermark_mb:
+                return False
+
+        return True
+
+    def can_worker_0_steal(
+        self,
+        queue_size: int,
+        heavy_tasks_cleared: bool = True,
+    ) -> bool:
+        """评估 Worker 0 尾段工作窃取五道门限准入策略 (Five-Gate Admission):
+        Gate 1: 启用开关 (steal_enabled)；
+        Gate 2: 夜间重任务已出清 (heavy_tasks_cleared is True)；
+        Gate 3: Worker 0 NVDEC 算力空闲 (active_nv_decoders < max_nv_decoders)；
+        Gate 4: QSV 队列积压超过门限 (queue_size >= steal_backlog_threshold)；
+        Gate 5: 物理空闲显存裕度充沛 (has_vram_margin(steal_vram_margin_mb))。
+        """
+        with self._lock:
+            if not getattr(self, "steal_enabled", True):
+                return False
+            if not heavy_tasks_cleared:
+                return False
+            if self._active_nv_decoders >= self.max_nv_decoders:
+                return False
+            if queue_size < getattr(self, "steal_backlog_threshold", 2):
+                return False
+            margin_mb = getattr(self, "steal_vram_margin_mb", 3072)
+            if not self.has_vram_margin(margin_mb):
+                return False
+            return True
+
+    def can_steal_analysis_task(
+        self,
+        queue_size: int,
+        heavy_tasks_cleared: bool = True,
+    ) -> bool:
+        """Alias for can_worker_0_steal."""
+        return self.can_worker_0_steal(queue_size, heavy_tasks_cleared=heavy_tasks_cleared)
 
     def enable_cold_start_burst(self) -> None:
         """激活冷启动破冰模式：在渲染任务就绪前优先调用 NVDEC 协同解码冲刷队列。"""
@@ -465,10 +631,11 @@ class WorkStealingManager:
 
     def get_analysis_device(
         self,
-        queue_size: int,
+        queue_size: int = 0,
         is_render_active: bool | None = None,
         prescreen_idle: bool = False,
         file_duration: float = 0.0,
+        is_stolen: bool = False,
     ) -> str:
         """
         根据队列水位、渲染状态与任务负载成本 (file_duration) 决策当前分析任务的解码硬件设备。
@@ -476,6 +643,18 @@ class WorkStealingManager:
         返回值: "qsv" | "cuda"
         """
         with self._lock:
+            # R2: 工作窃取专属通道 (Tail Work Stealing)
+            # 若任务已被窃取（次长切片），在显存安全且 NVDEC 算力空闲时授权 CUDA 解码，
+            # 绝对不进入 RENDER_PREEMPTION_YIELD 让步逻辑！
+            if is_stolen:
+                if self.is_vram_under_pressure():
+                    self._state = "VRAM_PRESSURE_YIELD"
+                    return "qsv"
+                if self._active_nv_decoders < self.max_nv_decoders:
+                    self._state = "TAIL_WORK_STEALING"
+                    return "cuda"
+                return "qsv"
+
             render_active = (
                 is_render_active if is_render_active is not None else (self._render_active_count > 0)
             )
@@ -505,12 +684,6 @@ class WorkStealingManager:
                     self._state = "RENDER_PREEMPTION_YIELD"
                     return "qsv"
                 return "cuda"
-
-            # 在 cost_priority 模式下，NVDEC 专供 LPT 重型长文件消费，6 个 QSV Worker 专供 SJF 轻型短切片
-            # 杜绝轻切片抢占 NVDEC 槽位导致 55 分钟巨型文件被反向错配至 QSV 爬行 800 秒
-            if self.config.get("pipeline", {}).get("cost_priority", False):
-                self._state = "NORMAL_DECOUPLED"
-                return "qsv"
 
             # 渲染进行中分支：开启协同且显存安全时，采用滞回控制 (Hysteresis) 借调 NVDEC 槽位，避免频繁让步抖动
             if render_active:
@@ -547,12 +720,12 @@ class WorkStealingManager:
                     return "cuda"
                 return "qsv"
 
-    def acquire_nvdec_slot(self, timeout: float = 0.0) -> bool:
+    def acquire_nvdec_slot(self, timeout: float = 0.0, is_stolen: bool = False) -> bool:
         """尝试占用一个 NVDEC 解码协同槽位。若 timeout > 0，在槽位满时等待释放。"""
         deadline = time.monotonic() + timeout if timeout > 0 else 0.0
         with self._slot_condition:
             while True:
-                if self._render_active_count > 0 and not self.cooperative_during_render:
+                if not is_stolen and self._render_active_count > 0 and not self.cooperative_during_render:
                     return False
                 if self.is_vram_under_pressure():
                     self._state = "VRAM_PRESSURE_YIELD"
@@ -576,9 +749,10 @@ class WorkStealingManager:
     @contextmanager
     def lease_device(
         self,
-        queue_size: int,
+        queue_size: int = 0,
         prescreen_idle: bool = False,
         file_duration: float = 0.0,
+        is_stolen: bool = False,
     ):
         """上下文管理器：自动决策解码设备并在使用 CUDA 时安全管理 NVDEC 槽位生命周期。"""
         is_heavy = (file_duration >= self.heavy_duration_s)
@@ -588,10 +762,11 @@ class WorkStealingManager:
             queue_size,
             prescreen_idle=prescreen_idle,
             file_duration=file_duration,
+            is_stolen=is_stolen,
         )
         acquired_slot = False
         if device == "cuda":
-            if self.acquire_nvdec_slot(timeout=timeout):
+            if self.acquire_nvdec_slot(timeout=timeout, is_stolen=is_stolen):
                 acquired_slot = True
             else:
                 device = "qsv"
@@ -600,6 +775,13 @@ class WorkStealingManager:
         finally:
             if acquired_slot:
                 self.release_nvdec_slot()
+            if is_stolen:
+                with self._lock:
+                    if self._active_nv_decoders == 0:
+                        if self._render_active_count > 0:
+                            self._state = "COOPERATIVE_RENDER_COEXIST" if self.cooperative_during_render else "RENDER_PREEMPTION_YIELD"
+                        else:
+                            self._state = "NORMAL_DECOUPLED"
 
 
 @dataclass
