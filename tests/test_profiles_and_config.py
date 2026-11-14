@@ -358,3 +358,34 @@ class TestIFramePrescreenConfigGovernance:
         assert detector.iframe_window_gap_merge == 8.0
         assert detector.iframe_fallback_active_ratio == 0.50
         assert detector.iframe_max_isolated_windows == 12
+
+    def test_speedup_phase_config_validation(self):
+        """验证加速优化阶段引入的新配置项校验规则。"""
+        from src.core.config import validate_config
+
+        valid = {
+            "output": {"fps": 20, "audio": {"codec": "aac", "concat_codec": "auto"}},
+            "detection": {
+                "cpu_analysis_workers": 2,
+                "cpu_analysis_max_duration_s": 600.0,
+                "cpu_decode_threads": 4,
+            },
+            "render": {
+                "night_sparse_enabled": True,
+                "night_sparse_min_duration_s": 16.0,
+                "nv_tail_use_cpu_decode": True,
+                "cpu_nvenc_decode_threads": 6,
+            },
+        }
+        validate_config(valid)
+
+        with pytest.raises(ValueError, match="cpu_analysis_workers must be non-negative"):
+            validate_config({"detection": {"cpu_analysis_workers": -1}})
+        with pytest.raises(ValueError, match="cpu_analysis_max_duration_s must be positive"):
+            validate_config({"detection": {"cpu_analysis_max_duration_s": 0}})
+        with pytest.raises(ValueError, match="night_sparse_enabled must be a boolean"):
+            validate_config({"render": {"night_sparse_enabled": "yes"}})
+        with pytest.raises(ValueError, match="night_sparse_min_duration_s must be >= 4.0"):
+            validate_config({"render": {"night_sparse_min_duration_s": 2.0}})
+        with pytest.raises(ValueError, match="Unsupported output.audio.concat_codec"):
+            validate_config({"output": {"audio": {"concat_codec": "invalid_codec"}}})

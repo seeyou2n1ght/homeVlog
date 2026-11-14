@@ -8,7 +8,7 @@
 5. 各阶段 Top-N 最慢记录（长尾定位）。
 
 用法:
-    uv run python scripts/analyze_perf.py [--top 5] [--glob "logs/perf_*.json"]
+    uv run python scripts/analyze_perf.py [--top 5] [--glob "logs/perf/perf_*.json"]
 """
 
 import argparse
@@ -205,15 +205,18 @@ def analyze_file(path: Path, top_n: int) -> None:
     if w_stats:
         nv_idles = [ws["idle_time_s"] for wid, ws in w_stats.items() if ws.get("gpu") == "nv"]
         qsv_ws = [ws for wid, ws in w_stats.items() if ws.get("gpu") == "qsv"]
-        if nv_idles and statistics.mean(nv_idles) > wall * 0.25:
+        if wall > 0 and nv_idles and statistics.mean(nv_idles) > wall * 0.25:
             rca.append(f"NVENC 渲染端存在明显等待饥饿 (平均空闲 {_fmt_s(statistics.mean(nv_idles))}, 占壁钟 {statistics.mean(nv_idles)/wall*100:.1f}%)，瓶颈在前期分析产出速度。")
-        if qsv_ws and qsv_ws[0]["utilization_pct"] < 45.0:
-            rca.append(f"QSV 核显利用率偏低 ({qsv_ws[0]['utilization_pct']:.1f}%)，建议评估调优工作窃取门限以分担更多渲染。")
-        if qsv_ws and qsv_ws[0].get("qsv_steal_rejected", 0) > 15:
-            rca.append(f"QSV 尝试窃取动态批次被拒收 {qsv_ws[0]['qsv_steal_rejected']} 次，表明队列动态时长偏重或门限约束较紧。")
+        if qsv_ws:
+            avg_qsv_util = statistics.mean(ws.get("utilization_pct", 0.0) for ws in qsv_ws)
+            total_steal_rejected = sum(ws.get("qsv_steal_rejected", 0) for ws in qsv_ws)
+            if avg_qsv_util < 45.0:
+                rca.append(f"QSV 核显利用率偏低 ({avg_qsv_util:.1f}%)，建议评估调优工作窃取门限以分担更多渲染。")
+            if total_steal_rejected > 15:
+                rca.append(f"QSV 尝试窃取动态批次被拒收 {total_steal_rejected} 次，表明队列动态时长偏重或门限约束较紧。")
     if yolo_sum and yolo_sum.get("total_lock_wait_s", 0) > 30.0:
         rca.append(f"YOLO 推理锁争用严重 (累计排队 {_fmt_s(yolo_sum['total_lock_wait_s'])})，建议加大分析端帧批量或降低 YOLO 采样率。")
-    if ana:
+    if ana and total_worker_time > 0:
         total_dec = sum(r["extra"].get("decode_time_s", r["extra"].get("decode_time", 0)) for r in ana)
         if total_dec > total_worker_time * 0.40:
             rca.append(f"解码及同步逐帧处理占主阶段工时 {total_dec/total_worker_time*100:.1f}%；不能据此区分纯解码、I/O 和运动计算成本。")

@@ -272,7 +272,7 @@ def print_doctor_report(console: Console = None) -> bool:
         a_wok = opt["detection"].get("analysis_max_workers", 7)
         nv_dec = opt["scheduler"].get("max_nv_decoders", 2)
         vram_wm = opt["scheduler"].get("vram_watermark_mb", 6200)
-        tune_desc = f"渲染: {r_con} 路 ({nv_enc} NVENC + {qsv_enc} QSV) | 分析: {a_wok} 路 (NVDEC借调上限 {nv_dec}) | 显存水线: {vram_wm} MB"
+        tune_desc = f"推荐渲染 {r_con} 路 ({nv_enc} NVENC + {qsv_enc} QSV) | 分析 {a_wok} 路 (NVDEC借调 {nv_dec}) | 显存水线 {vram_wm} MB (仅作兜底，显式配置优先)"
         table.add_row("自适应算力推荐", "[bold green]✔ 动态推导[/bold green]", tune_desc)
     except Exception as e:
         table.add_row("自适应算力推荐", "[yellow]⚠ 默认[/yellow]", f"推导探针跳过: {e}")

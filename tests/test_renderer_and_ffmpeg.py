@@ -2552,3 +2552,130 @@ def test_source_identity_contract(tmp_path):
     # 4. Directory raises OSError
     with pytest.raises(OSError):
         source_identity(tmp_path)
+
+
+def test_night_sparse_plan_mixed_and_sparse_only():
+    from src.stages.renderer import build_night_sparse_plan
+    from src.stages.timeline import TimelineSegment
+
+    # Mixed file: dense DYNAMIC + short 10s NIGHT_STATIONARY (<16s stays dense) + long 120s NIGHT_STATIONARY (>=16s sparse)
+    mixed = [
+        TimelineSegment("night.mp4", 0, 0.0, 20.0, "DYNAMIC", duration=20.0),
+        TimelineSegment("night.mp4", 0, 20.0, 30.0, "NIGHT_STATIONARY", duration=10.0),
+        TimelineSegment("night.mp4", 0, 30.0, 150.0, "NIGHT_STATIONARY", duration=120.0),
+        TimelineSegment("night.mp4", 0, 150.0, 170.0, "DYNAMIC", duration=20.0),
+    ]
+    plan = build_night_sparse_plan(mixed, min_night_duration_s=16.0)
+    assert plan is not None
+    assert plan.has_dense is True
+    assert plan.sparse_input_index == 1
+    assert plan.sparse_segments == 1
+    assert plan.edl_text is not None and "inpoint 150.000000" in plan.edl_text
+    assert [seg.input_index for seg in plan.mapped_timeline] == [0, 0, 1, 0]
+    assert [seg.start_in_file for seg in plan.source_timeline] == [0.0, 20.0, 30.0, 150.0]
+
+    # Sparse-only file: uses single input_index=0 without EDL
+    sparse_only = [
+        TimelineSegment("night.mp4", 0, 0.0, 600.0, "NIGHT_STATIONARY", duration=600.0),
+    ]
+    sparse_plan = build_night_sparse_plan(sparse_only, min_night_duration_s=16.0)
+    assert sparse_plan is not None
+    assert sparse_plan.has_dense is False
+    assert sparse_plan.sparse_input_index == 0
+    assert sparse_plan.edl_text is None
+
+    # Sparse fraction below 10% skips dual-input path
+    mostly_dense = [
+        TimelineSegment("day.mp4", 0, 0.0, 500.0, "DYNAMIC", duration=500.0),
+        TimelineSegment("day.mp4", 0, 500.0, 535.0, "NIGHT_STATIONARY", duration=35.0),
+    ]
+    assert build_night_sparse_plan(mostly_dense, min_night_duration_s=16.0) is None
+
+
+def test_build_batch_render_night_sparse_cpu_nvenc_and_concat_codec(monkeypatch, tmp_path):
+    from src.stages import renderer
+    from src.stages.timeline import TimelineSegment
+
+    captured = {}
+
+    def fake_run_batch(input_files, fc, batch_path, encoder, fps, out_cfg, audio_cfg,
+                       date, cam_index, **kwargs):
+        captured["encoder"] = encoder
+        captured["fc"] = fc
+        captured["input_args"] = list(kwargs.get("input_args") or [])
+        return str(batch_path)
+
+    monkeypatch.setattr(renderer, "_run_batch_render", fake_run_batch)
+    segs = [
+        TimelineSegment(str(tmp_path / "c.mp4"), 0, 0.0, 15.0, "DYNAMIC", duration=15.0),
+        TimelineSegment(str(tmp_path / "c.mp4"), 0, 15.0, 195.0, "NIGHT_STATIONARY", duration=180.0),
+    ]
+    rows = [{"filepath": str(tmp_path / "c.mp4"), "has_audio": 1, "file_duration": 195.0}]
+    cfg = {
+        "render": {"night_sparse_enabled": True, "night_sparse_min_duration_s": 16.0, "cpu_nvenc_decode_threads": 6},
+        "presence": {"night_speed_factor": 16.0},
+    }
+    res = renderer.build_batch_render(
+        segs, 0, "nv", 20, 1920, 1080, {}, {"codec": "hevc_nvenc"},
+        {"codec": "aac", "bitrate": "96k", "channels": 1}, "20260326", 0, rows,
+        config=cfg, inspect_only=True, cpu_decode=True,
+    )
+    assert res is not None
+    assert captured["encoder"] == "cpu_nvenc"
+    assert "-discard" in captured["input_args"]
+    assert "nokey" in captured["input_args"]
+    assert "-hwaccel" not in captured["input_args"]
+    assert "-threads" in captured["input_args"] and "6" in captured["input_args"]
+    assert "[2:a]" in captured["fc"]
+    assert "[1:v]scale=1920:1080" in captured["fc"]
+
+    assert renderer._resolve_concat_audio_codec({"codec": "aac", "concat_codec": "aac"}) == "aac"
+    assert renderer._resolve_concat_audio_codec({"codec": "aac", "concat_codec": "aac_mf"}) == "aac_mf"
+    monkeypatch.setattr(renderer, "_probe_aac_mf", lambda: True)
+    assert renderer._resolve_concat_audio_codec({"codec": "aac", "concat_codec": "auto"}) == "aac_mf"
+    monkeypatch.setattr(renderer, "_probe_aac_mf", lambda: False)
+    assert renderer._resolve_concat_audio_codec({"codec": "aac", "concat_codec": "auto"}) == "aac"
+
+
+def test_pure_static_files_include_discard_nokey(monkeypatch, tmp_path):
+    from src.stages import renderer
+    from src.hardware import scheduler
+
+    launched = {}
+
+    class DummyProc:
+        returncode = 0
+        def wait(self, timeout=None):
+            return 0
+        def poll(self):
+            return 0
+
+    tmp_out = tmp_path / "out.tmp.mp4"
+
+    def fake_start(key, cmd, **_kw):
+        launched["cmd"] = list(cmd)
+        tmp_out.write_bytes(b"mp4")
+        return DummyProc()
+
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"hardware": {"max_qsv_concurrency": 4, "max_qsv_render_concurrency": 2}})
+    scheduler.reset_semaphores()
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "reap_cleanups", lambda: None)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "is_owned", lambda _k: False)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "is_interrupted", lambda: False)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "start", fake_start)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "terminate", lambda _k: None)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "wait_for_exit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(renderer.FFmpegProcessRegistry, "deregister", lambda *_a, **_kw: None)
+    monkeypatch.setattr("src.hardware.render_cache.reusable", lambda *_a, **_kw: False)
+    monkeypatch.setattr("src.hardware.render_cache.valid_video", lambda *_a, **_kw: True)
+    monkeypatch.setattr("src.hardware.render_cache.save_manifest", lambda *_a, **_kw: None)
+
+    src = str(tmp_path / "static.mp4")
+    out = tmp_path / "out.mp4"
+    res = renderer._run_batch_render_owned(
+        [src], "[0:v]null[v];anullsrc[a]", out, "qsv", 20, {}, {"codec": "aac"},
+        "20260326", 0, pure_static_files={src}, expected_duration=2.0, config={},
+    )
+    assert res == str(out)
+    cmd = launched["cmd"]
+    assert "-discard" in cmd and "nokey" in cmd and "-skip_frame" in cmd

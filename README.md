@@ -37,12 +37,12 @@ uv run python main.py --help
 - 默认7个分析worker、NV作业预算2及QSV协同；硬件和I/O由共享调度器管理。预算不是显存或驱动会话上限保证。
 - 批次先写临时媒体并验证再原子发布；交付包括媒体、元数据、字幕和manifest。完成记录提交失败、中断或取消不得伪装成功。
 - `render_tasks.COMPLETED`为历史交付记录，普通运行不会因产物已移走而自动重做。备份交付时同时备份数据库；明确重做使用 `--force-render`。
-- 默认保留有效批次供恢复；`render.cleanup_batches_on_success`可控制成功后清理。`--clean-temp`会显式清理历史批次，只在确认不再需要恢复时使用。
+- `config/settings.yaml` 默认启用 `render.cleanup_batches_on_success: true`，交付成功后自动清理本次临时渲染批次；如需保留批次供调试或复用恢复，可设为 `false`。`--clean-temp` 会显式清理历史批次，只在确认不再需要恢复时使用。若需重析并重渲染已交付日期，需同时传入 `--reanalyze --force-render`。
 - `.delivery_backup_*` 和 `recovery.json` 用于恢复失败的交付。同一共享工作区通过内核认领限制并发处理，避免多个进程改写同一批次和交付资产。
 
 ## 维护与验证
 
-维护工具包括 `analyze_perf.py`（汇总性能日志）、`benchmark_day.py`（隔离运行冻结负载）和 `inspect_detection.py`（单源诊断）。
+维护工具包括 `analyze_perf.py`（汇总性能日志）、`benchmark_day.py`（隔离运行冻结负载）、`verify_cold_run_audit.py`（核验已交付冷跑成片的事件与时长对齐）和 `inspect_detection.py`（单源诊断）。
 
 ```powershell
 uv run ruff check main.py src scripts tests

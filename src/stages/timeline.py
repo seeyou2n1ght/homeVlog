@@ -808,7 +808,7 @@ def build_timeline(db: VlogDatabase, date: str, cam_index: int) -> list[Timeline
 
 def _single_pass_dense_video(timeline, source_timeline, display_plans, scale_parts,
                              output_fps, planned_frames, *, scale_mode, preselected_static,
-                             timecode_osd):
+                             timecode_osd, sparse_inputs=None):
     """Retiming on one dense frame clock avoids one video branch per segment.
 
     Keep the existing spatial filter and audio chains. The balanced lookup
@@ -816,7 +816,7 @@ def _single_pass_dense_video(timeline, source_timeline, display_plans, scale_par
     the shared plan's exact frame slots. Unsupported slices retain the legacy
     graph, including sparse inputs, ramps, OSD and overlapping/sub-frame cuts.
     """
-    if (len(timeline) < 2 or preselected_static or timecode_osd
+    if (len(timeline) < 2 or preselected_static or sparse_inputs or timecode_osd
             or scale_mode not in ("cpu", "cuda_passthrough")
             or len({seg.input_index for seg in timeline}) != 1
             or len({seg.filepath for seg in timeline}) != 1
@@ -904,6 +904,8 @@ def build_concat_filter(
     sparse_mixed: bool = False,
     static_sample_window_s: float = 0.25,
     audio_input_offset: int = 0,
+    audio_input_index_override: int | None = None,
+    sparse_inputs: set[int] | None = None,
     source_timeline: list[TimelineSegment] | None = None,
     config: dict | None = None,
     audio_groups_out: list[GroupedAudioPlan] | None = None,
@@ -1005,20 +1007,24 @@ def build_concat_filter(
     file_split_counter: dict[int, int] = {}
     n_keyframe_fast = 0
 
+    sparse_input_set = set(sparse_inputs or ())
+
     for idx in sorted(segs_per_file):
         n_segs = segs_per_file[idx]
         file_segs = segs_by_file.get(idx, [])
         all_static = all(s.state == "STATIC" for s in file_segs)
         min_src_dur = min((s.end_in_file - s.start_in_file) for s in file_segs) if file_segs else 0.0
+        is_sparse_input = idx in sparse_input_set
         use_kf_fastpath = (
             not preselected_static
+            and not is_sparse_input
             and render_cfg.get("static_mode") != "continuous"
             and all_static
             and min_src_dur >= 2.0 * kf_interval
         )
         has_dynamic = any(s.state in ACTIVE_STATES for s in file_segs)
         has_static = any(s.state == "STATIC" for s in file_segs)
-        use_sparse_mixed = sparse_mixed and has_dynamic and has_static
+        use_sparse_mixed = sparse_mixed and not is_sparse_input and has_dynamic and has_static
 
         input_v = f"[{idx}:v]"
 
@@ -1070,11 +1076,14 @@ def build_concat_filter(
             sel = f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{kf_interval:.1f})'"
             scale_parts.append(f"{input_v}{sel},{scale_core}[scaled_{idx}]")
             n_keyframe_fast += 1
+        elif is_sparse_input:
+            # Night-sparse keyframe stream: preserve sparse PTS until per-segment retiming and fps expansion.
+            scale_parts.append(f"{input_v}{scale_core}[scaled_{idx}]")
         elif scale_filter is not None:
             scale_parts.append(f"{input_v}{scale_filter}[scaled_{idx}]")
         else:
             scale_parts.append(f"{input_v}null[skip_{idx}]")
-        base_label = f"scaled_{idx}" if (scale_filter is not None or use_kf_fastpath) else f"skip_{idx}"
+        base_label = f"scaled_{idx}" if (scale_filter is not None or use_kf_fastpath or is_sparse_input) else f"skip_{idx}"
         # A final trim can be empty when the camera stops just before its nominal end.
         # Pad before splitting so every planned slice can still see the last frame.
         source_end = max(seg.end_in_file for seg in file_segs)
@@ -1128,7 +1137,7 @@ def build_concat_filter(
 
     for i, seg in enumerate(timeline):
         idx = seg.input_index
-        audio_idx = idx + audio_input_offset
+        audio_idx = audio_input_index_override if audio_input_index_override is not None else (idx + audio_input_offset)
         s = seg.start_in_file
         e = seg.end_in_file
         # Dense input has already been resampled to output_fps. FFmpeg rounds
@@ -1136,7 +1145,11 @@ def build_concat_filter(
         # interval (e.g. 325.700..325.724 at 20 fps). Keep one source frame for
         # the display plan's minimum one-frame slot; audio/source mapping stays
         # on the original interval. Padding before split covers physical EOF.
-        video_end = max(e, s + 1 / output_fps) if not preselected_static and seg.state in ACTIVE_STATES else e
+        video_end = (
+            max(e, s + 1 / output_fps)
+            if (not preselected_static and idx not in sparse_input_set and seg.state in ACTIVE_STATES)
+            else e
+        )
         source_seg = source_timeline[i]
         source_s = source_seg.start_in_file
         source_e = source_seg.end_in_file
@@ -1237,7 +1250,8 @@ def build_concat_filter(
     planned_samples = round(planned_frames * audio_sample_rate / output_fps)
     single_pass = _single_pass_dense_video(
         timeline, source_timeline, display_plans, scale_parts, output_fps, planned_frames,
-        scale_mode=scale_mode, preselected_static=preselected_static, timecode_osd=timecode_osd)
+        scale_mode=scale_mode, preselected_static=preselected_static, timecode_osd=timecode_osd,
+        sparse_inputs=sparse_input_set)
     if single_pass is not None:
         audio_labels = "".join(f"[a{i}]" for i in range(seg_count))
         final_audio = (
@@ -1245,7 +1259,8 @@ def build_concat_filter(
             f"apad,atrim=end_sample={planned_samples},asettb=1/{audio_sample_rate},asetpts=N[a]"
         )
         if (audio_groups_out is not None and seg_count >= GROUPED_AUDIO_MIN_SEGMENTS
-                and audio_input_offset == 0 and input_has_audio.get(0, False)
+                and audio_input_offset == 0 and audio_input_index_override is None
+                and not sparse_input_set and input_has_audio.get(0, False)
                 and timeline[0].input_index == 0 and audio_sample_rate == 48000
                 and output_fps > 0 and int(output_fps) == output_fps
                 and audio_sample_rate % int(output_fps) == 0

@@ -3,11 +3,8 @@ Test Helper Utilities for HomeVlog E2E and Tier 1-4 Test Suites.
 """
 
 import json
-import math
 import os
 import re
-import struct
-import wave
 from pathlib import Path
 from typing import Any
 
@@ -133,34 +130,3 @@ def verify_filtergraph_labels_closure(filter_str: str) -> tuple[bool, str]:
             return False, f"Missing audio label [{a_lbl}] in concat inputs"
 
     return True, "Filtergraph labels properly closed"
-
-
-def create_synthetic_wav(
-    filepath: Path,
-    duration_sec: float = 1.0,
-    sample_rate: int = 48000,
-    frequency: float = 440.0,
-    silence: bool = False,
-) -> Path:
-    """
-    Generate a synthetic WAV file for testing audio extraction and VAD.
-    """
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    num_samples = int(sample_rate * duration_sec)
-
-    with wave.open(str(filepath), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-
-        frames = bytearray()
-        for i in range(num_samples):
-            if silence:
-                value = 0
-            else:
-                t = i / sample_rate
-                value = int(16000.0 * math.sin(2.0 * math.pi * frequency * t))
-            frames.extend(struct.pack("<h", value))
-        wav_file.writeframes(frames)
-
-    return filepath

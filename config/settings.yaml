@@ -85,6 +85,9 @@ detection:
   analysis_fps: 5
   analysis_resolution: "416x234"
   analysis_max_workers: 7
+  cpu_analysis_workers: 0         # 默认 0：避免 10 核宿主上与 QSV/NVDEC 抢占 CPU 及拖慢 CUDA/YOLO
+  cpu_analysis_max_duration_s: 600.0
+  cpu_decode_threads: 4
   analysis_buffer_mb: 256
   analysis_fps_adaptive: true
   analysis_fps_tiers:
@@ -136,7 +139,11 @@ render:
   batch_max_files: 1
   max_concurrency: 3
   nv_tail_concurrency: 3
+  nv_tail_use_cpu_decode: true
+  cpu_nvenc_decode_threads: 6
   max_qsv_dynamic_duration_s: 420.0
+  night_sparse_enabled: true
+  night_sparse_min_duration_s: 16.0
   virtual_concat_enabled: true
   virtual_concat_mixed_enabled: true
   virtual_concat_max_decode_ratio: 0.80
@@ -175,6 +182,7 @@ output:
     pix_fmt: "nv12"
   audio:
     codec: "aac"
+    concat_codec: "aac"           # 保持原生 "aac" 以确保 <1ms 音画时长闭合；"aac_mf" 会产生 1024-sample 对齐漂移
     bitrate: "96k"
     channels: 1
 

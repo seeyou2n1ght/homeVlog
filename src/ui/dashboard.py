@@ -373,7 +373,7 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
             sz_text = f"{out_size_mb:.1f} MB"
         elif status == "COMPLETED":
             st_text = "[green]✔ 已渲染[/green]"
-            sz_text = "[dim]未知路径[/dim]"
+            sz_text = "[dim]文件已移走 (--force-render可重产)[/dim]" if out_file else "[dim]未知路径[/dim]"
         else:
             st_text = "[yellow]⏳ 待处理[/yellow]"
             sz_text = "-"

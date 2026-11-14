@@ -23,4 +23,4 @@ uv run python -m pytest tests/ -v --durations=10
 | 渲染与恢复 | 软件 FFmpeg 像素、时钟、音频和接缝，失败及取消不标完成，交付回滚与骤停恢复 |
 | 合成端到端 | 多机位扫描、动静判定、软件渲染、伴生资产、遥测和重复运行复用 |
 
-合成素材用于验证流程合同。识别准确率、主观质量、真实 SMB 故障和全天硬件性能分别需要相应的实测证据。真实机先运行 `uv run python main.py --doctor`，再按 [BENCHMARK](BENCHMARK.md) 的负载和口径测量。架构决策见 [ADR0082](DECISIONS.md)。
+合成素材用于验证流程合同。识别准确率、主观质量、真实 SMB 故障和全天硬件性能分别需要相应的实测证据。真实机先运行 `uv run python main.py --doctor`，全冷跑交付后运行 `uv run python scripts/verify_cold_run_audit.py <YYYYMMDD>` 核验成片包时钟、源区间与接缝连续性，再按 [BENCHMARK](BENCHMARK.md) 的负载和口径测量。架构决策见 [ADR0082](DECISIONS.md) 至 [ADR0087](DECISIONS.md)。

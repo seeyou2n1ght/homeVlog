@@ -31,12 +31,12 @@ def test_cleanup_temp_artifacts_preserves_valid_batches(tmp_path):
         tmp_b = tmp_path / '_batch1_test.tmp.mp4'
         tmp_b.write_bytes(b'temp data')
         fc = tmp_path / '_fc_batch0_test.txt'
-        fc.write_text('filter complex')
+        p_log = tmp_path / '.pipe_decode_c_1_2.log'; p_log.write_text(''); w_log = tmp_path / '.pipe_win_c_10_1_2.log'; w_log.write_text(''); fc.write_text('filter complex')
 
         cleaned = cleanup_temp_artifacts(clean_batches=False)
         assert b1.exists()
         assert not tmp_b.exists()
-        assert not fc.exists()
+        assert not fc.exists() and not p_log.exists() and not w_log.exists()
 
         cleaned_all = cleanup_temp_artifacts(clean_batches=True)
         assert not b1.exists()

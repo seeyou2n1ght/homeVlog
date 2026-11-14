@@ -364,6 +364,218 @@ def build_compact_virtual_concat_plan(
     )
 
 
+@dataclass(frozen=True)
+class NightSparsePlan:
+    edl_text: str | None
+    has_dense: bool
+    sparse_input_index: int
+    sparse_segments: int
+    sparse_source_duration: float
+    total_source_duration: float
+    mapped_timeline: tuple = ()
+    source_timeline: tuple = ()
+
+
+def build_night_sparse_plan(
+    timeline,
+    min_night_duration_s: float = 16.0,
+    source_override: str | Path | None = None,
+    dynamic_coalesce_gap_s: float = 20.0,
+    dynamic_window_max_s: float = 600.0,
+) -> NightSparsePlan | None:
+    """Build a dual-input plan separating dense clips from sparse 16x night keyframes.
+
+    Long NIGHT_STATIONARY spans (>= min_night_duration_s, default 16s at 16x -> >= 1s display)
+    only need keyframe decoding (`-discard nokey`), whereas all other segments retain full
+    continuous frame decoding via a compact dense EDL (when mixed) or full sparse single-input
+    keyframe decode (when sparse-only). Audio always reads from a continuous input stream.
+    """
+    from copy import deepcopy
+    from src.stages.timeline import TimelineSegment
+
+    if not timeline:
+        return None
+    files = {str(seg.filepath) for seg in timeline}
+    if len(files) != 1:
+        return None
+
+    min_dur = max(4.0, float(min_night_duration_s))
+
+    def _is_sparse(seg) -> bool:
+        return (
+            seg.state == SegmentState.NIGHT_STATIONARY
+            and (float(seg.end_in_file) - float(seg.start_in_file)) >= min_dur
+        )
+
+    is_sparse_flags = [_is_sparse(seg) for seg in timeline]
+    sparse_count = sum(1 for flag in is_sparse_flags if flag)
+    if sparse_count == 0:
+        return None
+
+    total_dur = sum(max(0.0, float(seg.end_in_file) - float(seg.start_in_file)) for seg in timeline)
+    sparse_dur = sum(
+        max(0.0, float(seg.end_in_file) - float(seg.start_in_file))
+        for seg, flag in zip(timeline, is_sparse_flags)
+        if flag
+    )
+    has_dense = sparse_count < len(timeline)
+    if has_dense:
+        # Require substantial sparse duration before paying dual-decoder overhead.
+        if sparse_dur < max(min_dur, 30.0) or sparse_dur / max(0.001, total_dur) < 0.10:
+            return None
+
+    if not has_dense:
+        mapped = tuple(
+            TimelineSegment(
+                filepath=seg.filepath,
+                input_index=0,
+                start_in_file=float(seg.start_in_file),
+                end_in_file=float(seg.end_in_file),
+                state=seg.state,
+                duration=float(seg.end_in_file) - float(seg.start_in_file),
+                max_energy=seg.max_energy,
+                avg_confidence=seg.avg_confidence,
+            )
+            for seg in timeline
+        )
+        source_segments = tuple(deepcopy(seg) for seg in timeline)
+        return NightSparsePlan(
+            edl_text=None,
+            has_dense=False,
+            sparse_input_index=0,
+            sparse_segments=sparse_count,
+            sparse_source_duration=sparse_dur,
+            total_source_duration=total_dur,
+            mapped_timeline=mapped,
+            source_timeline=source_segments,
+        )
+
+    source = str(source_override) if source_override is not None else next(iter(files))
+    escaped = _ffconcat_path(source)
+    gap_limit = max(0.0, float(dynamic_coalesce_gap_s))
+    window_limit = max(1.0, float(dynamic_window_max_s))
+
+    # Coalesce contiguous dense segments into compact windows without crossing sparse spans.
+    windows: list[list[float]] = []
+    seg_window_idx: dict[int, int] = {}
+    last_was_dense = False
+    for idx_seg, (seg, is_sparse) in enumerate(zip(timeline, is_sparse_flags)):
+        if is_sparse:
+            last_was_dense = False
+            continue
+        s = max(0.0, float(seg.start_in_file))
+        e = max(s, float(seg.end_in_file))
+        if (
+            last_was_dense
+            and windows
+            and s - windows[-1][1] <= gap_limit
+            and max(e, windows[-1][1]) - windows[-1][0] <= window_limit
+        ):
+            windows[-1][1] = max(windows[-1][1], e)
+        else:
+            windows.append([s, e])
+        seg_window_idx[idx_seg] = len(windows) - 1
+        last_was_dense = True
+
+    lines = ["ffconcat version 1.0"]
+    virtual_cursor = 0.0
+
+    def _add_desc(start: float, end: float) -> float:
+        duration = max(0.04, end - start)
+        end_adj = start + duration
+        lines.extend([
+            f"file '{escaped}'",
+            f"inpoint {start:.6f}",
+            f"outpoint {end_adj:.6f}",
+            f"duration {duration:.6f}",
+        ])
+        return duration
+
+    # Keep the deterministic zero-origin anchor when the first dense window is offset from 0.
+    if windows and windows[0][0] > 1e-3:
+        virtual_cursor += _add_desc(0.0, 10.0)
+
+    window_cursors: list[tuple[float, float]] = []
+    for w_start, w_end in windows:
+        window_cursors.append((w_start, virtual_cursor))
+        virtual_cursor += _add_desc(w_start, w_end)
+
+    mapped_list: list[TimelineSegment] = []
+    source_list: list[TimelineSegment] = []
+    for idx_seg, (seg, is_sparse) in enumerate(zip(timeline, is_sparse_flags)):
+        source_list.append(deepcopy(seg))
+        a = max(0.0, float(seg.start_in_file))
+        b = max(a, float(seg.end_in_file))
+        if is_sparse:
+            mapped_list.append(TimelineSegment(
+                filepath=seg.filepath,
+                input_index=1,
+                start_in_file=a,
+                end_in_file=b,
+                state=seg.state,
+                duration=b - a,
+                max_energy=seg.max_energy,
+                avg_confidence=seg.avg_confidence,
+            ))
+        else:
+            w_start, w_cursor = window_cursors[seg_window_idx[idx_seg]]
+            mapped_list.append(TimelineSegment(
+                filepath=seg.filepath,
+                input_index=0,
+                start_in_file=w_cursor + (a - w_start),
+                end_in_file=w_cursor + (b - w_start),
+                state=seg.state,
+                duration=b - a,
+                max_energy=seg.max_energy,
+                avg_confidence=seg.avg_confidence,
+            ))
+
+    return NightSparsePlan(
+        edl_text="\n".join(lines) + "\n",
+        has_dense=True,
+        sparse_input_index=1,
+        sparse_segments=sparse_count,
+        sparse_source_duration=sparse_dur,
+        total_source_duration=total_dur,
+        mapped_timeline=tuple(mapped_list),
+        source_timeline=tuple(source_list),
+    )
+
+
+def _build_night_sparse_input_args(
+    encoder: str,
+    has_dense: bool,
+    descriptor_path: Path | None,
+    video_source: str,
+    has_audio: bool,
+    cpu_decode_threads: int = 0,
+) -> list[str]:
+    """Assemble FFmpeg per-input arguments for night-sparse batch rendering."""
+    args: list[str] = []
+    if has_dense and descriptor_path is not None:
+        args += ["-fflags", "+genpts", "-segment_time_metadata", "1", "-f", "concat", "-safe", "0"]
+        if encoder == "nv":
+            args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif encoder == "qsv":
+            args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        elif encoder == "cpu_nvenc" and cpu_decode_threads > 0:
+            args += ["-threads", str(cpu_decode_threads)]
+        args += ["-i", str(descriptor_path)]
+
+    args += ["-fflags", "+genpts", "-discard", "nokey"]
+    if encoder == "nv":
+        args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    elif encoder == "qsv":
+        args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+    elif encoder == "cpu_nvenc" and cpu_decode_threads > 0:
+        args += ["-threads", str(cpu_decode_threads)]
+    args += ["-i", video_source]
+
+    if has_audio:
+        args += ["-i", video_source]
+    return args
+
+
 _staging_locks: dict[str, threading.Lock] = {}
 _staging_registry_lock = threading.Lock()
 
@@ -456,7 +668,7 @@ def _stage_source_for_render(source: str | Path, *, needed=None) -> Path | None:
             disk_sem.release()
 
 
-def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows, *, config=None, inspect_only=False, cache_observer=None):
+def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cfg, out_cfg, audio_cfg, date, cam_index, rows, *, config=None, inspect_only=False, cache_observer=None, cpu_decode=False):
     from copy import deepcopy
     from src.core.config import load_config
     cfg = config
@@ -466,6 +678,8 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         except Exception:
             cfg = {}
     render_cfg = cfg.get("render", {})
+    if enc_for_batch == "nv" and cpu_decode:
+        enc_for_batch = "cpu_nvenc"
 
     batch_copy = deepcopy(batch_segs)
     # A few historical DB rows contain a tiny leading interval overlapping the
@@ -529,6 +743,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
     staged_source = None
     input_args = None
     plan = None
+    night_sparse_plan = None
     prepare_input = None
     if virtual_enabled:
         plan_builder = build_compact_virtual_concat_plan if has_dynamic else build_virtual_concat_plan
@@ -575,7 +790,52 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             # inpoints can drop AAC priming packets and shorten short motion
             # islands even when video packet metadata is exact.
             input_args += ["-i", files[0]]
-    elif render_cfg.get("local_staging_enabled", True) and len(files) == 1 and not (batch_copy and all(s.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO, "DYNAMIC", "DYNAMIC_AUDIO") for s in batch_copy)):
+    elif (
+        bool(render_cfg.get("night_sparse_enabled", True))
+        and render_cfg.get("static_mode") != "continuous"
+        and len(files) == 1
+    ):
+        night_min_dur = float(render_cfg.get("night_sparse_min_duration_s", 16.0))
+        night_sparse_plan = build_night_sparse_plan(
+            batch_copy,
+            min_night_duration_s=night_min_dur,
+            dynamic_coalesce_gap_s=float(render_cfg.get("dynamic_coalesce_gap_s", 20.0)),
+            dynamic_window_max_s=float(render_cfg.get("dynamic_window_max_s", 600.0)),
+        )
+        if night_sparse_plan is not None:
+            has_file_audio = any(r.get("has_audio") for r in rows if r.get("filepath") in files)
+            cpu_nvenc_threads = int(render_cfg.get("cpu_nvenc_decode_threads", 6)) if enc_for_batch == "cpu_nvenc" else 0
+            if night_sparse_plan.has_dense:
+                descriptor_path = TEMP_DIR / f"_edl_dense_batch{bi}_{date}_cam{cam_index}.ffconcat"
+
+            def _prepare_night_sparse_input():
+                nonlocal staged_source
+                if render_cfg.get("local_staging_enabled", True):
+                    staged_source = _stage_source_for_render(files[0])
+                video_src = str(staged_source) if staged_source is not None else files[0]
+                if night_sparse_plan.has_dense and descriptor_path is not None:
+                    descriptor_path.parent.mkdir(parents=True, exist_ok=True)
+                    execution_plan = build_night_sparse_plan(
+                        batch_copy,
+                        min_night_duration_s=night_min_dur,
+                        source_override=video_src,
+                        dynamic_coalesce_gap_s=float(render_cfg.get("dynamic_coalesce_gap_s", 20.0)),
+                        dynamic_window_max_s=float(render_cfg.get("dynamic_window_max_s", 600.0)),
+                    )
+                    descriptor_path.write_text(execution_plan.edl_text or "", encoding="utf-8")
+                input_args[:] = _build_night_sparse_input_args(
+                    enc_for_batch, night_sparse_plan.has_dense, descriptor_path,
+                    video_src, has_file_audio, cpu_decode_threads=cpu_nvenc_threads,
+                )
+                return True
+
+            prepare_input = _prepare_night_sparse_input
+            input_args = _build_night_sparse_input_args(
+                enc_for_batch, night_sparse_plan.has_dense, descriptor_path,
+                files[0], has_file_audio, cpu_decode_threads=cpu_nvenc_threads,
+            )
+
+    if not virtual_enabled and night_sparse_plan is None and render_cfg.get("local_staging_enabled", True) and len(files) == 1 and not (batch_copy and all(s.state in (SegmentState.DYNAMIC, SegmentState.DYNAMIC_AUDIO, "DYNAMIC", "DYNAMIC_AUDIO") for s in batch_copy)):
         def _prepare_direct_input():
             nonlocal staged_source
             staged_source = _stage_source_for_render(files[0])
@@ -583,8 +843,17 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
 
         prepare_input = _prepare_direct_input
 
-    filter_timeline = list(plan.mapped_timeline) if plan and plan.mapped_timeline else batch_copy
-    source_timeline = list(plan.source_timeline) if plan and plan.source_timeline else batch_copy
+    if night_sparse_plan is not None:
+        filter_timeline = list(night_sparse_plan.mapped_timeline)
+        source_timeline = list(night_sparse_plan.source_timeline)
+        sparse_inputs = {night_sparse_plan.sparse_input_index}
+        has_file_audio = any(r.get("has_audio") for r in rows if r.get("filepath") in files)
+        audio_input_idx_override = (2 if night_sparse_plan.has_dense else 1) if has_file_audio else None
+    else:
+        filter_timeline = list(plan.mapped_timeline) if plan and plan.mapped_timeline else batch_copy
+        source_timeline = list(plan.source_timeline) if plan and plan.source_timeline else batch_copy
+        sparse_inputs = None
+        audio_input_idx_override = None
 
     audio_plans = []
     fc = build_concat_filter(
@@ -610,8 +879,10 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         sparse_mixed=(not virtual_enabled and render_cfg.get("static_mode") != "continuous" and bool(render_cfg.get("mixed_sparse_enabled", True))),
         static_sample_window_s=render_cfg.get("static_sample_window_s", 0.25),
         audio_input_offset=1 if virtual_enabled and any(r.get("has_audio") for r in rows if r.get("filepath") in files) else 0,
+        audio_input_index_override=audio_input_idx_override,
+        sparse_inputs=sparse_inputs,
         source_timeline=source_timeline,
-        audio_groups_out=audio_plans if enc_for_batch == "nv" and int(audio_cfg.get("channels", 1)) == 1 else None,
+        audio_groups_out=audio_plans if enc_for_batch == "nv" and night_sparse_plan is None and int(audio_cfg.get("channels", 1)) == 1 else None,
     )
 
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
@@ -633,24 +904,38 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             "virtual concat batch %d: %d EDL ranges (%d static samples), one decoder context",
             bi, plan.entries, plan.static_entries,
         )
+    elif night_sparse_plan is not None:
+        pure_static_files = set()
+        logger.info(
+            "night-sparse batch %d (%s): %d sparse >=%.0fs spans (%.1fs/%.1fs), mode=%s",
+            bi, enc_for_batch, night_sparse_plan.sparse_segments,
+            float(render_cfg.get("night_sparse_min_duration_s", 16.0)),
+            night_sparse_plan.sparse_source_duration,
+            night_sparse_plan.total_source_duration,
+            "dual-edl" if night_sparse_plan.has_dense else "sparse-only",
+        )
     if render_cfg.get("static_mode") == "continuous":
         pure_static_files = set()
+    fingerprint_salt = (
+        plan.text if plan
+        else (night_sparse_plan.edl_text or "night-sparse-only-v1" if night_sparse_plan is not None else "")
+    )
     retain_inputs = False
     try:
         result = _run_batch_render(
             files, fc, batch_path, enc_for_batch, fps, out_cfg, audio_cfg,
             date, cam_index, config=cfg, batch_idx=bi, pure_static_files=pure_static_files,
             expected_duration=expected_duration, input_args=input_args,
-            fingerprint_salt=plan.text if plan else "", prepare_input=prepare_input,
+            fingerprint_salt=fingerprint_salt, prepare_input=prepare_input,
             inspect_only=inspect_only, cache_observer=cache_observer,
             audio_plan=audio_plans[0] if audio_plans else None,
         )
-        if result is not None or not virtual_enabled or FFmpegProcessRegistry.is_interrupted():
+        if result is not None or (not virtual_enabled and night_sparse_plan is None) or FFmpegProcessRegistry.is_interrupted():
             return result
 
         logger.warning(
-            "virtual concat batch %d failed validation; retrying continuous sparse path",
-            bi,
+            "%s batch %d failed validation; retrying continuous path",
+            "virtual concat" if virtual_enabled else "night-sparse", bi,
         )
         fallback_scale = "cuda_passthrough" if enc_for_batch == "nv" else ("qsv" if enc_for_batch == "qsv" else "cpu")
         fallback_fc = build_concat_filter(
@@ -863,13 +1148,17 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
     else:
         for fp in input_files:
             hwaccel_args += ["-fflags", "+genpts"]
-        # 对纯静态长文件跳过所有非关键帧解码，直接消除 batch_0 835s NVDEC 解码长尾
+        # 对纯静态长文件跳过所有非关键帧解码，-discard nokey 让 QSV/CPU 同步丢弃 P/B 包
             if pure_static_files and str(fp) in pure_static_files:
-                hwaccel_args += ["-skip_frame", "nokey"]
+                hwaccel_args += ["-discard", "nokey", "-skip_frame", "nokey"]
             if encoder == "nv":
                 hwaccel_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             elif encoder == "qsv":
                 hwaccel_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+            elif encoder == "cpu_nvenc":
+                cpu_nvenc_threads = int(render_cfg.get("cpu_nvenc_decode_threads", 6))
+                if cpu_nvenc_threads > 0:
+                    hwaccel_args += ["-threads", str(cpu_nvenc_threads)]
             staged = get_staged_source(fp)
             input_fp = str(staged) if staged is not None else str(fp)
             hwaccel_args += ["-i", input_fp]
@@ -1186,6 +1475,49 @@ def _preserve_concat_failure(output, temporary, concat_list, report, stderr):
         logger.exception("could not retain concat failure diagnostics for %s", output)
 
 
+_concat_audio_probe_lock = threading.Lock()
+_aac_mf_available: bool | None = None
+
+
+def _probe_aac_mf() -> bool:
+    """Return True if Windows MediaFoundation aac_mf encoder works on this host."""
+    global _aac_mf_available
+    if os.name != "nt":
+        return False
+    with _concat_audio_probe_lock:
+        if _aac_mf_available is not None:
+            return _aac_mf_available
+        ok = False
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=0.05",
+                    "-c:a", "aac_mf", "-f", "null", "-",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+            )
+            ok = proc.returncode == 0
+        except Exception:
+            ok = False
+        _aac_mf_available = ok
+        return ok
+
+
+def _resolve_concat_audio_codec(audio_cfg: dict | None = None) -> str:
+    """Resolve the final_concat audio codec from output.audio config."""
+    audio = audio_cfg or {}
+    fallback = str(audio.get("codec", "aac"))
+    configured = str(audio.get("concat_codec", "auto")).strip()
+    if configured and configured != "auto":
+        return configured
+    if _probe_aac_mf():
+        return "aac_mf"
+    return fallback
+
+
 def concat_output_files(
     files: list[Path],
     output: Path,
@@ -1261,8 +1593,9 @@ def concat_output_files(
         )+"\n", encoding="utf-8")
         from src.core.config import load_config
         audio = load_config().get("output", {}).get("audio", {})
+        concat_codec = _resolve_concat_audio_codec(audio)
         cmd = ["-f", "concat", "-safe", "0", "-i", str(concat_list),
-               "-c:v", "copy", "-c:a", audio.get("codec", "aac"),
+               "-c:v", "copy", "-c:a", concat_codec,
                "-b:a", audio.get("bitrate", "96k"),
                "-af", "aresample=48000:async=1:min_hard_comp=0:first_pts=0,"
                f"atrim=duration={sum(durations):.9f}"]

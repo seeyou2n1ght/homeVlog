@@ -162,6 +162,94 @@ def _evaluate_prescreen_motion(
     return MotionDecision(is_motion=False, reason="below_threshold")
 
 
+def _iter_sparse_keyframes(
+    container,
+    stream,
+    duration: float,
+    target_samples: int,
+    *,
+    seek_min_duration_s: float = 30.0,
+):
+    """Yield representative keyframes using container seek on long indexed clips.
+
+    For duration >= seek_min_duration_s, sample evenly across [0, duration - 2s] via
+    backward keyframe seeks (covering the tail window per ADR 0025), avoiding decoding
+    intermediate keyframes over SMB. Falls back to sequential strided decoding cleanly
+    whenever seek is unavailable, raises, or produces fewer than 2 distinct frames.
+    """
+    last_pts = None
+    yielded = 0
+    time_base = getattr(stream, "time_base", None)
+    can_seek = (
+        duration >= seek_min_duration_s
+        and time_base is not None
+        and float(time_base) > 0
+        and hasattr(container, "seek")
+    )
+
+    if can_seek:
+        n_targets = max(2, target_samples)
+        tail_target = max(0.0, duration - 2.0)
+        targets = [0.0] + [
+            min(tail_target, (duration * i) / (n_targets - 1))
+            for i in range(1, n_targets)
+        ]
+        seek_failed = False
+        tb_val = float(time_base)
+        for target_s in targets:
+            try:
+                offset = int(round(target_s / tb_val))
+                container.seek(offset, stream=stream, backward=True, any_frame=False)
+                frame = next(container.decode(stream), None)
+            except Exception as exc:
+                logger.debug("Keyframe seek at %.1fs failed (%s); falling back to sequential decode", target_s, exc)
+                seek_failed = True
+                break
+            if frame is None:
+                continue
+            f_pts = getattr(frame, "pts", None)
+            if f_pts is not None and last_pts is not None and f_pts <= last_pts:
+                continue
+            if f_pts is not None:
+                last_pts = f_pts
+            yielded += 1
+            yield frame
+        if not seek_failed and yielded >= 2:
+            return
+        if not seek_failed and yielded == 1:
+            # Single-frame result may mean seek landed past EOF or an unindexed stream;
+            # rewind and let sequential strided decoding verify from the last yielded PTS.
+            logger.debug("Keyframe seek yielded only %d frame(s); falling back to sequential decode", yielded)
+        try:
+            container.seek(0, stream=stream)
+        except Exception:
+            pass
+
+    est_keyframes = max(1, int(duration / 2.5))
+    kf_step = max(1, est_keyframes // target_samples)
+    k = 0
+    last_skipped_frame = None
+    # The stride can omit the last keyframe even though decode reaches EOF.
+    for frame in chain(container.decode(stream), (None,)):
+        if frame is None:
+            if last_skipped_frame is None:
+                break
+            frame = last_skipped_frame
+        else:
+            f_pts = getattr(frame, "pts", None)
+            if f_pts is not None and last_pts is not None and f_pts <= last_pts:
+                continue
+            k += 1
+            if k > 1 and (k - 1) % kf_step != 0:
+                last_skipped_frame = frame
+                continue
+            last_skipped_frame = None
+        f_pts = getattr(frame, "pts", None)
+        if f_pts is not None:
+            last_pts = f_pts
+        yield frame
+
+
 def _prescreen_keyframes(
     filepath: str,
     duration: float,
@@ -220,25 +308,9 @@ def _prescreen_keyframes(
             prev_frame: np.ndarray | None = None
             concentrations: list[float] = []
             mean_lumas: list[float] = []
-            k = 0
-            last_skipped_frame = None
-            # 关键帧稀疏步长采样：按 max_keyframes 均匀稀疏采样（默认目标 20 帧），杜绝遍历上千关键帧
             target_samples = max(10, max_keyframes) if max_keyframes > 0 else 20
-            est_keyframes = max(1, int(duration / 2.5))
-            kf_step = max(1, est_keyframes // target_samples)
 
-            # The stride can omit the last keyframe even though decode reaches EOF.
-            for frame in chain(container.decode(stream), (None,)):
-                if frame is None:
-                    if last_skipped_frame is None:
-                        break
-                    frame = last_skipped_frame
-                else:
-                    k += 1
-                    if k > 1 and (k - 1) % kf_step != 0:
-                        last_skipped_frame = frame
-                        continue
-                    last_skipped_frame = None
+            for k, frame in enumerate(_iter_sparse_keyframes(container, stream, duration, target_samples), start=1):
                 y_raw = video_frame_to_gray(frame)
                 curr_frame = cv2.resize(y_raw, (width, height), interpolation=cv2.INTER_LINEAR)
                 if time.monotonic() - _t_sem > timeout:
@@ -251,7 +323,6 @@ def _prescreen_keyframes(
                 if first_frame is None:
                     first_frame = curr_frame
                     prev_frame = curr_frame
-                    k += 1
                     continue
 
                 # 动态环境光自适应与先验保护
@@ -313,7 +384,6 @@ def _prescreen_keyframes(
                     return base_result
 
                 prev_frame = curr_frame
-                k += 1
                 # A negative decision requires reaching EOF, never just the first N keyframes.
     except MediaTerminationUnconfirmed:
         raise

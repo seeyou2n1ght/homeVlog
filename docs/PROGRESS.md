@@ -1,132 +1,26 @@
 # 项目状态
 
-## 2026-11-13 交付加固 + 调度/识别精度优化 + 20260326 零缓存冷启动实测验收（2,234.62 秒 / 37分14秒，38.66× 实时）
+## 当前目标
 
-围绕生产交付审查与硬件利用/识别准确度进一步优化，完成 4 项生产交付加固与 3 项性能/算法精度改进，并通过 **`20260326 / cam0`（130 个 4K 切片，24.00 小时 / 86,387.0s，含 9 个 44.3m ~ 69.0m 跨时段巨型长切片）零缓存冷启动端到端实测**（`logs/perf/perf_20260326_cam0_20261113_211526.json`）：
+完成最终交付前全仓清理、文档收敛与多维回归验证，准备交付合并。
 
-1. **生产交付加固（4 项）**：
-   - 移除冗余 `.github/workflows/ci.yml`（项目依赖本地 NVIDIA NVDEC/NVENC + Intel QSV 异构硬件与 NAS 媒体源）；
-   - 开启 `render.cleanup_batches_on_success: true`（成片校验通过后自动清理 `temp/batches/` 中 5~6.5GB 的 `_batch*.mp4` 中间文件），显式配置 `recovery.skip_corrupt: false` 与 `logging.retention_days: 7`，并在 `main.py` 非 `--auto` 入口补齐 `cleanup_temp_artifacts()` 残留清理；
-   - `src/stages/scanner.py` 新增基于文件名时间戳的零 `stat()` 跨午夜写盘保护（距当前时间 `< 120s` 自动冻结），并将 `freeze_minutes > 0` 与 `skip_today` 解耦；
-   - `src/core/utils.py` 在 `cleanup_stale_logs()` 中排除 `logs/perf/` 基准遥测目录，并在 `src/pipeline.py` 启动横幅中解析语义机位名（`baby_room` / `living_room`）。
-2. **异构调度防饥饿与识别准确度优化（3 项）**：
-   - **QSV 超长 4K 切片渲染防阻塞（`src/pipeline.py`）**：针对 `>= 1800s`（30~69 分钟）且含大量加速活跃段（`NIGHT_STATIONARY` / `PRESENCE` / `MICRO_MOTION`）的巨型夜间文件，在渲染队列成本与 `_render_worker` QSV 准入判定中计入 `0.25 * max(0.0, active_dur - dynamic_dur)` 折算负载，防止 `qsv_0` 误窃取 55~69 分钟 4K 巨型夜间批次导致核显单批卡死 749 秒；
-   - **粗扫门控提升与长文件窗口聚合（`config/settings.yaml`, `src/stages/detector.py`）**：将 `iframe_min_file_duration` 提升至 `1800.0s`（避免 20~26 分钟中高活跃傍晚/清晨切片浪费粗扫回退开销），并对 `>= 1800s` 超长切片将 Tier 2 窗口合并间隔提升至 `60.0s`；
-   - **红外暗光局部反光抗干扰与短时交互保真（`src/algorithms/yolo_verifier.py`）**：直接在二维灰度帧上以 `min(mean, median)` 计算房间暗度（避免婴儿床栏杆/被子局部红外高光掩盖暗光降阈 `0.15`），为 `is_stationary_human` 增加 `seg.duration >= 8.0 and len(p_boxes) >= 3` 门控（保护 2~7 秒短时护理动作维持 `1x DYNAMIC`），并将 `MICRO_MOTION` 兜底阈值与 `min_motion_threshold` 联动。
-3. **20260326 / cam0 零缓存冷启动实测证据 (`logs/perf/perf_20260326_cam0_20261113_211526.json`)**：
-   - **端到端总耗时**: **`2,234.62 秒`（37 分 14 秒，38.66× 实时）**，流式阶段（预筛 + 精析 + 渲染）仅 **`2,131.17 秒`（35 分 31 秒）**，最终拼接与 129 接缝校验 `90.20s`；
-   - **7 路精析 Worker 齐步收尾**: `ana_0` ~ `ana_6` 完成时刻落在 **`1,683.4s ~ 1,739.7s`（极差仅 `56.3s`）**；
-   - **3 路异构渲染器零故障均衡收尾**: `qsv_0` 渲染 50 批（7 轻量 + 43 窃取，**0 失败 / 0 拒单**，单批最大耗时仅 `122.5s`，利用率 `94.2%`，完成于 `2,087.6s`），`nv_1` 渲染 39 批（利用率 `94.7%`，完成于 `2,113.9s`），`nv_0` 渲染 41 批（利用率 `92.4%`，完成于 `2,130.1s`），整场平均 GPU 解码器利用率高达 **`93.9%`**（渲染尾段达 **`99.0%`**）；
-   - **成片质量与清理验证 (`scripts/verify_cold_run_audit.py 20260326`)**: 成片 `output/DailyVlog_20260326_B888805AA3CD.mp4`（`4,851.36 MiB`，`243分59秒`，`5.9×` 浓缩），捕获 `MICRO_MOTION` `10,771.0s`、`PRESENCE` `5,615.0s`、`DYNAMIC` `8,343.2s`；292,786 个媒体包时钟漂移 $\le 1\text{ tick}$，834 个关键活动事件零遗漏，129 个批次接缝 0 断裂，且交付后 `temp/batches/` 中间文件已 100% 自动清空。
+## 已验证交付状态
 
-## 2026-11-13 第二轮深度提速优化 + 0 缓存冷跑突破 2,193.52 秒（36分33秒，40.73× 实时）
+- **架构形态**：纯命令行确定性视频浓缩流水线（`main.py` -> `src/stages/` / `src/hardware/` / `src/algorithms/` / `src/core/` / `src/ui/`），无 Web 审核台或历史兼容 Shim。
+- **最新版本基准（`20260326 / cam0`，130 源 / 1,439.9 分钟 / 零缓存冷跑）**：
+  - 端到端壁钟 **`31.2 分钟`（`1,873.5s` / `46.11×` 实时）**，产出 `5,388.27 MB`（`5.9×` 浓缩），对比优化前 `20260326` 冷跑基线（`37.2 分钟` / `2,234.6s` / `38.66×`）缩短 `361.1s`（`-16.2%`）；证据：`logs/perf/perf_20260326_cam0_20261115_023847.json`。
+  - 主阶段工时：`prescreen` 130 项 `20.8min`（均 `9.6s`）、`analysis` 116 项 `171.7min`（均 `88.8s`）、`render` 130 批 `61.9min`（均 `28.6s`）、`final_concat` `112.2s`；异构编队均衡：`nv_0` 52 批（`95.4%`）、`nv_1` 45 批（`95.4%`）、`qsv_0` 33 批（`23.2%`，逆向窃取 25 批）。
+  - 成片完整性核验（`uv run python scripts/verify_cold_run_audit.py 20260326`）：**PASS** — `294,557` 包时钟误差 `<= 1 tick`、129/129 接缝 0 断裂、元数据亮点事件 `843` 个。
+- **历史跨日参考基线（`20260320 / cam0`，142 源）**：冷跑 `2,193.52s`（`36m33s` / `40.73×` 实时），详见 [BENCHMARK](BENCHMARK.md)。
+- **自动化验证**：`ruff check` 与 `compileall` 全部通过；全库测试 **`1006 passed, 6 skipped`**（6 项 `HOMEVLOG_HARDWARE_TESTS` 硬件专项按预期跳过）；`main.py --doctor` 全项就绪。
 
-在第一轮（`2,399.36s`）基础上，通过逐文件/逐 Worker 遥测深挖并落地三项关键优化，再次完成 `20260320 / cam0`（142 个 4K 切片，24.82 小时）**0 缓存纯冷跑验证**（`logs/perf/perf_20260320_cam0_20261113_183031.json`）：
+## 当前生产默认约束与配置基线
 
-1. **短文件粗扫门控（`iframe_min_file_duration: 1200.0`）**：
-   - 针对第一轮中 108 个 `< 1200s` 日间活动短片 100% 触发 `FALLBACK_DENSE_MOTION` 浪费 `1,674.5s` 聚合预扫开销的问题，新增 `detection.iframe_min_file_duration: 1200.0`（默认 `0.0` 兼容单元测试），使 `< 1200s` 短片直接走单遍硬件全解，`>= 1200s` 超长夜间/跨时段文件走 R1 关键帧粗扫 + Tier 2 窗口精析（`45.0s` 窗口合并）；
-   - 全量精析聚合耗时由 `14,458.2s` 降至 **`13,336.5s`**（净省 **`1,121.7s`** 聚合算力）。
-2. **重文件分界提升与双 GPU 精析负载均衡（`heavy_file_duration_s: 1200.0`）**：
-   - 将 `heavy_file_duration_s` 与 `steal_sublongest_max_duration` 对齐至 `1200.0s`，并修复 `src/pipeline.py` 中 QSV 重任务延迟接管条件；
-   - 实测 **全部 7 个精析 Worker（`ana_0` ~ `ana_6`）在 `1,826.3s ~ 1,912.2s`（极差仅 `85.9s`）内齐步收尾**，上游排空时刻由第一轮 `2,205.48s`（重构基准 `2,305.27s`）大幅压降至 **`1,912.16 秒`（31分52秒，较重构基准快 `393.11s`，较第一轮快 `293.32s`）**。
-3. **渲染动态时长口径对齐与三路异构编码器同步收尾（`src/pipeline.py`）**：
-   - 修正提交给渲染队列的 `effective_dyn_dur` 为实际 `1x` 常速动态时长（对齐 `_render_worker` 准入判定），消除含长段 `PRESENCE`/`MICRO_MOTION` 的中短切片误阻塞 QSV 窃取的问题；
-   - 实测 `qsv_0` 渲染 62 批（29 轻量 + 33 窃取，0 拒单，利用率 `95.7%`），`nv_0` 渲染 42 批（利用率 `95.7%`），`nv_1` 渲染 38 批（利用率 `94.2%`），**三路渲染器在 `2,054.86s ~ 2,060.00s`（极差仅 `5.14s`）内同时收尾**，流式渲染完成时刻由 `2,281.45s` 压降至 **`2,060.05 秒`（34分20秒，较重构基准快 `330.5s`）**。
-4. **端到端冷跑总耗时与质量审计**：
-   - **Pipeline 总耗时**: **`2,193.52 秒`（36 分 33 秒，40.73× 实时）**，较重构基准 `2,510.08s` 净省 **`316.56 秒` (-12.6%)**，较第一轮 `2,399.36s` 再快 **`205.84 秒` (-8.6%)**，较初版 R1+R2 冷跑 `2,768.92s` 净省 **`575.40 秒` (-20.8%)**；
-   - **成片质量审计 (`scripts/verify_cold_run_audit.py`)**: 142 批 100% 全新编码，141 个接缝 0 跳帧/0 断裂，374,844 个媒体包时钟漂移 $\le 1\text{ tick}$，1,034 个连续关键活动区间零遗漏。
+- **关键帧预筛选**：`detection.iframe_min_file_duration: 1800.0`、`detection.iframe_fallback_active_ratio: 0.45`；`detection.cpu_analysis_workers: 0`（实测多路 CPU 分析线程推高负载且导致整日性能回退）。
+- **异构渲染与交付**：`render.nv_tail_concurrency: 3` 配合 `render.nv_tail_use_cpu_decode: true`（[ADR0087](DECISIONS.md)）；`render.cleanup_batches_on_success: true` 交付后自动清理本次临时批次；`output.audio.concat_codec: "aac"`（保证 `< 1 tick` A/V 时钟闭合）。
+- **目录与维护约定**：临时运行产物（`temp/`、`logs/`、`data/`）及 `scratch/` 已从交付态剥离；诊断与验证入口为 `main.py --doctor`、`main.py --status`、`scripts/analyze_perf.py`、`scripts/benchmark_day.py`、`scripts/verify_cold_run_audit.py` 与 `scripts/inspect_detection.py`。
 
-## 2026-11-13 R1 关键帧粗扫根因修复 + YOLO 异步重叠流水线实测突破（0 缓存冷跑 2,399.36 秒）
+## 下一步动作
 
-围绕 `2026-11-12` R1 高回退率根因与用户提出的“YOLO 推理与下一文件解码流水线重叠”方向，完成深度优化并通过 `20260320 / cam0`（142 个 4K 切片，24.82 小时）**0 缓存纯冷跑实测**：
-
-1. **R1 关键帧粗扫与窗口唤醒四大根因修复 (`src/stages/detector.py`)**：
-   - **Demuxer 级跳包 (`-discard nokey`) + 单遍 `showinfo` PTS 提取**：对 `>= 180s` 正式长切片启用 `-discard nokey -skip_frame nokey` 并通过 `-vf scale=w:h,showinfo` 单遍提取关键帧图像与精确 PTS，免除 `_extract_keyframe_pts` 对 1.5GB 4K 文件的二次 SMB 全包遍历，55 分钟 4K 切片粗扫耗时由 ~90 秒骤降至 **3.86 ~ 5.75 秒**；
-   - **消除 `scale_cuda` 9.23× 下采样混叠噪声**：Tier 1 粗扫改用双线性 `scale=416:234` 滤波，静态红外夜视关键帧混叠能量由 `p50 = 3.21` 降至 `0.36 ~ 0.39`；
-   - **关键帧大间隔 EMA 时间常数补偿与窗口时长自适应配额**：补偿 3.5s~4.0s GOP 间隔下的 `alpha_bg`/`alpha_fg` 收敛速度，对 `> 600s` 长切片按时长比例放宽 `iframe_max_isolated_windows` 并自动聚合相邻唤醒窗口，使 **全部 7 个 55 分钟夜间巨型长切片 100% 命中 `TIER2_WINDOWED_COMPLETION`**（零回退全解），单文件精析耗时从 `266 ~ 463s` 降至 **`81.4 ~ 276.2s`**；
-   - **回退音频零重复解码 (`_predecoded_audio`)**：回退全量解码时直接复用粗扫阶段已并发解码完成的音频流，消除二次 SMB 音频管道开销。
-2. **Per-Worker 异步 YOLO 后处理与下一文件解码重叠 (`src/pipeline.py`)**：
-   - 在每个 `_analysis_worker` 内引入单线程 `post_executor`，当文件 $N$ 完成视频/音频解码与运动特征提取后，将 `build_segments -> yolo_verifier.verify -> refine_activity_segments -> DB 写入 -> 入队渲染` 提交至后台线程异步执行，Worker 主线程立即拉取文件 $N+1$ 启动 NVDEC/QSV 硬件解码；
-   - 实测全天 109 次跨文件切换共重叠隐藏 **618.50 秒**的后处理与 YOLO 推理耗时（6 个 QSV Worker 各自隐藏 `79.7 ~ 117.6s`，Worker 0 隐藏 `31.0s`）。
-3. **20260320 纯冷跑（0 缓存）端到端实测结果 (`logs/perf/perf_20260320_cam0_20261113_152439.json`)**：
-   - **端到端总耗时**: 流水线跨度 **2,399.36 秒**（Summary 含收尾共 **2,415 秒 / 40 分 15 秒，37.0× 实时**），相比重构基准 `2,510.08s` 净提速 **110.72 秒 (-4.4%)**，相比前次 R1+R2 冷跑 `2,768.92s` 净提速 **369.56 秒 (-13.3%)**；
-   - **上游精析完成时刻 (Upstream Drain)**: 由基准 `2,305.27s`（前次 `2,711.58s`）压降至 **2,205.48 秒**（净省 **99.79 秒 / 506.10 秒**）；
-   - **渲染完成时刻**: `2,281.45 秒`（纯渲染尾段仅 **75.97 秒**，142 批 100% 全新编码）；
-   - **成片质量审计 (`scripts/verify_cold_run_audit.py`)**: 141 个接缝 0 跳帧/0 断裂，377,595 个媒体包时钟漂移 $\le 1\text{ tick}$，1,053 个关键活动事件零遗漏。
-
-## 2026-11-12 4K 极限冷跑优化与生产整合终态（R1 I-Frame 预筛选 + R2 自适应工作窃取）
-
-> **实测结论（以遥测为准）**：本轮 R1+R2 在 20260320 / cam0 纯冷跑中**没有达成提速目标**。三轮冷跑流水线墙钟分别为 2,727.9 / 2,827.2 / 2,911.1 秒（含 CLI），均慢于重构基准 2,510.08 秒。132 个分析任务中 108 个（82%）触发 `FALLBACK_*` 回退为完整解码（105 个为 `FALLBACK_DENSE_MOTION_ACTIVE_RATIO`），仅 6 个走 `TIER2_WINDOWED`、2 个走 `ZERO_DECODE_FAST_PATH`；夜间 55 分钟大文件同样回退，Tier 1 扫视成为额外开销。成片时长 314 分 50 秒，较基准 302 分 21 秒多 12 分钟，说明分类结果已不同；“关键事件零遗漏”**没有独立真值集验证**，不得作为结论。Teamwork 的 Gate 3 与 Victory Audit 因额度耗尽未执行。后续处理见 [BENCHMARK](BENCHMARK.md)。
-
-围绕方向一（I-Frame 关键帧跳帧预筛选）与方向二（尾段自适应工作窃取平衡两颗 GPU 负载），完成代码实现与测试，并完成纯冷跑（0 缓存、142 批全量重编码）；性能结论见上方实测结论：
-
-1. **R1: I-Frame 关键帧跳帧预筛选（极速扫视，局部精析）全面就绪**:
-   - `src/stages/detector.py` 落地 Tier 1 极速扫视（`-skip_frame nokey`），以 8x8 空间能量网格与 EMA 背景模型评估关键帧；
-   - 落地 Zero-Decode 快速通道，纯静态切片零完整解码直接合成时间轴区间；
-   - 落地 Tier 2 局部精析唤醒窗口（Padded Seek Decode，`-ss -to`，相邻间隔 $\le 6.0\text{s}$ 自动合并），配合多模态音频 VAD 唤醒，确保关键活动与人宠事件 0 漏检；
-   - 完备的保底机制（活动占比 $>60\%$ 或离散窗口 $>8$ 自动平滑退化为全量解码）。
-2. **R2: 尾段自适应工作窃取（Work Stealing）平衡双 GPU 负载全面就绪**:
-   - `src/hardware/scheduler.py` 落地 `WorkStealingManager` 四门禁准入策略（Worker 0 算力空闲、重任务出清、NVML 物理显存裕度 $>3072\text{ MB}$、QSV 队列积压超阈值）；
-   - `src/stages/pipeline_types.py` 落地 `AnalysisQueue.steal_sublongest` 线程安全原子提取次长切片，堆重平衡（`heapq.heapify`）；
-   - `src/pipeline.py` 打通 Worker 0 CUDA NVDEC 租赁通道，杜绝 `RENDER_PREEMPTION_YIELD` 误锁。
-3. **M3: 纯冷跑（0 缓存）端到端交付与时钟接缝验收**:
-   - **全库回归套件**: 1,002 项测试收集，**996 passed, 6 skipped, 0 failed, 0 xfailed**，全部 42 项严格契约测试 100% 转绿；
-   - **系统就绪体检**: `uv run python main.py --doctor` 5/5 全绿，自适应算力动态推导正常；
-   - **纯冷跑性能**: 20260320 / cam0（142 切片，89,337.5 秒 4K 素材）在 `--reanalyze --force-render --no-tui` 下全量 142 批次全新编码（`render_enc count: 142`），纯渲染尾段用时压降至 57.34 秒（相比重构基准降低 25.8%）；
-   - **成片交付质量**: 141 个切片接缝全过连续性校验（PyAV 逐切片窗口实测），媒体包时钟漂移最大 $\le 1$ tick（377,813 个媒体包校验通过），1,088 个关键活动事件零遗漏。
-
-## 2026-11-12 缺陷加固与纯冷跑终态验收
-
-围绕 Codex 未竟缺陷完成全面加固并完成 100% 纯冷跑（0 缓存）端到端交付验证：
-1. **数据库层优化**: 新增 `idx_segments_file_time(file_id, start_time)` 复合索引，消除 filesort 临时 B-tree 开销；将 `sync_timeline_segments` 改为单事务 `executemany` 批量写入。
-2. **流水线解耦**: 抽取 `src/stages/pipeline_types.py`，承载 `PipelineTask`、`AnalysisQueue`、`RenderMessageQueue`，解耦队列契约。
-3. **异构调度与硬件探测**: 修复 `autotune.py` 纯软件环境下的脏默认值 `tail_nv_enc = 0`，支持多 GPU 显存优选；优化 `_analysis_worker` 中 CUDA Worker（`ana_0`）在出清任务时优先使用 `detector_cuda`，杜绝独显线程倒退争用核显。
-4. **容错机制**: 新增断网（Broken Pipe / Error 64）场景下单测，实测确认信号量无泄漏归还与进程安全注销。
-5. **30 分钟大关真相与极限冷跑确认**:
-   - 彻底厘清历史 1,738.9 秒（28.98 分钟）记录是建立在复用 94 个批次（仅新编码 48 个批次）的**暖缓存**之上；在 142 批全量全新编码的**纯冷跑（0 缓存）**条件下，历史冷跑为 2,569 秒（42.8 分钟）。
-   - 本次 20260320 素材在完全从 0（无 db、无 temp 批次缓存、无 output）冷跑下顺利完成交付，成片 6,110.99 MB，302分21秒，4.9× 浓缩，32.7× 实时，渲染尾段仅用时 24.9 秒。
-   - 全库回归套件 756 项测试全部通过（750 passed, 6 skipped, 0 failed）。
-
-## 2026-11-11 性能验证结论
-
-首次运行基线 2522.08 秒。仅将渲染并发从 2 NV + 1 QSV 调为 1 NV + 1 QSV，整日为 2589.48 秒；上游缩短被尾段增加抵消，已恢复原配置。固定夜间批次的软件解码 + NVENC 对照保持成片逐字节一致，但与 CUDA 分析共同运行的墙钟由 183.297 秒增至 273.250 秒，不推广。尚无实测支持空缓存 30 分钟方案。详细条件及证据见 [BENCHMARK](BENCHMARK.md)。
-
-## 阶段性收尾与目录清理（2026-11-11）
-
-重构与性能验证已阶段性收尾，生产并发保留原配置。旧重构方案、实验脚本、代码快照、性能记录和数据库快照已归档到 `reports/cleanup_20261111/evidence.zip`，ZIP 内保留原项目相对路径。重复实验视频、模型副本和批次缓存已移出项目，隔离在 `C:/Users/seeyo/code/homeVlog-cleanup-20261111/`；当前 `data/`、`output/`、`models/` 和性能日志保留。ZIP 归档不包含媒体；本次采用可恢复移出，隔离目录仍保留原文件，尚未释放其磁盘空间。
-
-`src.stages`、`src.hardware`、`src.algorithms` 的未使用通配符重导出已移除，调用方继续使用明确的子模块导入。历史性能条件和最终验证结论统一见 [BENCHMARK](BENCHMARK.md)。
-
-## 产品范围与架构演进（2026-11-10 架构大瘦身与纯算法闭环）
-
-1. **核心产品定位**:
-   HomeVlog 定位为纯命令行、高可靠、确定性的家庭监控素材智能浓缩流水线。
-   保留全自动目录扫描、关键帧/VAD自适应预筛选、YOLO多目标精析、单一事实源（Single Source of Truth）确定性时间轴、异构/CPU事务性渲染、以及 Companion 伴生资产（SRT字幕、.meta.json、性能遥测）生成。
-
-2. **退役与清理组件**:
-   - 彻底废除人工审核与重渲 Web 工具（`scripts/audit_tool/` 全目录及 37 个 HTTP 路由）；
-   - 彻底废除本地临时图片落地与主动学习归档模块（`src/stages/archiver.py`）；
-   - 彻底废除冗余的二次视觉索引与感知哈希（`src/core/visual_index.py`）；
-   - 彻底废除历史向后兼容门面脚本（`src/*.py` 根目录 20 个兼容 Shim）；
-   - 彻底废除 `Monitor` 中高开销的 `typeperf.exe` 轮询与启动计数器探测；
-   - 数据库 Schema 统一升级至精简 5 表结构，废除所有 SQLite 触发器及 JSON 冗余列。
-
-3. **核心不变量遵循**:
-   继续严格坚守 `AGENTS.md` 核心七大不变量：单次解码分析、内存中间帧、容错降级隔离、确定性时间轴、受控硬件并发、托管 FFmpeg 进程生命周期、事务性断点续跑。
-
----
-
-## 重构实施进展（2026-11-10 大规模架构重构实施路线图）
-
-| 里程碑 | 目标阶段 | 涵盖功能 | 状态 | 成果与验证 |
-|---|---|---|:---:|---|
-| **M1** | Phase 1: 关键依赖提炼与前置解耦 | F1, F2, F3 | **DONE** | `reader_process_state` 提炼至 `src/hardware/ffmpeg.py`，`source_identity` 提炼至 `src/core/identity.py`，解除层级倒置 |
-| **M2** | Phase 2: 辅助模块与工作台裁剪 | F4, F5, F6, F7, F8 | **DONE** | 裁剪 `scripts/audit_tool/`（37个路由）、`archiver.py`、`feedback.py`、`visual_index.py`，移除 2048 帧视觉描述子循环 |
-| **M3** | Phase 3: 数据库极简重构与配置优化 | F9, F10, F11, F12, F13 | **DONE** | `segments` 表 9 字段极简 DDL，删除 `visual_features`，参数化 JOIN 动态时长，修复批次折叠与配置项动态化 |
-| **M4** | Phase 4: 监控精简与测试套件收敛 | F14, F15, F16, F17 | **DONE** | 剔除 `typeperf.exe` 轮询与阻塞采样，O(1) 流式 StageStats，删除 3 个过时测试套件，收敛至 31 核心算法回归 |
-| **M5** | Phase 5: 架构垫片清理与文档对齐 | F18, F19, F20 | **DONE** | 迁移 `processing_fingerprint` 至 `src/core/identity.py`，删除 `src/*.py` 18个门面，更新 160 处引用，同步四大核心文档 |
-| **M6** | Final: 合成端到端流水线与总验收 | F21, F22 | **DONE** | CPU 合成端到端、Ruff、编译和 `--doctor` 通过。最终全库回归 749 通过、6 个硬件专项跳过，用时 121.39 秒。20260320 最终冷跑新编码 142 个批次，用时 2,510.08 秒，较历史冷跑少 58.92 秒。 |
-
-新库保留 `human_reviews` 历史事实表，生产流程使用独立的算法结果。检测到旧 schema 时启动会提示先备份旧库。交付恢复归阶段层，硬件调优和资源清理归运行入口及硬件层。
-
-最终冷跑中，1,200 秒重任务阈值使 4 个中等切片转入 QSV。全部源时间区间覆盖一致，片段分类发生变化，识别质量等价尚未用独立真值验证。耗时、成片和缓存比较口径见 [BENCHMARK](BENCHMARK.md)。
+- 如需针对特定生产日重算并覆盖已交付成片，使用 `uv run python main.py --date <YYYYMMDD> --reanalyze --force-render`。
+- 若部署至新主机或更换 GPU/驱动，先运行 `uv run python main.py --doctor` 并核对 `config/settings.yaml` 路径及显存预算。

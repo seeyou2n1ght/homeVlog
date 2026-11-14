@@ -296,7 +296,7 @@ def _cleanup_temp_artifacts_owned(clean_batches: bool = False) -> int:
     if not TEMP_DIR.exists():
         return 0
     patterns = [
-        "*.tmp.mp4", "_batch*.tmp.mp4", "_fc_*.txt", "_stderr_*.log",
+        "*.tmp.mp4", "_batch*.tmp.mp4", "_fc_*.txt", "_stderr_*.log", ".pipe_decode_*.log", ".pipe_win_*.log",
         ".concat_*.txt", "_edl_*.ffconcat", "_render_stage/*.mp4",
         "_render_stage/*.part", "staging/*.mp4", "staging/*.part",
         "scripts/*", "_batch*.json.tmp",

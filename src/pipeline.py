@@ -779,7 +779,12 @@ class StreamingOrchestrator:
                 self._sync_queue_levels()
             return None
 
-    def _analysis_worker(self, fixed_gpu: str | None = None, worker_id: str = ""):
+    def _analysis_worker(
+        self,
+        fixed_gpu: str | None = None,
+        worker_id: str = "",
+        cpu_max_duration_s: float | None = None,
+    ):
         """分析 Worker：对 SUSPICIOUS 文件进行运动检测与目标验证 (支持异构自适应工作窃取)。"""
         default_gpu = "cpu" if fixed_gpu == "cpu" else "qsv"
         default_detector = MotionDetector(self.config, decode_gpu=default_gpu)
@@ -791,7 +796,7 @@ class StreamingOrchestrator:
         if yolo_cfg.get("enabled", False) and yolo_cfg.get("streaming_verify", True):
             from src.algorithms.yolo_verifier import YoloVerifier
             try:
-                if fixed_gpu == "cpu":
+                if fixed_gpu == "cpu" and uses_software_pipeline(self.config):
                     yolo_verifier = YoloVerifier(self.config, device="cpu")
                 else:
                     yolo_verifier = YoloVerifier(self.config)
@@ -817,7 +822,14 @@ class StreamingOrchestrator:
                 task = None
                 is_stolen = False
                 try:
-                    if is_cuda_heavy_worker:
+                    if cpu_max_duration_s is not None:
+                        if hasattr(self.analysis_queue, "get_short"):
+                            task = self.analysis_queue.get_short(
+                                timeout=0.5, max_duration=cpu_max_duration_s
+                            )
+                        else:
+                            task = self.analysis_queue.get(timeout=0.5)
+                    elif is_cuda_heavy_worker:
                         # 1. 优先消费夜间巨型长任务 (>= heavy_dur, LPT)
                         if hasattr(self.analysis_queue, "has_heavy_tasks") and self.analysis_queue.has_heavy_tasks(heavy_dur):
                             task = self.analysis_queue.get_heavy(timeout=0.5, min_duration=heavy_dur)
@@ -835,14 +847,37 @@ class StreamingOrchestrator:
                     else:
                         task = self.analysis_queue.get(timeout=0.5)
                 except queue.Empty:
+                    if cpu_max_duration_s is not None and self.prescreen_queue.unfinished_tasks == 0:
+                        has_short = (
+                            self.analysis_queue.has_short_tasks(cpu_max_duration_s)
+                            if hasattr(self.analysis_queue, "has_short_tasks")
+                            else not self.analysis_queue.empty()
+                        )
+                        if not has_short:
+                            break
                     continue
 
                 filepath = task["filepath"]
                 file_dur = float(task.get("file_duration") or 0.0)
-                if fixed_gpu != "cpu" and not is_cuda_heavy_worker and file_dur >= heavy_dur and self.config.get("pipeline", {}).get("cost_priority", False):
-                    # 杜绝 QSV Worker 误领 55 分钟夜间长文件导致慢速爬行 850 秒 (14 分钟) 瘫痪核显编队；
-                    # 若队列中仍有其他轻切片可供消费，或 Worker 0 NVDEC 当前空闲可立即接手，将该重任务放回队列专供 Worker 0 出清
-                    if self.analysis_queue.qsize() > 0 or self.work_stealing.active_nv_decoders == 0 or not self.prescreen_queue.empty():
+                if fixed_gpu != "cpu" and not is_cuda_heavy_worker and file_dur >= heavy_dur and getattr(self.analysis_queue, "cost_priority", False):
+                    # 杜绝 QSV Worker 误领 55 分钟夜间长文件导致慢速爬行瘫痪核显编队；
+                    # 若预筛未完、队列中仍有 <heavy_dur 轻切片、或 NVDEC Worker 0 空闲则退回重任务；
+                    # 当所有轻切片与预筛已清空且 Worker 0 正在忙于巨型文件时，允许 QSV 协助处理 <1800s 的中重型文件以消除尾部串行阻塞
+                    has_short = (
+                        self.analysis_queue.has_short_tasks(heavy_dur)
+                        if hasattr(self.analysis_queue, "has_short_tasks")
+                        else True
+                    )
+                    should_defer_heavy = (
+                        not self.prescreen_queue.empty()
+                        or getattr(self.prescreen_queue, "unfinished_tasks", 0) > 0
+                        or self.work_stealing.active_nv_decoders == 0
+                        or (
+                            self.analysis_queue.qsize() > 0
+                            and (file_dur >= 1800.0 or has_short)
+                        )
+                    )
+                    if should_defer_heavy:
                         self.analysis_queue.put(task)
                         self.analysis_queue.task_done()
                         time.sleep(0.2)
@@ -1104,7 +1139,7 @@ class StreamingOrchestrator:
         nv_batch_durations: list[float] = []
         nv_duration_lock = threading.Lock()
 
-        def _render_worker(gpu: str, worker_id: str = ""):
+        def _render_worker(gpu: str, worker_id: str = "", tail_cpu_decode: bool = False):
             nonlocal qsv_workers_alive
             handoff_to_nv = False
             worker_name = worker_id or gpu
@@ -1172,13 +1207,26 @@ class StreamingOrchestrator:
                                         else:
                                             avg_nv_time = 42.0
                                     t_nv_eta = max(30.0, ((q_len + active_nv) / 2.0) * avg_nv_time)
-                                    # 当处于尾部收尾阶段时，收紧 QSV 窃取门限，杜绝 QSV 耗时超过 NVENC 清空剩余队列的时间
+                                    # 上游仍有分析或预筛待处理时，QSV 仅消化纯静态轻量批次，把核显全额让渡给上游分析编队；
+                                    # 仅在上游清零后才允许窃取动态批次（或进一步交接给 nv_tail_0）。
+                                    upstream_busy = (
+                                        (not self.upstream_drained.is_set())
+                                        and (
+                                            (not self.analysis_queue.empty())
+                                            or getattr(self.prescreen_queue, "unfinished_tasks", 0) > 0
+                                        )
+                                    )
                                     if all_dispatched_event.is_set():
                                         effective_max_dyn = min(max_qsv_dynamic_s, 180.0, t_nv_eta * 0.8)
                                     else:
                                         effective_max_dyn = max_qsv_dynamic_s
                                     allowed_dyn_s = effective_max_dyn if t_nv_eta >= 35.0 else min(effective_max_dyn, max(60.0, t_nv_eta * 1.5))
-                                    item = heavy_queue.steal_lightest(max_dynamic_s=allowed_dyn_s)
+                                    if upstream_busy:
+                                        item = None
+                                    else:
+                                        item = heavy_queue.steal_lightest(
+                                            max_dynamic_s=allowed_dyn_s,
+                                        )
                                     if item is None:
                                         if all_dispatched_event.is_set() and (heavy_queue.empty() or q_len <= active_nv):
                                             break
@@ -1359,17 +1407,21 @@ class StreamingOrchestrator:
                         # recreate its cache after the renderer has released it.
                         with self._prefetched_lock:
                             self._prefetched_files.difference_update(files_to_batch)
+                        render_kwargs = {"config": self.config}
+                        if tail_cpu_decode:
+                            render_kwargs["cpu_decode"] = True
                         res_path = build_batch_render(
                             batch_segs, b_idx, gpu, fps, width, height,
                             seg_cfg, out_cfg, audio_cfg, self.date, self.cam_index,
-                            all_rows, config=self.config,
+                            all_rows, **render_kwargs,
                         )
                         r_dur = round(time.monotonic() - t_r0, 3)
                         busy_time += r_dur
                         batches_count += 1
                         batch_dyn = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
                         dynamic_sec_total += batch_dyn
-                        logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, gpu, r_dur, bool(res_path))
+                        backend_label = "cpu_nvenc" if tail_cpu_decode and gpu == "nv" else gpu
+                        logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, backend_label, r_dur, bool(res_path))
                         if res_path:
                             if gpu == "nv" and not is_light and r_dur >= 5.0:
                                 with nv_duration_lock:
@@ -1392,6 +1444,7 @@ class StreamingOrchestrator:
                                         "source_duration_s": round(sum(float(r.get("file_duration") or 0) for r in all_rows), 2),
                                         "is_stolen": is_stolen,
                                         "is_light": is_light,
+                                        "cpu_decode": bool(tail_cpu_decode and gpu == "nv"),
                                         "render_queue_wait_s": round(render_queue_wait, 3),
                                     },
                                     start_time=round(t_r0, 3),
@@ -1523,8 +1576,15 @@ class StreamingOrchestrator:
                 capacity = nv_tail_capacity() if nv_budget == 2 else nullcontext(True)
                 with capacity as admitted:
                     if admitted and not self.abort_event.is_set():
-                        logger.info("QSV worker %s finished its eligible queue; reusing thread as NV tail worker (upstream drained)", worker_name)
-                        _render_worker("nv", "nv_tail_0")
+                        tail_cpu_decode = (
+                            render_hw_policy == "heterogeneous"
+                            and bool(render_cfg.get("nv_tail_use_cpu_decode", True))
+                        )
+                        logger.info(
+                            "QSV worker %s finished its eligible queue; reusing thread as nv_tail_0 (upstream drained, cpu_decode=%s)",
+                            worker_name, tail_cpu_decode,
+                        )
+                        _render_worker("nv", "nv_tail_0", tail_cpu_decode=tail_cpu_decode)
                     else:
                         with self.batch_lock:
                             self.render_worker_stats[worker_name]["handoff_to_nv"] = False
@@ -1755,6 +1815,20 @@ class StreamingOrchestrator:
             t = threading.Thread(target=self._guard_worker, args=(self._analysis_worker, analysis_device, w_id), daemon=True)
             t.start()
             threads.append(t)
+
+        det_cfg = self.config.get("detection", {})
+        cpu_analysis_workers = int(det_cfg.get("cpu_analysis_workers", 0))
+        cpu_max_dur_s = float(det_cfg.get("cpu_analysis_max_duration_s", 600.0))
+        if not software_pipeline and cpu_analysis_workers > 0 and analysis_max_workers > 0:
+            for j in range(cpu_analysis_workers):
+                w_id = f"ana_cpu_{j}"
+                t = threading.Thread(
+                    target=self._guard_worker,
+                    args=(self._analysis_worker, "cpu", w_id, cpu_max_dur_s),
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
 
         if self.render_enabled:
             t_rm = threading.Thread(target=self._guard_worker, args=(self._render_manager,), daemon=True)

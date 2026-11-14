@@ -200,8 +200,8 @@ def validate_config(config):
     integer_keys = {
         "hardware": ("max_nv_concurrency", "max_qsv_concurrency", "max_qsv_analysis_concurrency",
                      "max_qsv_render_concurrency", "max_io_concurrency"),
-        "detection": ("prescreen_parallel", "analysis_max_workers"),
-        "render": ("batch_max_files", "max_concurrency"),
+        "detection": ("prescreen_parallel", "analysis_max_workers", "cpu_analysis_workers", "cpu_decode_threads"),
+        "render": ("batch_max_files", "max_concurrency", "cpu_nvenc_decode_threads"),
         "logging": ("retention_days",),
     }
     for section, keys in integer_keys.items():
@@ -210,11 +210,27 @@ def validate_config(config):
                 val = config[section][key]
                 if isinstance(val, bool) or int(val) != float(val):
                     raise ValueError(f"{section}.{key} must be an integer")
+                if key in ("cpu_analysis_workers", "cpu_decode_threads", "cpu_nvenc_decode_threads") and int(val) < 0:
+                    raise ValueError(f"{section}.{key} must be non-negative")
                 if section == "logging" and int(val) < 1:
                     raise ValueError(f"{section}.{key} must be a positive integer")
-    for section, key in (("recovery", "skip_corrupt"), ("render", "cleanup_batches_on_success")):
+    for section, key in (
+        ("recovery", "skip_corrupt"),
+        ("render", "cleanup_batches_on_success"),
+        ("render", "night_sparse_enabled"),
+        ("render", "nv_tail_use_cpu_decode"),
+    ):
         if key in config.get(section, {}) and not isinstance(config[section][key], bool):
             raise ValueError(f"{section}.{key} must be a boolean")
+    cpu_max_dur = config.get("detection", {}).get("cpu_analysis_max_duration_s")
+    if cpu_max_dur is not None and (not math.isfinite(float(cpu_max_dur)) or float(cpu_max_dur) <= 0):
+        raise ValueError("detection.cpu_analysis_max_duration_s must be positive and finite")
+    night_sparse_min = config.get("render", {}).get("night_sparse_min_duration_s")
+    if night_sparse_min is not None and (not math.isfinite(float(night_sparse_min)) or float(night_sparse_min) < 4.0):
+        raise ValueError("render.night_sparse_min_duration_s must be >= 4.0 and finite")
+    concat_codec = config.get("output", {}).get("audio", {}).get("concat_codec")
+    if concat_codec is not None and str(concat_codec) not in {"auto", "aac", "aac_mf"}:
+        raise ValueError(f"Unsupported output.audio.concat_codec: {concat_codec}")
     if render_policy == "heterogeneous" and render_conc is not None and int(render_conc) > 3:
         raise ValueError("heterogeneous rendering supports at most 3 workers (2 NVENC + 1 QSV)")
     seg_cfg = config.get("segment", {})

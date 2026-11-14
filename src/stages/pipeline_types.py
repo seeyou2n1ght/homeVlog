@@ -136,6 +136,59 @@ class AnalysisQueue(queue.Queue):
                 for _prio, _seq, task in self.queue
             )
 
+    def _find_short_index(self, max_duration: float) -> int | None:
+        best_idx = None
+        best_key = None
+        for i, (prio, seq, task) in enumerate(self.queue):
+            dur = float(task.get("file_duration") or 0.0)
+            if dur < max_duration:
+                key = (prio, seq)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_idx = i
+        return best_idx
+
+    def _pop_at(self, idx: int):
+        import heapq
+        if idx == 0:
+            task = heapq.heappop(self.queue)[2]
+        else:
+            _, _, task = self.queue.pop(idx)
+            heapq.heapify(self.queue)
+        self.not_full.notify()
+        return task
+
+    def has_short_tasks(self, max_duration: float = 600.0) -> bool:
+        """Check whether any task with duration < max_duration remains queued."""
+        with self.mutex:
+            return any(
+                float(task.get("file_duration") or 0.0) < max_duration
+                for _prio, _seq, task in self.queue
+            )
+
+    def get_short(self, block: bool = True, timeout: float | None = None, max_duration: float = 600.0):
+        """Pop the highest-priority task with duration < max_duration without spinning."""
+        with self.not_empty:
+            if not block:
+                idx = self._find_short_index(max_duration)
+                if idx is None:
+                    raise queue.Empty
+                return self._pop_at(idx)
+            elif timeout is None:
+                while (idx := self._find_short_index(max_duration)) is None:
+                    self.not_empty.wait()
+                return self._pop_at(idx)
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time.monotonic() + timeout
+                while (idx := self._find_short_index(max_duration)) is None:
+                    remaining = endtime - time.monotonic()
+                    if remaining <= 0.0:
+                        raise queue.Empty
+                    self.not_empty.wait(remaining)
+                return self._pop_at(idx)
+
     def steal_sublongest(
         self,
         max_duration: float = 1200.0,

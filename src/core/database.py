@@ -495,25 +495,6 @@ class VlogDatabase:
                 logger.error("DB error in get_dynamic_duration_for_file: %s", e)
                 return 0.0
 
-
-    def get_segment_by_id(self, segment_id: int) -> dict | None:
-        with self._lock:
-            try:
-                row = self.conn.execute(
-                    """SELECT s.id, s.file_id, s.start_time, s.end_time, s.state,
-                              s.max_energy, s.avg_confidence, s.file_start_offset, s.created_at,
-                              (s.end_time - s.start_time) AS duration,
-                              ft.filepath, ft.cam_index, ft.date
-                       FROM segments s
-                       JOIN file_tasks ft ON s.file_id = ft.id
-                       WHERE s.id=?""",
-                    (segment_id,),
-                ).fetchone()
-                return dict(row) if row else None
-            except Exception as e:
-                logger.error("DB error in get_segment_by_id: %s", e)
-                return None
-
     def reset_failed_tasks(self, date: str, cam_index: int, max_retries: int = 3) -> dict:
         """将 FAILED 预筛/分析任务重置为 PENDING，使重跑时自愈补齐丢失内容。
 

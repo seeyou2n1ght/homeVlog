@@ -17,8 +17,8 @@ Focus Areas:
    - Completely static video with Audio VAD events
    - Fine window awakening, DYNAMIC_AUDIO labeling, zero recall loss in build_segments
    - Timeline monotonicity and boundary closure
-4. Empirical Vulnerability Verification:
-   - UnboundLocalError in _decode_file_pyav on corrupt media opening
+4. PyAV Open Failure:
+   - Missing input reports an incomplete decode and releases its I/O permit
 """
 
 import os
@@ -501,17 +501,22 @@ class TestAudioInVisuallyDeadSceneChallenger2:
 
 
 # ============================================================================
-# 4. Empirical Vulnerability Verification
+# 4. PyAV Open Failure
 # ============================================================================
 
-class TestEmpiricalVulnerabilities:
-    """Empirical demonstration and verification of detected vulnerabilities."""
+def test_pyav_missing_file_reports_incomplete_and_releases_io(tmp_path, monkeypatch, caplog):
+    missing_source = tmp_path / "missing.mp4"
+    io_permit = threading.BoundedSemaphore(1)
+    monkeypatch.setattr("src.hardware.scheduler.get_disk_semaphore", lambda: io_permit)
+    detector = MotionDetector({}, decode_gpu="cpu")
 
-    def test_vulnerability_unbound_local_error_in_decode_file_pyav(self):
-        """Demonstrate UnboundLocalError bug in detector.py:954 when media opening fails."""
-        detector = MotionDetector({})
-        # Calling _decode_file_pyav on a non-existent file causes av.open to raise FileNotFoundError/InvalidDataError.
-        # Due to 'from src.hardware.ffmpeg import FFmpegProcessRegistry' on line 865,
-        # line 954 crashes with UnboundLocalError instead of handling the exception safely.
-        with pytest.raises(UnboundLocalError, match="cannot access local variable 'FFmpegProcessRegistry'"):
-            detector._decode_file_pyav("nonexistent_corrupt_test_file.mp4", 10.0)
+    frames, yolo_buffer, _, metadata = detector._decode_file_pyav(str(missing_source), 10.0)
+
+    assert len(frames) == 0 and not yolo_buffer
+    assert metadata["frames"] == 0
+    assert metadata["complete"] is False
+    assert metadata["completion_error"].startswith("FileNotFoundError:")
+    assert missing_source.name in metadata["completion_error"]
+    assert f"PyAV decode error for {missing_source.name}" in caplog.text
+    assert io_permit.acquire(blocking=False)
+    io_permit.release()

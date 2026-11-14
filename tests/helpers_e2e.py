@@ -6,13 +6,11 @@ Strictly non-mutating: does NOT monkeypatch or modify production classes/modules
 
 from datetime import datetime, timedelta
 from fractions import Fraction
-import json
 from pathlib import Path
 
 import av
 import numpy as np
 
-from src.core.database import VlogDatabase
 from src.hardware import scheduler
 from src.hardware.ffmpeg import FFmpegProcessRegistry
 
@@ -202,61 +200,6 @@ class MockVramController:
 
     def probe_margin(self) -> int:
         return self.free_mb
-
-
-def assert_zero_decode_fast_path(db: VlogDatabase, filepath: str):
-    """Verify that a clip was processed via zero-decode fast path."""
-    task = db.get_file_task(str(filepath))
-    assert task is not None
-    assert task["prescreen_status"] in ("STATIC", "SKIPPED_EMPTY")
-    assert task["analysis_status"] in ("ANALYZED", "PENDING")
-
-
-def assert_awakened_windows(db: VlogDatabase, filepath: str, expected_bounds: list[tuple[float, float]], tolerance: float = 0.5):
-    """Verify awakened windows alignment with expected bounds."""
-    segs = db.get_segments_for_file(str(filepath))
-    dynamic_segs = [s for s in segs if s.get("state") in ("DYNAMIC", "DYNAMIC_AUDIO", "MICRO_MOTION")]
-    assert len(dynamic_segs) > 0, f"Expected dynamic segments for {filepath}, found none"
-    for exp_start, exp_end in expected_bounds:
-        matched = any(
-            abs(s["start_in_file"] - exp_start) <= tolerance and abs(s["end_in_file"] - exp_end) <= tolerance
-            for s in dynamic_segs
-        )
-        assert matched, f"Expected window [{exp_start}, {exp_end}] not found in {dynamic_segs}"
-
-
-def assert_fallback_triggered(db: VlogDatabase, filepath: str, reason: str | None = None):
-    """Assert that fallback to full decode occurred."""
-    task = db.get_file_task(str(filepath))
-    assert task is not None
-    raw_comp = task.get("decode_completion") or "{}"
-    if isinstance(raw_comp, str):
-        try:
-            comp = json.loads(raw_comp)
-        except Exception:
-            comp = {}
-    else:
-        comp = raw_comp
-    if reason:
-        assert comp.get("fallback_reason") == reason or comp.get("reason") == reason
-
-
-def assert_seam_and_clock_continuity(output_path: Path, max_drift_ticks: int = 1):
-    """Assert delivery PTS clock continuity and bounded drift."""
-    meta_path = output_path.with_suffix(".meta.json")
-    if meta_path.exists():
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-        mapping = metadata.get("delivery_mapping", {})
-        assert mapping.get("status") == "AVAILABLE"
-        assert mapping.get("max_error_ticks", 0) <= max_drift_ticks
-
-    with av.open(str(output_path)) as media:
-        if media.streams.video:
-            v_stream = media.streams.video[0]
-            frames = list(media.decode(video=0))
-            pts_list = [f.pts for f in frames if f.pts is not None]
-            for a, b in zip(pts_list, pts_list[1:]):
-                assert b > a, f"Non-monotonic PTS: {a} -> {b}"
 
 
 def assert_resource_hygiene():

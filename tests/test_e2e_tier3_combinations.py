@@ -178,6 +178,9 @@ def test_tier3_f5_f10_fallback_continuous_decode_lease_safety(mock_config):
 def test_tier3_f8_f12_work_stealing_upstream_makespan_reduction(mock_config):
     """T3-13: F8 (Admission) x F12 (Makespan): Stealing medium tasks significantly reduces queue drain time."""
     mgr = scheduler.WorkStealingManager(mock_config)
+    ctrl = MockVramController(free_mb=4000, used_mb=3000)
+    mgr._vram_margin_probe_fn = ctrl.probe_margin
+    mgr.set_vram_probe_fn(ctrl.probe_used)
     q = AnalysisQueue()
     q.cost_priority = True
     for i in range(6):

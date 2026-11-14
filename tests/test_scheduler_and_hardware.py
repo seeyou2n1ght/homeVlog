@@ -983,3 +983,41 @@ def test_scheduler_work_stealing_config_validation():
     with pytest.raises(ValueError, match="scheduler.steal_sublongest_min_duration cannot be greater than or equal to steal_sublongest_max_duration"):
         validate_config({**base, "scheduler": {"steal_sublongest_min_duration": 1200.0, "steal_sublongest_max_duration": 600.0}})
 
+
+def test_analysis_queue_get_short_and_has_short_tasks():
+    import queue
+    from src.stages.pipeline_types import AnalysisQueue
+
+    q = AnalysisQueue()
+    q.put({"filepath": "heavy_3900.mp4", "file_duration": 3900.0, "file_start_time": "20260326010000"})
+    q.put({"filepath": "short_350.mp4", "file_duration": 350.0, "file_start_time": "20260326060000"})
+    q.put({"filepath": "short_120.mp4", "file_duration": 120.0, "file_start_time": "20260326070000"})
+
+    assert q.has_short_tasks(600.0) is True
+    first = q.get_short(block=False, max_duration=600.0)
+    assert first["filepath"] == "short_350.mp4"
+    second = q.get_short(block=False, max_duration=600.0)
+    assert second["filepath"] == "short_120.mp4"
+
+    assert q.has_short_tasks(600.0) is False
+    with pytest.raises(queue.Empty):
+        q.get_short(block=False, max_duration=600.0)
+    assert q.get(block=False)["filepath"] == "heavy_3900.mp4"
+
+
+def test_dual_ended_batch_queue_steal_lightest_eligible_fn():
+    from src.hardware.scheduler import DualEndedBatchQueue
+
+    q = DualEndedBatchQueue()
+    q.put(0, ["heavy_src.mp4"], 100.0)
+    q.put(1, ["short_src.mp4"], 120.0)
+
+    durations = {"heavy_src.mp4": 3900.0, "short_src.mp4": 300.0}
+    def only_short(item):
+        return sum(durations[f] for f in item.files) <= 600.0
+    # Tail item is batch 0 (dynamic=100.0), which has heavy source 3900s -> rejected without dequeueing
+    assert q.steal_lightest(180.0, eligible_fn=only_short) is None
+    assert q.qsize() == 2
+    assert q.steal_lightest(180.0) is not None
+    assert q.qsize() == 1
+

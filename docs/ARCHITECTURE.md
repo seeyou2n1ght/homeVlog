@@ -149,7 +149,7 @@ flowchart TD
 - **Stages Layer (`src/stages/`)**: 业务流程编排（`scanner.py`, `prescreen.py`, `detector.py`, `timeline.py`, `renderer.py`, `companion.py`, `delivery_recovery.py`, `pipeline_types.py`）
 - **Algorithms Layer (`src/algorithms/`)**: 纯算法无状态实现（`filters.py`, `motion_trace.py`, `segment.py`, `yolo_verifier.py`, `audio_features.py`）
 - **Hardware Layer (`src/hardware/`)**: 硬件资源与子进程管理（`ffmpeg.py`, `frame_pool.py`, `monitor.py`, `render_cache.py`, `scheduler.py`, `autotune.py`, `lifecycle.py`）
-- **Core Layer (`src/core/`)**: 核心基础库与单一事实源（`database.py`, `config.py`, `identity.py`, `utils.py`, `process_lock.py`）
+- **Core Layer (`src/core/`)**: 核心基础库与单一事实源（`database.py`, `config.py`, `identity.py`, `profiles.py`, `replay_evidence.py`, `replay_journal.py`, `utils.py`, `process_lock.py`）
 
 流水线主协调器 `src/pipeline.py` 位于顶层，直接协调上述模块，层间依赖遵循严格自顶向下调用契约。
 
@@ -324,12 +324,12 @@ Prescreen 使用空间能量分布而不仅是全局平均差分判断运动。
 
 ---
 
-## 5.5 Two-Tier I-Frame Skip-Frame Pre-Screening & Windowed Fine Analysis (ADR0083 & ADR0085)
+## 5.2 Two-Tier I-Frame Skip-Frame Pre-Screening & Windowed Fine Analysis (ADR0083 & ADR0085)
 
 为消除对超长静态/夜间监控素材无意义的逐帧完整解码，同时避免高活动度日间短片承受双重扫描开销，`src/stages/detector.py` 实现了带时长门控的分层预筛选与时域窗口精析机制：
 
 1. **Duration Gate (`detection.iframe_min_file_duration`)**：
-   - 仅当文件时长 $\ge \text{iframe\_min\_file\_duration}$（生产配置 `1200.0s`，默认 `0.0s`）时启用两级窗口化路径；短于该阈值的日间常规切片直接进入单遍硬件解码，规避高频活动场景下的回退重扫开销。
+   - 仅当文件时长 $\ge \text{iframe\_min\_file\_duration}$（生产配置 `1800.0s`，代码默认 `0.0s`）时启用两级窗口化路径；短于该阈值的日间常规切片直接进入单遍硬件解码，规避高频活动场景下的回退重扫开销。
 2. **Tier 1 (极速扫视 / Coarse I-Frame Scan)**：
    - 对 $\ge 180\text{s}$ 的正式长文件联合启用 Demuxer 级 `-discard nokey` 与解码器级 `-skip_frame nokey`，并在同一单遍管道中挂载双线性下采样与 `showinfo` 滤镜（`scale=w:h,showinfo`），一次性提取无混叠的 8-bit 灰度关键帧与精确 PTS，免除独立 `ffprobe`/`ffmpeg` 全包 PTS 预探测；
    - 根据关键帧实际平均步长对 EMA 背景学习率（`alpha_bg` / `alpha_fg`）作时间常数补偿，融合全画幅运动能量、8×8 空间网格最大局部单元能量与并发预解码的音频 VAD 事件。
@@ -339,7 +339,7 @@ Prescreen 使用空间能量分布而不仅是全局平均差分判断运动。
    - 对触发视觉或音频唤醒的关键帧区间扩展安全时域边距（默认 `3.0s` padding），并对超长文件（`> 1200s`）将间隔 $\le 45.0\text{s}$（中短文件 $\le 12.0\text{s}$）的相邻窗口合并，减少 SMB 重复打开与硬件解码器上下文创建次数；
    - 仅对合并后的活跃窗口通过 FFmpeg 精确 Seek（`-ss start -to end`）解码并提取内存候选帧送入 `MotionTrace` 与 YOLO 验证，未唤醒空隙自动插值闭合为 `STATIC` 或 `NIGHT_STATIONARY`。
 5. **Fallback Safeguards & Audio Reuse (保底退化与音频复用)**：
-   - 对 `> 600s` 长切片按时长比例扩展离散窗口上限（`iframe_max_isolated_windows`），当活跃窗口占比超过 `iframe_max_active_ratio`（`0.60`）或离散窗口数超限时，平滑退化为单次完整文件解码，并通过 `_predecoded_audio` 直接复用 Tier 1 已解码的音频流，杜绝二次音频解码。
+   - 对 `> 600s` 长切片按时长比例扩展离散窗口上限（`iframe_max_isolated_windows`），当活跃窗口占比超过 `iframe_fallback_active_ratio`（`0.45`）或离散窗口数超限时，平滑退化为单次完整文件解码，并通过 `_predecoded_audio` 直接复用 Tier 1 已解码的音频流，杜绝二次音频解码。
 
 ---
 
@@ -459,7 +459,7 @@ NAS
 主要调度入口位于：
 
 ```text
-src.scheduler
+src/hardware/scheduler.py
 ```
 
 ---
@@ -542,6 +542,19 @@ Scheduler 可以根据：
 
 ---
 
+## 8.4 Tail Guard, Dynamic Steal Balancing & NV Tier-3 (ADR0072 & ADR0087)
+
+生产默认配置已启用 `render.nv_tail_concurrency: 3` 与 `render.nv_tail_use_cpu_decode: true`（ADR0087）：在默认 NV 预算 2 下，当上游满足尾段准入条件且原 QSV/显存门禁通过时，借用第 3 个 NVENC 尾段许可；采用软解码供帧避免与尾部 NVDEC 解码争用硬件引擎。
+
+- **借用前置条件**：仅当预筛/分析队列 `unfinished_tasks` 全部归零、未取消、全部渲染输入派发完毕且原 QSV 准入/显存检查通过时才允许借用。NV semaphore 仍为同一实例，作用域结束撤销空闲额外许可；若全部在用则登记撤销债务，由后续真实租约归还偿还，不提前释放未确认停止的媒体许可。债务未清不允许再次借用。
+- **退出守卫**：所有源派发完成后，重队列为空或排队任务数不超过活跃 NV 数时，QSV 停止领取重批次；
+- **准入门限**：派发完成前沿用配置上限（当前 420 秒）；之后为配置上限、180 秒和 NV 剩余 ETA 的 0.8 倍三者最小值。成本是队列活动源时长，包含夜间/存在状态，并非仅常速动态展示时长；
+- **线程复用（ADR0072）**：异构 NV/QSV 编队在配置 NV 预算至少 3、所有源已派发、最轻剩余批次严格超过 QSV 最大收尾准入，且现有显存探针取得低于水位的有效非负有限值时，允许原 QSV 线程结束自己的统计后进入现有 NV 循环；水位过高、探针缺失或失败时继续原 NV 处理并在后续循环重检，不取消在途任务。
+
+其目标是最小化端到端 `makespan`；是否改善收尾由同条件完整墙钟验证。
+
+---
+
 ## 8.5 Hardware Auto-Tuning & Dynamic Provisioning (ADR0078)
 
 系统在 `src/hardware/autotune.py` 中实现了硬件自适应画像探测与并发参数推导：
@@ -566,25 +579,6 @@ Scheduler 可以根据：
    - **QSV 让步**：启用成本优先且队列中仅剩达到重任务阈值的文件时，普通 worker 让出这些任务给 NVDEC。
 3. **单文件批次 NVMe SSD 预暂存直通**：
    - 扩展 `src/stages/renderer.py`，全天所有文件（包括非 virtual 的单文件长批次）在压制前均通过后台 Prefetch 线程提前拷至本地 NVMe SSD，以 500~680 MB/s 极速读入，彻底消除千兆 SMB NAS 跨网络多区间 Seek 造成的 I/O 气泡与 400 秒长耗时。
-
-## 8.4 Tail Guard & Dynamic Steal Balancing
-
-实验候选`render.nv_tail_concurrency=3`可在默认NV预算2下借用一个尾段许可；省略该键仍保持原预算。只有预筛/分析队列的unfinished_tasks全部归零、未取消、全部渲染输入派发完毕且原QSV准入/显存检查通过，才允许借用。NV semaphore仍为同一实例，作用域结束撤销空闲额外许可；若全部在用则登记撤销债务，由后续真实租约归还偿还，不提前释放未确认停止的媒体许可。债务未清不允许再次借用。适用于现有按日/机位串行入口，不承诺多个并行Orchestrator间的上游隔离。候选尚未通过单日性能验收，生产默认配置未启用。
-
-临近任务结束时，应避免较慢 Worker 接手可能形成长尾的任务，同时杜绝过早退出导致尾部饥饿。
-
-Tail Guard 遵循自适应平衡原则：
-- **退出守卫**：所有源派发完成后，重队列为空或排队任务数不超过活跃NV数时，QSV停止领取重批次；
-- **准入门限**：派发完成前沿用配置上限（当前420秒）；之后为配置上限、180秒和NV剩余ETA的0.8倍三者最小值。成本是队列活动源时长，包含夜间/存在状态，并非仅常速动态展示时长；
-- **线程复用（ADR0072）**：异构两NV/一QSV编队在配置NV预算至少3、所有源已派发、最轻剩余批次严格超过QSV最大收尾准入，且现有显存探针取得低于水位的有效非负有限值时，允许原QSV线程结束自己的统计后进入现有NV循环。水位过高、探针缺失或失败时继续原两NV处理，并在后续循环重新检查；不取消在途任务。保留末尾硬保护、三线程总数和原资源租约。当前默认预算2；历史分析重建的三路收益未覆盖新分析显存边界，默认推广已暂停。该探针是准入快照，不构成额外显存租约或后续峰值保证。
-
-其目标是最小化：
-
-```text
-makespan
-```
-
-是否改善收尾由同条件完整墙钟验证，不从局部占用率或成本估计推导同步收尾精度。
 
 ## 8.8 Tail Adaptive Work Stealing & Dual-GPU Load Balancing (ADR0084)
 
@@ -956,7 +950,7 @@ produced batches ∪ terminal batches
 
 最终完成标记是一个提交边界：验证过的批次生成 `.pending.mp4`，候选字幕/元数据完成后才替换交付资产。`promote_vlog_assets()` 在原输出目录保留上一份视频、字幕、元数据及 manifest，调用方提交新 manifest 与成功状态后才移除备份。正常异常/取消恢复旧资产；回滚失败或进程骤停遗留的 `.delivery_backup_*/` 保留，`recovery.json` 标识原路径。新包另保存PREPARED/COMMITTED/RECOVERED事务身份并在认领下恢复（ADR0053），旧无事务身份包需显式检查。文件各自原子替换，不宣称跨文件原子性或物理断电保证。
 
-主流水线只有 manifest 和数据库完成记录均成功才返回成功；实际数据库写入错误向上传播，关闭数据库时保留既有安全退出行为。审核重渲染使用相同资产提交边界，成功状态只属于审核任务，不改主交付记录。有效批次在完整提交前始终保留；`render.cleanup_batches_on_success` 默认 false，开启时仅清理本次批次及清单。
+主流水线只有 manifest 和数据库完成记录均成功才返回成功；实际数据库写入错误向上传播，关闭数据库时保留既有安全退出行为。审核重渲染使用相同资产提交边界，成功状态只属于审核任务，不改主交付记录。有效批次在完整提交前始终保留；`render.cleanup_batches_on_success` 在 `config/settings.yaml` 生产默认开启（`true`），仅清理本次批次及清单；若配置设为 `false` 则保留有效批次供调试与恢复。
 
 `COMPLETED` 代表历史成功交付，普通运行在配置指纹失效处理前直接跳过，不依赖产物仍在本地。发现待处理素材时提示；显式 `--force-render` 才绕过完成记录。重析包含已交付日期时也必须显式传入该参数，否则在重置前拒绝。未完成任务的恢复仍校验媒体与 manifest；备份移走产物后须保留 `data/vlog.db`（ADR 0028）。仅分析按源任务终态返回结果并保存遥测，不写交付完成记录。
 

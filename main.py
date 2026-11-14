@@ -84,7 +84,7 @@ def main():
             sys.exit(1)
         return
 
-    # 输入目录解析（支持多次 --input-dir 指定与 settings.yaml 配置混合）
+    # 输入目录解析（传入 --input-dir 时覆盖 settings.yaml 配置，支持多次指定）
     if args.input_dir:
         input_dirs = args.input_dir
     else:

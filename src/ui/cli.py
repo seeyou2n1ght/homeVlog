@@ -122,7 +122,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         metavar="PATH",
-        help="覆盖或追加监控切片输入目录 (支持多次指定)",
+        help="覆盖 settings.yaml 中的 paths.input_dirs (支持多次指定多个目录)",
     )
 
     # 2. 流水线阶段与运行控制
@@ -185,7 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     group_maint.add_argument(
         "--reanalyze",
         action="store_true",
-        help="重置指定日期/机位的分析缓存，强制使用最新模型重新精析与渲染",
+        help="重置指定日期/机位的分析缓存并重新精析；若该日已交付，须同时传 --force-render",
     )
 
     # 5. 终端交互与系统配置

@@ -2306,3 +2306,148 @@ def test_qsv_tail_thread_reuses_nv_budget_without_changing_encoder(tmp_path, mon
         dispatched.set()
         thread.join(5)
         db.close()
+
+
+def test_cpu_analysis_worker_keeps_gpu_yolo_and_filters_short_files(tmp_path, monkeypatch):
+    import src.pipeline as pipeline
+    from src.pipeline import StreamingOrchestrator
+
+    db = VlogDatabase(tmp_path / "cpu_ana.db")
+    cfg = {
+        "pipeline": {"render_gpu_policy": "heterogeneous"},
+        "yolo": {"enabled": True, "streaming_verify": True, "device": "cuda:0"},
+        "detection": {"cpu_analysis_workers": 1, "cpu_analysis_max_duration_s": 600.0},
+    }
+    db.add_file_task("short.mp4", 0, "20260326", "20260326060000", "20260326060500", 300.0)
+    db.add_file_task("heavy.mp4", 0, "20260326", "20260326010000", "20260326020500", 3900.0)
+    orch = StreamingOrchestrator(db, "20260326", 0, cfg, dashboard_enabled=False, render_enabled=False)
+
+    yolo_devices = []
+    executed = []
+
+    class FakeYolo:
+        def __init__(self, _cfg, device=None):
+            yolo_devices.append(device)
+
+    monkeypatch.setattr("src.algorithms.yolo_verifier.YoloVerifier", FakeYolo)
+    monkeypatch.setattr(
+        orch,
+        "_execute_analysis_task",
+        lambda task, filepath, _off, detector, _yolo, gpu, _perf, _t0, **_kw: executed.append((filepath, detector.decode_gpu, gpu)),
+    )
+
+    orch.analysis_queue.put({"filepath": "heavy.mp4", "file_duration": 3900.0, "file_start_time": "20260326010000"})
+    orch.analysis_queue.put({"filepath": "short.mp4", "file_duration": 300.0, "file_start_time": "20260326060000"})
+    orch._analysis_warmup_event.set()
+    # prescreen_queue is already drained (unfinished_tasks == 0)
+    orch._analysis_worker(fixed_gpu="cpu", worker_id="ana_cpu_0", cpu_max_duration_s=600.0)
+
+    assert yolo_devices == [None]  # GPU default from config, NOT device="cpu"
+    assert executed == [("short.mp4", "cpu", "cpu")]
+    assert orch.analysis_queue.qsize() == 1
+    assert orch.analysis_queue.get(block=False)["filepath"] == "heavy.mp4"
+    db.close()
+
+
+def test_qsv_steal_guard_while_upstream_busy(tmp_path, monkeypatch):
+    import threading
+    import src.pipeline as pipeline
+    from src.pipeline import StreamingOrchestrator
+    from src.hardware import scheduler
+
+    db = VlogDatabase(tmp_path / "qsv_guard.db")
+    cfg = {
+        "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
+        "hardware": {"max_nv_concurrency": 2},
+        "render": {"batch_max_files": 1, "max_concurrency": 3, "nv_tail_use_cpu_decode": True, "local_staging_enabled": False},
+    }
+    monkeypatch.setattr(scheduler, "load_config", lambda: cfg)
+    scheduler.reset_semaphores()
+    db.add_file_task("long.mp4", 0, "20260326", "20260326000000", "20260326010500", 3900.0)
+    db.set_prescreen_result("long.mp4", "SUSPICIOUS")
+    db.add_file_task("nv1.mp4", 0, "20260326", "20260326020000", "20260326030000", 3600.0)
+    db.set_prescreen_result("nv1.mp4", "SUSPICIOUS")
+    db.add_file_task("nv2.mp4", 0, "20260326", "20260326030000", "20260326040000", 3600.0)
+    db.set_prescreen_result("nv2.mp4", "SUSPICIOUS")
+    orch = StreamingOrchestrator(db, "20260326", 0, cfg, dashboard_enabled=False)
+
+    # Keep upstream unfinished with backlog >= 6 so QSV refuses to steal heavy >600s long.mp4
+    for i in range(6):
+        orch.analysis_queue.put({"filepath": f"pending{i}.mp4", "file_duration": 300.0, "file_start_time": f"20260326060{i}00"})
+
+    orch.render_batch_queue.put({"filepath": "long.mp4", "status": "ANALYZED", "dynamic_duration": 50.0, "is_heavy": True})
+    orch.render_batch_queue.put({"filepath": "nv1.mp4", "status": "ANALYZED", "dynamic_duration": 500.0, "is_heavy": True})
+    orch.render_batch_queue.put({"filepath": "nv2.mp4", "status": "ANALYZED", "dynamic_duration": 500.0, "is_heavy": True})
+
+    calls = []
+    cpu_decode_flags = []
+    busy_gate = threading.Event()
+    release_nv = threading.Event()
+
+    def render(segs, batch, gpu, *_args, **kwargs):
+        calls.append((gpu, segs[0].filepath, kwargs.get("cpu_decode", False)))
+        cpu_decode_flags.append((gpu, kwargs.get("cpu_decode", False)))
+        if gpu == "nv":
+            busy_gate.set()
+            release_nv.wait(timeout=3.0)
+        return str(tmp_path / f"b{batch}.mp4")
+
+    monkeypatch.setattr(pipeline, "build_batch_render", render)
+    orch.stop_event.set()
+    t = threading.Thread(target=orch._render_manager, daemon=True)
+    t.start()
+    assert busy_gate.wait(3.0)
+    # Give QSV a brief moment to inspect queue while upstream is still busy
+    import time
+    time.sleep(0.3)
+    assert all(g == "nv" for g, _, _ in calls)
+    # Drain analysis backlog and signal upstream_drained -> long.mp4 now runs via nv_tail_0 or NV/QSV
+    while not orch.analysis_queue.empty():
+        orch.analysis_queue.get_nowait()
+    orch.upstream_drained.set()
+    release_nv.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    db.close()
+
+
+def test_qsv_analysis_assists_medium_heavy_tail_when_short_and_prescreen_drained(tmp_path, monkeypatch):
+    from src.pipeline import StreamingOrchestrator
+
+    db = VlogDatabase(tmp_path / "qsv_tail_assist.db")
+    cfg = {
+        "pipeline": {"render_gpu_policy": "heterogeneous", "cost_priority": True},
+        "render": {"batch_max_files": 1},
+        "scheduler": {"heavy_file_duration_s": 600.0},
+        "yolo": {"enabled": False, "streaming_verify": False},
+        "detection": {"cpu_analysis_workers": 0},
+    }
+    db.add_file_task("night_3600.mp4", 0, "20260326", "20260326010000", "20260326020000", 3600.0)
+    db.add_file_task("med_1200.mp4", 0, "20260326", "20260326180000", "20260326182000", 1200.0)
+    orch = StreamingOrchestrator(db, "20260326", 0, cfg, dashboard_enabled=False, render_enabled=False)
+
+    executed = []
+
+    def fake_exec(task, filepath, _off, _det, _yolo, gpu, _perf, _t0, **_kw):
+        executed.append((filepath, gpu))
+        # Stop after medium-heavy executes so night_3600 remains queued for verification
+        orch.abort_event.set()
+        return None
+
+    monkeypatch.setattr(orch, "_execute_analysis_task", fake_exec)
+    orch._analysis_warmup_event.set()
+
+    # Simulate ana_0 NVDEC busy on another ultra-heavy file while prescreen + short tasks are empty
+    with orch.work_stealing._lock:
+        orch.work_stealing._active_nv_decoders = 1
+
+    orch.analysis_queue.put({"filepath": "med_1200.mp4", "file_duration": 1200.0, "file_start_time": "20260326180000"})
+    orch.analysis_queue.put({"filepath": "night_3600.mp4", "file_duration": 3600.0, "file_start_time": "20260326010000"})
+
+    # QSV worker must process med_1200.mp4 immediately instead of bouncing it forever while night_3600 remains
+    orch._analysis_worker(fixed_gpu="qsv", worker_id="ana_1")
+
+    assert executed == [("med_1200.mp4", "qsv")]
+    assert orch.analysis_queue.qsize() == 1
+    assert orch.analysis_queue.get(block=False)["filepath"] == "night_3600.mp4"
+    db.close()

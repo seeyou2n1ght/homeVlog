@@ -678,3 +678,46 @@ def test_prescreen_keyframes_error_after_samples_routes_to_suspicious():
     meta = json.loads(res["result_json"])
     assert meta.get("truncated") is True
     assert "stream_error" in meta.get("reason", "")
+
+
+def test_prescreen_keyframes_seek_path_and_sequential_fallback():
+    from fractions import Fraction
+    from src.stages.prescreen import _iter_sparse_keyframes
+
+    class SeekStream:
+        time_base = Fraction(1, 1000)
+
+    class SeekContainer:
+        def __init__(self, fail_seek: bool = False):
+            self.fail_seek = fail_seek
+            self.seeks = []
+            self.cur_t = 0.0
+
+        def seek(self, offset, stream=None, backward=True, any_frame=False):
+            if self.fail_seek and offset > 0:
+                raise RuntimeError("seek unsupported")
+            self.seeks.append(offset)
+            self.cur_t = offset * float(stream.time_base)
+
+        def decode(self, stream):
+            if not self.fail_seek and self.seeks:
+                frame = MagicMock()
+                frame.pts = int(self.cur_t * 1000)
+                yield frame
+            else:
+                for idx in range(5):
+                    frame = MagicMock()
+                    frame.pts = idx * 30000
+                    yield frame
+
+    seek_c = SeekContainer(fail_seek=False)
+    frames = list(_iter_sparse_keyframes(seek_c, SeekStream(), duration=120.0, target_samples=10))
+    assert len(frames) == 10
+    assert len(seek_c.seeks) == 10
+    # Final seek covers the tail (duration - 2.0s = 118.0s -> 118000ms)
+    assert seek_c.seeks[-1] == 118000
+
+    # Seek failure after first sample cleanly falls back to sequential decode
+    fallback_c = SeekContainer(fail_seek=True)
+    fallback_frames = list(_iter_sparse_keyframes(fallback_c, SeekStream(), duration=120.0, target_samples=10))
+    assert [f.pts for f in fallback_frames] == [0, 30000, 120000]

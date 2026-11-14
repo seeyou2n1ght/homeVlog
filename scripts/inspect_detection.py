@@ -49,6 +49,7 @@ def main():
     parser.add_argument("filepath", type=str, help="Path to MP4 file to analyze")
     parser.add_argument("--extract-frames", action="store_true", help="Extract PNG frames at transition boundaries")
     parser.add_argument("--csv", action="store_true", help="Write per-frame labels to CSV")
+    parser.add_argument("--gpu", type=str, default="cuda", choices=["cuda", "qsv", "cpu"], help="Decode/YOLO backend")
     parser.add_argument("--open-dir", action="store_true", help="Open output directory in Explorer")
     parser.add_argument("--outdir", type=str, default=None, help="Output directory (default: ./inspect_out)")
     args = parser.parse_args()
@@ -68,8 +69,8 @@ def main():
     print(f"Duration: {file_dur:.1f}s")
     print()
 
-    detector = MotionDetector(config, decode_gpu="cuda")
-    labels = detector.analyze(str(filepath), start_offset=0.0, file_duration=file_dur)
+    detector = MotionDetector(config, decode_gpu=args.gpu)
+    labels, yolo_buffer = detector.analyze(str(filepath), start_offset=0.0, file_duration=file_dur)
 
     if not labels:
         print("ERROR: no frames analyzed")
@@ -113,7 +114,13 @@ def main():
     # Run YOLO Verifier
     from src.algorithms.yolo_verifier import YoloVerifier
     yolo_verifier = YoloVerifier(config)
-    segments_yolo = yolo_verifier.verify(str(filepath), segments_raw, gpu="cuda")
+    segments_yolo = yolo_verifier.verify(
+        str(filepath),
+        segments_raw,
+        gpu=args.gpu,
+        frames_buffer=yolo_buffer,
+        analysis_fps=detector.fps,
+    )
     
     # Apply filtering now
     segments_yolo_filtered = _filter_short(
@@ -152,11 +159,10 @@ def main():
             writer = csv.writer(f)
             writer.writerow(["frame_index", "time_sec", "is_motion", "formatted_time"])
             for i, label in enumerate(labels):
-                if label["is_motion"]:
-                    t = label["time"]
-                    mm = int(t // 60)
-                    ss = t % 60
-                    writer.writerow([i, f"{t:.2f}", 1, f"{mm}:{ss:05.2f}"])
+                t = label["time"]
+                mm = int(t // 60)
+                ss = t % 60
+                writer.writerow([i, f"{t:.2f}", int(bool(label["is_motion"])), f"{mm}:{ss:05.2f}"])
         print(f"\nCSV written: {csv_path}")
 
     # Extract frames at transition points

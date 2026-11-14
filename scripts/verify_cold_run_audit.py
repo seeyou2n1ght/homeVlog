@@ -1,16 +1,34 @@
 """Standalone Cold-Run Acceptance Verifier for HomeVlog."""
+import argparse
+import json
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import json
 import av
 from src.hardware.render_cache import _window_is_continuous
 
-date_arg = sys.argv[1] if len(sys.argv) > 1 else "20260320"
-META_PATH = Path(f"output/DailyVlog_{date_arg}_B888805AA3CD.meta.json")
-VIDEO_PATH = Path(f"output/DailyVlog_{date_arg}_B888805AA3CD.mp4")
-DB_PATH = Path("data/vlog.db")
+ap = argparse.ArgumentParser(description="Verify HomeVlog delivery clock drift and seam continuity")
+ap.add_argument("date", nargs="?", default="20260320", help="Delivery date YYYYMMDD (default: 20260320)")
+ap.add_argument("--mac", type=str, default=None, help="Optional camera MAC filter (e.g. B888805AA3CD)")
+args = ap.parse_args()
+
+output_dir = Path("output")
+if args.mac:
+    META_PATH = output_dir / f"DailyVlog_{args.date}_{args.mac}.meta.json"
+    VIDEO_PATH = output_dir / f"DailyVlog_{args.date}_{args.mac}.mp4"
+else:
+    candidates = sorted(output_dir.glob(f"DailyVlog_{args.date}_*.meta.json"))
+    if len(candidates) == 1:
+        META_PATH = candidates[0]
+        VIDEO_PATH = META_PATH.with_name(META_PATH.name[:-len(".meta.json")] + ".mp4")
+    elif len(candidates) > 1:
+        names = ", ".join(c.name for c in candidates)
+        raise SystemExit(f"Multiple meta files matched {args.date}; pass --mac explicitly: {names}")
+    else:
+        META_PATH = output_dir / f"DailyVlog_{args.date}_B888805AA3CD.meta.json"
+        VIDEO_PATH = output_dir / f"DailyVlog_{args.date}_B888805AA3CD.mp4"
 
 assert META_PATH.exists(), f"Meta JSON missing: {META_PATH}"
 assert VIDEO_PATH.exists(), f"Delivered MP4 missing: {VIDEO_PATH}"
@@ -24,13 +42,11 @@ clock_val = mapping.get("clock_validation", {})
 assert clock_val.get("max_error_ticks", 999) <= 1, f"Clock drift exceeded 1 tick: {clock_val}"
 print(f"[PASS] Clock Drift Verified: <= 1 tick ({clock_val.get('packets')} packets verified, max_error_ticks={clock_val.get('max_error_ticks')})")
 
-# 2. Source Coverage & Zero Omission Check
+# 2. Source coverage; highlight counts are not independent event ground truth.
 assert meta.get("skipped_sources") == [], f"Sources were skipped: {meta.get('skipped_sources')}"
 assert meta.get("unavailable_source_ranges") == [], f"Unavailable ranges detected: {meta.get('unavailable_source_ranges')}"
 highlights = meta.get("timeline_highlights", [])
-print(f"Highlights count: {len(highlights)}")
-assert len(highlights) >= 500, f"Activity omission detected! Highlights count: {len(highlights)} < 500"
-print(f"[PASS] Zero Activity Omission Verified: {len(highlights)} key activity events preserved")
+print(f"Timeline highlights reported by the pipeline: {len(highlights)}")
 
 # 3. Seam Continuity Check
 segments = mapping.get("segments", [])

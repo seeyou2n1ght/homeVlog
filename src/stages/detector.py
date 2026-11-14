@@ -541,7 +541,8 @@ class MotionDetector:
         if self.decode_gpu == "cpu":
             from src.hardware.scheduler import get_disk_semaphore
             io_sem = get_disk_semaphore()
-            hw_args = []
+            cpu_threads = int(self.config.get("detection", {}).get("cpu_decode_threads", 4))
+            hw_args = ["-threads", str(cpu_threads)] if cpu_threads > 0 else []
             vf = f"fps={effective_fps:.3f},scale={w}:{h}"
         elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore
@@ -1467,7 +1468,8 @@ class MotionDetector:
         if self.decode_gpu == "cpu":
             from src.hardware.scheduler import get_disk_semaphore
             io_sem = get_disk_semaphore()
-            hw_args = []
+            cpu_threads = int(self.config.get("detection", {}).get("cpu_decode_threads", 4))
+            hw_args = ["-threads", str(cpu_threads)] if cpu_threads > 0 else []
             vf = f"fps={effective_fps:.3f},scale={w}:{h}"
         elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore, VideoLease

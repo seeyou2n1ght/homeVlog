@@ -841,13 +841,13 @@ class DualEndedBatchQueue:
                 self._not_empty.wait(timeout=min(0.5, remaining))
             return self._items.popleft()
 
-    def steal_lightest(self, max_dynamic_s: float) -> RenderBatchItem | None:
+    def steal_lightest(self, max_dynamic_s: float, eligible_fn=None) -> RenderBatchItem | None:
         """QSV 窃取入口：若队尾最轻批次的动态时长 <= max_dynamic_s，则逆向窃取 (SPT)。"""
         with self._lock:
             if not self._items:
                 return None
             tail = self._items[-1]
-            if tail.dynamic_duration <= max_dynamic_s:
+            if tail.dynamic_duration <= max_dynamic_s and (eligible_fn is None or eligible_fn(tail)):
                 return self._items.pop()
             return None
 
