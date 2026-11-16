@@ -84,7 +84,7 @@ detection:
   prescreen_extract_timeout: 120.0
   analysis_fps: 5
   analysis_resolution: "416x234"
-  analysis_max_workers: 7
+  analysis_max_workers: 3         # 1 CUDA + 2 QSV；实测最快的分析并发配比（兼顾 UHD770 吞吐甜点与 YOLO 锁等待）
   cpu_analysis_workers: 0         # 默认 0：避免 10 核宿主上与 QSV/NVDEC 抢占 CPU 及拖慢 CUDA/YOLO
   cpu_analysis_max_duration_s: 600.0
   cpu_decode_threads: 4

@@ -1283,6 +1283,20 @@ def test_cleanup_cannot_delete_an_owned_workspace(delivery_workspace,external_da
     assert batch.read_bytes()==b'preserve live batch'
 
 
+def test_cleanup_sweeps_stale_batch_locks_while_preserving_complete_batches(tmp_path, monkeypatch):
+    from src.core import utils
+    monkeypatch.setattr(utils, "TEMP_DIR", tmp_path)
+    locks_dir = tmp_path / ".task_locks"
+    locks_dir.mkdir(parents=True)
+    stale_lock = locks_dir / "batch-deadbeef.lock"
+    stale_lock.write_bytes(b"0")
+    batch = tmp_path / "_batch0_20260321_cam0.mp4"
+    batch.write_bytes(b"completed")
+    utils.cleanup_temp_artifacts(clean_batches=False)
+    assert not stale_lock.exists()
+    assert batch.exists()
+
+
 @pytest.mark.parametrize("count", [1, 2])
 @pytest.mark.parametrize("cleanup", [False, True])
 @pytest.mark.parametrize("failure", ["assets_false", "assets_exception", "promotion", "manifest", "database", "cancelled", "after_database_cancelled", "none"])
@@ -1293,6 +1307,9 @@ def test_delivery_commits_before_cleanup_and_preserves_previous_assets(delivery_
     w.config["render"]["cleanup_batches_on_success"] = cleanup
     unrelated = w.output.parent / "unrelated_batch.mp4"
     unrelated.write_bytes(b"preserve unrelated")
+    stale_diag = w.output.parent / ".concat_failures" / f"{w.output.stem}.pending"
+    stale_diag.mkdir(parents=True)
+    (stale_diag / "failed.mp4").write_bytes(b"stale failed output")
     if failure.startswith("assets"):
         replacement = MagicMock(return_value=False) if failure == "assets_false" else MagicMock(side_effect=OSError("assets exception"))
         monkeypatch.setattr(pipeline, "_save_vlog_companion_assets", replacement)
@@ -1327,9 +1344,12 @@ def test_delivery_commits_before_cleanup_and_preserves_previous_assets(delivery_
     if failure != "none":
         assert {path: path.read_bytes() for path in w.original} == w.original
         assert not w.db.is_render_completed("20260901", 0)
+        assert stale_diag.exists()
     else:
         assert w.db.is_render_completed("20260901", 0)
         assert w.output.read_bytes() == b"new media"
+        assert not stale_diag.exists()
+        assert not (w.output.parent / ".concat_failures").exists()
         assert not w.output.with_suffix(".srt").exists()  # disabled subtitles remove the previous SRT only on commit
         from src.hardware.render_cache import _manifest_path, file_identity
         import json
@@ -2408,6 +2428,9 @@ def test_qsv_steal_guard_while_upstream_busy(tmp_path, monkeypatch):
     release_nv.set()
     t.join(timeout=5.0)
     assert not t.is_alive()
+    qsv_stats = orch.render_worker_stats["qsv_0"]
+    assert qsv_stats["qsv_steal_rejected"] == 0
+    assert "qsv_upstream_yields" in qsv_stats
     db.close()
 
 
@@ -2451,3 +2474,112 @@ def test_qsv_analysis_assists_medium_heavy_tail_when_short_and_prescreen_drained
     assert orch.analysis_queue.qsize() == 1
     assert orch.analysis_queue.get(block=False)["filepath"] == "night_3600.mp4"
     db.close()
+
+
+def test_compute_qsv_queue_weight_prioritizes_daytime_full_decode_and_preserves_short_night():
+    from src.algorithms.segment import Segment
+    from src.pipeline import _compute_qsv_queue_weight
+    from src.stages.timeline import TimelineSegment
+
+    render_cfg = {"night_sparse_enabled": True, "night_sparse_min_duration_s": 16.0}
+
+    # Daytime full-decode MICRO_MOTION (>= 120s) outranks low-decode virtual_concat batches
+    day_full = [
+        Segment(0.0, 12.0, "DYNAMIC", "d.mp4"),
+        Segment(12.0, 412.0, "MICRO_MOTION", "d.mp4"),
+    ]
+    low_decode_vc = [
+        Segment(0.0, 90.0, "DYNAMIC", "vc.mp4"),
+        Segment(90.0, 150.0, "MICRO_MOTION", "vc.mp4"),
+        Segment(150.0, 600.0, "STATIC", "vc.mp4"),
+    ]
+    has_dyn_full, w_day_full = _compute_qsv_queue_weight(day_full, 500.0, render_cfg)
+    has_dyn_vc, w_low_vc = _compute_qsv_queue_weight(low_decode_vc, 600.0, render_cfg)
+    assert has_dyn_full and has_dyn_vc
+    assert w_day_full == pytest.approx(12.0 + 0.35 * 400.0)
+    assert w_low_vc == pytest.approx(90.0)
+    assert w_day_full > w_low_vc
+
+    # Pure PRESENCE 590s batch exceeds 180s QSV admission limit so NV keeps it
+    presence_segs = [TimelineSegment("p.mp4", 0, 0.0, 590.0, "PRESENCE", duration=590.0)]
+    _, w_presence = _compute_qsv_queue_weight(presence_segs, 600.0, render_cfg, single_file_batch=True)
+    assert w_presence == pytest.approx(60.0 + 0.35 * 590.0)
+    assert w_presence > 180.0
+
+    # Single-file sparse-night uses -discard nokey -> fast on QSV, weight stays <= 60s
+    sparse_night = [
+        TimelineSegment("n.mp4", 0, 0.0, 590.0, "NIGHT_STATIONARY", duration=590.0),
+    ]
+    _, w_sparse_single = _compute_qsv_queue_weight(sparse_night, 600.0, render_cfg, single_file_batch=True)
+    assert w_sparse_single == pytest.approx(60.0)
+
+    # Multi-file batch cannot use NightSparsePlan -> NIGHT_STATIONARY decodes in full
+    _, w_sparse_multi = _compute_qsv_queue_weight(sparse_night, 600.0, render_cfg, single_file_batch=False)
+    assert w_sparse_multi == pytest.approx(60.0 + 0.35 * 590.0)
+
+    # Short < 120s file stays unchanged at 60s
+    short_night = [Segment(0.0, 60.0, "NIGHT_STATIONARY", "short.mp4")]
+    _, w_short = _compute_qsv_queue_weight(short_night, 60.0, render_cfg)
+    assert w_short == pytest.approx(60.0)
+
+
+def test_run_pipeline_stops_on_input_storage_unavailable_and_preserves_pending_tasks(tmp_path, monkeypatch):
+    import src.pipeline as pipeline
+    from src.core.utils import InputStorageUnavailable
+    from src.stages.scanner import ScanResult
+
+    online_dir = tmp_path / "share"
+    online_dir.mkdir()
+    missing_dir = tmp_path / "offline_share"
+
+    db = VlogDatabase(tmp_path / "storage_stop.db")
+    f1 = str(missing_dir / "00_20260901000000_20260901000100.mp4")
+    f2 = str(missing_dir / "00_20260902000000_20260902000100.mp4")
+    db.add_file_task(f1, 0, "20260901", "20260901000000", "20260901000100", 60.0)
+    db.add_file_task(f2, 0, "20260902", "20260902000000", "20260902000100", 60.0)
+
+    # Part 1: worker-detected InputStorageUnavailable leaves queued file PENDING and halts cross-day batch
+    original_close = db.close
+    monkeypatch.setattr(db, "close", lambda: None)
+    monkeypatch.setattr(pipeline, "VlogDatabase", lambda: db)
+    monkeypatch.setattr(pipeline, "scan_directory", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "get_monitor", MagicMock())
+    monkeypatch.setattr(pipeline, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(pipeline, "check_disk_space", lambda *a: True)
+    monkeypatch.setattr(pipeline, "cleanup_resources", lambda: None)
+    monkeypatch.setattr("src.core.utils.cleanup_temp_artifacts", lambda: None)
+    monkeypatch.setattr(pipeline, "print_batch_startup_banner", MagicMock())
+    monkeypatch.setattr(pipeline, "print_startup_banner", MagicMock())
+    monkeypatch.setattr("src.ui.print_batch_summary_table", MagicMock())
+    monkeypatch.setattr(pipeline, "build_batch_summary_item", lambda *a, **k: {"status": a[6]})
+    monkeypatch.setattr(pipeline, "prescreen_file",
+                        MagicMock(side_effect=InputStorageUnavailable("offline share")))
+
+    res = pipeline.run_pipeline(
+        dashboard_enabled=False,
+        config={"hardware": {"device": "cpu"}, "paths": {"input_dirs": [str(online_dir)]}},
+    )
+    assert res == {"total": 2, "ok": 0, "failed": 1, "skipped": 0,
+                   "remaining": 1, "stopped_reason": "INPUT_STORAGE_UNAVAILABLE"}
+    assert db.get_file_task(f1)["prescreen_status"] == "PENDING"
+    assert db.get_file_task(f2)["prescreen_status"] == "PENDING"
+
+    # Part 2: scan-verified input directory dropping before next group halts before touching it
+    calls = []
+    def succeed_then_disconnect(*_args, **_kwargs):
+        calls.append(_args[1])
+        online_dir.rmdir()
+        return True
+
+    monkeypatch.setattr(pipeline, "scan_directory", lambda *a, **k: ScanResult(added=0, skipped=2, frozen_pending=0))
+    monkeypatch.setattr(pipeline, "process_date_cam", succeed_then_disconnect)
+    res2 = pipeline.run_pipeline(
+        dashboard_enabled=False,
+        input_dir=[str(online_dir)],
+        config={"hardware": {"device": "cpu"}, "paths": {"input_dirs": [str(online_dir)]}},
+    )
+    assert calls == ["20260901"]
+    assert res2 == {"total": 2, "ok": 1, "failed": 0, "skipped": 0,
+                    "remaining": 1, "stopped_reason": "INPUT_STORAGE_UNAVAILABLE"}
+    original_close()
+

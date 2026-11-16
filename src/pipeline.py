@@ -19,7 +19,7 @@ from src.ui import (
     print_summary_card,
 )
 from src.core.database import VlogDatabase
-from src.stages.scanner import scan_directory, get_date_cam_groups
+from src.stages.scanner import scan_directory, get_date_cam_groups, ScanResult
 from src.stages.prescreen import prescreen_file
 from src.stages.detector import MotionDetector, detect_audio_activity
 from src.stages.renderer import RenderInterrupted, build_batch_render, concat_output_files
@@ -45,7 +45,11 @@ from src.hardware.scheduler import (
 from src.hardware.ffmpeg import FFmpegProcessRegistry
 from src.hardware.lifecycle import cleanup_resources
 from src.core.utils import (
+    InputStorageUnavailable,
     check_disk_space,
+    check_input_storage,
+    get_input_dirs,
+    is_directory_accessible,
     register_dashboard,
     unregister_dashboard,
 )
@@ -62,6 +66,87 @@ from src.stages.pipeline_types import (
     AnalysisQueue,
     RenderMessageQueue,
 )
+
+
+def _compute_qsv_queue_weight(
+    segments,
+    file_dur_s: float = 0.0,
+    render_cfg: dict | None = None,
+    *,
+    single_file_batch: bool = True,
+) -> tuple[bool, float]:
+    """Compute queue sort / QSV admission weight reflecting real decode cost.
+
+    Accounts for full-decode PRESENCE/MICRO_MOTION (and non-sparse NIGHT_STATIONARY)
+    spans >= 120s so QSV steals fast virtual-concat / sparse-night batches while heavy
+    daytime full-decode batches remain on NVDEC/NVENC.
+    """
+    cfg = render_cfg or {}
+    night_sparse_enabled = bool(cfg.get("night_sparse_enabled", True))
+    min_night_dur = max(4.0, float(cfg.get("night_sparse_min_duration_s", 16.0)))
+
+    active_source_duration = 0.0
+    normal_speed_duration = 0.0
+    presence_micro_dur = 0.0
+    night_total_dur = 0.0
+    night_sparse_dur = 0.0
+    night_sparse_count = 0
+    active_count = 0
+
+    for seg in segments:
+        if hasattr(seg, "end_time") and hasattr(seg, "start_time"):
+            dur = max(0.0, float(seg.end_time) - float(seg.start_time))
+        elif getattr(seg, "duration", None) is not None:
+            dur = max(0.0, float(seg.duration))
+        else:
+            dur = max(0.0, float(getattr(seg, "end_in_file", 0.0)) - float(getattr(seg, "start_in_file", 0.0)))
+
+        state = getattr(seg, "state", "")
+        is_1x = bool(getattr(seg, "is_active_motion", False)) or state in ("DYNAMIC", "DYNAMIC_AUDIO")
+        is_active = bool(getattr(seg, "is_dynamic", False)) or (bool(state) and state != "STATIC") or is_1x
+        if not is_active:
+            continue
+
+        active_count += 1
+        active_source_duration += dur
+        if is_1x:
+            normal_speed_duration += dur
+        elif state == "NIGHT_STATIONARY":
+            night_total_dur += dur
+            if dur >= min_night_dur:
+                night_sparse_dur += dur
+                night_sparse_count += 1
+        else:
+            presence_micro_dur += dur
+
+    has_dynamic = active_source_duration > 0.0
+    effective_dyn_dur = (
+        normal_speed_duration
+        if normal_speed_duration > 0.0
+        else (min(60.0, active_source_duration) if has_dynamic else 0.0)
+    )
+
+    night_sparse_active = (
+        single_file_batch
+        and night_sparse_enabled
+        and night_sparse_count > 0
+        and (
+            night_sparse_count == active_count
+            or (
+                night_sparse_dur >= max(min_night_dur, 30.0)
+                and night_sparse_dur / max(0.001, active_source_duration) >= 0.10
+            )
+        )
+    )
+    non_sparse_night_dur = (night_total_dur - night_sparse_dur) if night_sparse_active else night_total_dur
+    full_decode_non_dyn = presence_micro_dur + non_sparse_night_dur
+
+    if full_decode_non_dyn >= 120.0:
+        effective_dyn_dur += 0.35 * full_decode_non_dyn
+    elif float(file_dur_s) >= 1800.0 and active_source_duration >= 1200.0:
+        effective_dyn_dur += 0.25 * max(0.0, active_source_duration - normal_speed_duration)
+
+    return has_dynamic, effective_dyn_dur
 
 
 class StreamingOrchestrator:
@@ -140,6 +225,7 @@ class StreamingOrchestrator:
         self.upstream_drained = threading.Event()
         self._render_interruption_reason: str | None = None
         self._media_cleanup_failure: str | None = None
+        self._storage_unavailable_failure: str | None = None
         self.render_finished_event = threading.Event()
         self.batch_paths = []
         self.batch_lock = threading.Lock()
@@ -197,6 +283,28 @@ class StreamingOrchestrator:
         FFmpegProcessRegistry.mark_interrupted()
         FFmpegProcessRegistry.kill_all()
         logger.error("Stopping pipeline with unresolved media reader: %s", self._media_cleanup_failure)
+
+    def _stop_for_storage_unavailable(self, context: str, error: BaseException):
+        """Abort workers when source storage goes offline so pending files stay PENDING."""
+        from src.hardware.ffmpeg import FFmpegProcessRegistry
+        with self.error_lock:
+            if self._storage_unavailable_failure is None:
+                self._storage_unavailable_failure = f"{context}: {error}"
+        self.abort_event.set()
+        self.stop_event.set()
+        self.render_finished_event.set()
+        self._add_error(f"input storage unavailable: {error}")
+        FFmpegProcessRegistry.kill_all()
+        logger.error("Stopping pipeline due to unavailable input storage (%s): %s", context, error)
+
+    @staticmethod
+    def _is_source_dir_offline(filepaths: list[str] | tuple[str, ...]) -> bool:
+        """Return True if any non-trivial source parent directory cannot be enumerated."""
+        for fp in filepaths:
+            parent_dir = Path(fp).parent
+            if str(parent_dir) not in ("", ".") and not is_directory_accessible(parent_dir):
+                return True
+        return False
 
     def _sync_queue_levels(self) -> None:
         """同步三阶段积压水位与调度器状态到仪表盘。"""
@@ -413,6 +521,9 @@ class StreamingOrchestrator:
                 except Exception:
                     logger.exception("Cannot persist FAILED after unconfirmed prescreen stop: %s", filepath)
                     self._add_error(f"prescreen FAILED persistence failed: {Path(filepath).name}")
+                break
+            except InputStorageUnavailable as exc:
+                self._stop_for_storage_unavailable(f"prescreen {Path(filepath).name}", exc)
                 break
             except Exception as exc:
                 if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
@@ -676,21 +787,13 @@ class StreamingOrchestrator:
                             worker=worker_id or "ana",
                         )
                     )
-                    active_source_duration = sum(
-                        (s.end_time - s.start_time)
-                        for s in segments
-                        if getattr(s, "is_dynamic", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
-                    )
-                    normal_speed_duration = sum(
-                        (s.end_time - s.start_time)
-                        for s in segments
-                        if getattr(s, "is_active_motion", False) or getattr(s, "state", "") in ("DYNAMIC", "DYNAMIC_AUDIO")
-                    )
-                    has_dynamic = active_source_duration > 0
-                    effective_dyn_dur = normal_speed_duration if normal_speed_duration > 0 else (min(60.0, active_source_duration) if has_dynamic else 0.0)
                     task_file_dur = float(task.get("file_duration") or 0.0)
-                    if task_file_dur >= 1800.0 and active_source_duration >= 1200.0:
-                        effective_dyn_dur += 0.25 * max(0.0, active_source_duration - normal_speed_duration)
+                    has_dynamic, effective_dyn_dur = _compute_qsv_queue_weight(
+                        segments,
+                        file_dur_s=task_file_dur,
+                        render_cfg=self.config.get("render", {}),
+                        single_file_batch=True,
+                    )
                     self.render_batch_queue.put(
                         {
                             "filepath": filepath,
@@ -951,6 +1054,9 @@ class StreamingOrchestrator:
                                 fn()
                             except Exception as exc:
                                 if not (self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted()):
+                                    if self._is_source_dir_offline([fp]):
+                                        self._stop_for_storage_unavailable(f"analysis {Path(fp).name}", exc)
+                                        return
                                     logger.exception("Streaming: async post-analysis failed for %s", fp)
                                     self.db.set_analysis_result(fp, "FAILED", "", error_msg=str(exc))
                                     self._add_error(f"analysis failed: {Path(fp).name}")
@@ -985,9 +1091,15 @@ class StreamingOrchestrator:
                         logger.exception("Cannot persist FAILED after unconfirmed analysis stop: %s", filepath)
                         self._add_error(f"analysis FAILED persistence failed: {Path(filepath).name}")
                     break
+                except InputStorageUnavailable as exc:
+                    self._stop_for_storage_unavailable(f"analysis {Path(filepath).name}", exc)
+                    break
                 except Exception as exc:
                     if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
                         continue
+                    if self._is_source_dir_offline([filepath]):
+                        self._stop_for_storage_unavailable(f"analysis {Path(filepath).name}", exc)
+                        break
                     logger.exception("Streaming: analysis failed for %s", filepath)
                     self.db.set_analysis_result(filepath, "FAILED", "", error_msg=str(exc))
                     self._add_error(f"analysis failed: {Path(filepath).name}")
@@ -1150,6 +1262,7 @@ class StreamingOrchestrator:
             qsv_light_count = 0
             qsv_stolen_count = 0
             qsv_steal_rejected = 0
+            qsv_upstream_yields = 0
 
             try:
                 while not self.abort_event.is_set() and not FFmpegProcessRegistry.is_interrupted():
@@ -1246,7 +1359,10 @@ class StreamingOrchestrator:
                                             handoff_to_nv = True
                                             break
                                         if not heavy_queue.empty():
-                                            qsv_steal_rejected += 1
+                                            if upstream_busy:
+                                                qsv_upstream_yields += 1
+                                            else:
+                                                qsv_steal_rejected += 1
                                         time.sleep(0.5)
                                         continue
                                     else:
@@ -1390,11 +1506,13 @@ class StreamingOrchestrator:
 
                         # 异构长尾保护：QSV 仅消费中轻量动态任务，若真实切片包含超过门限的 DYNAMIC 动作或超长 4K 活动流则交还 NVENC
                         if gpu == "qsv" and render_hw_policy == "heterogeneous":
-                            dynamic_dur = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
-                            active_dur = sum(s.duration for s in batch_segs if s.state != "STATIC")
                             src_dur = sum(float(r.get("file_duration") or 0.0) for r in all_rows)
-                            if src_dur >= 1800.0 and active_dur >= 1200.0:
-                                dynamic_dur += 0.25 * max(0.0, active_dur - dynamic_dur)
+                            _, dynamic_dur = _compute_qsv_queue_weight(
+                                batch_segs,
+                                file_dur_s=src_dur,
+                                render_cfg=render_cfg,
+                                single_file_batch=(len(files_to_batch) <= 1),
+                            )
                             if is_stolen and dynamic_dur > qsv_admission_limit:
                                 logger.info(
                                     "render batch %d on qsv contains %.1fs dynamic motion (exceeds %.1fs), offloading to nv heavy queue",
@@ -1510,8 +1628,11 @@ class StreamingOrchestrator:
                         FFmpegProcessRegistry.kill_all()
                         logger.warning("Rendering interrupted; preserving completed batches: %s", exc)
                         break
-                    except Exception:
+                    except Exception as exc:
                         if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                            break
+                        if self._is_source_dir_offline(files_to_batch):
+                            self._stop_for_storage_unavailable(f"render batch {b_idx}", exc)
                             break
                         logger.exception("Streaming: render batch %d failed on %s", b_idx, gpu)
                         if gpu == "qsv" and render_hw_policy == "heterogeneous":
@@ -1567,6 +1688,7 @@ class StreamingOrchestrator:
                         "qsv_light_batches": qsv_light_count,
                         "qsv_stolen_batches": qsv_stolen_count,
                         "qsv_steal_rejected": qsv_steal_rejected,
+                        "qsv_upstream_yields": qsv_upstream_yields,
                         "handoff_to_nv": handoff_to_nv,
                     }
             if handoff_to_nv and not self.abort_event.is_set():
@@ -1891,6 +2013,8 @@ class StreamingOrchestrator:
             raise KeyboardInterrupt(self._render_interruption_reason)
         if self._media_cleanup_failure is not None:
             raise MediaTerminationUnconfirmed(self._media_cleanup_failure)
+        if self._storage_unavailable_failure is not None:
+            raise InputStorageUnavailable(self._storage_unavailable_failure)
 
         with self.batch_lock:
             self.batch_paths.sort(key=lambda x: x[0])
@@ -2115,6 +2239,9 @@ def _process_date_cam_owned(
         # The failure remains fatal for this batch even if later reaping can
         # confirm termination. Only an explicit new execution may resume it.
         raise
+    except InputStorageUnavailable as exc:
+        fail(f"input storage unavailable: {exc}")
+        raise
     except Exception as exc:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
         return fail(f"streaming pipeline failed: {exc}")
@@ -2288,6 +2415,14 @@ def _process_date_cam_owned(
     # 自动回收本地预暂存文件，释放磁盘存储空间
     from src.core.utils import cleanup_staging_files
     cleanup_staging_files()
+    failure_root = output_path.parent / ".concat_failures"
+    stale_failure_dir = failure_root / candidate.stem
+    if stale_failure_dir.exists():
+        shutil.rmtree(stale_failure_dir, ignore_errors=True)
+        try:
+            failure_root.rmdir()
+        except OSError:
+            pass
     if config.get("render", {}).get("cleanup_batches_on_success", False):
         for batch in batch_paths:
             try:
@@ -2309,7 +2444,13 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
     monitor = get_monitor()
     monitor.start()
     try:
-        scan_directory(db, input_dir=input_dir)
+        scan_result = scan_directory(db, input_dir=input_dir)
+        verified_input_dirs = (
+            ([str(input_dir)] if isinstance(input_dir, str)
+             else [str(p) for p in input_dir] if input_dir is not None
+             else get_input_dirs(config or load_config()))
+            if isinstance(scan_result, ScanResult) else []
+        )
         groups = get_date_cam_groups(db)
         if not groups:
             return {"total": 0, "ok": 0, "failed": 0, "skipped": 0, "remaining": 0, "stopped_reason": None}
@@ -2340,6 +2481,15 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 stopped_reason = "LOW_DISK_SPACE"
                 logger.warning("Batch stopped: LOW_DISK_SPACE; %d groups remain", len(groups) - ok - failed - skipped)
                 break
+            if not already_completed and verified_input_dirs:
+                bad_dir = check_input_storage(verified_input_dirs)
+                if bad_dir is not None:
+                    stopped_reason = "INPUT_STORAGE_UNAVAILABLE"
+                    logger.error(
+                        "Batch stopped: INPUT_STORAGE_UNAVAILABLE (%s); %d groups remain",
+                        bad_dir, len(groups) - ok - failed - skipped,
+                    )
+                    break
             t0 = time.monotonic()
             success = False
             try:
@@ -2361,6 +2511,10 @@ def run_pipeline(skip_render: bool = False, input_dir: list[str] | None = None, 
                 logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
                 failed += 1
                 stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
+            except InputStorageUnavailable:
+                logger.exception("Batch stopped: INPUT_STORAGE_UNAVAILABLE")
+                failed += 1
+                stopped_reason = "INPUT_STORAGE_UNAVAILABLE"
             except Exception:
                 logger.exception("pipeline crash")
                 failed += 1

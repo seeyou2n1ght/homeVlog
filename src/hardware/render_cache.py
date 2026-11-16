@@ -15,7 +15,7 @@ def render_fingerprint(inputs, filtergraph, encoder, fps, output, audio, config)
     model = Path(config.get("yolo", {}).get("model_path", "models/yolo11m.pt"))
     if not model.is_absolute():
         model = PROJECT_ROOT / model
-    payload = [2 if encoder == "analysis" else 3, [file_identity(p) for p in inputs], filtergraph, encoder, fps,
+    payload = [2 if encoder == "analysis" else 4, [file_identity(p) for p in inputs], filtergraph, encoder, fps,
                output, audio, config, file_identity(model)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -135,9 +135,11 @@ def valid_video(path, expected_duration=None, checkpoints=(), require_audio=Fals
             elif require_audio:
                 _log.warning("valid_video: file %s has no audio stream", path)
                 return False
-            if audio_duration is not None and abs(audio_duration - duration) > tolerance:
-                _log.warning("valid_video: file %s A/V duration mismatch %.3fs", path, abs(audio_duration-duration))
-                return False
+            if audio_duration is not None:
+                av_diff = abs(audio_duration - duration)
+                if av_diff > tolerance and not math.isclose(av_diff, tolerance, rel_tol=0, abs_tol=1e-9):
+                    _log.warning("valid_video: file %s A/V duration mismatch %.3fs", path, av_diff)
+                    return False
             if expected_duration is not None:
                 tol = tolerance
                 diff = abs(duration - expected_duration)

@@ -238,6 +238,11 @@ class Monitor:
         except Exception:
             pass
 
+    def reset(self) -> None:
+        """Clear accumulated completed stage snapshots between batch dates."""
+        with self._active_lock:
+            self._stages.clear()
+
     @contextmanager
     def stage(self, name: str, *, include_in_total: bool = True):
         s = StageStats(name=name, start_ts=time.monotonic(), include_in_total=include_in_total)

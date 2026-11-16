@@ -2040,3 +2040,29 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
    - 上游 `analysis_queue` 或 `prescreen_queue` 尚有积压时，`qsv_0` 渲染线程仅消化 `light_queue`（纯静态轻批次），让渡核显全额算力给 `ana_1..6`；
    - 当预筛与 `< heavy_file_duration_s` 短任务全部清空且 `ana_0` NVDEC 繁忙时，放行 `[heavy_file_duration_s, 1800s)` 中重型切片由 QSV 并行分析，`>= 1800s` 巨型文件仍优先保留给 NVDEC；
    - **实验证伪保留项**：`detection.cpu_analysis_workers` 默认设为 `0`（实测 `2` 路软解与 GPU 编队并发会把 CPU 推至 `78.4%` 并拖慢 CUDA/YOLO 导致总壁钟反慢 `+51.8s`，故默认禁用并保留可配置能力）；`output.audio.concat_codec` 默认保留 `"aac"`（实测 `aac_mf` 会破坏 `<1ms` 音画闭环）。
+
+
+## ADR0088：分析并发度收敛、全解码渲染权重校准与中间批产物精简（2026-11-15）
+
+状态：Accepted。
+
+### 背景
+在 [ADR0087](DECISIONS.md#adr0087两阶段流水线渲染减负与异构去争用2026-11-15) 将 `20260326 / cam0` 冷跑降至 `1,873.53s` 后，实测遥测仍显示两处主要瓶颈：
+1. 7 路分析并发（`1 CUDA + 6 QSV`）使 Intel UHD 770 单文件平均精析耗时升至 `82.3s` 并产生 `46.48s` YOLO 锁等待；
+2. 队列排序及 QSV 窃取准入仅按 `1x DYNAMIC` 或 `>=1800s` 超长文件加权，导致 `qsv_0` 窃取了含 `300~597s` 日间 `PRESENCE`/`MICRO_MOTION` 全解码片段的慢批（`42~55s`），而低解码 `virtual_concat_mixed` 批次反被留给 `nv_0`/`nv_1`。
+
+### 核心决策
+1. **收敛精析 Worker 并发度至吞吐最优值（`config/settings.yaml`）**：
+   - 将 `detection.analysis_max_workers` 从 `7` 调整为 `3`（`1 CUDA + 2 QSV`），保留 `hardware.max_qsv_analysis_concurrency: 7` 以维持前端 10 路 Seek 预筛的并发突击能力。
+   - 经全量冷跑消融对比（`3` 路 `1,785.19s` vs `4` 路 `1,795.97s` vs `7` 路 `1,873.53s`），`1 CUDA + 2 QSV` 避开 UHD 770 多路 QSV 媒体引擎拥塞与 NVDEC/YOLO 争用放大，将精析累计算力压缩 `-50.6%`（`10,304.46s -> 5,094.05s`）并将 YOLO 锁等待减半（`46.48s -> 22.80s`）。
+2. **统一全解码负载队列权重 `_compute_qsv_queue_weight`（`src/pipeline.py`）**：
+   - 在 `_finalize_post` 入队估算与 `_render_worker` 的 QSV 二次准入检查中共享 `_compute_qsv_queue_weight`，当非 `1x` 全解码时段（`PRESENCE`、`MICRO_MOTION` 以及不满足 `NightSparsePlan` 的 `NIGHT_STATIONARY`）总长 `>= 120.0s` 时按 `0.35×` 计入调度权重；保持 `<120s` 文件原有权重不变，不改变 `DualEndedBatchQueue.put` 三参契约与 `180s` 窃取门限。
+   - 该权重使重型日间全解码批自动保留给 NVDEC/NVENC，`qsv_0` 专注快速 `virtual_concat` 与稀疏夜间批次（单批均耗 `8.47s`），渲染尾段从 `255.16s` 降至 `38.80s`（`-84.8%`）。
+3. **移除中间批产物冗余 `faststart` 并完善 `cpu_nvenc` 回退路径（`src/stages/renderer.py`）**：
+   - 仅由最终拼接 `concat_output_files` 生成 `faststart` MOOV 前置，移除 `_run_batch_render_owned` 为临时 `batch_*.mp4` 执行的第二遍重封装 `-movflags +faststart`；
+   - 为 `cpu_nvenc` 虚拟拼接解码分支补齐 `-threads` 参数注入，并在 `build_batch_render` 与 `_run_batch_render_owned` 中对齐 `cpu_nvenc` 分组音频资格。
+4. **已验证但明确不采纳的折中方向**：
+   - 降采样 `yolo.imgsz=416`（改变 YOLO 检出与抑制数）、缩窄 Tier-2 `coalesce_gap`（Seek 重启增耗）、降低 `nv` 并发或用 `cpu_nvenc` 替代主路 `nv` 渲染，以及重新启用 `cpu_analysis_workers`。
+
+### 结果
+- `20260326 / cam0` 全量零缓存冷跑降至 **`1,785.19s`（`29m45s` / `48.40×` 实时）**，`verify_cold_run_audit.py 20260326` 验证 296,919 个媒体包最大误差 `1 tick`、129/129 接缝 0 断裂。

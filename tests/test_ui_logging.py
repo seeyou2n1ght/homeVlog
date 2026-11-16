@@ -640,3 +640,16 @@ def test_cli_stops_cross_day_after_unconfirmed_media(cli_workspace, cli_pending_
     else:
         assert 'MEDIA_TERMINATION_UNCONFIRMED' not in output
     permit.release.assert_not_called()
+
+
+def test_cli_stops_cross_day_on_input_storage_unavailable(cli_workspace, monkeypatch, capsys):
+    from src.core.utils import InputStorageUnavailable
+    w = cli_workspace
+    w.processor.side_effect = InputStorageUnavailable("offline nas")
+    monkeypatch.setattr("sys.argv", ["main.py", "--cam", "1", "--no-tui"])
+    with pytest.raises(SystemExit) as stopped:
+        w.cli.main()
+    assert stopped.value.code == 1
+    assert w.processor.call_count == 1
+    output = capsys.readouterr().out
+    assert "INPUT_STORAGE_UNAVAILABLE" in output and "未处理=1" in output

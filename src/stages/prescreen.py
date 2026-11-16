@@ -15,10 +15,24 @@ from src.hardware.ffmpeg import (
     MediaTerminationUnconfirmed, MediaStartTerminationUnconfirmed,
 )
 from src.hardware.scheduler import acquire_with_retry, VideoLease
-from src.core.utils import parse_res
+from src.core.utils import InputStorageUnavailable, is_directory_accessible, parse_res
 from src.algorithms.filters import video_frame_to_gray
 
 logger = logging.getLogger("homevlog")
+
+
+def _raise_if_storage_unavailable(filepath: str, detail: str = "", cause: BaseException | None = None) -> None:
+    """Raise InputStorageUnavailable when the parent directory itself is unreachable."""
+    parent_dir = Path(filepath).parent
+    if str(parent_dir) in ("", "."):
+        return
+    if not is_directory_accessible(parent_dir):
+        msg = f"input storage unavailable for {filepath}"
+        if detail:
+            msg = f"{msg}: {detail}"
+        if cause is not None:
+            raise InputStorageUnavailable(msg) from cause
+        raise InputStorageUnavailable(msg)
 
 
 def _calc_sample_timestamps(duration: float, segments: int, margin: float = 0.5) -> list[float]:
@@ -292,6 +306,8 @@ def _prescreen_keyframes(
         return {"status": "FAILED", "error": "io semaphore acquire timeout", "has_audio": 0}
 
     effective_threshold = threshold
+    first_frame: np.ndarray | None = None
+    media_duration = duration
     try:
         with av.open(str(filepath), options={"buffer_size": "2097152"}, timeout=30.0) as container:
             if not container.streams.video:
@@ -304,7 +320,6 @@ def _prescreen_keyframes(
                 duration = media_duration
             stream.codec_context.skip_frame = "NONKEY"
 
-            first_frame: np.ndarray | None = None
             prev_frame: np.ndarray | None = None
             concentrations: list[float] = []
             mean_lumas: list[float] = []
@@ -385,7 +400,7 @@ def _prescreen_keyframes(
 
                 prev_frame = curr_frame
                 # A negative decision requires reaching EOF, never just the first N keyframes.
-    except MediaTerminationUnconfirmed:
+    except (MediaTerminationUnconfirmed, InputStorageUnavailable):
         raise
     except Exception as e:
         logger.debug("PyAV keyframes prescreen failed for %s: %s", filepath, e)
@@ -397,7 +412,7 @@ def _prescreen_keyframes(
             return {
                 "status": "SUSPICIOUS",
                 "has_audio": has_audio,
-                "media_duration": media_duration if "media_duration" in locals() else duration,
+                "media_duration": media_duration,
                 "result_json": json.dumps({
                     "mode": "keyframes",
                     "reason": f"stream_error_after_{len(sample_ts)}_samples: {e}",
@@ -406,6 +421,7 @@ def _prescreen_keyframes(
                     "truncated": True,
                 }),
             }
+        _raise_if_storage_unavailable(filepath, str(e), cause=e)
         return {"status": "FALLBACK", "error": str(e), "has_audio": has_audio}
     finally:
         io_sem.release()
@@ -467,6 +483,7 @@ def prescreen_file(
         actual_dur = get_duration(filepath)
         if actual_dur is not None and actual_dur > 0:
             duration = actual_dur
+    fallback_error: str | None = None
     if mode in ("keyframes", "auto"):
         kf_res = _prescreen_keyframes(
             filepath=filepath,
@@ -485,6 +502,7 @@ def prescreen_file(
                 if is_prior_active and prior_result is not None:
                     kf_res = prior_result
             return kf_res
+        fallback_error = kf_res.get("error")
     elif mode == "stream_fps":
         if prior_active_resolver is not None:
             is_prior_active = prior_active_resolver()
@@ -509,7 +527,9 @@ def prescreen_file(
     # 提取第 0 帧
     first_frame = _extract_frame(filepath, ts_list[0], width, height, gpu=gpu)
     if first_frame is None:
-        return {"status": "FAILED", "error": f"failed to extract first frame at t={ts_list[0]:.1f}s"}
+        _raise_if_storage_unavailable(filepath, fallback_error or "")
+        detail = f" ({fallback_error})" if fallback_error else ""
+        return {"status": "FAILED", "error": f"failed to extract first frame at t={ts_list[0]:.1f}s{detail}"}
     
     prev_frame = first_frame
     effective_threshold = threshold
@@ -787,6 +807,7 @@ def _prescreen_stream_fps(
 
     if expired.is_set() or (proc and proc.returncode not in (0, None)):
         err = "".join(stderr_lines[-5:])
+        _raise_if_storage_unavailable(filepath, err)
         return {
             "status": "FAILED",
             "error": f"stream_fps ffmpeg 失败，returncode={proc.returncode}: {err}",
@@ -794,6 +815,7 @@ def _prescreen_stream_fps(
 
     if not diffs:
         err = "".join(stderr_lines[-5:])
+        _raise_if_storage_unavailable(filepath, err)
         return {"status": "FAILED", "error": f"stream_fps 没有可比较帧对: {err}"}
 
     max_diff = max(diffs)

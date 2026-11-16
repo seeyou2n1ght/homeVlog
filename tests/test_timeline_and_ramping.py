@@ -382,4 +382,20 @@ class TestPresenceAndMicroMotionPlans:
         assert "setpts=PTS-STARTPTS" in fc
 
 
+def test_build_delivery_mapping_skips_smb_resolve_on_unc_and_offline_paths(monkeypatch):
+    from pathlib import Path
+    from src.stages.companion import build_delivery_mapping
+    from src.stages.timeline import TimelineSegment
 
+    def boom(self, strict=False):
+        raise OSError(1326, "The user name or password is incorrect", str(self))
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    timeline = [
+        TimelineSegment(r"\\192.0.2.1\LyuShare\cam0\00_20260415000000_20260415001000.mp4", 0, 0.0, 5.0, "DYNAMIC", 5.0),
+        TimelineSegment("/offline/local/clip.mp4", 0, 5.0, 10.0, "STATIC", 5.0),
+    ]
+    mapping = build_delivery_mapping(timeline, {"output": {"fps": 20}, "render": {"batch_max_files": 1}})
+    assert mapping["planned_frames"] > 0
+    assert len(mapping["segments"]) == 2
+    assert mapping["segments"][0]["source_file"].endswith("00_20260415000000_20260415001000.mp4")

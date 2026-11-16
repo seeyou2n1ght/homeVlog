@@ -721,3 +721,31 @@ def test_prescreen_keyframes_seek_path_and_sequential_fallback():
     fallback_c = SeekContainer(fail_seek=True)
     fallback_frames = list(_iter_sparse_keyframes(fallback_c, SeekStream(), duration=120.0, target_samples=10))
     assert [f.pts for f in fallback_frames] == [0, 30000, 120000]
+
+
+def test_prescreen_av_open_failure_preserves_error_and_detects_offline_storage(monkeypatch, tmp_path):
+    from src.core.utils import InputStorageUnavailable
+    from src.hardware import scheduler
+    from src.stages import prescreen
+    import av
+
+    disk = scheduler.FileBudget(1)
+    monkeypatch.setattr(scheduler, "get_disk_semaphore", lambda: disk)
+    monkeypatch.setattr(av, "open", MagicMock(side_effect=OSError(22, "Invalid argument")))
+
+    # Case 1: accessible parent directory -> no UnboundLocalError, fallback preserves root error
+    local_bad = tmp_path / "bad_clip.mp4"
+    with patch("src.stages.prescreen._extract_frame", return_value=None) as mock_extract:
+        res = prescreen.prescreen_file(str(local_bad), duration=60.0, config={})
+    assert res["status"] == "FAILED"
+    assert "Invalid argument" in res["error"]
+    mock_extract.assert_called_once()
+    assert disk.available == 1
+
+    # Case 2: offline parent directory -> raises InputStorageUnavailable without fallback spawn or leak
+    offline_file = tmp_path / "offline_share" / "clip.mp4"
+    with patch("src.stages.prescreen._extract_frame") as mock_extract:
+        with pytest.raises(InputStorageUnavailable, match="input storage unavailable"):
+            prescreen.prescreen_file(str(offline_file), duration=60.0, config={})
+    mock_extract.assert_not_called()
+    assert disk.available == 1

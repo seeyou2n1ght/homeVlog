@@ -428,6 +428,8 @@ class TestSystemMonitoring:
             ("pipeline", 4.0, True, 25.0), ("render_tail", 2.0, False, 25.0)]
         assert "TOTAL: 4.0s" in monitor.summary()
         assert not monitor._active_stages
+        monitor.reset()
+        assert monitor.stages_data() == []
 
     def test_queue_eligibility_inspection_does_not_consume_work(self):
         from src.hardware.scheduler import DualEndedBatchQueue

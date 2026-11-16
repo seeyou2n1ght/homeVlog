@@ -884,6 +884,8 @@ class TestBuildEncArgs:
         assert nv_args[nv_args.index("-forced-idr") + 1] == "1"
         assert "-g" in nv_args
         assert nv_args[nv_args.index("-g") + 1] == "60"
+        assert "-bf" in nv_args
+        assert nv_args[nv_args.index("-bf") + 1] == "0"
 
     def test_qsv_enc_args_aligned_and_dump_extra(self):
         from src.stages.renderer import _build_enc_args
@@ -904,6 +906,8 @@ class TestBuildEncArgs:
         assert qsv_args[qsv_args.index("-forced_idr") + 1] == "1"
         assert "-g" in qsv_args
         assert qsv_args[qsv_args.index("-g") + 1] == "60"
+        assert "-bf" in qsv_args
+        assert qsv_args[qsv_args.index("-bf") + 1] == "0"
 
     def test_advanced_enc_args_support(self):
         from src.stages.renderer import _build_enc_args
@@ -2679,3 +2683,61 @@ def test_pure_static_files_include_discard_nokey(monkeypatch, tmp_path):
     assert res == str(out)
     cmd = launched["cmd"]
     assert "-discard" in cmd and "nokey" in cmd and "-skip_frame" in cmd
+    assert "-movflags" not in cmd and "+faststart" not in cmd
+
+
+def test_cpu_nvenc_virtual_concat_uses_threads_and_grouped_audio(monkeypatch, tmp_path):
+    from src.stages import renderer
+    from src.stages.timeline import TimelineSegment
+
+    captured = {}
+
+    def fake_run_batch(files, fc, out_path, encoder, fps, hw_cfg, enc_cfg, audio_cfg, *_args, **kwargs):
+        captured["encoder"] = encoder
+        captured["input_args"] = list(kwargs.get("input_args") or [])
+        captured["audio_plan"] = kwargs.get("audio_plan")
+        return str(out_path)
+
+    monkeypatch.setattr(renderer, "_run_batch_render", fake_run_batch)
+    src = str(tmp_path / "vc.mp4")
+    segs = [
+        TimelineSegment(src, 0, 0.0, 10.0, "DYNAMIC", duration=10.0),
+        TimelineSegment(src, 0, 10.0, 210.0, "STATIC", duration=200.0),
+        TimelineSegment(src, 0, 210.0, 225.0, "DYNAMIC", duration=15.0),
+    ]
+    rows = [{"filepath": src, "has_audio": 1, "file_duration": 225.0}]
+    cfg = {
+        "render": {
+            "virtual_concat_enabled": True,
+            "virtual_concat_mixed_enabled": True,
+            "cpu_nvenc_decode_threads": 6,
+        },
+    }
+    res = renderer.build_batch_render(
+        segs, 0, "nv", 20, 1920, 1080, {}, {"codec": "hevc_nvenc"},
+        {"codec": "aac", "bitrate": "96k", "channels": 1}, "20260326", 0, rows,
+        config=cfg, inspect_only=True, cpu_decode=True,
+    )
+    assert res is not None
+    assert captured["encoder"] == "cpu_nvenc"
+    assert "-threads" in captured["input_args"] and "6" in captured["input_args"]
+
+    many_segs = [
+        TimelineSegment(
+            src, 0, i * 2.0, (i + 1) * 2.0,
+            "DYNAMIC" if i % 2 == 0 else "MICRO_MOTION",
+            duration=2.0,
+        )
+        for i in range(180)
+    ]
+    res2 = renderer.build_batch_render(
+        many_segs, 1, "nv", 20, 1920, 1080, {}, {"codec": "hevc_nvenc"},
+        {"codec": "aac", "bitrate": "96k", "channels": 1}, "20260326", 0,
+        [{"filepath": src, "has_audio": 1, "file_duration": 360.0}],
+        config={"render": {"virtual_concat_enabled": False, "speed_ramping_enabled": False}},
+        inspect_only=True, cpu_decode=True,
+    )
+    assert res2 is not None
+    assert captured["encoder"] == "cpu_nvenc"
+    assert captured["audio_plan"] is not None
+

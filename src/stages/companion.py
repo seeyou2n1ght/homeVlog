@@ -1,6 +1,7 @@
 """Vlog companion assets generator: .srt subtitles, .meta.json manifest, and perf dumping."""
 import json
 import logging
+import os
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -129,6 +130,19 @@ def promote_vlog_assets(candidate: Path, output: Path, config: dict, *, keep_pre
             logger.warning("Delivery committed; could not remove backup directory %s", backup_dir)
 
 
+def _normalize_source_path(raw_path: str) -> str:
+    """Normalize source path without failing when remote/NAS storage is offline."""
+    text = str(raw_path)
+    # UNC shares trigger SMB RPC on Path.resolve(); normalize lexically so
+    # local companion asset generation does not depend on live NAS sessions.
+    if text.startswith(("\\\\", "//")):
+        return os.path.normpath(text)
+    try:
+        return str(Path(text).resolve())
+    except OSError:
+        return os.path.abspath(text)
+
+
 def build_delivery_mapping(timeline, config):
     """Frame ranges of complete rendered segments on the shared batch clock."""
     from copy import deepcopy
@@ -143,7 +157,7 @@ def build_delivery_mapping(timeline, config):
             frames = round(duration * fps)
             if frames <= 0:
                 continue
-            entries.append({"source_file": str(Path(segment.filepath).resolve()),
+            entries.append({"source_file": _normalize_source_path(segment.filepath),
                 "source_start_s": segment.start_in_file, "source_end_s": segment.end_in_file,
                 "output_start_frame": cursor, "output_end_frame": cursor + frames,
                 "state": segment.state, "batch_index": batch_index})
@@ -283,6 +297,8 @@ def dump_perf(
             metadata["headline"] = headline
         perf.dump(perf_path, metadata=metadata)
         perf.reset()
+        if hasattr(monitor, "reset"):
+            monitor.reset()
     except Exception as e:
         logger.debug("dump_perf skipped or failed: %s", e)
 

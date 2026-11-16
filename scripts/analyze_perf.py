@@ -151,7 +151,7 @@ def analyze_file(path: Path, top_n: int) -> None:
         for wid, ws in sorted(w_stats.items()):
             extra_info = ""
             if ws.get("qsv_stolen_batches") or ws.get("qsv_light_batches"):
-                extra_info = f" (轻批次 {ws.get('qsv_light_batches', 0)} │ 逆向窃取 {ws.get('qsv_stolen_batches', 0)} │ 窃取拒收 {ws.get('qsv_steal_rejected', 0)})"
+                extra_info = f" (轻批次 {ws.get('qsv_light_batches', 0)} │ 逆向窃取 {ws.get('qsv_stolen_batches', 0)} │ 上游让渡 {ws.get('qsv_upstream_yields', 0)} │ 窃取拒收 {ws.get('qsv_steal_rejected', 0)})"
             print(
                 f"      [{wid:<7}] 繁忙 {_fmt_s(ws['busy_time_s'])} / 空闲 {_fmt_s(ws['idle_time_s'])}"
                 f" │ 利用率 {ws['utilization_pct']:>5.1f}%"

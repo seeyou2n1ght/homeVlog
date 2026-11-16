@@ -784,6 +784,10 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
             input_args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif enc_for_batch == "qsv":
             input_args += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        elif enc_for_batch == "cpu_nvenc":
+            cpu_nvenc_threads = int(render_cfg.get("cpu_nvenc_decode_threads", 6))
+            if cpu_nvenc_threads > 0:
+                input_args += ["-threads", str(cpu_nvenc_threads)]
         input_args += ["-i", str(descriptor_path)]
         if any(r.get("has_audio") for r in rows if r.get("filepath") in files):
             # Keep audio on the original continuous timeline. Repeated concat
@@ -882,7 +886,7 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         audio_input_index_override=audio_input_idx_override,
         sparse_inputs=sparse_inputs,
         source_timeline=source_timeline,
-        audio_groups_out=audio_plans if enc_for_batch == "nv" and night_sparse_plan is None and int(audio_cfg.get("channels", 1)) == 1 else None,
+        audio_groups_out=audio_plans if enc_for_batch in ("nv", "cpu_nvenc") and night_sparse_plan is None and int(audio_cfg.get("channels", 1)) == 1 else None,
     )
 
     batch_path = TEMP_DIR / f"_batch{bi}_{date}_cam{cam_index}.mp4"
@@ -1123,7 +1127,7 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
     audio_prepare_fallback = False
     grouped_audio = False
     pcm_path = output_path.with_name(output_path.stem + ".audio.f32")
-    if audio_plan is not None and encoder == "nv" and input_args is None and len(input_files) == 1 and int(audio_cfg.get("channels", 1)) == 1:
+    if audio_plan is not None and encoder in ("nv", "cpu_nvenc") and input_args is None and len(input_files) == 1 and int(audio_cfg.get("channels", 1)) == 1:
         started = time.monotonic()
         try:
             staged = get_staged_source(input_files[0])
@@ -1187,10 +1191,8 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
     cmd += enc_args
     tmp_output_path.unlink(missing_ok=True)
     cmd += ["-c:a", audio_codec, "-b:a", audio_bitrate, "-ac", str(audio_channels)]
-    if encoder in ("cpu", "software"):
-        cmd += ["-movflags", "+faststart"]
-    else:
-        cmd += ["-tag:v", "hev1", "-movflags", "+faststart"]
+    if encoder not in ("cpu", "software"):
+        cmd += ["-tag:v", "hev1"]
     cmd += [str(tmp_output_path)]
 
     if encoder == "qsv":
@@ -1674,6 +1676,7 @@ def _build_enc_args(encoder, out_cfg):
             "-preset", qsv.get("preset", "fast"),
             "-global_quality", str(qsv.get("global_quality", 28)),
             "-g", gop,
+            "-bf", str(qsv.get("bf", 0)),
             "-forced_idr", "1",
             "-pix_fmt", qsv.get("pix_fmt", "nv12"),
             "-bsf:v", "dump_extra",
@@ -1697,6 +1700,8 @@ def _build_enc_args(encoder, out_cfg):
             "-pix_fmt", nv.get("pix_fmt", "nv12"),
             "-bsf:v", "dump_extra",
         ]
+        if nv.get("bf") is not None or nv.get("b_ref_mode") is None:
+            args.extend(["-bf", str(nv.get("bf", 0))])
         if nv.get("tune"):
             args.extend(["-tune", str(nv["tune"])])
         if nv.get("rc_lookahead") is not None:

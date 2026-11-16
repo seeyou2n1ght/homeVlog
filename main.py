@@ -29,7 +29,15 @@ if __name__ == "__main__":
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.core.utils import setup_logging, load_config, cleanup_temp_artifacts, get_input_dirs, check_disk_space
+from src.core.utils import (
+    InputStorageUnavailable,
+    setup_logging,
+    load_config,
+    cleanup_temp_artifacts,
+    get_input_dirs,
+    check_disk_space,
+    check_input_storage,
+)
 from src.hardware.lifecycle import cleanup_resources
 from src.hardware.scheduler import reset_semaphores
 from src.pipeline import run_pipeline, process_date_cam
@@ -37,7 +45,7 @@ from src.hardware.autotune import apply_auto_tune
 from src.hardware.ffmpeg import FFmpegProcessRegistry, MediaTerminationUnconfirmed
 from src.stages.companion import build_batch_summary_item
 from src.core.database import VlogDatabase
-from src.stages.scanner import scan_directory, get_date_cam_groups, resolve_camera_ui_name
+from src.stages.scanner import ScanResult, scan_directory, get_date_cam_groups, resolve_camera_ui_name
 from src.ui import (
     build_arg_parser,
     resolve_cli_dates,
@@ -231,7 +239,8 @@ def main():
             db = VlogDatabase()
             monitor = None
             try:
-                scan_directory(db, input_dir=input_dirs)
+                scan_result = scan_directory(db, input_dir=input_dirs)
+                verified_input_dirs = list(input_dirs) if isinstance(scan_result, ScanResult) else []
                 active_groups = get_date_cam_groups(db, dates=target_dates, cam_index=args.cam)
                 if not active_groups:
                     console.print("[yellow]未在任务库中找到所选日期/机位对应的监控切片。[/yellow]")
@@ -267,6 +276,12 @@ def main():
                     if not already_completed and not check_disk_space(OUTPUT_DIR):
                         stopped_reason = "LOW_DISK_SPACE"
                         break
+                    if not already_completed and verified_input_dirs:
+                        bad_dir = check_input_storage(verified_input_dirs)
+                        if bad_dir is not None:
+                            logger.error("Batch stopped: INPUT_STORAGE_UNAVAILABLE (%s)", bad_dir)
+                            stopped_reason = "INPUT_STORAGE_UNAVAILABLE"
+                            break
                     t0 = time.monotonic()
                     try:
                         ok = process_date_cam(
@@ -280,6 +295,10 @@ def main():
                         logger.exception("Batch stopped: MEDIA_TERMINATION_UNCONFIRMED")
                         ok = False
                         stopped_reason = "MEDIA_TERMINATION_UNCONFIRMED"
+                    except InputStorageUnavailable:
+                        logger.exception("Batch stopped: INPUT_STORAGE_UNAVAILABLE")
+                        ok = False
+                        stopped_reason = "INPUT_STORAGE_UNAVAILABLE"
                     wall_s = time.monotonic() - t0
                     if ok:
                         if already_completed:

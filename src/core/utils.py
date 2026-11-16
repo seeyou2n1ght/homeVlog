@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -299,7 +300,7 @@ def _cleanup_temp_artifacts_owned(clean_batches: bool = False) -> int:
         "*.tmp.mp4", "_batch*.tmp.mp4", "_fc_*.txt", "_stderr_*.log", ".pipe_decode_*.log", ".pipe_win_*.log",
         ".concat_*.txt", "_edl_*.ffconcat", "_render_stage/*.mp4",
         "_render_stage/*.part", "staging/*.mp4", "staging/*.part",
-        "scripts/*", "_batch*.json.tmp",
+        "scripts/*", "_batch*.json.tmp", ".task_locks/batch-*.lock",
     ]
     if clean_batches:
         patterns.extend([
@@ -374,6 +375,28 @@ def get_input_dirs(config: dict | None = None) -> list[str]:
     elif isinstance(raw_dirs, list):
         return [str(p).strip() for p in raw_dirs if str(p).strip()]
     return []
+
+
+class InputStorageUnavailable(RuntimeError):
+    """Raised when an expected input directory or network share is unreachable."""
+
+
+def is_directory_accessible(path: str | Path) -> bool:
+    """Return True if *path* can actually be opened and enumerated."""
+    try:
+        with os.scandir(path) as entries:
+            next(entries, None)
+        return True
+    except OSError:
+        return False
+
+
+def check_input_storage(input_dirs: list[str] | tuple[str, ...] | None) -> str | None:
+    """Return the first inaccessible input directory path, or None if all are online."""
+    for directory in input_dirs or ():
+        if directory and not is_directory_accessible(directory):
+            return str(directory)
+    return None
 
 
 # Keep wildcard imports of the legacy configuration names working without snapshots.
