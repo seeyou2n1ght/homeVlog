@@ -703,3 +703,150 @@ class TestYoloFpsAlignment:
             analysis_fps=1.0,
         )
         assert out is segs or len(out) == len(segs)
+
+
+class TestRecognitionAccuracyFixes:
+    """Regression tests for recall, precision, and confidence integrity."""
+
+    def test_find_connected_components_deduplicated(self):
+        from src.algorithms.filters import SpatialGridMotionFilter
+
+        filt = SpatialGridMotionFilter()
+        grid = np.zeros((4, 4), dtype=bool)
+        grid[0:2, 0:2] = True
+        grid[3, 3] = True
+        comps = filt.find_connected_components(grid)
+        assert len(comps) == 2
+        assert {(0, 0), (0, 1), (1, 0), (1, 1)} in comps
+        assert {(3, 3)} in comps
+
+    def test_vad_voiced_rescue_respects_snr_margin_floor(self):
+        from src.algorithms.filters import AudioEnergyVAD
+
+        vad = AudioEnergyVAD(noise_margin_db=14.0, min_dbfs=-34.0, min_speech_duration=0.25)
+        sr = 16000
+        t = np.arange(sr * 2, dtype=np.float32) / sr
+        # Steady low-frequency hum at -32 dBFS (high lag-1 autocorrelation, tiny +2 dB spread)
+        hum = (0.025 * np.sin(2.0 * np.pi * 120.0 * t)).astype(np.float32)
+        events_hum, _ = vad.detect_events(hum)
+        assert events_hum == []
+
+    def test_build_segments_does_not_leak_motion_confidence(self):
+        from src.algorithms.segment import build_segments
+
+        labels = [
+            {"time": float(t), "is_motion": (2 <= t <= 6), "is_audio_active": False, "energy": 5.0 if 2 <= t <= 6 else 0.5, "confidence": 0.98}
+            for t in range(10)
+        ]
+        segs = build_segments(labels, source_file="cam.mp4", apply_smoothing=False, pre_roll=0.0, post_roll=0.0)
+        assert all(s.avg_confidence == 0.0 for s in segs)
+
+    def test_refine_activity_segments_does_not_resurrect_yolo_negative_micro_motion(self):
+        from src.algorithms.segment import Segment, refine_activity_segments
+
+        parent = Segment(
+            0.0, 20.0, "MICRO_MOTION", "empty.mp4", max_energy=18.0, avg_confidence=0.0,
+            needs_review=True, review_reason="YOLO_NEGATIVE_ENERGY_HIGH: no target",
+        )
+        labels = [
+            {"time": float(t), "is_motion": True, "is_audio_active": (14 <= t <= 16), "energy": 18.0 if 5 <= t <= 8 else 1.0, "active_cells": 3 if 5 <= t <= 8 else 0, "max_cell_energy": 40.0 if 5 <= t <= 8 else 0.0}
+            for t in range(21)
+        ]
+        refined = refine_activity_segments([parent], labels, {"micro_motion": {"day_energy_threshold": 16.0}})
+        assert any(s.state == "DYNAMIC_AUDIO" for s in refined)
+        assert not any(s.state == "DYNAMIC" for s in refined)
+
+    def test_resolve_presence_requires_real_confidence_and_never_invents_035(self):
+        from src.algorithms.segment import Segment, resolve_presence_segments
+
+        segs = [
+            Segment(0.0, 10.0, "DYNAMIC", "empty.mp4", avg_confidence=0.0),
+            Segment(10.0, 40.0, "STATIC", "empty.mp4", max_energy=1.0),
+            Segment(40.0, 50.0, "DYNAMIC", "empty.mp4", avg_confidence=0.0),
+        ]
+        resolved = resolve_presence_segments(segs, max_presence_gap_s=120.0, person_conf_threshold=0.20)
+        assert resolved[1].state == "STATIC"
+        assert resolved[1].avg_confidence == 0.0
+
+    def test_yolo_verifier_precision_guards_and_local_window_energy(self):
+        from types import SimpleNamespace
+        from src.algorithms.yolo_verifier import YoloVerifier
+        from src.algorithms.segment import Segment
+
+        class FakeModel:
+            def __call__(self, frames, **kwargs):
+                out = []
+                for idx in range(len(frames)):
+                    # First 8 frames (indices 0..7): one weak 0.24 daytime hallucination at idx 0
+                    # Next 8 frames (indices 8..15): genuine person at 0.85 on idx 8,9
+                    if self.phase == 0:
+                        data = np.array([[10, 10, 50, 50, 0.24, 0]], dtype=np.float32) if idx == 0 else np.zeros((0, 6), dtype=np.float32)
+                    else:
+                        data = np.array([[10, 10, 50, 50, 0.85, 0]], dtype=np.float32) if idx in (0, 1) else np.zeros((0, 6), dtype=np.float32)
+                    out.append(SimpleNamespace(boxes=SimpleNamespace(data=data), orig_shape=(360, 640)))
+                self.phase += 1
+                return out
+
+        verifier = YoloVerifier.__new__(YoloVerifier)
+        verifier.enabled = True
+        verifier.confidence = 0.30
+        verifier.target_classes = [0, 15, 16]
+        verifier.batch_size = 8
+        verifier.device = "cpu"
+        verifier._inference_lock = __import__("threading").Lock()
+        verifier.model = FakeModel()
+        verifier.model.phase = 0
+        verifier.config = {
+            "detection": {"min_motion_threshold": 2.5},
+            "presence": {"enabled": True, "night_hours": [23, 7], "person_conf_threshold": 0.20},
+            "micro_motion": {"day_energy_threshold": 16.0, "night_energy_threshold": 18.0},
+        }
+
+        day_offset = 12 * 3600.0
+        # Window 0..8s has low energy (4.0), window 8..16s has high energy (22.0) + person
+        labels = [{"time": day_offset + t * 1.0, "energy": 4.0 if t < 8 else 22.0} for t in range(17)]
+        parent = Segment(day_offset, day_offset + 16.0, "DYNAMIC", "test.mp4", file_start_offset=day_offset, max_energy=22.0)
+        buf = {k: np.full((32, 32, 3), 180, dtype=np.uint8) for k in range(16)}
+
+        out = verifier.verify("test.mp4", [parent], gpu="cpu", device="cpu", frames_buffer=buf, analysis_fps=1.0, labels=labels)
+        # First window (< 8.5s) was negative and had local max_energy=4.0 (<16.0) -> STATIC with avg_confidence=0.0
+        assert out[0].state == "STATIC"
+        assert out[0].avg_confidence == 0.0
+        # Second window detected person cleanly
+        assert any(s.state == "DYNAMIC" and s.avg_confidence >= 0.85 for s in out)
+
+    def test_detector_noise_spread_cap_preserves_sustained_motion(self, mock_config):
+        from src.stages.detector import MotionDetector
+
+        det = MotionDetector(mock_config, decode_gpu="cpu")
+        # Construct 20 frames where >50% of frames have sustained localized motion
+        h, w = det.height, det.width
+        frames = []
+        for idx in range(20):
+            frame = np.full((h, w), 30, dtype=np.uint8)
+            if idx >= 4:
+                x0 = ((idx - 4) * 12) % max(20, w - 40)
+                frame[20:h - 20, x0:x0 + 36] = 210
+            frames.append(frame)
+        labels, _ = det.analyze_frames(frames, fps=5.0, file_duration=4.0)
+        active = sum(1 for lb in labels if lb["is_motion"])
+        assert active >= 10
+
+    def test_decode_file_pipe_color_yolo_buffer_contract(self, tmp_path, mock_config):
+        import cv2
+        from src.stages.detector import MotionDetector
+
+        clip = _create_tiny_mp4_helper(tmp_path / "color_pipe.mp4", n_frames=10, fps=5)
+        cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in mock_config.items()}
+        cfg.setdefault("yolo", {})["enabled"] = True
+        cfg["yolo"]["sample_fps"] = 5.0
+        det = MotionDetector(cfg, decode_gpu="cpu")
+        det.yolo_enabled = True
+        frames, yolo_buf, meta = det._decode_file_pipe(str(clip), file_duration=2.0, effective_fps=5.0)
+        assert meta["frames"] > 0
+        assert len(yolo_buf) > 0
+        sample = next(iter(yolo_buf.values()))
+        assert isinstance(sample, bytes)
+        img = cv2.imdecode(np.frombuffer(sample, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert img is not None and img.shape == (det.height, det.width, 3)
+

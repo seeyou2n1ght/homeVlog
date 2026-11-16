@@ -381,9 +381,9 @@ width × height
 width × height × 3
 ```
 
-不要在 FFmpeg / decoder 输出 RGB/BGR 后再执行 CPU 灰度转换，除非新的实现经过明确基准验证并更新相关架构决策。
+不要在 FFmpeg / decoder 输出 RGB/BGR 后再执行 CPU 灰度转换，除非新的实现经过明确基准验证并更新相关架构决策。当启用 YOLO 时（`yolo.enabled=true` 且分析分辨率宽高为偶数），管道与活跃窗口解码输出 `yuvj420p`（`scale=out_range=full`）：`MotionTrace` / `FramePool` 直接切片消费首平面 `Y`（`width × height` 8-bit 全范围灰度，零多余灰度转换开销），仅抽样送检帧经 `COLOR_YUV2BGR_I420` 编码为内存 JPEG（q=85）存入 `yolo_buffer`，兼顾高召回彩色目标识别与低内存预算（ADR0089）。当关闭 YOLO 时管道维持 `-pix_fmt gray`。
 
-阈值算法的规范输入是 8 位全范围灰度。只有 PyAV `gray` 帧可直接读取平面；limited-range YUV、10 位 YUV 和 RGB 必须经共享 `video_frame_to_gray()` 转换，Prescreen 与 Analysis 不得维护不同的像素解释。
+阈值算法的规范输入是 8 位全范围灰度。只有 `yuvj420p` 首平面与 PyAV `gray` 帧可直接读取 Y 平面；limited-range YUV、10 位 YUV 和 RGB 必须经共享 `video_frame_to_gray()` 转换，Prescreen 与 Analysis 不得维护不同的像素解释。
 
 scanner 写入的文件名跨度只是名义时长。只有实际打开媒体容器后才可设置 `duration_verified=1`；未验证时长不能用于跳过媒体探测。
 
@@ -773,9 +773,9 @@ $$\text{local\_t} = \max\left(0.0, \min\left(\text{start\_time} - \text{file\_of
 | 状态标识 (`state`) | 播放倍速与呈现模式 | 触发与识别条件 | 适用场景与业务目标 |
 | :--- | :--- | :--- | :--- |
 | **`DYNAMIC`** / **`DYNAMIC_AUDIO`** | **1.0x 常速原画** (无损保全) | YOLO 置信度达标目标或音频能量触发 | 行走、抱起、走动互动、有声事件（核心高光） |
-| **`PRESENCE`** | **4.0x 温和快进** (实体解码保留) | 白天两次活动事件间 $\le 180\text{s}$ 静止停顿，且具主体因果证据 | 家长看护坐定、静止陪伴、看书、看手机（防丢弃） |
-| **`NIGHT_STATIONARY`** | **16.0x 高倍浓缩** (平滑变速过渡) | 夜间 23:00~07:00 睡眠静止或全天持续低能量 $\ge 180\text{s}$ 极低能量静止 | 夜间熟睡期、长时卧床休息（去虚胖，保留呼吸节奏） |
-| **`MICRO_MOTION`** | **16.0x 巡航 + 3.0s 锚点** | 差分能量 $\ge 2.5$，YOLO 虽未框选但具有物理运动 | 夜间睡眠翻身、微弱手足活动、遮挡动作（事件保全） |
+| **`PRESENCE`** | **4.0x 基准 + 长时对数封顶浓缩**（`adaptive_stationary_speed=true` 时 $30\text{s}$ 后渐近收敛至 $\approx 15\text{s}$） | 白天两次活动事件间 $\le 180\text{s}$ 静止停顿（具确认人体证据）或 YOLO 静止主体判定 | 家长看护坐定、静止陪伴、看书、看手机（防丢弃且不虚胖） |
+| **`NIGHT_STATIONARY`** | **16.0x 基准 + 长时对数封顶浓缩**（$60\text{s}$ 后渐近收敛至 $\approx 10\text{s}$） | 夜间睡眠静止或确认/持续低能量静止 | 夜间熟睡期、长时卧床休息（去虚胖，保留呼吸与睡眠过渡节奏） |
+| **`MICRO_MOTION`** | **16.0x 基准 + 长时对数封顶浓缩**（$40\text{s}$ 后渐近收敛至 $\approx 8\text{s}$） | YOLO 未框选目标但局部窗口物理运动达日/夜微动能量阈值 | 夜间睡眠翻身、微弱手足活动、遮挡动作（事件保全，不再回退误燃为 1x `DYNAMIC`） |
 | **`STATIC`** | **55.0s 抽 1 帧** (幻灯片快进) | 差分能量 $< 2.5$，无人无声，深度睡眠静止 | 纯静态空房间背景、深夜平稳深度睡眠期（极限浓缩） |
 
 ### 跨文件时序因果链传递 (Cross-File Presence Propagation)

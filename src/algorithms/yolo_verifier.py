@@ -83,7 +83,8 @@ class YoloVerifier:
         self.model = YoloVerifier._shared_model
         
     def verify(self, filepath: str, segments: list, gpu: str = "qsv", device: str | None = None,
-               frames_buffer: dict | None = None, analysis_fps: float = 5.0) -> list:
+               frames_buffer: dict | None = None, analysis_fps: float = 5.0,
+               labels: list | None = None) -> list:
         """Bounded inference over shared JPEGs. Missing evidence never means a negative result."""
         t_yolo_start = time.monotonic()
         if not self.enabled:
@@ -100,9 +101,10 @@ class YoloVerifier:
             return segments
         import cv2
         import torch
-        from bisect import bisect_left
+        from bisect import bisect_left, bisect_right
         from src.algorithms.segment import _merge_same_state
 
+        label_times = [float(l.get("time", 0.0)) for l in labels] if labels else []
         frames_buffer = frames_buffer or {}
         keys = sorted(frames_buffer)
         # Inspect every retained candidate. The decoder already bounds this pool.
@@ -121,11 +123,18 @@ class YoloVerifier:
             for n, group in enumerate(groups):
                 right = (seg.file_start_offset + (group[-1] + groups[n + 1][0]) / (2 * analysis_fps)
                          if n + 1 < len(groups) else seg.end_time)
-                windows.append(replace(seg, start_time=left, end_time=right))
+                if labels:
+                    lo = bisect_left(label_times, left)
+                    hi = bisect_right(label_times, right)
+                    win_energies = [float(labels[idx].get("energy", 0.0)) for idx in range(lo, hi)]
+                    local_max = max(win_energies) if win_energies else seg.max_energy
+                    windows.append(replace(seg, start_time=left, end_time=right, max_energy=local_max))
+                else:
+                    windows.append(replace(seg, start_time=left, end_time=right))
                 left = right
         segments = windows
         jobs = []
-        counts, confirmed, confidences = {}, {}, {}
+        counts, hits, confirmed, confidences, max_thresh = {}, {}, {}, {}, {}
         for i, seg in enumerate(segments):
             if not seg.is_dynamic:
                 continue
@@ -133,7 +142,7 @@ class YoloVerifier:
             end = max(0, seg.end_time - seg.file_start_offset) * analysis_fps
             matched = keys[bisect_left(keys, start):bisect_left(keys, end)]
             jobs.extend((i, k) for k in matched)
-            counts[i], confirmed[i], confidences[i] = 0, False, 0.0
+            counts[i], hits[i], confirmed[i], confidences[i], max_thresh[i] = 0, 0, False, 0.0, 0.0
         person_boxes_by_seg: dict[int, list[np.ndarray]] = {i: [] for i in counts}
 
         batch_size = max(1, int(getattr(self, "batch_size", 4)))
@@ -158,9 +167,9 @@ class YoloVerifier:
                         if img is None:
                             continue
                         luma = float(np.minimum(np.mean(luma_src), np.median(luma_src)))
-                        threshold = min(self.confidence, 0.15 if luma < 50 else 0.20 if luma < 100 else self.confidence)
-                        if segments[i].max_energy >= 3.5:
-                            threshold = min(threshold, 0.20)
+                        threshold = min(self.confidence, 0.15 if luma < 50 else 0.22 if luma < 100 else self.confidence)
+                        if segments[i].max_energy >= 12.0:
+                            threshold = min(threshold, max(0.22, self.confidence - 0.05))
                         frames.append(img)
                         owners.append(i)
                         thresholds.append(threshold)
@@ -210,11 +219,14 @@ class YoloVerifier:
                     best_person_conf = -1.0
                     best_person_box = None
 
+                    frame_hit = False
+                    max_thresh[i] = max(max_thresh[i], float(threshold))
                     for idx, (cls, conf) in enumerate(zip(cls_arr, conf_arr)):
                         c_int = int(cls)
                         if c_int in self.target_classes:
                             confidences[i] = max(confidences[i], float(conf))
-                            confirmed[i] |= float(conf) >= threshold
+                            if float(conf) >= threshold:
+                                frame_hit = True
                         if c_int == 0 and float(conf) >= threshold and xyxy_arr is not None and idx < len(xyxy_arr):
                             if float(conf) > best_person_conf:
                                 best_person_conf = float(conf)
@@ -225,6 +237,8 @@ class YoloVerifier:
                                     b[2] / max(1.0, w_orig),
                                     b[3] / max(1.0, h_orig),
                                 ], dtype=np.float32)
+                    if frame_hit:
+                        hits[i] += 1
                     if best_person_box is not None:
                         person_boxes_by_seg[i].append(best_person_box)
         except Exception as exc:
@@ -244,11 +258,17 @@ class YoloVerifier:
             }
             return segments
 
+        for i, count in counts.items():
+            if hits[i] >= 2:
+                confirmed[i] = True
+            elif hits[i] == 1:
+                confirmed[i] = count <= 2 or confidences[i] >= max(0.38, max_thresh[i] + 0.12)
+
         confirmed_count = sum(1 for c in confirmed.values() if c)
         rejected_count = 0
         for i, count in counts.items():
             seg = segments[i]
-            seg.avg_confidence = round(confidences[i], 4)
+            seg.avg_confidence = round(confidences[i], 4) if (confirmed[i] or count < 2) else 0.0
             if count == 0 or (not confirmed[i] and count < 2):
                 seg.needs_review = True
                 seg.review_reason = "INSUFFICIENT_YOLO_EVIDENCE"
@@ -297,12 +317,21 @@ class YoloVerifier:
             else:
                 cfg = getattr(self, "config", None) or {}
                 micro_cfg = cfg.get("micro_motion", {})
+                pres_cfg = cfg.get("presence", {})
+                night_hours = tuple(pres_cfg.get("night_hours", [23, 7]))
+                hour = (seg.start_time % 86400) / 3600
+                is_seg_night = (night_hours[0] <= hour < night_hours[1] if night_hours[0] < night_hours[1]
+                                else hour >= night_hours[0] or hour < night_hours[1])
                 if "energy_threshold" in micro_cfg:
                     micro_thresh = float(micro_cfg["energy_threshold"])
+                elif is_seg_night and "night_energy_threshold" in micro_cfg:
+                    micro_thresh = float(micro_cfg["night_energy_threshold"])
+                elif (not is_seg_night) and "day_energy_threshold" in micro_cfg:
+                    micro_thresh = float(micro_cfg["day_energy_threshold"])
                 elif "min_motion_threshold" in cfg.get("detection", {}):
-                    micro_thresh = max(5.0, float(cfg["detection"]["min_motion_threshold"]) * 2.6)
+                    micro_thresh = max(8.0, float(cfg["detection"]["min_motion_threshold"]) * 4.0)
                 else:
-                    micro_thresh = 6.0
+                    micro_thresh = 16.0
                 # 若差分能量显著 (>= micro_thresh)，表明存在真实的物理运动 (如夜间睡眠翻身、遮挡动作)，
                 # 严禁将其作为纯静态抽帧丢弃！保全为 MICRO_MOTION 事件状态，防漏检
                 if seg.max_energy >= micro_thresh:

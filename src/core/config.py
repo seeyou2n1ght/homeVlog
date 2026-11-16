@@ -219,6 +219,7 @@ def validate_config(config):
         ("render", "cleanup_batches_on_success"),
         ("render", "night_sparse_enabled"),
         ("render", "nv_tail_use_cpu_decode"),
+        ("segment", "adaptive_stationary_speed"),
     ):
         if key in config.get(section, {}) and not isinstance(config[section][key], bool):
             raise ValueError(f"{section}.{key} must be a boolean")

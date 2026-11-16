@@ -212,8 +212,8 @@ def test_camera_profile_resolution_and_hierarchy():
     assert baby_cfg["detection"]["min_motion_threshold"] == 1.2
     # 机位特有覆盖生效
     assert baby_cfg["detection"]["fg_threshold"] == 9.9
-    # 红外夜视不误抑微动
-    assert baby_cfg["detection"]["ambient_drift_suppress"] is False
+    # 白天启用光影漫射抑制（夜间模式由 SpatialGridMotionFilter 自动豁免）
+    assert baby_cfg["detection"]["ambient_drift_suppress"] is True
 
     # 2. 针对客厅机位解析
     living_cfg = resolve_camera_config(config, camera_id="B888806BD537")
@@ -389,3 +389,30 @@ class TestIFramePrescreenConfigGovernance:
             validate_config({"render": {"night_sparse_min_duration_s": 2.0}})
         with pytest.raises(ValueError, match="Unsupported output.audio.concat_codec"):
             validate_config({"output": {"audio": {"concat_codec": "invalid_codec"}}})
+
+
+def test_profile_prescreen_audio_vad_and_adaptive_stationary_defaults():
+    from src.core.profiles import apply_motion_sensitivity, resolve_camera_config, resolve_profile_config
+    from src.core.config import load_config, validate_config
+
+    cfg = load_config(reload=True)
+    assert cfg["detection"]["analysis_resolution"] == "640x360"
+    assert cfg["segment"]["adaptive_stationary_speed"] is True
+
+    baby_cfg = resolve_profile_config({"detection": {"profile": "baby_room"}})
+    assert baby_cfg["detection"]["prescreen_diff_threshold"] == 7.0
+    assert baby_cfg["audio_vad"]["noise_margin_db"] == 12.0
+    assert baby_cfg["audio_vad"]["min_dbfs"] == -34.0
+    assert baby_cfg["audio_vad"]["speech_min_dur"] == 0.4
+    assert baby_cfg["segment"]["adaptive_stationary_speed"] is True
+
+    scaled = apply_motion_sensitivity(baby_cfg, 2.0)
+    assert scaled["detection"]["prescreen_diff_threshold"] == 3.5
+
+    corridor_cfg = resolve_camera_config({"detection": {"profile": "outdoor_corridor"}})
+    assert corridor_cfg["audio_vad"]["enabled"] is False
+    assert corridor_cfg["detection"]["prescreen_diff_threshold"] == 10.0
+
+    with pytest.raises(ValueError, match="adaptive_stationary_speed must be a boolean"):
+        validate_config({"segment": {"adaptive_stationary_speed": "yes"}})
+

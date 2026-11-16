@@ -17,6 +17,9 @@
   - 修复 `Monitor.reset()` 未随 `dump_perf()` 跨天清零、分离 `qsv_upstream_yields` 与 `qsv_steal_rejected` 计数，并补充 `cleanup_temp_artifacts` 对 `temp/.task_locks/batch-*.lock` 及交付提交后陈旧 `.concat_failures/` 诊断目录的自动清理；
   - 排查 `2026-11-16` 凌晨 SMB 失联事故并修复三处隐患：`companion.build_delivery_mapping()` 对 UNC 路径免 `.resolve()` 触网（顺带整数化时钟校验并复用时长省去二次 `ffprobe`，实测 `20260414` 提速 `6.92s -> 2.48s`）、`prescreen._prescreen_keyframes()` 修复 `first_frame` `UnboundLocalError`，以及跨日与单日 `InputStorageUnavailable` 早停熔断（避免未处理任务被刷成 `FAILED`）；
   - 闭合 `render_tail` 尾段 `t_nv_eta * 0.8 < lightest <= 180s` 调度死区，并经 `verify_cold_run_audit.py` 修复交付 `20260321`（`410,609` 包 0 异常）与 `20260415`（`275,692` 包 0 异常）；同时经同机实测证伪 4 路并肩渲染、`ana_0(CPU)` 替代 CUDA 与 `4.01s GOP` 仅解关键帧方案，详见 [BENCHMARK](BENCHMARK.md)。
+- **识别精度专项审计与长静止浓缩升级（2026-11-16，[ADR0089](DECISIONS.md#adr0089全彩-640x360-yolo-管道直通高精确率分段门控与长时静止对数封顶浓缩2026-11-16)）**：
+  - 将分析管道升级为 `640x360` `yuvj420p` 单遍复用（Y 平面做灰度运动跟踪，BGR JPEG 送 YOLO），同步修复置信度泄漏、白天漫射/噪音误判 1x `DYNAMIC`/`MICRO_MOTION`/`PRESENCE`、`p20` 噪声门限劫持与长片盲区；
+  - 启用 `segment.adaptive_stationary_speed: true` 对数封顶浓缩：基于生产库 `20260326`/`20260321` 对比验证，静止与巡航展示耗时分别压缩 `-29.4m` 与 `-31.9m`（其中 `NIGHT_STATIONARY` 由 `27.7m -> 10.1m`、`26.0m -> 12.2m`），同时保持原有音画时钟闭合与关键帧跳过路径一致。
 - **自动化验证**：`ruff check`、`compileall` 与 `pytest tests/` 全量通过（6 项 `HOMEVLOG_HARDWARE_TESTS` 硬件专项按预期跳过）；`main.py --doctor` 全项就绪。
 
 ## 当前生产默认约束与配置基线

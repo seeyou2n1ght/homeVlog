@@ -46,6 +46,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "description": "客厅标准场景：平衡动作捕捉与光影漫射抑制，启用有人驻留4x温和快进与夜间睡眠16x延时",
         "detection": {
             "min_motion_threshold": 2.5,
+            "prescreen_diff_threshold": 8.5,
             "fg_threshold": 12.0,
             "timestamp_margin": 0.5,
             "ambient_drift_suppress": True,
@@ -70,6 +71,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "min_motion_duration": 2.0,
             "min_static_duration": 3.0,
             "motion_absorb_energy_threshold": 12.0,
+            "adaptive_stationary_speed": True,
             "gap_tolerance": 1.5,
             "action_coalesce_gap": 1.2,
             "pre_roll": 1.0,
@@ -108,9 +110,10 @@ PROFILES: dict[str, dict[str, Any]] = {
         "description": "婴儿房高敏场景：极低微动触发门限，全黑红外夜视不误抑微动，高敏啼哭唤醒，较早入睡时间段",
         "detection": {
             "min_motion_threshold": 1.8,
+            "prescreen_diff_threshold": 7.0,
             "fg_threshold": 8.0,
             "timestamp_margin": 0.5,
-            "ambient_drift_suppress": False,  # 红外微光无室外阳光漫射，关闭大面积软抑制避免吞噬婴儿翻身
+            "ambient_drift_suppress": True,   # 白天抑制大面积阳光漫射；夜间微光模式自动放行
             "ambient_drift_active_ratio": 0.40,
             "ambient_drift_max_energy": 5.0,
             "camera_motion_suppress": False,  # 固定机位无云台巡航
@@ -120,18 +123,19 @@ PROFILES: dict[str, dict[str, Any]] = {
         },
         "audio_vad": {
             "enabled": True,
-            "noise_margin_db": 10.0,  # 提升声音灵敏度
-            "min_dbfs": -38.0,        # 捕捉微弱婴儿啼哭与哼唧
+            "noise_margin_db": 12.0,  # 抑制空调/白噪误报，保留啼哭唤醒
+            "min_dbfs": -34.0,        # 捕捉真实啼哭并过滤低底噪
             "window_ms": 50,
             "sample_rate": 16000,
             "prescreen_audio_gate": True,
-            "speech_min_dur": 0.3,
+            "speech_min_dur": 0.4,
         },
         "segment": {
             "apply_smoothing": True,
             "min_motion_duration": 1.5,
             "min_static_duration": 3.0,
             "motion_absorb_energy_threshold": 8.0,
+            "adaptive_stationary_speed": True,
             "gap_tolerance": 1.5,
             "action_coalesce_gap": 1.5,
             "pre_roll": 1.0,
@@ -155,8 +159,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         "micro_motion": {
             "enabled": True,
             "cruise_speed": 16.0,
-            "day_energy_threshold": 10.0,
-            "day_cell_threshold": 20.0,
+            "day_energy_threshold": 16.0,
+            "day_cell_threshold": 38.0,
             "night_energy_threshold": 12.0,
             "night_cell_threshold": 25.0,
             "min_active_cells": 2,
@@ -170,6 +174,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "description": "室外与走廊场景：高抗噪与抗光影车灯漂移，较高运动门限，关闭室内驻留与睡眠延时",
         "detection": {
             "min_motion_threshold": 3.5,
+            "prescreen_diff_threshold": 10.0,
             "fg_threshold": 15.0,
             "timestamp_margin": 0.5,
             "ambient_drift_suppress": True,
@@ -181,7 +186,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "camera_motion_max_focal_ratio": 3.5,
         },
         "audio_vad": {
-            "enabled": True,
+            "enabled": False,
             "noise_margin_db": 18.0,  # 抗风噪与道路背景噪声
             "min_dbfs": -28.0,
             "window_ms": 50,
@@ -194,6 +199,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "min_motion_duration": 2.5,
             "min_static_duration": 4.0,
             "motion_absorb_energy_threshold": 15.0,
+            "adaptive_stationary_speed": True,
             "gap_tolerance": 1.5,
             "action_coalesce_gap": 1.0,
             "pre_roll": 1.0,
@@ -248,6 +254,7 @@ def apply_motion_sensitivity(profile_dict: dict[str, Any], sensitivity: float = 
     # 需要缩放的门限字段及其安全下界
     scalers = [
         ("detection", "min_motion_threshold", 0.5),
+        ("detection", "prescreen_diff_threshold", 2.5),
         ("detection", "fg_threshold", 2.0),
         ("audio_vad", "noise_margin_db", 3.0),
         ("micro_motion", "day_energy_threshold", 2.0),

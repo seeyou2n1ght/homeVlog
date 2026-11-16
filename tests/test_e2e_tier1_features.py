@@ -292,9 +292,15 @@ def test_t1_f04_04_yolo_candidate_frame_buffering_in_active_windows(tmp_path, mo
         yolo_buffer=yolo_buffer,
         yolo_sample_interval=2,
     )
+    import cv2
     assert len(yolo_buffer) > 0
-    assert all(isinstance(v, np.ndarray) for v in yolo_buffer.values())
-    assert all(v.shape == (detector.height, detector.width) for v in yolo_buffer.values())
+    assert all(isinstance(v, (bytes, bytearray, np.ndarray)) for v in yolo_buffer.values())
+    for v in yolo_buffer.values():
+        if isinstance(v, (bytes, bytearray)):
+            decoded = cv2.imdecode(np.frombuffer(v, dtype=np.uint8), cv2.IMREAD_COLOR)
+            assert decoded is not None and decoded.shape == (detector.height, detector.width, 3)
+        else:
+            assert v.shape[:2] == (detector.height, detector.width)
 
 
 def test_t1_f04_05_timeline_closure_with_interleaved_segments(mock_config):

@@ -481,7 +481,13 @@ class TestFiltergraphGenerationAndClosure:
             speed_ramping=True,
         )
         assert "tpad=stop_mode=clone" in filter_str
-        assert "trim=end_frame=600" in filter_str
+        assert "trim=end_frame=245" in filter_str
+        assert "atrim=end_sample=588000" in filter_str
+        linear_str = build_concat_filter(
+            timeline=[t1], rows=rows, output_fps=20, output_width=1920, output_height=1080,
+            speed_ramping=True, config={"segment": {"adaptive_stationary_speed": False}},
+        )
+        assert "trim=end_frame=600" in linear_str
         is_closed, reason = verify_filtergraph_labels_closure(filter_str)
         assert is_closed, f"Filtergraph not closed: {reason}"
 

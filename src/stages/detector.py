@@ -32,6 +32,14 @@ from src.algorithms.filters import (
     _smooth_labels,
 )
 
+def _encode_yuv420p_to_jpeg(raw: bytes, w: int, h: int, gray_fallback: np.ndarray) -> bytes | np.ndarray:
+    yuv = np.frombuffer(raw, dtype=np.uint8).reshape((h * 3 // 2, w))
+    bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if ok:
+        return encoded.tobytes()
+    return gray_fallback.copy()
+
 __all__ = [
     "AudioEnergyVAD",
     "EmaBackgroundModel",
@@ -301,6 +309,7 @@ class MotionDetector:
                 trace.append(frame)
         energies = list(trace.energies)
         confidences = list(trace.confidences)
+        active_cells = list(getattr(trace, "active_cells", ()))
 
         if len(energies) < 2:
             return [], {"audio_events": audio_events, "vad_stats": vad_stats}
@@ -315,10 +324,18 @@ class MotionDetector:
         energies_arr = np.array(energies, dtype=np.float32)
         p5 = float(np.percentile(energies_arr, 5))
         p20 = float(np.percentile(energies_arr, 20))
-        noise_spread = (p20 - p5) * 2.5
-        threshold = max(self.min_motion_threshold, p5 + noise_spread / max(0.001, self.sensitivity))
+        # Cap adaptive spread/floor so sustained human motion (>20% active) cannot push threshold above real motion.
+        noise_spread = min((p20 - p5) * 2.5, max(1.5, self.min_motion_threshold * 0.8))
+        base_noise = min(p5, max(self.min_motion_threshold * 2.5, 6.0))
+        threshold = max(self.min_motion_threshold, base_noise + noise_spread / max(0.001, self.sensitivity))
 
-        raw_labels = [bool(e > threshold) for e in energies]
+        raw_labels = [
+            bool(
+                e > threshold
+                or (i < len(active_cells) and active_cells[i] >= 2 and e >= self.min_motion_threshold * 1.2)
+            )
+            for i, e in enumerate(energies)
+        ]
 
         smoothed = _smooth_labels(
             raw_labels, max(1, round(self.min_motion_frames * effective_fps / self.fps)),
@@ -536,29 +553,34 @@ class MotionDetector:
         yolo_buffer: dict[int, np.ndarray] = {}
         jpeg_bytes = 0
         w, h = self.width, self.height
-        frame_size = w * h  # 单通道灰度直通，IPC 管道数据量降低 66.7%
+        use_color_yolo = bool(getattr(self, "yolo_enabled", False)) and (w % 2 == 0) and (h % 2 == 0)
+        y_plane_bytes = w * h
+        frame_size = (y_plane_bytes * 3) // 2 if use_color_yolo else y_plane_bytes
+        pix_fmt = "yuvj420p" if use_color_yolo else "gray"
+        range_suffix = ":out_range=full" if use_color_yolo else ""
+        scale_range = ",scale=out_range=full" if use_color_yolo else ""
 
         if self.decode_gpu == "cpu":
             from src.hardware.scheduler import get_disk_semaphore
             io_sem = get_disk_semaphore()
             cpu_threads = int(self.config.get("detection", {}).get("cpu_decode_threads", 4))
             hw_args = ["-threads", str(cpu_threads)] if cpu_threads > 0 else []
-            vf = f"fps={effective_fps:.3f},scale={w}:{h}"
+            vf = f"fps={effective_fps:.3f},scale={w}:{h}{range_suffix}"
         elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore
             io_sem = VideoLease(get_qsv_semaphore())
             hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-            vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12"
+            vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12{scale_range}"
         else:
             from src.hardware.scheduler import get_nvdec_semaphore
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12"
+            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12{scale_range}"
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             *hw_args, "-i", str(filepath),
-            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
+            "-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "-",
         ]
 
         # AGENTS.md 铁律：acquire 必须带 timeout 并重试，禁止无限阻塞
@@ -621,11 +643,11 @@ class MotionDetector:
                     raw = proc.stdout.read(frame_size)
                     if len(raw) < frame_size:
                         break
-                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+                    gray = np.frombuffer(raw[:y_plane_bytes] if use_color_yolo else raw, dtype=np.uint8).reshape((h, w))
 
                     if getattr(self, "yolo_enabled", False) and total_frames % yolo_sample_interval == 0:
-                        item = gray.copy()
-                        jpeg_bytes += item.nbytes
+                        item = _encode_yuv420p_to_jpeg(raw, w, h, gray) if use_color_yolo else gray.copy()
+                        jpeg_bytes += len(item) if isinstance(item, bytes) else item.nbytes
                         if jpeg_bytes > self.buffer_limit // 4:
                             raise MemoryError("YOLO candidate budget exceeded")
                         yolo_buffer[total_frames] = item
@@ -1457,7 +1479,12 @@ class MotionDetector:
             )
 
         w, h = self.width, self.height
-        frame_size = w * h
+        use_color_yolo = bool(getattr(self, "yolo_enabled", False)) and (w % 2 == 0) and (h % 2 == 0)
+        y_plane_bytes = w * h
+        frame_size = (y_plane_bytes * 3) // 2 if use_color_yolo else y_plane_bytes
+        pix_fmt = "yuvj420p" if use_color_yolo else "gray"
+        range_suffix = ":out_range=full" if use_color_yolo else ""
+        scale_range = ",scale=out_range=full" if use_color_yolo else ""
         window_duration = max(0.001, w_end - w_start)
 
         trace = MotionTrace(
@@ -1470,23 +1497,23 @@ class MotionDetector:
             io_sem = get_disk_semaphore()
             cpu_threads = int(self.config.get("detection", {}).get("cpu_decode_threads", 4))
             hw_args = ["-threads", str(cpu_threads)] if cpu_threads > 0 else []
-            vf = f"fps={effective_fps:.3f},scale={w}:{h}"
+            vf = f"fps={effective_fps:.3f},scale={w}:{h}{range_suffix}"
         elif self.decode_gpu == "qsv":
             from src.hardware.scheduler import get_qsv_semaphore, VideoLease
             io_sem = VideoLease(get_qsv_semaphore())
             hw_args = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
-            vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12"
+            vf = f"fps={effective_fps:.3f},scale_qsv=w={w}:h={h},hwdownload,format=nv12{scale_range}"
         else:  # cuda
             from src.hardware.scheduler import get_nvdec_semaphore, VideoLease
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12"
+            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12{scale_range}"
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-ss", f"{w_start:.3f}", "-to", f"{w_end:.3f}",
             *hw_args, "-i", str(filepath),
-            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
+            "-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "-",
         ]
 
         _sem_ok = acquire_with_retry(io_sem, timeout=30.0, retries=6)
@@ -1530,14 +1557,16 @@ class MotionDetector:
                     raw = proc.stdout.read(frame_size)
                     if len(raw) < frame_size:
                         break
-                    gray = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
+                    gray = np.frombuffer(raw[:y_plane_bytes] if use_color_yolo else raw, dtype=np.uint8).reshape((h, w))
 
                     # Global frame index for yolo_buffer alignment with yolo_verifier
                     t_frame_rel = min(w_start + frames_decoded * dt, w_end)
                     global_frame_idx = int(round(t_frame_rel * effective_fps))
 
                     if getattr(self, "yolo_enabled", False) and global_frame_idx % yolo_sample_interval == 0:
-                        yolo_buffer[global_frame_idx] = gray.copy()
+                        yolo_buffer[global_frame_idx] = (
+                            _encode_yuv420p_to_jpeg(raw, w, h, gray) if use_color_yolo else gray.copy()
+                        )
 
                     trace.append(gray)
                     frames_decoded += 1
@@ -1631,6 +1660,7 @@ class MotionDetector:
             # 2. Process fine frames inside window
             energies = list(trace.energies) if hasattr(trace, "energies") else []
             confidences = list(trace.confidences) if hasattr(trace, "confidences") else []
+            active_cells = list(getattr(trace, "active_cells", ()))
 
             if len(energies) >= 2:
                 median_win = max(1, int(round(self.median_window * effective_fps / self.fps)))
@@ -1639,7 +1669,13 @@ class MotionDetector:
                 if median_win >= 3:
                     energies = _median_filter(energies, median_win)
 
-                raw_labels = [bool(e > baseline_threshold) for e in energies]
+                raw_labels = [
+                    bool(
+                        e > baseline_threshold
+                        or (i < len(active_cells) and active_cells[i] >= 2 and e >= self.min_motion_threshold * 1.2)
+                    )
+                    for i, e in enumerate(energies)
+                ]
                 smoothed = _smooth_labels(
                     raw_labels,
                     max(1, round(self.min_motion_frames * effective_fps / self.fps)),
@@ -1821,8 +1857,9 @@ class MotionDetector:
         if len(energies_arr) >= 2:
             p5 = float(np.percentile(energies_arr, 5))
             p20 = float(np.percentile(energies_arr, 20))
-            noise_spread = (p20 - p5) * 2.5
-            baseline_threshold = max(self.min_motion_threshold, p5 + noise_spread / max(0.001, self.sensitivity))
+            noise_spread = min((p20 - p5) * 2.5, max(1.5, self.min_motion_threshold * 0.8))
+            base_noise = min(p5, max(self.min_motion_threshold * 2.5, 6.0))
+            baseline_threshold = max(self.min_motion_threshold, base_noise + noise_spread / max(0.001, self.sensitivity))
         else:
             baseline_threshold = self.min_motion_threshold
 
@@ -1918,9 +1955,13 @@ class MotionDetector:
             windows = coalesced
         from src.algorithms.motion_trace import MotionTrace
         yolo_buffer = {}
+        est_window_frames = max(
+            1.0,
+            sum(max(0.0, w_e - w_s) for w_s, w_e in windows) * effective_fps,
+        )
         yolo_sample_interval = max(
             1, int(round(effective_fps / max(0.1, getattr(self, "yolo_sample_fps", 0.5)))),
-            int(np.ceil(max(1.0, file_duration * effective_fps) /
+            int(np.ceil(est_window_frames /
                        max(1, getattr(self, "yolo_max_frames", 512))))
         )
 

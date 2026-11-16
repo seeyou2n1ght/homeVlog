@@ -194,7 +194,7 @@ class SpatialGridMotionFilter:
                                     if binary_grid[nr, nc] and not visited[nr, nc]:
                                         visited[nr, nc] = True
                                         queue.append((nr, nc))
-                            components.append(comp)
+                    components.append(comp)
         return components
 
     def process_frame(
@@ -445,13 +445,14 @@ class AudioEnergyVAD:
         )
 
         n_windows = len(dbfs_vec)
+        snr_floor_db = noise_floor_db + max(3.0, self.noise_margin_db * 0.5)
         w_size = self.window_samples
         if hasattr(audio, "voiced_windows"):
             active_mask = is_relative_active.copy()
             if noise_floor_db >= -38.0:
-                active_mask |= (dbfs_vec >= max(self.min_dbfs, -35.0)) & audio.voiced_windows()
+                active_mask |= (dbfs_vec >= max(self.min_dbfs, -35.0)) & (dbfs_vec >= snr_floor_db) & audio.voiced_windows()
         elif noise_floor_db >= -38.0 and n_windows > 0 and len(audio) >= n_windows * w_size:
-            candidate_idx = np.where(~is_relative_active & (dbfs_vec >= max(self.min_dbfs, -35.0)))[0]
+            candidate_idx = np.where(~is_relative_active & (dbfs_vec >= max(self.min_dbfs, -35.0)) & (dbfs_vec >= snr_floor_db))[0]
             if len(candidate_idx) > 0:
                 truncated = audio[: n_windows * w_size].reshape((n_windows, w_size)).astype(np.float32)
                 cand_blocks = truncated[candidate_idx]

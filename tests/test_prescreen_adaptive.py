@@ -749,3 +749,35 @@ def test_prescreen_av_open_failure_preserves_error_and_detects_offline_storage(m
             prescreen.prescreen_file(str(offline_file), duration=60.0, config={})
     mock_extract.assert_not_called()
     assert disk.available == 1
+
+
+def test_prescreen_8x8_spatial_grid_and_long_duration_sample_scaling():
+    from src.stages.prescreen import _calc_spatial_metrics, _prescreen_keyframes
+
+    # 8x8 grid sharpens concentration vs 4x4 on small concentrated targets (160x320)
+    small_target = np.zeros((160, 320), dtype=np.float32)
+    small_target[0:20, 0:40] = 64.0
+    conc, max_cell = _calc_spatial_metrics(small_target)
+    assert max_cell == pytest.approx(64.0)
+    assert conc > 20.0
+
+    # Long video (1800s) scales sparse target_samples up above base 10 without exceeding 48
+    captured = {}
+
+    from types import SimpleNamespace
+    dummy_stream = SimpleNamespace(type="video", time_base=0.001, duration=1800000, codec_context=SimpleNamespace())
+
+    class DummyContainer:
+        streams = SimpleNamespace(video=[dummy_stream], audio=[])
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def decode(self, *a): return []
+
+    def fake_iter(container, stream, duration, target_samples=10, deadline=None):
+        captured["target_samples"] = target_samples
+        return iter([])
+
+    with patch("av.open", return_value=DummyContainer()), patch("src.stages.prescreen._iter_sparse_keyframes", side_effect=fake_iter):
+        _prescreen_keyframes("dummy.mp4", duration=1800.0, max_keyframes=10, threshold=8.5, gpu="cpu")
+    assert 10 < captured["target_samples"] <= 48
+

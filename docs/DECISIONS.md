@@ -2066,3 +2066,26 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
 
 ### 结果
 - `20260326 / cam0` 全量零缓存冷跑降至 **`1,785.19s`（`29m45s` / `48.40×` 实时）**，`verify_cold_run_audit.py 20260326` 验证 296,919 个媒体包最大误差 `1 tick`、129/129 接缝 0 断裂。
+
+
+## ADR0089：全彩 640×360 YOLO 管道直通、高精确率分段门控与长时静止对数封顶浓缩（2026-11-16）
+
+状态：Accepted。
+
+### 背景
+全量数据库（2,885 源 / 545.65 小时）与 NAS 实片对照诊断暴露三类系统性精度与时长膨胀问题：
+1. **灰度低分辨率 YOLO 失真**：`416x234` 单通道 `gray` 输入导致日间侧身/坐姿人物漏检（真值 `640_RGB` / 4K 原图均 `0.87–0.90` 稳定命中）且在纯空房间出现低置信误检；
+2. **空画面误膨为 1x 常速及假驻留**：`MotionTrace` 冷却置信度泄漏进 `Segment.avg_confidence`、`YoloVerifier` 误读不存在的 `micro_motion.energy_threshold` 且向子窗继承父段最高能量、`refine_activity_segments` 将 YOLO 否决切片回升为 1x `DYNAMIC`、`resolve_presence_segments` 无证据桥接两段 `conf=0.0` `DYNAMIC` 并硬造 `0.35` 置信度、Tier-1 长片过长运动拉高 `p20` 噪声门限、`prescreen_audio_gate` 跳过长串音频验证，以及 `baby_room` 日间关闭 `ambient_drift_suppress` 与过低语音门限造成大量无人常速片段；
+3. **线性长静止浓缩效率不足**：夜间 `NIGHT_STATIONARY`（16x）与日间 `PRESENCE`（4x）在长时连续静止下仍产出单日 `~64 分钟` 平铺慢放。
+
+### 核心决策
+1. **单遍解码彩色 YOLO + Y 平面运动分析双轨复用（`config/settings.yaml`, `src/stages/detector.py`）**：
+   - 默认 `detection.analysis_resolution` 调至 `640x360`；启用 `yolo.enabled` 且分辨率宽高为偶数时，FFmpeg 管道与 Tier-2 活跃窗口解码输出 `yuvj420p`（`scale=out_range=full`），运动追踪零复制切片直接消费 `Y` 平面，YOLO 抽样帧经 `COLOR_YUV2BGR_I420` 编码为 JPEG（q=85）进入 `yolo_buffer`。
+2. **全链路高精确率/高召回率修复（`filters.py`, `profiles.py`, `prescreen.py`, `detector.py`, `yolo_verifier.py`, `segment.py`, `pipeline.py`）**：
+   - 修复 `find_connected_components` 重复追加、`AudioEnergyVAD` voiced 救济补齐 `snr_floor_db` 门限；
+   - 预筛升级至 `8x8` 空间网格（小图回退 `4x4`）且 $\ge 180\text{s}$ 长片按时长扩展关键帧样本数（至多 48 帧）；
+   - 限制自适应 `p20` 噪声扩展上界并用 `active_cells >= 2` 保护持续动作，修复 Tier-2 窗口 `yolo_sample_interval` 分母口径为解码窗口总帧数；
+   - `YoloVerifier` 通过传入的帧级 `labels` 计算每个 8 帧子窗的真实局部能量、移除白天 `max_energy >= 3.5 -> 0.20` 放宽、约束多帧场景单帧弱峰值误触发、否定切片 `avg_confidence` 归零，并按昼夜读取 `day_energy_threshold` / `night_energy_threshold`；
+   - `build_segments` 不再继承运动冷却置信度（初值恒为 `0.0`），`refine_activity_segments` 不再将 `YOLO_NEGATIVE` 的 `MICRO_MOTION` 或日间非极端视觉能量重启为 1x `DYNAMIC`，`resolve_presence_segments` 取消 `conf=0` 对的无证据桥接及伪造 `0.35`，`pipeline` 对 `>12` 段或 `>45.0s` 的声音门禁切片转入完整视觉+YOLO 校验。
+3. **分段对数封顶静止浓缩策略（`src/stages/timeline.py`, `src/core/config.py`, `src/core/profiles.py`, `config/settings.yaml`）**：
+   - 新增 `segment.adaptive_stationary_speed`（默认 `true`，经 `display_plan_options()`、`compute_display_plans()` 与 `build_concat_filter()` 统一消费）：短暂停留在拐点内维持原线性倍速（`PRESENCE <= 30s @ 4x`、`NIGHT_STATIONARY <= 60s @ 16x`、`MICRO_MOTION <= 40s @ 16x`），超过拐点后按指数饱和曲线收敛至对应封顶时长（分别按基准倍速等比缩放于 `15s`、`10s`、`8s`），保持单调且严格闭合音画帧数契约。

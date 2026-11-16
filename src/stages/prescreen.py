@@ -105,19 +105,20 @@ class MotionDecision:
 
 
 def _calc_spatial_metrics(diff_map: np.ndarray) -> tuple[float, float]:
-    """计算 4x4 空间网格的能量集中度与最大单格能量峰值。
+    """计算 8x8（极小图回退 4x4）空间网格的能量集中度与最大单格能量峰值。
 
     返回: (concentration, max_cell_energy)
     - concentration: 最大网格均值 / 全图均值（反映能量是否局域聚集）
-    - max_cell_energy: 4x4 网格中局部均值的最大值（用于局部小目标剧烈运动唤醒）
+    - max_cell_energy: 空间网格中局部均值的最大值（用于局部小目标剧烈运动唤醒）
     """
     if diff_map.size == 0:
         return 1.0, 0.0
     h, w = diff_map.shape[:2]
-    gh, gw = max(1, h // 4), max(1, w // 4)
+    grid_n = 8 if min(h, w) >= 32 else 4
+    gh, gw = max(1, h // grid_n), max(1, w // grid_n)
     grid_means = [
         float(np.mean(diff_map[r * gh : (r + 1) * gh, c * gw : (c + 1) * gw]))
-        for r in range(4) for c in range(4)
+        for r in range(grid_n) for c in range(grid_n)
     ]
     if not grid_means:
         return 1.0, 0.0
@@ -323,7 +324,8 @@ def _prescreen_keyframes(
             prev_frame: np.ndarray | None = None
             concentrations: list[float] = []
             mean_lumas: list[float] = []
-            target_samples = max(10, max_keyframes) if max_keyframes > 0 else 20
+            base_samples = max(10, max_keyframes) if max_keyframes > 0 else 20
+            target_samples = min(48, max(base_samples, int(round(duration / 30.0)))) if duration >= 180.0 else base_samples
 
             for k, frame in enumerate(_iter_sparse_keyframes(container, stream, duration, target_samples), start=1):
                 y_raw = video_frame_to_gray(frame)

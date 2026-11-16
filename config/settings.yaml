@@ -83,7 +83,7 @@ detection:
   prescreen_diff_threshold: 8.5
   prescreen_extract_timeout: 120.0
   analysis_fps: 5
-  analysis_resolution: "416x234"
+  analysis_resolution: "640x360"
   analysis_max_workers: 3         # 1 CUDA + 2 QSV；实测最快的分析并发配比（兼顾 UHD770 吞吐甜点与 YOLO 锁等待）
   cpu_analysis_workers: 0         # 默认 0：避免 10 核宿主上与 QSV/NVDEC 抢占 CPU 及拖慢 CUDA/YOLO
   cpu_analysis_max_duration_s: 600.0
@@ -116,6 +116,7 @@ audio_vad:
 
 segment:
   apply_smoothing: true
+  adaptive_stationary_speed: true
 
 # ---------------------------------------------------------------------------
 # AI 辅助多模态目标识别 (YOLO 目标过滤与保全)
@@ -207,6 +208,7 @@ logging:
 #
 # segment:
 #   apply_smoothing: true
+#   adaptive_stationary_speed: true
 #   min_motion_duration: 2.0
 #   min_static_duration: 3.0
 #   motion_absorb_energy_threshold: 12.0

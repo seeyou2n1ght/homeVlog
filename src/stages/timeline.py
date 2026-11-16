@@ -175,6 +175,25 @@ def _plan_speed_segment(
     return (target, None)
 
 
+def _condense_stationary_duration(
+    dur: float,
+    base_speed: float,
+    knee_s: float,
+    base_cap_s: float,
+    reference_speed: float,
+) -> float:
+    """Piecewise logarithmic-capped condensation for long stationary stretches."""
+    safe_speed = max(1.0, float(base_speed))
+    if dur <= knee_s:
+        return min(max(0.25, dur / safe_speed), dur)
+    linear_tail = knee_s / safe_speed
+    scaled_cap = max(linear_tail, base_cap_s * (reference_speed / safe_speed))
+    headroom = max(0.0, scaled_cap - linear_tail)
+    excess = dur - knee_s
+    condensed = linear_tail + headroom * (1.0 - math.exp(-excess / max(1.0, knee_s * 3.0)))
+    return min(max(0.25, condensed), dur)
+
+
 def display_plan_options(
     config: dict,
     *,
@@ -197,6 +216,7 @@ def display_plan_options(
         "presence_speed_factor": float(presence.get("speed_factor", 4.0)),
         "night_stationary_speed_factor": float(presence.get("night_speed_factor", 16.0)),
         "micro_motion_cruise_speed": float(micro.get("cruise_speed", 16.0)),
+        "adaptive_stationary_speed": bool(seg.get("adaptive_stationary_speed", False)),
         "output_fps": float(out.get("fps", 20)),
     }
 
@@ -212,6 +232,7 @@ def compute_display_plans(
     presence_speed_factor: float = 4.0,
     night_stationary_speed_factor: float = 16.0,
     micro_motion_cruise_speed: float = 16.0,
+    adaptive_stationary_speed: bool = False,
     output_fps: float = 20.0,
 ) -> list[tuple[float, SpeedRampInfo | None]]:
     """计算每个 TimelineSegment 的成片展示时长，与 build_concat_filter 严格同源。
@@ -242,11 +263,23 @@ def compute_display_plans(
             plans.append((math.ceil(dur * output_fps - 1e-9) / output_fps, None))
             continue
         elif seg.state == SegmentState.PRESENCE:
-            target = min(max(0.25, dur / max(1.0, presence_speed_factor)), dur)
+            target = (
+                _condense_stationary_duration(dur, presence_speed_factor, 30.0, 15.0, 4.0)
+                if adaptive_stationary_speed
+                else min(max(0.25, dur / max(1.0, presence_speed_factor)), dur)
+            )
         elif seg.state == SegmentState.NIGHT_STATIONARY:
-            target = min(max(0.25, dur / max(1.0, night_stationary_speed_factor)), dur)
+            target = (
+                _condense_stationary_duration(dur, night_stationary_speed_factor, 60.0, 10.0, 16.0)
+                if adaptive_stationary_speed
+                else min(max(0.25, dur / max(1.0, night_stationary_speed_factor)), dur)
+            )
         elif seg.state == SegmentState.MICRO_MOTION:
-            target = min(max(0.25, dur / max(1.0, micro_motion_cruise_speed)), dur)
+            target = (
+                _condense_stationary_duration(dur, micro_motion_cruise_speed, 40.0, 8.0, 16.0)
+                if adaptive_stationary_speed
+                else min(max(0.25, dur / max(1.0, micro_motion_cruise_speed)), dur)
+            )
         else:
             target = min(max(dur / global_speed_factor, min_static_display_duration), dur)
             if max_static_display_duration is not None and max_static_display_duration > 0:
@@ -1125,6 +1158,7 @@ def build_concat_filter(
         presence_speed_factor=float(presence_cfg.get("speed_factor", 4.0)),
         night_stationary_speed_factor=float(presence_cfg.get("night_speed_factor", 16.0)),
         micro_motion_cruise_speed=float(micro_cfg.get("cruise_speed", 16.0)),
+        adaptive_stationary_speed=bool(seg_cfg.get("adaptive_stationary_speed", False)),
         output_fps=output_fps,
     )
 

@@ -604,6 +604,15 @@ class StreamingOrchestrator:
                     pass
 
         if is_audio_gated and audio_events:
+            total_audio_dur = sum(max(0.0, float(e[1]) - float(e[0])) for e in audio_events)
+            if len(audio_events) > 12 or total_audio_dur > 45.0:
+                logger.info(
+                    "Bypassing audio_gate_fast_path for %s: %d events (%.1fs) require full visual+YOLO verification",
+                    Path(filepath).name, len(audio_events), total_audio_dur,
+                )
+                is_audio_gated = False
+
+        if is_audio_gated and audio_events:
             from src.algorithms.segment import build_audio_gated_segments
             seg_cfg = self.config.get("segment", {})
             file_dur = float(task.get("file_duration") or 0.0)
@@ -719,7 +728,8 @@ class StreamingOrchestrator:
                         # yolo_buffer 帧键以解码实际 effective_fps 为基准，禁止使用固定的 detector.fps
                         effective_fps = detector_lp.get("effective_fps") or detector_fps
                         segments = yolo_verifier.verify(
-                            filepath, segments, gpu=effective_gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps
+                            filepath, segments, gpu=effective_gpu, device=yolo_device, frames_buffer=yolo_buffer, analysis_fps=effective_fps,
+                            labels=labels,
                         )
                         yolo_telemetry = dict(getattr(yolo_verifier, "last_telemetry", {}) or {})
                         from src.algorithms.segment import _merge_same_state, _filter_short

@@ -399,3 +399,33 @@ def test_build_delivery_mapping_skips_smb_resolve_on_unc_and_offline_paths(monke
     assert mapping["planned_frames"] > 0
     assert len(mapping["segments"]) == 2
     assert mapping["segments"][0]["source_file"].endswith("00_20260415000000_20260415001000.mp4")
+
+
+class TestAdaptiveStationaryCondensation:
+    """Tests for piecewise logarithmic-capped long stationary condensation."""
+
+    def test_adaptive_condensation_monotone_and_bounded(self):
+        from src.stages.timeline import TimelineSegment, compute_display_plans, display_plan_options
+
+        durations = [15.0, 30.0, 60.0, 180.0, 600.0, 1800.0, 3300.0]
+        for state in ("NIGHT_STATIONARY", "PRESENCE", "MICRO_MOTION"):
+            prev_disp = 0.0
+            for dur in durations:
+                tl = [TimelineSegment("f.mp4", 0, 0.0, dur, state, dur)]
+                plans = compute_display_plans(tl, adaptive_stationary_speed=True, speed_ramping=False, output_fps=20.0)
+                disp = plans[0][0]
+                assert disp >= prev_disp
+                assert disp <= dur
+                prev_disp = disp
+            # Long stationary spans (3300s) condense far more than linear 16x/4x
+            long_tl = [TimelineSegment("f.mp4", 0, 0.0, 3300.0, state, 3300.0)]
+            long_disp = compute_display_plans(long_tl, adaptive_stationary_speed=True, speed_ramping=False)[0][0]
+            assert long_disp <= 16.0
+
+        # Legacy default remains linear unless enabled
+        tl_night = [TimelineSegment("f.mp4", 0, 0.0, 1600.0, "NIGHT_STATIONARY", 1600.0)]
+        assert compute_display_plans(tl_night, adaptive_stationary_speed=False)[0][0] == pytest.approx(100.0)
+        opts = display_plan_options({"segment": {"adaptive_stationary_speed": True}})
+        assert opts["adaptive_stationary_speed"] is True
+        assert compute_display_plans(tl_night, **opts)[0][0] < 12.0
+

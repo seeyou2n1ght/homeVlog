@@ -92,8 +92,6 @@ def build_segments(
     seg_start = frame_labels[0]["time"]
     seg_state = _resolve_state(frame_labels[0])
     seg_max_energy = frame_labels[0].get("energy", 0.0)
-    seg_conf_sum = frame_labels[0].get("confidence", 0.0)
-    seg_conf_count = 1
 
     for i in range(1, len(frame_labels)):
         cur_state = _resolve_state(frame_labels[i])
@@ -106,17 +104,13 @@ def build_segments(
                 source_file=source_file,
                 file_start_offset=file_offset,
                 max_energy=seg_max_energy,
-                avg_confidence=seg_conf_sum / max(1, seg_conf_count),
+                avg_confidence=0.0,
             ))
             seg_start = frame_labels[i]["time"]
             seg_state = cur_state
             seg_max_energy = frame_labels[i].get("energy", 0.0)
-            seg_conf_sum = frame_labels[i].get("confidence", 0.0)
-            seg_conf_count = 1
         else:
             seg_max_energy = max(seg_max_energy, frame_labels[i].get("energy", 0.0))
-            seg_conf_sum += frame_labels[i].get("confidence", 0.0)
-            seg_conf_count += 1
 
     segments.append(Segment(
         start_time=seg_start,
@@ -125,7 +119,7 @@ def build_segments(
         source_file=source_file,
         file_start_offset=file_offset,
         max_energy=seg_max_energy,
-        avg_confidence=seg_conf_sum / max(1, seg_conf_count),
+        avg_confidence=0.0,
     ))
 
     # Apply pre-roll and post-roll to dynamic segments for natural transition
@@ -324,6 +318,15 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
         ordered = sorted(cuts)
         for start, end in zip(ordered, ordered[1:]):
             state = next((e[2] for e in relevant if e[0] < end and e[1] > start), None)
+            lo, hi = bisect_left(times, start), bisect_left(times, end)
+            seg_max_e = max(energies[lo:hi], default=parent.max_energy)
+            if state == "DYNAMIC" and "YOLO_NEGATIVE" in (parent.review_reason or ""):
+                if parent.state == "MICRO_MOTION":
+                    state = "MICRO_MOTION"
+                elif not is_night(start):
+                    day_high = float(micro_cfg.get("day_energy_threshold", micro_cfg.get("energy_threshold", 16.0)))
+                    if seg_max_e < day_high * 1.5:
+                        state = "MICRO_MOTION"
             if state is None:
                 if has_uncertain_yolo_evidence(parent):
                     state = parent.state
@@ -333,9 +336,8 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
                     state = "PRESENCE"
                 else:
                     state = "STATIC" if parent.state in ("DYNAMIC", "DYNAMIC_AUDIO") else parent.state
-            lo, hi = bisect_left(times, start), bisect_left(times, end)
             result.append(replace(parent, start_time=start, end_time=end, state=state,
-                                  max_energy=max(energies[lo:hi], default=parent.max_energy)))
+                                  max_energy=seg_max_e))
     return _merge_same_state(result, gap_tolerance=0)
 
 
@@ -835,17 +837,11 @@ def resolve_presence_segments(
                 or next_seg.avg_confidence >= person_conf_threshold
                 or prev_seg.state in ("PRESENCE", "NIGHT_STATIONARY")
                 or next_seg.state in ("PRESENCE", "NIGHT_STATIONARY")
-                or (prev_seg.state == "DYNAMIC" and next_seg.state == "DYNAMIC")
-                or (cur.max_energy >= 2.5 and (left_active or right_active))
-                or (prev_seg.state == "DYNAMIC_AUDIO" and next_seg.state in ("DYNAMIC", "MICRO_MOTION"))
-                or (next_seg.state == "DYNAMIC_AUDIO" and prev_seg.state in ("DYNAMIC", "MICRO_MOTION"))
-                or (prev_seg.state in ("DYNAMIC", "PRESENCE", "NIGHT_STATIONARY") and next_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
-                or (next_seg.state in ("DYNAMIC", "PRESENCE", "NIGHT_STATIONARY") and prev_seg.state == "MICRO_MOTION" and cur.max_energy >= 2.0)
             )
 
             if left_active and right_active and has_person_evidence:
                 conf_candidates = [s.avg_confidence for s in (prev_seg, next_seg) if s.avg_confidence > 0]
-                cur.avg_confidence = round(sum(conf_candidates) / len(conf_candidates), 4) if conf_candidates else 0.35
+                cur.avg_confidence = round(sum(conf_candidates) / len(conf_candidates), 4) if conf_candidates else 0.0
 
                 # 判定是否属于夜间睡眠或长时静止驻留：
                 # 1. 若两侧均为高置信度显性动态活动（如日常走动/陪护），说明人处于真实互动停顿，维持 PRESENCE；
