@@ -1330,7 +1330,9 @@ class StreamingOrchestrator:
                                         )
                                     )
                                     if all_dispatched_event.is_set():
-                                        effective_max_dyn = min(max_qsv_dynamic_s, 180.0, t_nv_eta * 0.8)
+                                        # QSV 实测平均压制倍速 ~2x，允许窃取估算耗时可落在 t_nv_eta 内的中轻型尾批，
+                                        # 同时避免卡在 "QSV 拒收但低于 180s 导致 nv_tail_0 也不接力" 的调度死区。
+                                        effective_max_dyn = min(max_qsv_dynamic_s, 180.0, t_nv_eta * 1.4)
                                     else:
                                         effective_max_dyn = max_qsv_dynamic_s
                                     allowed_dyn_s = effective_max_dyn if t_nv_eta >= 35.0 else min(effective_max_dyn, max(60.0, t_nv_eta * 1.5))
@@ -1345,7 +1347,7 @@ class StreamingOrchestrator:
                                             break
                                         lightest = heavy_queue.lightest_dynamic_duration()
                                         # No more sources can arrive. If even the lightest batch
-                                        # exceeds the maximum tail admission, QSV cannot take any
+                                        # exceeds QSV's effective tail admission, QSV cannot take any
                                         # remaining work. Reuse this thread on NV within its existing
                                         # configured lease budget; keep every remaining encoder NV.
                                         if (all_dispatched_event.is_set()
@@ -1354,7 +1356,7 @@ class StreamingOrchestrator:
                                                 and nv_tail_budget >= 3
                                                 and nv_budget >= 2
                                                 and lightest is not None
-                                                and lightest > min(max_qsv_dynamic_s, 180.0)
+                                                and lightest > effective_max_dyn
                                                 and self.work_stealing.has_vram_headroom()):
                                             handoff_to_nv = True
                                             break

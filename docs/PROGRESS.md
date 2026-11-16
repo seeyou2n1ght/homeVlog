@@ -12,10 +12,11 @@
   - 主阶段工时：`prescreen` 130 项 `1,171.60s`（均 `9.01s`）、`analysis` 116 项 `5,094.05s`（均 `43.91s`，`-50.6%`）、`render` 130 批 `3,166.45s`（均 `24.36s`，`-14.7%`）、渲染尾段 **`38.80s`**（`-84.8%`）、`final_concat` **`96.48s`**；异构编队均衡：`nv_0` 52 批（`91.1%`）、`nv_1` 62 批（`90.7%`）、`qsv_0` 16 批（均耗时 `8.47s`，无全解码长批误窃）。
   - 成片完整性核验（`uv run python scripts/verify_cold_run_audit.py 20260326`）：**PASS** — `296,919` 包时钟误差 `<= 1 tick`、129/129 接缝 0 断裂、元数据亮点事件 `875` 个。
 - **历史跨日参考基线（`20260320 / cam0`，142 源）**：冷跑 `2,193.52s`（`36m33s` / `40.73×` 实时），详见 [BENCHMARK](BENCHMARK.md)。
-- **最新实跑与修复验证（2026-11-15 多日生产批跑收口）**：
-  - 结合 `20260320`–`20260327` 连续多日实跑日志定位并修复 `hevc_qsv` 缺少 `-bf 0` 导致的异构接缝 DTS 畸形与 `20260321` 结尾校验失败（同步升级 `render_fingerprint` 至 `v4` 防止命中旧 `has_b_frames=2` 缓存、对齐 `valid_video` `math.isclose` 容差边界）；
+- **最新实跑与修复验证（2026-11-15–16 生产批跑、离线熔断与交付收尾优化）**：
+  - 结合 `20260320`–`20260327` 连续多日实跑日志定位并修复 `hevc_qsv` 缺少 `-bf 0` 导致的异构接缝 DTS 畸形与 `20260321` 结尾校验失败（同步升级 `render_fingerprint` 至 `v4`、对齐 `valid_video` `math.isclose` 容差边界）；
   - 修复 `Monitor.reset()` 未随 `dump_perf()` 跨天清零、分离 `qsv_upstream_yields` 与 `qsv_steal_rejected` 计数，并补充 `cleanup_temp_artifacts` 对 `temp/.task_locks/batch-*.lock` 及交付提交后陈旧 `.concat_failures/` 诊断目录的自动清理；
-  - `20260321 / cam0` 修复交付并经 `verify_cold_run_audit.py 20260321` 及全包检验通过（`410,609` 视频包 `0` 例 DTS/时长异常、`139/139` 接缝连续）；同时同负载消融证伪 4 路并肩渲染（`1,315.6s` vs 3 路 `1,302.2s`），维持 3 路并发甜点，详见 [BENCHMARK](BENCHMARK.md)。
+  - 排查 `2026-11-16` 凌晨 SMB 失联事故并修复三处隐患：`companion.build_delivery_mapping()` 对 UNC 路径免 `.resolve()` 触网（顺带整数化时钟校验并复用时长省去二次 `ffprobe`，实测 `20260414` 提速 `6.92s -> 2.48s`）、`prescreen._prescreen_keyframes()` 修复 `first_frame` `UnboundLocalError`，以及跨日与单日 `InputStorageUnavailable` 早停熔断（避免未处理任务被刷成 `FAILED`）；
+  - 闭合 `render_tail` 尾段 `t_nv_eta * 0.8 < lightest <= 180s` 调度死区，并经 `verify_cold_run_audit.py` 修复交付 `20260321`（`410,609` 包 0 异常）与 `20260415`（`275,692` 包 0 异常）；同时经同机实测证伪 4 路并肩渲染、`ana_0(CPU)` 替代 CUDA 与 `4.01s GOP` 仅解关键帧方案，详见 [BENCHMARK](BENCHMARK.md)。
 - **自动化验证**：`ruff check`、`compileall` 与 `pytest tests/` 全量通过（6 项 `HOMEVLOG_HARDWARE_TESTS` 硬件专项按预期跳过）；`main.py --doctor` 全项就绪。
 
 ## 当前生产默认约束与配置基线

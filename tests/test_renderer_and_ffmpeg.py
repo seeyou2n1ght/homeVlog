@@ -1033,6 +1033,47 @@ def test_delivery_mapping_verifies_packet_clock(tmp_path, monkeypatch, case, ava
         budget.release()
     assert budget.acquire(blocking=False), "I/O lease was not returned after verification"
     budget.release()
+
+
+def test_bind_delivery_mapping_reuses_duration_without_redundant_ffprobe(tmp_path, monkeypatch):
+    from fractions import Fraction
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import threading
+    import av
+    import src.hardware.scheduler as scheduler
+    from src.stages import companion
+    from src.stages.timeline import TimelineSegment
+
+    movie = tmp_path / "movie.mp4"
+    movie.write_bytes(b"valid-media")
+    timeline = [TimelineSegment("source.mp4", 0, 0, 1.0, "DYNAMIC", 1.0)]
+    config = {"output": {"fps": 20}, "render": {"batch_max_files": 1, "generate_subtitles": False},
+              "segment": {"dynamic_speed": 1}}
+    stream = SimpleNamespace(frames=20, average_rate=Fraction(20), time_base=Fraction(1, 10240), duration=10240)
+    timestamps = [index * 512 for index in range(20)]
+
+    class Container:
+        duration = 1000000
+        streams = SimpleNamespace(video=[stream])
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def demux(self, selected):
+            for pts in timestamps:
+                yield SimpleNamespace(size=10, pts=pts)
+
+    budget = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(scheduler, "get_disk_semaphore", lambda: budget)
+    monkeypatch.setattr(av, "open", lambda *args, **kwargs: Container())
+    monkeypatch.setattr(companion, "build_timeline_from_rows", lambda *a, **k: timeline)
+    probe = MagicMock(side_effect=AssertionError("redundant ffprobe should be skipped"))
+    monkeypatch.setattr(companion, "get_duration", probe)
+    assert companion.save_vlog_companion_assets(movie, "20260901", 0, "camera", 1, 1.0, 1.0, MagicMock(), config, rows=[])
+    probe.assert_not_called()
+
+
 @pytest.mark.parametrize("io_timeout", [None, .05])
 def test_managed_ffmpeg_admission_options_preserve_defaults(monkeypatch, io_timeout):
     from src.hardware import ffmpeg, scheduler

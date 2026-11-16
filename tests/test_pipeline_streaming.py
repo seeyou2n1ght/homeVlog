@@ -2583,3 +2583,90 @@ def test_run_pipeline_stops_on_input_storage_unavailable_and_preserves_pending_t
                     "remaining": 1, "stopped_reason": "INPUT_STORAGE_UNAVAILABLE"}
     original_close()
 
+
+def test_qsv_tail_closes_eta_handoff_dead_zone(tmp_path, monkeypatch):
+    """Batches in (effective_max_dyn, 180s] must hand off to nv_tail_0 instead of stalling."""
+    import queue as pyqueue
+    import src.pipeline as pipeline
+    from src.hardware import scheduler
+    from src.hardware.scheduler import DualEndedBatchQueue
+
+    db = VlogDatabase(tmp_path / "deadzone.db")
+    cfg = {
+        "pipeline": {"render_start_delay": 0, "render_gpu_policy": "heterogeneous"},
+        "hardware": {"max_nv_concurrency": 3},
+        "render": {"batch_max_files": 1, "max_concurrency": 3, "nv_tail_concurrency": 3, "local_staging_enabled": False},
+    }
+    monkeypatch.setattr(scheduler, "load_config", lambda: cfg)
+    scheduler.reset_semaphores()
+    # 5 batches: 2 NV workers pop heaviest (170s, 170s), leaving 3 queued with 150s <= 180s.
+    # With t_nv_eta = ((3 + 2)/2) * 42 = 105s -> effective_max_dyn = min(180, 147) = 147s < 150s.
+    for index, dyn in enumerate((170, 170, 150, 150, 150)):
+        source = f"dz{index}.mp4"
+        db.add_file_task(source, 0, "20260901", f"20260901000{index}00", f"20260901000{index+1}00", 60)
+        db.set_prescreen_result(source, "STATIC")
+    orch = StreamingOrchestrator(db, "20260901", 0, cfg, dashboard_enabled=False)
+    orch.upstream_drained.set()
+    orch.work_stealing.set_vram_probe_fn(lambda: 0)
+    for index, dyn in enumerate((170, 170, 150, 150, 150)):
+        orch.render_batch_queue.put({"filepath": f"dz{index}.mp4", "status": "ANALYZED",
+                                     "dynamic_duration": dyn, "is_heavy": True})
+    orch.stop_event.set()
+
+    dispatched, nv_pair, release = threading.Event(), threading.Event(), threading.Event()
+    original_queue = pyqueue.Queue
+    q_idx = 0
+    running = 0
+    lock = threading.Lock()
+    calls = []
+
+    class HeavyQueue(DualEndedBatchQueue):
+        def notify_all(self):
+            dispatched.set()
+            return super().notify_all()
+        def pop_heaviest(self, *args, **kwargs):
+            assert dispatched.wait(5)
+            return super().pop_heaviest(*args, **kwargs)
+
+    class LightQueue(original_queue):
+        def get_nowait(self):
+            assert nv_pair.wait(5)
+            raise pyqueue.Empty
+
+    def make_queue(*args, **kwargs):
+        nonlocal q_idx
+        q_idx += 1
+        return (LightQueue if q_idx == 1 else original_queue)(*args, **kwargs)
+
+    def render(_segments, batch, gpu, *_args, **_kwargs):
+        nonlocal running
+        with lock:
+            calls.append((gpu, batch))
+            if gpu == "nv":
+                running += 1
+                if running >= 2:
+                    nv_pair.set()
+                if running == 3:
+                    release.set()
+            else:
+                release.set()
+        try:
+            assert release.wait(5)
+            return str(tmp_path / f"batch{batch}.mp4")
+        finally:
+            if gpu == "nv":
+                with lock:
+                    running -= 1
+
+    monkeypatch.setattr(pipeline, "DualEndedBatchQueue", HeavyQueue)
+    monkeypatch.setattr(pipeline.queue, "Queue", make_queue)
+    monkeypatch.setattr(pipeline, "build_batch_render", render)
+    thread = threading.Thread(target=orch._render_manager, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert orch.render_worker_stats["qsv_0"]["handoff_to_nv"] is True
+    assert "nv_tail_0" in orch.render_worker_stats
+    assert all(gpu == "nv" for gpu, _ in calls)
+    db.close()
+

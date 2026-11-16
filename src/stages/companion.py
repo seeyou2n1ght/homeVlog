@@ -205,8 +205,19 @@ def bind_delivery_mapping(output_path, timeline, config):
                 origin = timestamps[0]
                 if not 0 <= origin <= step:
                     raise ValueError("Media frame clock origin exceeds one frame")
-                if any(abs(pts - (origin + index * step)) > 1 for index, pts in enumerate(timestamps)):
+                if step.denominator == 1:
+                    step_int = int(step)
+                    if any(abs(pts - (origin + index * step_int)) > 1 for index, pts in enumerate(timestamps)):
+                        raise ValueError("Media frame timestamps differ from planned clock")
+                elif any(abs(pts - (origin + index * step)) > 1 for index, pts in enumerate(timestamps)):
                     raise ValueError("Media frame timestamps differ from planned clock")
+                stream_dur = getattr(stream, "duration", None)
+                container_dur = getattr(container, "duration", None)
+                probed_dur = (
+                    float(stream_dur * time_base)
+                    if stream_dur
+                    else (float(container_dur) / av.time_base if container_dur else 0.0)
+                )
         finally:
             disk.release()
         stat = output_path.stat()
@@ -214,8 +225,11 @@ def bind_delivery_mapping(output_path, timeline, config):
             raise ValueError("Media identity changed during frame clock verification")
         mapping["clock_validation"] = {"method": "packet_pts", "packets": frames,
                                        "origin_s": float(origin * time_base), "max_error_ticks": 1}
-        mapping.update(status="AVAILABLE", media_identity={"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                                                          "frames": frames, "fps": fps})
+        media_identity = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                          "frames": frames, "fps": fps}
+        if probed_dur > 0:
+            media_identity["duration_s"] = round(probed_dur, 6)
+        mapping.update(status="AVAILABLE", media_identity=media_identity)
     except Exception as exc:
         logger.warning("Delivery segment mapping unavailable for %s: %s", output_path, exc)
         mapping = {"version": 1, "status": "UNAVAILABLE", "reason": str(exc)}
@@ -375,7 +389,8 @@ def save_vlog_companion_assets(
         # 2. 生成伴随 .meta.json 结构化清单
         meta_path = output_path.with_suffix(".meta.json")
         vlog_size = output_path.stat().st_size if output_path.exists() else 0
-        vlog_dur = get_duration(str(output_path)) or 0.0
+        probed_dur = (delivery_mapping.get("media_identity") or {}).get("duration_s")
+        vlog_dur = float(probed_dur) if probed_dur and float(probed_dur) > 0 else (get_duration(str(output_path)) or 0.0)
         if vlog_size <= 0 or vlog_dur <= 0:
             logger.warning("companion assets require a valid media artifact: %s", output_path)
             return False

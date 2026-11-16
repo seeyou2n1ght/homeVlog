@@ -42,6 +42,23 @@
 
 ---
 
+## 19 天连续生产统计、交付收尾提速与 SMB/解码实测边界（2026-11-16）
+
+基于 `20260327`–`20260414` 共 `19` 个连续完成生产日（原始 `439.4h` -> 成片 `82.1h` / `97.85 GiB`，日均壁钟 `1,712.8s`：`upstream 1,480.7s [86.4%]`、`render_tail 125.8s [7.3%]`、`final_concat 92.6s [5.4%]`、`post_concat 13.8s [0.8%]`）：
+
+- **交付收尾单 pass 优化验证**：
+  - [companion.py](file:///c:/Users/seeyo/code/homeVlog/src/stages/companion.py) 在 `build_delivery_mapping()` 去除 UNC 路径 SMB `.resolve()` RPC、为整数时钟步长（如 `20fps` 对 `1/10240` 时基的 `512`）增加纯整数快速路径，并向 `save_vlog_companion_assets()` 透传 `media_identity["duration_s"]` 省去重复 `ffprobe` 调用；
+  - `20260414`（`4.35 GiB`，`279,220` 包）单函数实测：`bind_delivery_mapping()` 从 `6.92s`（含原 UNC `.resolve()` + `Fraction` 循环 `0.812s`）降至 **`2.48s`**，叠加省略的 `get_duration`（`1.14s`）合计提速 **`-64%`**；
+  - `20260415 / cam0` 复用 `temp/` 133 个批次完成交付（`4,741.79 MB` / `6.1×`），`verify_cold_run_audit.py 20260415` **PASS**（`275,692` 包误差 `<= 1 tick`、`132/132` 接缝 0 断裂），`post_concat` 实测为 **`10.08s`**（对比 19 天历史均值 `13.8s`）。
+- **尾段调度死区闭合（`src/pipeline.py`）**：
+  - 19 天生产数据中 `nv_tail_0` 命中 `0/19` 天，且如 `20260411`（`render_tail = 396.4s`）出现 `t_nv_eta * 0.8 < lightest <= 180.0` 时 `qsv_0` 拒收、同时 `handoff_to_nv` 又因要求 `> 180s` 不接棒的死区；已校准为 `t_nv_eta * 1.4` 并对齐 `handoff_to_nv` 至 `lightest > effective_max_dyn`（保留 `q_len <= active_nv` 硬屏障）。
+- **已实测并否决的激进改动边界**：
+  - **`ana_0` 改用 CPU 替代 CUDA**：在同机并行双路 `180s` 4K `NVENC` 渲染负载下实测 `1920s` 4K HEVC（`0.5 fps`）：`ana=cuda + 2x NV` 总耗时 **`72.80s`**（`ana=72.78s` / `13.2 fps`），而 `ana=cpu + 2x NV` 总耗时 **`106.73s`**（`ana=106.72s` / `9.0 fps`，仅将两路渲染从 `~27.5s` 降至 `~19.5s`），整组反而拖慢 **`+33.93s`**，维持 CUDA 主路径；
+  - **`MICRO_MOTION` / `0.5fps` 精析仅解关键帧**：实测小米 4K HEVC（`3840x2160`）关键帧间隔稳定为 **`4.01s`（`0.25 Hz`）**，硬切 `-discard nokey` 会把 `0.5fps` 精析采样砍半、并把 `16×` 微动巡航压至仅 4fps 跳帧感，不采纳；
+  - **`audio_gate` 耗时物理下界**：实测 `128.0 MB` 切片执行完整音频流读盘耗时 `3.44s`（`37.2 MB/s` 受制于千兆/SMB 顺序读整包 `mdat`），维持现有无损召回契约。
+
+---
+
 ## 预筛先验等待与渲染滤镜对照（2026-11-14）
 
 基准为 `264ef64`。从 `20260320 / cam0` 取时间顺序最早的 12 个 NAS 源。基准计时探针耗时 33.328 秒墙钟，各 Worker 累计花费 135.104 秒做视觉扫描、99.313 秒等待前源状态，单文件最长等待 17.219 秒。样本未触发音频门禁。累计等待含并发重叠。
