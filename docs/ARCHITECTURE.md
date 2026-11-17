@@ -381,7 +381,7 @@ width × height
 width × height × 3
 ```
 
-不要在 FFmpeg / decoder 输出 RGB/BGR 后再执行 CPU 灰度转换，除非新的实现经过明确基准验证并更新相关架构决策。当启用 YOLO 时（`yolo.enabled=true` 且分析分辨率宽高为偶数），管道与活跃窗口解码输出 `yuvj420p`（`scale=out_range=full`）：`MotionTrace` / `FramePool` 直接切片消费首平面 `Y`（`width × height` 8-bit 全范围灰度，零多余灰度转换开销），仅抽样送检帧经 `COLOR_YUV2BGR_I420` 编码为内存 JPEG（q=85）存入 `yolo_buffer`，兼顾高召回彩色目标识别与低内存预算（ADR0089）。当关闭 YOLO 时管道维持 `-pix_fmt gray`。
+不要在 FFmpeg / decoder 输出 RGB/BGR 后再执行 CPU 灰度转换，除非新的实现经过明确基准验证并更新相关架构决策。当启用 YOLO 时（`yolo.enabled=true` 且分析分辨率宽高为偶数），管道与活跃窗口解码输出 `yuvj420p`（`scale=out_range=full`；其中 CUDA 路径先 `fps` 抽帧并 `hwdownload,format=nv12`，再走抗锯齿 `swscale`，避免 `scale_cuda` 6× 缩放在蚊帐/织物纹理下产生莫尔条纹与虚假运动/目标误检，见 ADR0090）：`MotionTrace` / `FramePool` 直接切片消费首平面 `Y`（`width × height` 8-bit 全范围灰度，零多余灰度转换开销），仅抽样送检帧经 `COLOR_YUV2BGR_I420` 编码为内存 JPEG（q=85）存入 `yolo_buffer`，兼顾高召回彩色目标识别与低内存预算（ADR0089）。当关闭 YOLO 时管道维持 `-pix_fmt gray`。
 
 阈值算法的规范输入是 8 位全范围灰度。只有 `yuvj420p` 首平面与 PyAV `gray` 帧可直接读取 Y 平面；limited-range YUV、10 位 YUV 和 RGB 必须经共享 `video_frame_to_gray()` 转换，Prescreen 与 Analysis 不得维护不同的像素解释。
 

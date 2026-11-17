@@ -145,6 +145,9 @@ Superseded by: ADR xxxx
 | ADR 0085 | 关键帧粗扫根因校准、异步 YOLO 流水线重叠与双阶段均衡收敛 | [ACTIVE] Accepted | 2026-11 | — |
 | ADR 0086 | 关键帧视觉观测暂存与前源先验结算 | Rejected | 2026-11 | — |
 | ADR 0087 | 两阶段流水线渲染减负与异构去争用 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0088 | 分析并发度收敛、全解码渲染权重校准与中间批产物精简 | [ACTIVE] Accepted | 2026-11 | — |
+| ADR 0089 | 全彩 640×360 YOLO 管道直通、高精确率分段门控与长时静止对数封顶浓缩 | [ACTIVE] Accepted | 2026-11 | Evolves ADR 0001, ADR 0013, ADR 0019 |
+| ADR 0090 | CUDA 分析解码抗锯齿下采样统一与无视觉纯音频切片边界收紧 | [ACTIVE] Accepted | 2026-11 | Evolves ADR 0089 |
 
 ---
 
@@ -2089,3 +2092,21 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
    - `build_segments` 不再继承运动冷却置信度（初值恒为 `0.0`），`refine_activity_segments` 不再将 `YOLO_NEGATIVE` 的 `MICRO_MOTION` 或日间非极端视觉能量重启为 1x `DYNAMIC`，`resolve_presence_segments` 取消 `conf=0` 对的无证据桥接及伪造 `0.35`，`pipeline` 对 `>12` 段或 `>45.0s` 的声音门禁切片转入完整视觉+YOLO 校验。
 3. **分段对数封顶静止浓缩策略（`src/stages/timeline.py`, `src/core/config.py`, `src/core/profiles.py`, `config/settings.yaml`）**：
    - 新增 `segment.adaptive_stationary_speed`（默认 `true`，经 `display_plan_options()`、`compute_display_plans()` 与 `build_concat_filter()` 统一消费）：短暂停留在拐点内维持原线性倍速（`PRESENCE <= 30s @ 4x`、`NIGHT_STATIONARY <= 60s @ 16x`、`MICRO_MOTION <= 40s @ 16x`），超过拐点后按指数饱和曲线收敛至对应封顶时长（分别按基准倍速等比缩放于 `15s`、`10s`、`8s`），保持单调且严格闭合音画帧数契约。
+
+
+## ADR0090：CUDA 分析解码抗锯齿下采样统一与无视觉纯音频切片边界收紧（2026-11-17）
+
+状态：Accepted。
+
+### 背景
+基于 ADR0089 的 7 日（`20260320`–`20260326`）重跑审计暴露两项底层偏差：
+1. **CUDA 分析下采样莫尔条纹（`src/stages/detector.py`）**：`scale_cuda` 在 `3840×2160 -> 640×360`（6× 下采样）下缺少抗锯齿低通滤波，实测空婴儿床蚊帐切片 `20260320200620_20260320201135` 上 `CUDA` 与 `CPU`/`QSV` 产生 `15.85–16.79` 像素均差、帧间虚假能量升至 `16.52`（vs `CPU/QSV 3.60`）并在 241/315 帧误检 `cat`（最高 `0.799`），而 `CPU`/`QSV` 正确为 `0` 误检；
+2. **无视觉纯音频 `DYNAMIC_AUDIO (conf=0)` 3× 时长膨胀（`src/algorithms/segment.py`, `src/pipeline.py`）**：在 `0.5 fps` 长片与低能量静音缝隙下，`refine_activity_segments` 沿两侧相邻帧额外扩展了 `±2.0s` 采样步长 + `1.0s/1.5s` 前后滚，且 `build_segments`/`_filter_short` 对 `max_energy == 0.0` 或 `< threshold` 的纯音频段吸收最长 `8.0s` 静音缝隙，使 `73s–110s` 音频脉冲膨胀至 `237s–294s` 1× 播放。
+
+### 核心决策
+1. **NVDEC 抽帧后置 CPU `swscale`（`src/stages/detector.py`）**：
+   - `_decode_file_pipe` 与 `_decode_file_window` 的 CUDA 分析分支改为 `fps=...,hwdownload,format=nv12,scale={w}:{h}`（仅将 `fps` 抽选后的稀疏帧回传并经抗锯齿 `swscale` 下采样，保留渲染端 1080p `scale_cuda` 不变）；
+   - 实测 `cuda_swscale` 与 `CPU` 像素差 `0.00`、`30` 帧解码 `1.53s` 略快于 `scale_cuda` `1.56s`，且 `20260320200620` 与 `20260326143025` 在 `CUDA` 与 `QSV` 下实现 `0.1s` 级完全一致结果。
+2. **收紧无视觉目标 `DYNAMIC_AUDIO` 的边界与间隙吸收（`src/algorithms/segment.py`, `src/pipeline.py`）**：
+   - `refine_activity_segments` 限制邻居扩展步长上界（`<= 1.0s`），并对无确认人物且纯声触发事件使用紧边界（`<= 0.35s / 0.50s`、`coalesce <= 0.6s`）；已确认人体（`confirmed(parent)`）或视觉高能事件仍维持完整 `pre_roll` / `post_roll`；
+   - `build_segments` 与 `_filter_short` 停止把 `max_energy == 0.0` 快捷豁免用于无视觉目标的 `DYNAMIC_AUDIO`，仅允许吸收 `<= min(1.5s, gap_tolerance)` 短抖动，`pipeline.py` `audio_gate_fast_path` 采用 `(0.4s, 0.6s, 1.0s)` 有界前后滚。

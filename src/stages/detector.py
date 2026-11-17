@@ -575,7 +575,7 @@ class MotionDetector:
             from src.hardware.scheduler import get_nvdec_semaphore
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12{scale_range}"
+            vf = f"fps={effective_fps:.3f},hwdownload,format=nv12,scale={w}:{h}{range_suffix}"
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -1507,7 +1507,7 @@ class MotionDetector:
             from src.hardware.scheduler import get_nvdec_semaphore, VideoLease
             io_sem = VideoLease(get_nvdec_semaphore())
             hw_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            vf = f"fps={effective_fps:.3f},scale_cuda={w}:{h},hwdownload,format=nv12{scale_range}"
+            vf = f"fps={effective_fps:.3f},hwdownload,format=nv12,scale={w}:{h}{range_suffix}"
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",

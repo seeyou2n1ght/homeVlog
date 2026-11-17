@@ -129,8 +129,18 @@ def build_segments(
         dyn_spans = []
         for s in segments:
             if s.is_dynamic:
-                eff_pre = pre_roll if (s.max_energy == 0.0 or s.max_energy >= motion_absorb_energy_threshold) else min(0.5, pre_roll * 0.25)
-                eff_post = post_roll if (s.max_energy == 0.0 or s.max_energy >= motion_absorb_energy_threshold) else min(0.5, post_roll * 0.25)
+                has_strong_motion = (
+                    s.max_energy >= motion_absorb_energy_threshold
+                    or (s.state == "DYNAMIC" and s.max_energy == 0.0)
+                )
+                if has_strong_motion:
+                    eff_pre, eff_post = pre_roll, post_roll
+                elif s.state == "DYNAMIC_AUDIO":
+                    eff_pre = min(0.35, pre_roll * 0.35)
+                    eff_post = min(0.50, post_roll * 0.35)
+                else:
+                    eff_pre = min(0.5, pre_roll * 0.25)
+                    eff_post = min(0.5, post_roll * 0.25)
                 st = max(total_min_t, s.start_time - eff_pre)
                 et = min(total_max_t, s.end_time + eff_post)
                 dyn_spans.append((st, et, s.state, s.max_energy))
@@ -140,7 +150,9 @@ def build_segments(
             merged_dyn = [dyn_spans[0]]
             for st, et, state, energy in dyn_spans[1:]:
                 last_st, last_et, last_state, last_energy = merged_dyn[-1]
-                effective_gap = gap_tolerance if (max(last_energy, energy) == 0.0 or max(last_energy, energy) >= motion_absorb_energy_threshold) else min(0.5, gap_tolerance * 0.25)
+                both_visual = (last_state == "DYNAMIC" or state == "DYNAMIC")
+                strong_or_mock_dyn = (max(last_energy, energy) >= motion_absorb_energy_threshold or (both_visual and max(last_energy, energy) == 0.0))
+                effective_gap = gap_tolerance if strong_or_mock_dyn else min(0.8, gap_tolerance) if "DYNAMIC_AUDIO" in (last_state, state) else min(0.5, gap_tolerance * 0.25)
                 if st <= last_et + effective_gap:
                     resolved_state = "DYNAMIC" if (last_state == "DYNAMIC" or state == "DYNAMIC") else state
                     merged_dyn[-1] = (last_st, max(last_et, et), resolved_state, max(last_energy, energy))
@@ -255,11 +267,11 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
 
         min_cells_req = max(min_active_cells, 3) if is_night_mode else min_active_cells
         if has_grid_info:
-            is_high_trigger = (
-                audio
-                or (e >= high_threshold and act_cells >= min_cells_req)
+            visual_high = (
+                (e >= high_threshold and act_cells >= min_cells_req)
                 or (act_cells >= min_cells_req and max_cell_e >= cell_threshold)
             )
+            is_high_trigger = audio or visual_high
             low_e = high_threshold * low_ratio
             low_cell = cell_threshold * low_ratio
             is_maintain = (
@@ -271,7 +283,8 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
                 )
             )
         else:
-            is_high_trigger = (audio or e >= high_threshold)
+            visual_high = (e >= high_threshold)
+            is_high_trigger = audio or visual_high
             low_e = float(micro_cfg.get("hysteresis_low_threshold", high_threshold * 0.6))
             is_maintain = (
                 in_activity
@@ -283,29 +296,45 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
             if is_high_trigger:
                 activity_start_time = t_curr
             in_activity = True
-            start = max(times[0], times[max(0, i - 1)] - pre)
-            end = min(times[-1], times[i + 1] + post)
+            # Bound neighbor step by 1.0s so low adaptive_fps (0.5 fps / 2s step) does not inflate pulses.
+            start = max(times[0], max(t_curr - 1.0, times[max(0, i - 1)]) - pre)
+            end = min(times[-1], min(t_curr + 1.0, times[i + 1]) + post)
+            is_audio_only = bool(audio and not visual_high and not is_maintain)
+            tight_start = max(times[0], max(t_curr - 0.5, times[max(0, i - 1)]) - min(pre, 0.35))
+            tight_end = min(times[-1], min(t_curr + 0.5, times[i + 1]) + min(post, 0.50))
             state = "DYNAMIC_AUDIO" if audio else "DYNAMIC"
-            if events and start <= events[-1][1] + coalesce_gap:
-                old_start, old_end, old_state = events[-1]
-                duration_so_far = end - old_start
-                can_coalesce = (
+            if events:
+                old_start, old_end, old_state, old_t_start, old_t_end, old_audio_only = events[-1]
+                pair_audio_only = is_audio_only and old_audio_only
+                gap_lim = min(coalesce_gap, 0.6) if pair_audio_only else coalesce_gap
+                cur_s = tight_start if pair_audio_only else start
+                prev_e = old_t_end if pair_audio_only else old_end
+                duration_so_far = (tight_end if pair_audio_only else end) - (old_t_start if pair_audio_only else old_start)
+                can_coalesce = (cur_s <= prev_e + gap_lim) and (
                     duration_so_far <= max_coalesce_dur
-                    or (duration_so_far <= max_coalesce_dur * 1.5 and (audio or e >= high_threshold * 1.8))
+                    or (not pair_audio_only and duration_so_far <= max_coalesce_dur * 1.5 and (audio or e >= high_threshold * 1.8))
                 )
                 if can_coalesce:
-                    events[-1] = (old_start, max(old_end, end),
-                                  "DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
+                    merged_state = "DYNAMIC" if "DYNAMIC" in (state, old_state) else state
+                    if state == "DYNAMIC_AUDIO" or old_state == "DYNAMIC_AUDIO":
+                        merged_state = "DYNAMIC_AUDIO" if pair_audio_only else ("DYNAMIC" if "DYNAMIC" in (state, old_state) else state)
+                    events[-1] = (
+                        old_start, max(old_end, end), merged_state,
+                        old_t_start, max(old_t_end, tight_end), pair_audio_only,
+                    )
                 else:
-                    events.append((start, end, state))
+                    events.append((start, end, state, tight_start, tight_end, is_audio_only))
             else:
-                events.append((start, end, state))
+                events.append((start, end, state, tight_start, tight_end, is_audio_only))
         else:
             in_activity = False
 
     result = []
     event_index = 0
     for parent in segments:
+        parent_confirmed = confirmed(parent)
+        def _ev_bounds(ev):
+            return (ev[3], ev[4]) if (not parent_confirmed and ev[5]) else (ev[0], ev[1])
         cuts = {parent.start_time, parent.end_time}
         relevant = []
         while event_index < len(events) and events[event_index][1] <= parent.start_time:
@@ -313,8 +342,10 @@ def refine_activity_segments(segments: list[Segment], labels: list[dict], config
         for event in events[event_index:]:
             if event[0] >= parent.end_time:
                 break
-            relevant.append(event)
-            cuts.update((max(parent.start_time, event[0]), min(parent.end_time, event[1])))
+            es, ee = _ev_bounds(event)
+            if ee > parent.start_time and es < parent.end_time:
+                relevant.append((es, ee, event[2]))
+                cuts.update((max(parent.start_time, es), min(parent.end_time, ee)))
         ordered = sorted(cuts)
         for start, end in zip(ordered, ordered[1:]):
             state = next((e[2] for e in relevant if e[0] < end and e[1] > start), None)
@@ -402,15 +433,24 @@ def _filter_short(
                 left_absorbed = cumulative_absorbed.get(id(segments[i - 1]), 0.0) if i > 0 else 0.0
                 right_absorbed = cumulative_absorbed.get(id(segments[i + 1]), 0.0) if i + 1 < len(segments) else 0.0
                 # 能量门控与累计吸收上限：静态段仅当相邻动态段能量充沛（max_energy >= 门限，或无能量标注的测试用例），或者停顿极短（<= gap_tolerance）时，且累计吸收时长未超过上限才允许被动态吸收
+                def _can_absorb_into(neighbor) -> bool:
+                    if neighbor.state == "DYNAMIC_AUDIO" and neighbor.avg_confidence < 0.2 and neighbor.max_energy < motion_absorb_energy_threshold:
+                        return dur <= min(1.5, gap_tolerance)
+                    return (
+                        neighbor.max_energy == 0.0
+                        or neighbor.max_energy >= motion_absorb_energy_threshold
+                        or dur <= gap_tolerance
+                    )
+
                 can_absorb_left = (
                     i > 0 and segments[i - 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
                     and (left_absorbed + dur <= max_cumulative_absorb_s)
-                    and (segments[i - 1].max_energy == 0.0 or segments[i - 1].max_energy >= motion_absorb_energy_threshold or dur <= gap_tolerance)
+                    and _can_absorb_into(segments[i - 1])
                 )
                 can_absorb_right = (
                     i + 1 < len(segments) and segments[i + 1].state in ("DYNAMIC", "DYNAMIC_AUDIO")
                     and (right_absorbed + dur <= max_cumulative_absorb_s)
-                    and (segments[i + 1].max_energy == 0.0 or segments[i + 1].max_energy >= motion_absorb_energy_threshold or dur <= gap_tolerance)
+                    and _can_absorb_into(segments[i + 1])
                 )
 
                 if can_absorb_left:

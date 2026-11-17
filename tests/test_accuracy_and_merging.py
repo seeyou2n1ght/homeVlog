@@ -850,3 +850,87 @@ class TestRecognitionAccuracyFixes:
         img = cv2.imdecode(np.frombuffer(sample, dtype=np.uint8), cv2.IMREAD_COLOR)
         assert img is not None and img.shape == (det.height, det.width, 3)
 
+
+
+    def test_offscreen_audio_does_not_inflate_empty_gaps_while_preserving_confirmed_person_audio(self):
+        from src.algorithms.segment import Segment, _filter_short, build_segments, refine_activity_segments
+
+        # 1. _filter_short must not absorb 4s silent gap into unconfirmed low-energy DYNAMIC_AUDIO
+        segs = [
+            Segment(0.0, 2.5, "DYNAMIC_AUDIO", "empty.mp4", max_energy=1.0, avg_confidence=0.0),
+            Segment(2.5, 6.5, "STATIC", "empty.mp4", max_energy=0.5),
+            Segment(6.5, 9.0, "DYNAMIC_AUDIO", "empty.mp4", max_energy=1.0, avg_confidence=0.0),
+        ]
+        filtered = _filter_short(segs, min_motion=1.5, min_static=8.0, gap_tolerance=1.5, motion_absorb_energy_threshold=12.0)
+        assert [s.state for s in filtered] == ["DYNAMIC_AUDIO", "STATIC", "DYNAMIC_AUDIO"]
+
+        # Confirmed person DYNAMIC_AUDIO still merges short pause cleanly
+        confirmed_segs = [
+            Segment(0.0, 2.5, "DYNAMIC_AUDIO", "person.mp4", max_energy=15.0, avg_confidence=0.88),
+            Segment(2.5, 6.5, "STATIC", "person.mp4", max_energy=0.5),
+            Segment(6.5, 9.0, "DYNAMIC_AUDIO", "person.mp4", max_energy=15.0, avg_confidence=0.88),
+        ]
+        filtered_conf = _filter_short(confirmed_segs, min_motion=1.5, min_static=8.0, gap_tolerance=1.5, motion_absorb_energy_threshold=12.0)
+        assert len(filtered_conf) == 1 and filtered_conf[0].state == "DYNAMIC_AUDIO"
+
+        # 2. Adaptive 0.5 fps offscreen audio bursts in YOLO_NEGATIVE segment stay tightly bounded
+        labels = [
+            {"time": float(t * 2), "raw_energy": 0.5, "energy": 0.5, "is_audio_active": (t in (5, 8))}
+            for t in range(21)
+        ]
+        neg_parent = Segment(0.0, 40.0, "STATIC", "empty.mp4", avg_confidence=0.0, review_reason="YOLO_NEGATIVE_REQUIRES_AUDIT")
+        refined = refine_activity_segments(
+            [neg_parent], labels,
+            {"segment": {"pre_roll": 1.0, "post_roll": 1.5, "action_coalesce_gap": 1.5}, "presence": {"night_stationary_enabled": False}},
+        )
+        aud_segs = [s for s in refined if s.state == "DYNAMIC_AUDIO"]
+        assert len(aud_segs) == 2  # Sound pulses at t=10s and t=16s keep distinct events without swallowing 11..15s
+        assert sum(s.duration for s in aud_segs) <= 4.5
+        assert any(s.start_time <= 10.0 < s.end_time for s in aud_segs)
+        assert any(s.start_time <= 16.0 < s.end_time for s in aud_segs)
+
+        # 3. build_segments preserves DYNAMIC_AUDIO with zero missed bursts and tight bounds when visually still
+        bs_labels = [
+            {"time": float(t), "state": ("DYNAMIC_AUDIO" if t in (10, 14) else "STATIC"), "is_motion": (t in (10, 14)), "is_audio_active": (t in (10, 14)), "energy": 0.0}
+            for t in range(25)
+        ]
+        built = build_segments(bs_labels, source_file="empty.mp4", apply_smoothing=True, min_motion_dur=1.0, min_static_dur=8.0, pre_roll=1.0, post_roll=1.5, gap_tolerance=1.5)
+        built_aud = [s for s in built if s.state == "DYNAMIC_AUDIO"]
+        assert len(built_aud) == 2
+        assert sum(s.duration for s in built_aud) <= 4.5
+
+
+    def test_cuda_decode_uses_antialiased_swscale_after_hwdownload(self, mock_config, monkeypatch):
+        from unittest.mock import MagicMock
+        from src.stages.detector import MotionDetector
+        from src.hardware import ffmpeg as hw_ffmpeg
+        import src.hardware.scheduler as sched
+
+        captured_cmds = []
+
+        class DummyProc:
+            returncode = 0
+            stdout = __import__("io").BytesIO(b"")
+            def wait(self, timeout=None): return 0
+            def poll(self): return 0
+
+        def fake_start(key, cmd, **kwargs):
+            captured_cmds.append(cmd)
+            return DummyProc()
+
+        class DummySem:
+            def acquire(self, **kwargs): return True
+            def release(self): pass
+
+        monkeypatch.setattr(hw_ffmpeg.FFmpegProcessRegistry, "start", staticmethod(fake_start))
+        monkeypatch.setattr(hw_ffmpeg.FFmpegProcessRegistry, "reap_cleanups", staticmethod(lambda: None))
+        monkeypatch.setattr(hw_ffmpeg.FFmpegProcessRegistry, "is_interrupted", staticmethod(lambda: False))
+        monkeypatch.setattr(sched, "get_nvdec_semaphore", lambda: DummySem())
+
+        det = MotionDetector(mock_config, decode_gpu="cuda")
+        det.yolo_enabled = True
+        det._decode_file_pipe("clip.mp4", file_duration=10.0, effective_fps=1.0)
+        assert len(captured_cmds) == 1
+        vf = captured_cmds[0][captured_cmds[0].index("-vf") + 1]
+        assert "hwdownload,format=nv12,scale=" in vf
+        assert "scale_cuda=" not in vf

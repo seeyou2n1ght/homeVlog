@@ -626,9 +626,9 @@ class StreamingOrchestrator:
                 file_duration=file_dur,
                 file_start_offset=file_start_offset,
                 audio_events=audio_events,
-                pre_roll=seg_cfg.get("pre_roll", 1.0),
-                post_roll=seg_cfg.get("post_roll", 1.5),
-                gap_tolerance=seg_cfg.get("gap_tolerance", 1.5),
+                pre_roll=min(float(seg_cfg.get("pre_roll", 1.0)), 0.4),
+                post_roll=min(float(seg_cfg.get("post_roll", 1.5)), 0.6),
+                gap_tolerance=min(float(seg_cfg.get("gap_tolerance", 1.5)), 1.0),
             )
             self.db.set_analysis_result(filepath, "ANALYZED", segments)
             from src.core.identity import processing_fingerprint
