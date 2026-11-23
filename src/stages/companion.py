@@ -187,7 +187,7 @@ def bind_delivery_mapping(output_path, timeline, config):
                 stream = container.streams.video[0]
                 frames = stream.frames
                 if frames != mapping["planned_frames"] or not stream.time_base or stream.time_base <= 0:
-                    raise ValueError("Media frame count/time base differs from delivery mapping")
+                    raise ValueError(f"Delivery frame clock mismatch: planned={mapping['planned_frames']} actual={frames} time_base={stream.time_base}")
                 time_base = stream.time_base
                 step = Fraction(1, 1) / Fraction(str(fps)) / time_base
                 timestamps = []

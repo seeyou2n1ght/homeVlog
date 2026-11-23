@@ -77,9 +77,9 @@ class ContextualFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         if not hasattr(record, "subsystem"):
-            # 若未注入 subsystem，从 logger name 提取或默认为 core
+            # 未显式指定子系统时，使用子 logger 名或调用模块名
             name_parts = record.name.split(".")
-            record.subsystem = name_parts[-1] if len(name_parts) > 1 else "core"
+            record.subsystem = name_parts[-1] if len(name_parts) > 1 else record.module
         return super().format(record)
 
 
@@ -91,11 +91,14 @@ class JsonLinesFormatter(logging.Formatter):
         log_obj = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created)) + f".{int(record.msecs):03d}",
             "level": record.levelname,
-            "subsystem": getattr(record, "subsystem", "core"),
+            "subsystem": getattr(record, "subsystem", record.module),
             "logger": record.name,
             "message": record.getMessage(),
             "caller": f"{record.filename}:{record.lineno}",
         }
+        for key in ("reason", "date", "cam", "batch", "expected_frames", "actual_frames", "disposition"):
+            if hasattr(record, key):
+                log_obj[key] = getattr(record, key)
         if record.exc_info:
             log_obj["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_obj, ensure_ascii=False)
@@ -389,6 +392,20 @@ def is_directory_accessible(path: str | Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def raise_if_storage_unavailable(filepath: str, detail: str = "", cause: BaseException | None = None) -> None:
+    """Raise InputStorageUnavailable when the parent directory itself is unreachable."""
+    parent_dir = Path(filepath).parent
+    if str(parent_dir) in ("", "."):
+        return
+    if not is_directory_accessible(parent_dir):
+        msg = f"input storage unavailable for {filepath}"
+        if detail:
+            msg = f"{msg}: {detail}"
+        if cause is not None:
+            raise InputStorageUnavailable(msg) from cause
+        raise InputStorageUnavailable(msg)
 
 
 def check_input_storage(input_dirs: list[str] | tuple[str, ...] | None) -> str | None:

@@ -2670,3 +2670,36 @@ def test_qsv_tail_closes_eta_handoff_dead_zone(tmp_path, monkeypatch):
     assert all(gpu == "nv" for gpu, _ in calls)
     db.close()
 
+
+def test_render_staging_stops_only_for_inaccessible_source_directory(tmp_path):
+    from src.core.utils import InputStorageUnavailable
+    from src.stages.renderer import _stage_source_for_render
+
+    assert _stage_source_for_render(tmp_path / "missing.mp4") is None
+    with pytest.raises(InputStorageUnavailable):
+        _stage_source_for_render(tmp_path / "offline" / "source.mp4")
+
+
+def test_offline_render_without_output_stops_before_worker_retry(tmp_path, monkeypatch):
+    from src.hardware.ffmpeg import FFmpegProcessRegistry
+
+    source = str(tmp_path / "unmounted" / "clip.mp4")
+    db = VlogDatabase(tmp_path / "render-offline.sqlite")
+    try:
+        db.add_file_task(source, 0, "20260901", "20260901000000", "20260901000100", 60)
+        db.set_prescreen_result(source, "STATIC")
+        config = {"pipeline": {"render_start_delay": 0, "render_gpu_policy": "nv_only"},
+                  "render": {"batch_max_files": 1, "max_concurrency": 1, "local_staging_enabled": False}}
+        orch = StreamingOrchestrator(db, "20260901", 0, config, dashboard_enabled=False)
+        render = MagicMock(return_value=None)
+        monkeypatch.setattr("src.pipeline.build_batch_render", render)
+        orch.render_batch_queue.put({"filepath": source, "status": "STATIC"})
+        orch.stop_event.set()
+        with patch.object(FFmpegProcessRegistry, "kill_all") as terminate:
+            orch._render_manager()
+            render.assert_called_once()
+            terminate.assert_called_once()
+        assert orch.abort_event.is_set() and orch._storage_unavailable_failure
+        assert db.get_file_task(source)["analysis_status"] == "PENDING"
+    finally:
+        db.close()

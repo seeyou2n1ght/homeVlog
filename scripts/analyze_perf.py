@@ -230,6 +230,21 @@ def analyze_file(path: Path, top_n: int) -> None:
     for st in ("prescreen", "analysis", "render"):
         recs = sorted(
             (r for r in records if r.get("stage") == st),
+    finished_batches = [r for r in records if r.get("stage") == "render" and r.get("end_time")]
+    if finished_batches:
+        last = max(finished_batches, key=lambda r: r["end_time"])
+        others = [r["end_time"] for r in finished_batches if r.get("worker") != last.get("worker")]
+        gap = f" · 比其他渲染线程晚 {_fmt_s(last['end_time'] - max(others))} 完成" if others else ""
+        queued = last.get("extra", {}).get("render_queue_wait_s")
+        wait = f" · 领取前等待 {_fmt_s(queued)}" if queued is not None else ""
+        print(f"   最后完成批次 {last['file']} ({last.get('worker', '?')}) · 执行 {_fmt_s(last['duration'])}{wait}{gap}")
+
+    for attempt in sorted((r for r in records if r.get("stage") == "render_fallback"),
+                          key=lambda r: r["duration"], reverse=True)[:top_n]:
+        info = attempt["extra"]
+        print(f"   {attempt['file']} · {info['primary_path']} 首次尝试 {_fmt_s(info['primary_attempt_s'])}"
+              f" · 连续渲染 {_fmt_s(attempt['duration'])}")
+
             key=lambda r: r.get("duration", 0), reverse=True,
         )[:top_n]
         if recs:

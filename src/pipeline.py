@@ -288,14 +288,17 @@ class StreamingOrchestrator:
         """Abort workers when source storage goes offline so pending files stay PENDING."""
         from src.hardware.ffmpeg import FFmpegProcessRegistry
         with self.error_lock:
-            if self._storage_unavailable_failure is None:
-                self._storage_unavailable_failure = f"{context}: {error}"
+            if self._storage_unavailable_failure is not None:
+                return
+            self._storage_unavailable_failure = f"{context}: {error}"
         self.abort_event.set()
         self.stop_event.set()
         self.render_finished_event.set()
         self._add_error(f"input storage unavailable: {error}")
         FFmpegProcessRegistry.kill_all()
-        logger.error("Stopping pipeline due to unavailable input storage (%s): %s", context, error)
+        logger.error("Stopping pipeline due to unavailable input storage (%s): %s", context, error,
+                     extra={"reason": "INPUT_STORAGE_UNAVAILABLE", "date": self.date, "cam": self.cam_index,
+                            "disposition": "stop_batch"})
 
     @staticmethod
     def _is_source_dir_offline(filepaths: list[str] | tuple[str, ...]) -> bool:
@@ -357,8 +360,11 @@ class StreamingOrchestrator:
                 if timeline and all(segment.state in pure_dynamic for segment in timeline):
                     continue
                 _stage_source_for_render(fp, needed=lambda: self._needs_prefetch(fp))
+            except InputStorageUnavailable as exc:
+                self._stop_for_storage_unavailable("render prefetch", exc)
+                return
             except Exception:
-                pass
+                logger.debug("Render prefetch failed", exc_info=True)
             finally:
                 self._prefetch_queue.task_done()
 
@@ -1559,6 +1565,9 @@ class StreamingOrchestrator:
                             with self.batch_lock:
                                 self.batch_paths.append((b_idx, Path(res_path)))
                             get_perf().add(
+                            if self._is_source_dir_offline(files_to_batch):
+                                self._stop_for_storage_unavailable(f"render batch {b_idx}", InputStorageUnavailable("source directory offline"))
+                                break
                                 PerfRecord(
                                     stage="render",
                                     file=f"batch_{b_idx}.mp4",
@@ -1591,6 +1600,9 @@ class StreamingOrchestrator:
                                 avg_s = el_sec / max(1, n_done)
                                 enc_name = "NVENC" if gpu == "nv" else gpu.upper()
                                 self.dashboard.update_render(
+                    except InputStorageUnavailable as exc:
+                        self._stop_for_storage_unavailable(f"render batch {b_idx}", exc)
+                        break
                                     completed=n_done,
                                     latest_batch=f"批次 {b_idx}（{enc_name} 编码）",
                                     speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
@@ -2220,8 +2232,9 @@ def _process_date_cam_owned(
                                   "final", out_cfg.get("fps", 20), out_cfg, out_cfg.get("audio", {}), config)
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render,
                                          dashboard_enabled=dashboard_enabled, cam_name=cam_display)
-    def fail(message):
-        logger.error("Pipeline %s cam%d failed: %s", date, cam_index, message)
+    def fail(message, reason="PIPELINE_FAILED"):
+        logger.error("Pipeline %s cam%d failed: %s", date, cam_index, message,
+                     extra={"reason": reason, "date": date, "cam": cam_index, "disposition": "failed"})
         if not skip_render:
             try:
                 db.set_render_status(date, cam_index, "FAILED", error_msg=message)
@@ -2229,7 +2242,7 @@ def _process_date_cam_owned(
                 logger.exception("Could not persist failed delivery status")
         _dump_perf(get_perf(), monitor, date, cam_index, time.monotonic() - t_start,
                    worker_stats=getattr(orchestrator, "render_worker_stats", {}),
-                   run_context={**run_context, "status": "failed", "error": message})
+                   run_context={**run_context, "status": "failed", "error": message, "reason": reason})
         return False
 
     def record_media_failure(context, error):
@@ -2252,7 +2265,7 @@ def _process_date_cam_owned(
         # confirm termination. Only an explicit new execution may resume it.
         raise
     except InputStorageUnavailable as exc:
-        fail(f"input storage unavailable: {exc}")
+        fail(f"input storage unavailable: {exc}", "INPUT_STORAGE_UNAVAILABLE")
         raise
     except Exception as exc:
         logger.exception("streaming pipeline failed for %s cam%d", date, cam_index)
@@ -2299,7 +2312,7 @@ def _process_date_cam_owned(
             "render %s cam%d has %d batch failures, aborting concat to preserve valid batches for resume: %s",
             date, cam_index, len(render_batch_errors), "; ".join(render_batch_errors[:3]),
         )
-        return fail("; ".join(render_batch_errors[:3]))
+        return fail("; ".join(render_batch_errors[:3]), "RENDER_BATCH_FAILED")
 
     # A render batch can succeed while an upstream file task failed. Never
     # publish a day that silently omits failed or unfinished source material.
@@ -2377,7 +2390,7 @@ def _process_date_cam_owned(
             media_metrics=media_metrics,
         )
         if not assets_ok:
-            return fail("required companion assets failed")
+            return fail("required companion assets failed", "DELIVERY_COMPANION_FAILED")
         fingerprint = final_fingerprint()
         with promote_vlog_assets(candidate, output_path, config,fingerprint=fingerprint,
                                  context={'role':'pipeline','date':date,'cam_index':cam_index}):
@@ -2422,7 +2435,7 @@ def _process_date_cam_owned(
     _dump_perf(get_perf(), monitor, date, cam_index, elapsed_wall,
                headline=_build_headline(output_path, total_input_dur, elapsed_wall,
                                         output_duration_s=media_metrics.get("duration_s")),
-               worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context=run_context)
+               worker_stats=getattr(orchestrator, "render_worker_stats", {}), run_context={**run_context, "status": "completed"})
 
     # 自动回收本地预暂存文件，释放磁盘存储空间
     from src.core.utils import cleanup_staging_files

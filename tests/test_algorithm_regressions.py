@@ -177,6 +177,16 @@ def test_valid_video_duration_tolerance(tmp_path):
     # 2 - 1.9 is slightly greater than 0.1 in binary floating point.
     assert valid_video(frame_rate_path, 1.9)
     assert not valid_video(frame_rate_path, 1.899)
+    # Both durations satisfy the audio/container tolerance. Only the exact
+    # display clock can distinguish the two-frame production shortfall.
+    from src.hardware.render_cache import reusable, save_manifest
+    save_manifest(frame_rate_path, "same-graph", duration=2.0)
+    assert reusable(frame_rate_path, "same-graph", 2.0, expected_frames=40)
+    diagnostics = {}
+    assert not valid_video(frame_rate_path, 2.1, expected_frames=42, diagnostics=diagnostics)
+    assert (diagnostics["actual_frames"], diagnostics["expected_frames"]) == (40, 42)
+    assert not reusable(frame_rate_path, "same-graph", 2.1, expected_frames=42)
+
 
 
 @pytest.mark.parametrize("fps", [20, 24])

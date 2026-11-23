@@ -10,6 +10,8 @@
 """
 
 import json
+import logging
+from datetime import datetime, timedelta
 import sys
 import threading
 import time
@@ -156,16 +158,19 @@ def print_summary_card(
     # 尝试从伴随 .meta.json 中提取真实时长与指标（若未显式传入）
     meta_path = output_path.with_suffix(".meta.json")
     by_state = {}
-    if meta_path.exists() and vlog_dur is None:
+    m_data = {}
+    if meta_path.exists():
         try:
             m_data = json.loads(meta_path.read_text(encoding="utf-8"))
             metrics = m_data.get("metrics", {})
-            vlog_dur = metrics.get("vlog_duration_s")
-            dynamic_dur = metrics.get("dynamic_duration_s")
-            static_dur = metrics.get("static_duration_s")
+            if vlog_dur is None:
+                vlog_dur = metrics.get("vlog_duration_s")
+                dynamic_dur = metrics.get("dynamic_duration_s")
+                static_dur = metrics.get("static_duration_s")
             by_state = metrics.get("source_duration_by_state_s", {})
-        except Exception:
-            pass
+        except (OSError, ValueError, AttributeError) as exc:
+            m_data = {}
+            logging.getLogger("homevlog").warning("Delivery summary metadata unreadable: %s", exc)
 
     # 核心指标统计表
     metric_table = Table(show_header=True, header_style="bold cyan", border_style="dim")
@@ -182,6 +187,26 @@ def print_summary_card(
         f"[bold green]{output_path.name}[/] ([cyan]{file_sz_mb:.2f} MB[/cyan])",
     )
 
+    metric_table.add_row("本地成片", "存在" if output_path.is_file() else "未找到")
+    mapping = m_data.get("delivery_mapping", {})
+    clock = mapping.get("clock_validation", {})
+    if mapping.get("status") == "AVAILABLE" and clock.get("method") == "packet_pts":
+        metric_table.add_row("交付时时钟", f"{clock['packets']:,} 个视频包 · 最大误差 {clock['max_error_ticks']} tick")
+    else:
+        metric_table.add_row("交付时时钟", "无校验记录")
+    if "unavailable_source_ranges" in m_data and "skipped_sources" in m_data:
+        gaps = m_data["unavailable_source_ranges"]
+        skipped = m_data["skipped_sources"]
+        missing_s = sum(item["missing_duration_s"] for item in gaps)
+        skipped_s = sum(item.get("nominal_duration_s") or 0 for item in skipped)
+        metric_table.add_row("源素材缺口", f"缺失 {len(gaps)} 段 / {missing_s:.1f} 秒 · 跳过 {len(skipped)} 个文件 / 名义 {skipped_s:.1f} 秒")
+        for item in gaps:
+            start = datetime.strptime(item["source_start"], "%Y%m%d%H%M%S")
+            left = start + timedelta(seconds=item["missing_start_offset_s"])
+            right = start + timedelta(seconds=item["missing_end_offset_s"])
+            metric_table.add_row("缺失源时段", f"{left:%m-%d %H:%M:%S} – {right:%m-%d %H:%M:%S}")
+        for item in skipped:
+            metric_table.add_row("跳过源时段", f"{item['source_start']} – {item['source_end']}")
     if vlog_dur and vlog_dur > 0:
         condense_ratio = total_input_dur / max(vlog_dur, 0.1)
         v_m, v_s = divmod(int(vlog_dur), 60)
@@ -373,7 +398,7 @@ def print_status_table(db: Any, camera_display_names: Optional[Dict[int, str]] =
             sz_text = f"{out_size_mb:.1f} MB"
         elif status == "COMPLETED":
             st_text = "[green]✔ 已渲染[/green]"
-            sz_text = "[dim]文件已移走 (--force-render可重产)[/dim]" if out_file else "[dim]未知路径[/dim]"
+            sz_text = "[dim]记录的路径下未找到文件[/dim]" if out_file else "[dim]未知路径[/dim]"
         else:
             st_text = "[yellow]⏳ 待处理[/yellow]"
             sz_text = "-"

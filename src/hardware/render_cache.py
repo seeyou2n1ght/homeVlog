@@ -91,7 +91,7 @@ def _validate_checkpoint_chunk(chunk: list[float], path: Path | str, duration: f
         details["total_s"] = round(open_s + time.monotonic() - started, 6)
 
 
-def valid_video(path, expected_duration=None, checkpoints=(), require_audio=False, *, diagnostics=None):
+def valid_video(path, expected_duration=None, checkpoints=(), require_audio=False, *, diagnostics=None, expected_frames=None):
     """Reject empty/corrupt output, not legitimate small videos."""
     import av
     import logging
@@ -110,6 +110,12 @@ def valid_video(path, expected_duration=None, checkpoints=(), require_audio=Fals
                 _log.warning("valid_video: file %s has no video stream", path)
                 return False
             stream = container.streams.video[0]
+            if expected_frames is not None and stream.frames != expected_frames:
+                details.update(stage="frame_count", expected_frames=expected_frames, actual_frames=stream.frames)
+                _log.warning("BATCH_FRAME_COUNT_MISMATCH %s planned=%d actual=%d", p.name, expected_frames, stream.frames,
+                             extra={"subsystem": "render", "reason": "BATCH_FRAME_COUNT_MISMATCH",
+                                    "expected_frames": expected_frames, "actual_frames": stream.frames, "batch": p.name})
+                return False
             container_duration = float(container.duration or 0) / av.time_base
             duration = (float(stream.duration * stream.time_base) if stream.duration else container_duration)
             if duration <= 0:
@@ -230,7 +236,7 @@ def _manifest_path(path: Path | str) -> Path:
     return Path(str(p) + ".json")
 
 
-def reusable(path, fingerprint, expected_duration=None, require_audio=False):
+def reusable(path, fingerprint, expected_duration=None, require_audio=False, *, expected_frames=None):
     try:
         manifest_p = _manifest_path(path)
         if not manifest_p.exists():
@@ -243,7 +249,7 @@ def reusable(path, fingerprint, expected_duration=None, require_audio=False):
         manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
         return (manifest["fingerprint"] == fingerprint and
                 manifest["output"] == file_identity(path) and
-                valid_video(path, expected_duration, require_audio=require_audio))
+                valid_video(path, expected_duration, require_audio=require_audio, expected_frames=expected_frames))
     except (OSError, ValueError, KeyError):
         return False
 

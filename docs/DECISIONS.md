@@ -2110,3 +2110,9 @@ concat内部也保留原位置的临时MP4及ffconcat清单，不经失败归档
 2. **收紧无视觉目标 `DYNAMIC_AUDIO` 的边界与间隙吸收（`src/algorithms/segment.py`, `src/pipeline.py`）**：
    - `refine_activity_segments` 限制邻居扩展步长上界（`<= 1.0s`），并对无确认人物且纯声触发事件使用紧边界（`<= 0.35s / 0.50s`、`coalesce <= 0.6s`）；已确认人体（`confirmed(parent)`）或视觉高能事件仍维持完整 `pre_roll` / `post_roll`；
    - `build_segments` 与 `_filter_short` 停止把 `max_energy == 0.0` 快捷豁免用于无视觉目标的 `DYNAMIC_AUDIO`，仅允许吸收 `<= min(1.5s, gap_tolerance)` 短抖动，`pipeline.py` `audio_gate_fast_path` 采用 `(0.4s, 0.6s, 1.0s)` 有界前后滚。
+
+## ADR0091：批次发布与恢复共用计划帧时钟（2026-11-23）
+
+三个生产批次的最后一个 PRESENCE 片段均短于一个输出帧。虚拟输入上没有足够的视频帧时，音轨仍能到达计划终点；原有两帧时长容差允许短批次进入清单。批次首次发布与缓存复用都必须核对共享展示计划的整数视频帧数。末尾活跃区间短于一个输出帧时走连续输入，由既有的密集帧裁切规则处理，保留真实源区间和音轨。成片继续执行逐包 PTS 校验。
+
+异构恢复允许使用另一受支持后端已完成的批次，条件是本次源身份、配置、该后端实际滤镜图对应的指纹、媒体身份及验证均匹配。检查在批次认领内完成；旧清单可以直接通过实测帧数验证。

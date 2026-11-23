@@ -156,6 +156,25 @@ def test_single_pass_dense_video_preserves_legacy_for_unsupported_slices(unsuppo
     assert "[v_tmp]" in graph  # original paired audio/video concat remains
 
 
+@pytest.mark.parametrize("tail_duration, virtual", [(0.018, False), (0.05, True)])
+def test_mixed_render_uses_dense_clock_for_subframe_active_tail(tmp_path, monkeypatch, tail_duration, virtual):
+    from src.stages import renderer, timeline
+    source = str(tmp_path / "clip.mp4")
+    segments = [timeline.TimelineSegment(source, 0, 0, 90, "STATIC", 90),
+                timeline.TimelineSegment(source, 0, 90, 92, "DYNAMIC", 2),
+                timeline.TimelineSegment(source, 0, 92, 92 + tail_duration, "PRESENCE", tail_duration)]
+    config = {"render": {"virtual_concat_enabled": True, "virtual_concat_mixed_enabled": True}}
+    plans = []
+    def observe(*args, **kwargs):
+        plans.append(kwargs)
+        return "inspected"
+
+    monkeypatch.setattr(renderer, "_run_batch_render", observe)
+    renderer.build_batch_render(segments, 0, "nv", 20, 64, 64, {}, {"fps": 20}, {}, "20260605", 1,
+                                [{"filepath": source}], config=config, inspect_only=True)
+    assert bool(plans[0]["input_args"]) == virtual
+
+
 @pytest.mark.parametrize("cache_hit", [False, True])
 def test_batch_inspection_uses_real_cache_decision_without_encoding(tmp_path, monkeypatch, cache_hit):
     from src.stages import renderer, timeline

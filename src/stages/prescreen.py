@@ -15,24 +15,10 @@ from src.hardware.ffmpeg import (
     MediaTerminationUnconfirmed, MediaStartTerminationUnconfirmed,
 )
 from src.hardware.scheduler import acquire_with_retry, VideoLease
-from src.core.utils import InputStorageUnavailable, is_directory_accessible, parse_res
+from src.core.utils import InputStorageUnavailable, raise_if_storage_unavailable, parse_res
 from src.algorithms.filters import video_frame_to_gray
 
 logger = logging.getLogger("homevlog")
-
-
-def _raise_if_storage_unavailable(filepath: str, detail: str = "", cause: BaseException | None = None) -> None:
-    """Raise InputStorageUnavailable when the parent directory itself is unreachable."""
-    parent_dir = Path(filepath).parent
-    if str(parent_dir) in ("", "."):
-        return
-    if not is_directory_accessible(parent_dir):
-        msg = f"input storage unavailable for {filepath}"
-        if detail:
-            msg = f"{msg}: {detail}"
-        if cause is not None:
-            raise InputStorageUnavailable(msg) from cause
-        raise InputStorageUnavailable(msg)
 
 
 def _calc_sample_timestamps(duration: float, segments: int, margin: float = 0.5) -> list[float]:
@@ -423,7 +409,7 @@ def _prescreen_keyframes(
                     "truncated": True,
                 }),
             }
-        _raise_if_storage_unavailable(filepath, str(e), cause=e)
+        raise_if_storage_unavailable(filepath, str(e), cause=e)
         return {"status": "FALLBACK", "error": str(e), "has_audio": has_audio}
     finally:
         io_sem.release()
@@ -529,7 +515,7 @@ def prescreen_file(
     # 提取第 0 帧
     first_frame = _extract_frame(filepath, ts_list[0], width, height, gpu=gpu)
     if first_frame is None:
-        _raise_if_storage_unavailable(filepath, fallback_error or "")
+        raise_if_storage_unavailable(filepath, fallback_error or "")
         detail = f" ({fallback_error})" if fallback_error else ""
         return {"status": "FAILED", "error": f"failed to extract first frame at t={ts_list[0]:.1f}s{detail}"}
     
@@ -809,7 +795,7 @@ def _prescreen_stream_fps(
 
     if expired.is_set() or (proc and proc.returncode not in (0, None)):
         err = "".join(stderr_lines[-5:])
-        _raise_if_storage_unavailable(filepath, err)
+        raise_if_storage_unavailable(filepath, err)
         return {
             "status": "FAILED",
             "error": f"stream_fps ffmpeg 失败，returncode={proc.returncode}: {err}",
@@ -817,7 +803,7 @@ def _prescreen_stream_fps(
 
     if not diffs:
         err = "".join(stderr_lines[-5:])
-        _raise_if_storage_unavailable(filepath, err)
+        raise_if_storage_unavailable(filepath, err)
         return {"status": "FAILED", "error": f"stream_fps 没有可比较帧对: {err}"}
 
     max_diff = max(diffs)
