@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.core.utils import raise_if_storage_unavailable, InputStorageUnavailable
+from src.core.run_observation import current_run
 from src.core.config import TEMP_DIR
 from src.hardware.scheduler import acquire_with_retry, VideoLease
 from src.hardware.ffmpeg import (
@@ -1007,9 +1008,11 @@ def build_batch_render(batch_segs, bi, enc_for_batch, fps, width, height, seg_cf
         logger.warning(
             "%s batch %d failed validation; retrying continuous path",
             primary_path, bi,
-            extra={"reason": "RENDER_PATH_FALLBACK", "batch": bi, "date": date, "cam": cam_index,
+            extra={"event": "batch_fallback", "reason": "RENDER_PATH_FALLBACK", "batch": bi, "date": date, "cam": cam_index,
                    "disposition": "continuous_render"},
         )
+        if run := current_run.get():
+            run.note(bi, "已切换连续渲染", new_attempt=True)
         fallback_started = time.monotonic()
         try:
             return run_fallback(False, cache_observer)
@@ -1161,7 +1164,9 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
         # or launching an encoder. A miss is not a completed render artifact.
         return str(output_path)
     if cache_hit or (alternate_cache and Path(output_path).is_file() and alternate_cache()):
-        logger.info("Reusing verified batch %s", output_path.name)
+        if run := current_run.get():
+            run.batch(batch_idx, "reused")
+        logger.info("Reusing verified batch %s", output_path.name, extra={"event": "batch_reused"})
         return str(output_path)
 
     if prepare_input is not None:
@@ -1353,6 +1358,8 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
                     if cur_frames > last_frame_count:
                         has_progress = True
                         last_frame_count = cur_frames
+                        if run := current_run.get():
+                            run.progress(batch_idx, cur_frames)
                         if cur_frames >= 0:
                             encoding_started = True
 
@@ -1372,6 +1379,8 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
                         last_active_time = now
                     active_timeout = inactivity_timeout if encoding_started else startup_timeout
                     if not has_progress and now - last_active_time > active_timeout:
+                        if run := current_run.get():
+                            run.note(batch_idx, "编码无进展，正在终止")
                         logger.warning(
                             "batch-render cam%d batch%d stalled on %s during %s "
                             "(no progress for %.1fs, frame=%d), terminating process",
@@ -1430,6 +1439,9 @@ def _run_batch_render_owned(input_files, filter_complex, output_path, encoder, f
                 # 原子重命名为正式批次成片，保证断点续传绝不复用半成品
                 tmp_output_path.replace(output_path)
                 save_manifest(output_path, fingerprint, duration=val_diag.get("duration", expected_duration))
+                if run := current_run.get():
+                    run.batch(batch_idx, "encoded")
+                logger.info("Batch %d encoded", batch_idx, extra={"event": "batch_encoded"})
             else:
                 logger.warning("batch-render cam%d batch%d output failed container/duration validation (%d bytes), discarding",
                                cam_index, batch_idx, tmp_output_path.stat().st_size)

@@ -125,6 +125,7 @@ def test_synthetic_cli_delivers_and_reuses_two_cameras(tmp_path, mock_config, mo
     settings_file = tmp_path / "settings.yaml"
     settings_file.write_text(yaml.safe_dump(settings), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["main.py", "--no-tui", "--config", str(settings_file)])
+    main.setup_logging()
     main.main()
 
     db = VlogDatabase()
@@ -171,8 +172,23 @@ def test_synthetic_cli_delivers_and_reuses_two_cameras(tmp_path, mock_config, mo
 
     perf_files = sorted((config.LOGS_DIR / "perf").glob("*.json"))
     assert len(perf_files) == 2
+    events = [json.loads(line) for event_file in (config.LOGS_DIR / "events").glob("*.jsonl*")
+              for line in event_file.read_text(encoding="utf-8").splitlines()]
+    run_ids = set()
     for path in perf_files:
         perf = _read_json(path)
+        rid = perf["run_context"]["run_id"]
+        assert rid not in run_ids
+        run_ids.add(rid)
+        group = [e for e in events if e.get("run_id") == rid]
+        assert all((e["date"], e["cam"]) == (perf["date"], perf["cam"]) for e in group)
+        terminal, = [e for e in group if e.get("event") == "run_finished"]
+        encoded = [e for e in group if e.get("event") == "batch_encoded"]
+        assert encoded and all(isinstance(e["batch"], int) and e["worker"] for e in encoded)
+        assert terminal["status"] == "completed" and terminal["counts"]["encoded"] == len(encoded)
+        assert [e["phase"] for e in group if e.get("event") == "phase_changed"][-4:] == [
+            "最终拼接中", "时钟校验与元数据生成中", "交付提交中", "已交付",
+        ]
         valid, message = validate_perf_json_schema(perf)
         assert valid, message
         stages = {row["stage"] for row in perf["records"]}

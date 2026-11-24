@@ -7,7 +7,8 @@ import threading
 import queue
 import stat
 import shutil
-import uuid
+from contextvars import copy_context
+from src.core.run_observation import RunObservation, current_run, current_batch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -250,12 +251,14 @@ class StreamingOrchestrator:
         self._active_qsv_renders = 0
 
         # Rich 仪表盘 (tqdm 已下线，统一由 PipelineDashboard 呈现)
+        self.observation = current_run.get()
         self.dashboard_enabled = dashboard_enabled
         self.dashboard: PipelineDashboard | None = None
         self._prescreen_t0 = 0.0
         self._analysis_t0 = 0.0
 
     def _guard_worker(self, worker, *args):
+        token = current_run.set(self.observation)
         try:
             worker(*args)
         except BaseException as exc:
@@ -266,6 +269,9 @@ class StreamingOrchestrator:
             self.render_finished_event.set()
             from src.hardware.ffmpeg import FFmpegProcessRegistry
             FFmpegProcessRegistry.kill_all()
+
+        finally:
+            current_run.reset(token)
 
     def _add_error(self, message: str):
         with self.error_lock:
@@ -1096,7 +1102,7 @@ class StreamingOrchestrator:
                             finally:
                                 self.analysis_queue.task_done()
 
-                        pending_post_future = post_executor.submit(_run_post)
+                        pending_post_future = post_executor.submit(copy_context().run, _run_post)
                         task_done_deferred = True
 
                 except MediaTerminationUnconfirmed as exc:
@@ -1416,7 +1422,11 @@ class StreamingOrchestrator:
                         render_start_t.append(time.monotonic())
                     t_r0 = time.monotonic()
                     render_queue_wait = max(0.0, t_r0 - batch_ready_at.get(b_idx, t_r0))
-                    logger.info("render batch %d started on %s (%d files, worker=%s)", b_idx, gpu, len(files_to_batch), worker_name)
+                    batch_token = current_batch.set((b_idx, worker_name))
+                    if self.observation:
+                        self.observation.batch(b_idx, "running", worker=worker_name)
+                    logger.info("render batch %d started on %s (%d files, worker=%s)", b_idx, gpu, len(files_to_batch), worker_name,
+                                extra={"event": "batch_started", "queue_wait_s": round(render_queue_wait, 3)})
                     if gpu == "nv":
                         with self.batch_lock:
                             self._active_nv_renders += 1
@@ -1490,6 +1500,8 @@ class StreamingOrchestrator:
                                 )
                                 with self.batch_lock:
                                     terminal_batch_ids.add(b_idx)
+                                if self.observation:
+                                    self.observation.batch(b_idx, "skipped")
                                 if self.dashboard is not None:
                                     self.dashboard.render_batch_finished(len(files_to_batch))
                                 continue
@@ -1518,6 +1530,8 @@ class StreamingOrchestrator:
                                 logger.warning("render batch %d has no usable timeline or metadata", b_idx)
                                 with self.batch_lock:
                                     terminal_batch_ids.add(b_idx)
+                                if self.observation:
+                                    self.observation.batch(b_idx, "skipped")
                                 if self.dashboard is not None:
                                     self.dashboard.render_batch_finished(len(files_to_batch))
                                 continue
@@ -1536,6 +1550,8 @@ class StreamingOrchestrator:
                                     "render batch %d on qsv contains %.1fs dynamic motion (exceeds %.1fs), offloading to nv heavy queue",
                                     b_idx, dynamic_dur, qsv_admission_limit,
                                 )
+                                if self.observation:
+                                    self.observation.batch(b_idx, "queued")
                                 heavy_queue.put(b_idx, files_to_batch, dynamic_dur)
                                 continue
 
@@ -1557,7 +1573,9 @@ class StreamingOrchestrator:
                         batch_dyn = sum(s.duration for s in batch_segs if s.state in ("DYNAMIC", "DYNAMIC_AUDIO"))
                         dynamic_sec_total += batch_dyn
                         backend_label = "cpu_nvenc" if tail_cpu_decode and gpu == "nv" else gpu
-                        logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, backend_label, r_dur, bool(res_path))
+                        logger.info("render batch %d finished on %s in %.3fs (output=%s)", b_idx, backend_label, r_dur, bool(res_path),
+                                    extra={"event": "batch_attempt_finished", "duration_s": r_dur,
+                                           "status": "ready" if res_path else "no_output"})
                         if res_path:
                             if gpu == "nv" and not is_light and r_dur >= 5.0:
                                 with nv_duration_lock:
@@ -1588,6 +1606,8 @@ class StreamingOrchestrator:
                                     worker=worker_name,
                                 )
                             )
+                            if self.observation:
+                                self.observation.batch(b_idx, "ready")
                             if self.dashboard is not None:
                                 self.dashboard.render_batch_finished(len(files_to_batch))
                                 # 精准渲染阶段自身计时与剩余预估
@@ -1615,6 +1635,8 @@ class StreamingOrchestrator:
                                     "render batch %d returned no output on qsv; queued for nv retry",
                                     b_idx,
                                 )
+                                if self.observation:
+                                    self.observation.batch(b_idx, "retry")
                                 nv_retry_queue.put((b_idx, files_to_batch))
                                 continue
 
@@ -1628,12 +1650,16 @@ class StreamingOrchestrator:
                                     "render batch %d returned no output on %s; queued for retry (attempt 1/1)",
                                     b_idx, gpu,
                                 )
+                                if self.observation:
+                                    self.observation.batch(b_idx, "retry")
                                 nv_retry_queue.put((b_idx, files_to_batch))
                                 continue
 
                             self._add_error(f"render batch {b_idx} returned no output")
                             with self.batch_lock:
                                 terminal_batch_ids.add(b_idx)
+                            if self.observation:
+                                self.observation.batch(b_idx, "failed")
                             if self.dashboard is not None:
                                 self.dashboard.render_batch_finished(len(files_to_batch))
                     except MediaTerminationUnconfirmed as exc:
@@ -1664,6 +1690,8 @@ class StreamingOrchestrator:
                                 "render batch %d crashed on qsv; queued for nv retry",
                                 b_idx,
                             )
+                            if self.observation:
+                                self.observation.batch(b_idx, "retry")
                             nv_retry_queue.put((b_idx, files_to_batch))
                             continue
 
@@ -1677,15 +1705,20 @@ class StreamingOrchestrator:
                                 "render batch %d crashed on %s; queued for retry (attempt 1/1)",
                                 b_idx, gpu,
                             )
+                            if self.observation:
+                                self.observation.batch(b_idx, "retry")
                             nv_retry_queue.put((b_idx, files_to_batch))
                             continue
 
                         self._add_error(f"render batch {b_idx} failed on {gpu}")
                         with self.batch_lock:
                             terminal_batch_ids.add(b_idx)
+                        if self.observation:
+                            self.observation.batch(b_idx, "failed")
                         if self.dashboard is not None:
                             self.dashboard.render_batch_finished(len(files_to_batch))
                     finally:
+                        current_batch.reset(batch_token)
                         if gpu == "nv":
                             with self.batch_lock:
                                 self._active_nv_renders = max(0, self._active_nv_renders - 1)
@@ -1786,6 +1819,9 @@ class StreamingOrchestrator:
                             self._prefetched_files.add(fp)
                             self._prefetch_queue.put(fp)
 
+            if self.observation:
+                self.observation.batch(b_idx, "queued")
+            logger.info("Batch %d queued", b_idx, extra={"event": "batch_queued", "batch": b_idx})
             dyn_dur = _estimate_dynamic_duration(files)
             if dyn_dur > 0 or _is_heavy_batch(files):
                 if dyn_dur <= 0:
@@ -1897,6 +1933,8 @@ class StreamingOrchestrator:
             enabled=self.dashboard_enabled,
             cam_name=self.cam_name,
         )
+        if self.observation is not None:
+            self.observation.dashboard = self.dashboard
         self.dashboard.start()
         if self.dashboard.enabled:
             register_dashboard(self.dashboard)
@@ -1908,6 +1946,10 @@ class StreamingOrchestrator:
             [t for t in all_tasks if t["prescreen_status"] == "SUSPICIOUS" and t["analysis_status"] != "PENDING"]
         )
         self.dashboard.update_prescreen(completed=prescreen_done_pre, total=len(all_tasks))
+        self.dashboard.analysis_cached = sum(
+            t["prescreen_status"] == "SUSPICIOUS" and t["analysis_status"] in ("ANALYZED", "COMPLETED")
+            for t in all_tasks
+        )
         self.dashboard.update_analysis(completed=analysis_done_pre, total=len(pending_analysis) + analysis_done_pre)
         self._sync_queue_levels()
 
@@ -1998,6 +2040,8 @@ class StreamingOrchestrator:
             if not self.abort_event.is_set():
                 self.upstream_drained.set()
             if self.render_enabled:
+                if self.observation and not self.abort_event.is_set():
+                    self.observation.set_phase("渲染收尾中")
                 with monitor.stage(f"render_tail_{self.date}_cam{self.cam_index}", include_in_total=False):
                     _wait_queue_interruptible(self.render_batch_queue)
                     self.stop_event.set()
@@ -2008,17 +2052,17 @@ class StreamingOrchestrator:
             else:
                 self.stop_event.set()
         except (KeyboardInterrupt, SystemExit):
-            logger.warning("StreamingOrchestrator interrupted. Terminating subprocesses...")
+            logger.info("StreamingOrchestrator interrupted. Terminating subprocesses...", extra={"event": "cancellation_requested"})
             self.abort_event.set()
             self.stop_event.set()
             self.render_finished_event.set()
             from src.hardware.ffmpeg import FFmpegProcessRegistry
             FFmpegProcessRegistry.mark_interrupted()
             FFmpegProcessRegistry.kill_all()
-            if self.dashboard is not None:
+            if self.dashboard is not None and self.observation is None:
                 self.dashboard.stop()
                 self.dashboard = None
-            unregister_dashboard()
+                unregister_dashboard()
             # 给工作线程 1 秒平稳收尾时间，避免孤儿线程继续向已关闭的 DB 发起请求
             for t in threads:
                 t.join(timeout=1.0)
@@ -2028,10 +2072,10 @@ class StreamingOrchestrator:
         for t in threads:
             t.join(timeout=5.0)
 
-        if self.dashboard is not None:
+        if self.dashboard is not None and self.observation is None:
             self.dashboard.stop()
             self.dashboard = None
-        unregister_dashboard()
+            unregister_dashboard()
 
         if self._render_interruption_reason is not None:
             raise KeyboardInterrupt(self._render_interruption_reason)
@@ -2129,6 +2173,39 @@ def _process_date_cam_owned(
             logger.warning("%s cam%d 已交付，但有 %d 个待处理素材（可能为新增素材）；"
                            "本次不自动重做，请使用 --force-render 纳入成片", date, cam_index, pending)
         return True
+    observation = RunObservation(date, cam_index)
+    token = current_run.set(observation)
+    status = "failed"
+    try:
+        logger.info("Starting %s cam%d run_id=%s", date, cam_index, observation.identity["run_id"],
+                    extra={"event": "run_started"})
+        success = _execute_date_cam(db, date, cam_index, skip_render, dashboard_enabled, config, observation)
+        if success:
+            status = "analysis_completed" if skip_render else "completed"
+        return success
+    except (KeyboardInterrupt, SystemExit):
+        status = "cancelled"
+        raise
+    finally:
+        try:
+            if observation.committed:
+                status = "completed"
+            totals = observation.totals()
+            retained = totals["encoded"] + totals["reused"] + totals["ready"] if status in ("failed", "cancelled") else 0
+            labels = {"completed": "已交付", "cancelled": "已取消", "failed": "失败", "analysis_completed": "分析完成"}
+            observation.phase = labels[status]
+            logger.info("%s cam%d %s · 编码 %d · 复用 %d · 保留 %d 批 · run_id=%s",
+                        date, cam_index, labels[status], totals["encoded"], totals["reused"], retained,
+                        observation.identity["run_id"], extra={"event": "run_finished", "status": status,
+                        "reason": observation.reason or status.upper(), "counts": totals, "retained": retained})
+            if observation.dashboard is not None:
+                observation.dashboard.stop()
+                unregister_dashboard()
+        finally:
+            current_run.reset(token)
+
+
+def _execute_date_cam(db, date, cam_index, skip_render, dashboard_enabled, config, observation):
     if config is None:
         config = load_config()
     all_tasks = db.get_all_file_tasks_for_date(date, cam_index)
@@ -2164,7 +2241,7 @@ def _process_date_cam_owned(
         for row in all_tasks
     ]
     run_context = {
-        "run_id": uuid.uuid4().hex,
+        "run_id": observation.identity["run_id"],
         "config_sha256": hashlib.sha256(
             json.dumps(config, sort_keys=True, default=str).encode()
         ).hexdigest(),
@@ -2233,6 +2310,7 @@ def _process_date_cam_owned(
     orchestrator = StreamingOrchestrator(db, date, cam_index, config, render_enabled=not skip_render,
                                          dashboard_enabled=dashboard_enabled, cam_name=cam_display)
     def fail(message, reason="PIPELINE_FAILED"):
+        observation.reason = reason
         logger.error("Pipeline %s cam%d failed: %s", date, cam_index, message,
                      extra={"reason": reason, "date": date, "cam": cam_index, "disposition": "failed"})
         if not skip_render:
@@ -2333,6 +2411,7 @@ def _process_date_cam_owned(
     ok = False
     try:
         try:
+            observation.set_phase("最终拼接中")
             with monitor.stage(f"final_concat_{date}_cam{cam_index}"):
                 db.set_render_status(date, cam_index, "RENDERING")
                 if len(batch_paths) == 1:
@@ -2377,6 +2456,7 @@ def _process_date_cam_owned(
     media_metrics = {}
     retain_candidate = False
     try:
+        observation.set_phase("时钟校验与元数据生成中")
         assets_ok = _save_vlog_companion_assets(
             output_path=candidate,
             date=date,
@@ -2391,6 +2471,7 @@ def _process_date_cam_owned(
         )
         if not assets_ok:
             return fail("required companion assets failed", "DELIVERY_COMPANION_FAILED")
+        observation.set_phase("交付提交中")
         fingerprint = final_fingerprint()
         with promote_vlog_assets(candidate, output_path, config,fingerprint=fingerprint,
                                  context={'role':'pipeline','date':date,'cam_index':cam_index}):
@@ -2398,6 +2479,7 @@ def _process_date_cam_owned(
             db.set_render_status(date, cam_index, "COMPLETED", output_file=str(output_path))
             if not db.is_render_completed(date, cam_index):
                 raise RuntimeError("completion record was not committed")
+        observation.committed = True
     except (KeyboardInterrupt, SystemExit):
         try:
             db.set_render_status(date, cam_index, "PENDING", error_msg="delivery commit cancelled")
@@ -2417,6 +2499,7 @@ def _process_date_cam_owned(
     finally:
         if not retain_candidate:
             cleanup_delivery_candidate(candidate)
+    observation.set_phase("已交付")
     # End-to-end means the final container, manifest, optional subtitles and DB
     # completion marker are all durable.  Previous reports stopped this clock
     # before concat and under-reported the user-observed runtime by ~20 seconds.

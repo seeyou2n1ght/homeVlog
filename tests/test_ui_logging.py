@@ -653,3 +653,73 @@ def test_cli_stops_cross_day_on_input_storage_unavailable(cli_workspace, monkeyp
     assert w.processor.call_count == 1
     output = capsys.readouterr().out
     assert "INPUT_STORAGE_UNAVAILABLE" in output and "未处理=1" in output
+
+
+@pytest.mark.parametrize("width", [80, 120])
+def test_dashboard_renders_batch_progress_and_delivery_boundaries(width, monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    from src.core.run_observation import RunObservation
+    from src.ui import dashboard
+
+    screen = Console(file=StringIO(), width=width)
+    monkeypatch.setattr(dashboard, "console", screen)
+    monkeypatch.setattr("src.hardware.scheduler.get_nv_vram_info", lambda: {"used_mb": 400, "total_mb": 8000})
+    dash = PipelineDashboard("20260605", 1, enabled=False)
+    run = dash.observation = RunObservation("20260605", 1)
+
+    def view():
+        with screen.capture() as content:
+            screen.print(dash._generate_view())
+        return content.get()
+
+    for index in range(114):
+        run.batch(index, "reused")
+        run.batch(index, "ready")
+    run.batch(114, "running", worker="nv_0")
+    run.progress(114, 217)
+    run.note(114, "编码无进展，正在终止")
+    during = view()
+    assert all(label in during for label in ("复用 114", "nv_0", "第 217 帧", "无进展"))
+    assert ("整卡显存" in during) == (width == 120)
+    run.note(114, "已切换连续渲染", new_attempt=True)
+    assert "已切换连续渲染" in view() and "第 217 帧" not in view()
+    run.batch(114, "encoded")
+    run.set_phase("最终拼接中")
+    concat = view()
+    assert "就绪 115 批" in concat and "编码 1" in concat and "已交付" not in concat
+    run.set_phase("已交付")
+    assert run.identity["run_id"] in view()
+
+
+def test_cancelled_run_emits_single_summary_with_confirmed_batches(monkeypatch):
+    from unittest.mock import Mock
+    from src import pipeline
+    from src.core import utils
+    from src.core.run_observation import current_run
+
+    def cancel(*args):
+        for index in range(9):
+            current_run.get().batch(index, "encoded")
+        current_run.get().batch(9, "running", worker="cpu_0")
+        raise KeyboardInterrupt
+
+    setup_logging()
+    monkeypatch.setattr(pipeline, "_execute_date_cam", cancel)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline._process_date_cam_owned(Mock(), "20260827", 1, force_render=True)
+    events = [json.loads(line) for path in utils.LOGS_DIR.rglob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()]
+    terminal, = [e for e in events if e.get("event") == "run_finished"]
+    assert terminal["status"] == "cancelled" and terminal["retained"] == 9
+    assert current_run.get() is None
+
+
+def test_live_refresh_failure_continues_with_plain_heartbeat(capsys):
+    from unittest.mock import Mock
+
+    dash = PipelineDashboard("20260605", 1, enabled=False)
+    dash.live = Mock()
+    dash.live.update.side_effect = RuntimeError("screen unavailable")
+    dash.update_view(force=True)
+    assert dash.live is None and dash.tracker is not None
+    assert "流水处理" in capsys.readouterr().out

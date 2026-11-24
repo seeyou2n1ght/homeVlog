@@ -96,9 +96,14 @@ class JsonLinesFormatter(logging.Formatter):
             "message": record.getMessage(),
             "caller": f"{record.filename}:{record.lineno}",
         }
-        for key in ("reason", "date", "cam", "batch", "expected_frames", "actual_frames", "disposition"):
+        from src.core.run_observation import log_context
+        log_obj.update(log_context())
+        for key in ("event", "run_id", "worker", "phase", "status", "counts", "retained", "queue_wait_s", "duration_s", "reason", "date", "cam", "batch", "expected_frames", "actual_frames", "disposition"):
             if hasattr(record, key):
-                log_obj[key] = getattr(record, key)
+                if key == "batch" and key in log_obj and isinstance(getattr(record, key), str):
+                    log_obj["artifact"] = record.batch
+                else:
+                    log_obj[key] = getattr(record, key)
         if record.exc_info:
             log_obj["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_obj, ensure_ascii=False)
@@ -130,7 +135,7 @@ class RichConsoleBridgeHandler(logging.Handler):
                 # 仪表盘处于激活态：仅将告警与异常送入跑马灯
                 if record.levelno >= logging.WARNING:
                     brief = f"[{record.levelname}] {record.getMessage()}"
-                    dash.add_alert(brief)
+                    dash.add_alert(brief, key=getattr(record, "reason", None))
             else:
                 # 仪表盘未激活：直接着色输出到终端
                 color = "white"
@@ -245,6 +250,8 @@ def setup_logging(level_override: int | None = None) -> logging.Logger:
     fh_main.homevlog_role = "run"
     fh_main.setLevel(level)
     fh_main.setFormatter(human_fmt)
+    routine_events = {"batch_queued", "batch_started", "batch_attempt_finished", "batch_encoded", "batch_reused"}
+    fh_main.addFilter(lambda record: record.levelno >= logging.WARNING or getattr(record, "event", "") not in routine_events)
     logger.addHandler(fh_main)
 
     # 2. 独立错误排错日志 (WARNING 及以上)

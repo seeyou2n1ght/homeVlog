@@ -300,7 +300,9 @@ def dump_perf(
             "perf_summary": perf.summary_by_stage(),
         }
         if run_context:
-            metadata["run_context"] = run_context
+            from src.core.run_observation import current_run
+            run = current_run.get()
+            metadata["run_context"] = {**run_context, "counts": run.totals()} if run else run_context
         if worker_stats:
             metadata["worker_stats"] = worker_stats
         if yolo_sum:
@@ -314,7 +316,8 @@ def dump_perf(
         if hasattr(monitor, "reset"):
             monitor.reset()
     except Exception as e:
-        logger.debug("dump_perf skipped or failed: %s", e)
+        logger.warning("Could not write perf for %s cam%d: %s", date, cam_index, e,
+                       extra={"event": "perf_write_failed"})
 
 
 def build_headline(

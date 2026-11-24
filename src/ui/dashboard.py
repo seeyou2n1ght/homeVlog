@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.core.run_observation import current_run
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -481,6 +482,7 @@ class PlainProgressTracker:
         render_done: int,
         render_total: int,
         force: bool = False,
+        detail: str = "",
     ) -> None:
         now = time.monotonic()
         with self._lock:
@@ -495,14 +497,15 @@ class PlainProgressTracker:
             r_pct = int((render_done / max(1, render_total)) * 100) if render_total > 0 else 0
 
             now_str = time.strftime("%H:%M:%S")
+            render_progress = "" if detail else f"③渲染: {render_done}/{render_total} ({r_pct}%) | "
             line = (
                 f"[{now_str}] [HomeVlog {self.date} | 机位 {self.cam_name}] "
                 f"①粗筛: {prescreen_done}/{prescreen_total} ({p_pct}%) | "
                 f"②精析: {analysis_done}/{analysis_total} ({a_pct}%) | "
-                f"③渲染: {render_done}/{render_total} ({r_pct}%) | "
+                f"{render_progress}"
                 f"耗时: {m:02d}:{s:02d}"
             )
-            console.print(f"[dim]{line}[/dim]")
+            console.print(Text(line + (" | " + detail if detail else ""), style="dim"))
 
 
 class PipelineDashboard:
@@ -541,6 +544,7 @@ class PipelineDashboard:
         self.prescreen_done = 0
         self.prescreen_total = total_prescreen
         self.analysis_done = 0
+        self.analysis_cached = 0
         self.analysis_total = 0
         self.render_done = 0
         self.render_total = 0
@@ -577,57 +581,57 @@ class PipelineDashboard:
         self._pulse_stop = threading.Event()
         self._pulse_thread: Optional[threading.Thread] = None
 
+        self.observation = current_run.get()
+        self._paint_lock = threading.RLock()
+        self._memory_at = float("-inf")
+        self._memory = None
+        self._alert_counts = {}
         self.live: Optional[Live] = None
         if self.enabled:
-            self._cached_view = self._generate_view()
-            self.live = Live(
-                self._cached_view,
-                console=console,
-                refresh_per_second=5,
-                transient=False,
-                auto_refresh=True,
-            )
+            try:
+                self._cached_view = self._generate_view()
+                self.live = Live(self._cached_view, console=console, auto_refresh=False, transient=False)
+            except Exception as exc:
+                self._fallback(exc)
+
+    def _fallback(self, exc):
+        from src.core.utils import unregister_dashboard
+        live, self.live = self.live, None
+        self.enabled = False
+        unregister_dashboard()
+        self.tracker = PlainProgressTracker(self.date, self.cam_index, self.total_files, cam_name=self.cam_name)
+        if live:
+            try:
+                live.stop()
+            except Exception as stop_exc:
+                logging.getLogger("homevlog").debug("Live cleanup failed: %s", stop_exc)
+        logging.getLogger("homevlog").warning("TUI unavailable (%s); using plain progress", type(exc).__name__,
+                                               extra={"event": "tui_fallback"})
 
     def start(self) -> None:
-        """启动实时仪表盘或无头心跳定时器。"""
         self._pulse_stop.clear()
         if self.live:
-            self.live.start()
-            self._pulse_thread = threading.Thread(target=self._pulse_loop, daemon=True)
-            self._pulse_thread.start()
-        elif self.tracker:
-            self.tracker.heartbeat(
-                self.prescreen_done,
-                self.prescreen_total,
-                self.analysis_done,
-                self.analysis_total,
-                self.render_done,
-                self.render_total,
-                force=True,
-            )
-            self._pulse_thread = threading.Thread(target=self._pulse_loop, daemon=True)
-            self._pulse_thread.start()
+            try:
+                self.live.start()
+            except Exception as exc:
+                self._fallback(exc)
+        self.update_view(force=True)
+        self._pulse_thread = threading.Thread(target=self._pulse_loop, daemon=True)
+        self._pulse_thread.start()
 
     def stop(self) -> None:
-        """安全停止脉冲线程并关闭仪表盘/心跳。"""
         self._pulse_stop.set()
         if self._pulse_thread:
             self._pulse_thread.join(timeout=1.0)
             self._pulse_thread = None
+        self.update_view(force=True)
         if self.live:
-            self.update_view(force=True)
-            self.live.stop()
+            try:
+                self.live.stop()
+            except Exception as exc:
+                self._fallback(exc)
+                self.update_view(force=True)
             self.live = None
-        elif self.tracker:
-            self.tracker.heartbeat(
-                self.prescreen_done,
-                self.prescreen_total,
-                self.analysis_done,
-                self.analysis_total,
-                self.render_done,
-                self.render_total,
-                force=True,
-            )
 
     def _pulse_loop(self) -> None:
         """周期性强制重建视图或发送无头心跳。"""
@@ -703,204 +707,102 @@ class PipelineDashboard:
             self.max_nv_decoders = max_nv
         self.update_view()
 
-    def add_alert(self, message: str) -> None:
-        """向仪表盘添加一条告警或异常追踪记录。"""
+    def add_alert(self, message: str, key=None) -> None:
         with self._lock:
-            now_str = time.strftime("%H:%M:%S")
-            self.recent_alerts.append(f"[{now_str}] {message}")
-            if len(self.recent_alerts) > 3:
-                self.recent_alerts.pop(0)
+            key = key or message
+            self._alert_counts[key] = (self._alert_counts.get(key, (0, ""))[0] + 1, message)
+            item = self._alert_counts.pop(key)
+            self._alert_counts[key] = item
+            if len(self._alert_counts) > 3:
+                del self._alert_counts[next(iter(self._alert_counts))]
+            self.recent_alerts = [f"{msg} ×{n}" if n > 1 else msg for n, msg in self._alert_counts.values()]
         self.update_view()
 
-    def update_view(self, force: bool = False) -> None:
-        """触发界面刷新或无头心跳输出。"""
-        if not self.live:
-            if self.tracker:
-                self.tracker.heartbeat(
-                    self.prescreen_done,
-                    self.prescreen_total,
-                    self.analysis_done,
-                    self.analysis_total,
-                    self.render_done,
-                    self.render_total,
-                    force=force,
-                )
-            return
+    def _status(self):
+        run = self.observation
+        counts, active = run.snapshot() if run else ({}, [])
+        phase = run.phase if run else "流水处理"
+        ready = sum(counts.get(key, 0) for key in ("encoded", "reused", "ready")) if run else self.render_done
+        batch_text = (f"就绪 {ready} 批 · 编码 {counts.get('encoded', 0)} · 复用 {counts.get('reused', 0)}"
+                      f" · 跳过 {counts.get('skipped', 0)} · 失败 {counts.get('failed', 0)}")
+        detail = ""
+        if phase in ("已取消", "失败"):
+            detail = f"本轮确认保留 {ready} 批，可续跑"
+        elif active and phase in ("流水处理", "渲染收尾中"):
+            idx, item = active[0]
+            now = time.monotonic()
+            detail = f"批次 {idx} · {item['worker']} · 执行 {int(now - item['started'])} 秒"
+            if item.get("note"):
+                detail += f" · {item['note']}"
+            if "progress_at" in item:
+                detail += f" · 第 {item['frames']} 帧，{int(now - item['progress_at'])} 秒前推进"
+        return phase, counts, batch_text, detail
 
-        now = time.monotonic()
-        if not force and (now - self._last_view_build) < self._view_min_interval:
+    def update_view(self, force: bool = False) -> None:
+        if not self._paint_lock.acquire(blocking=force):
             return
         try:
-            self._cached_view = self._generate_view()
-            self._last_view_build = now
-            self.live.update(self._cached_view, refresh=False)
-        except Exception:
-            pass
+            if self.live:
+                now = time.monotonic()
+                if not force and now - self._last_view_build < self._view_min_interval:
+                    return
+                try:
+                    self._cached_view = self._generate_view()
+                    self.live.update(self._cached_view, refresh=True)
+                    self._last_view_build = now
+                    return
+                except Exception as exc:
+                    self._fallback(exc)
+                    force = True
+            if self.tracker:
+                if not force and time.monotonic() - self.tracker._last_report < self.tracker.interval_s:
+                    return
+                phase, _, batches, detail = self._status()
+                if force and self.observation:
+                    detail = (detail + " · " if detail else "") + "run_id=" + self.observation.identity["run_id"]
+                self.tracker.heartbeat(self.prescreen_done, self.prescreen_total, self.analysis_done,
+                                       self.analysis_total, self.render_done, self.render_total, force=force,
+                                       detail=" | ".join(filter(None, (phase, batches if self.render_enabled else "", detail))))
+
+        finally:
+            self._paint_lock.release()
 
     def _generate_view(self) -> Panel:
-        """组合并渲染符合方案 A (全生命周期堆叠状态条) 的现代仪表盘。"""
         with self._lock:
-            # 1. 顶部硬件调度与队列监控表 (2:2:3 配比防折行)
-            hw_table = Table.grid(padding=(0, 2), expand=True)
-            hw_table.add_column("Col1", ratio=2)
-            hw_table.add_column("Col2", ratio=2)
-            hw_table.add_column("Col3", ratio=3)
-
-            # 格式化调度器状态徽标 (短文本防折行)
-            if self.scheduler_state == "COOPERATIVE_BURST":
-                sched_badge = f"[bold yellow on black] ⚡ 双卡协同 (NVDEC {self.active_nv_decoders}/{self.max_nv_decoders}) [/]"
-            elif self.scheduler_state == "RENDER_PREEMPTION_YIELD":
-                sched_badge = "[bold magenta on black] 🎬 渲染优先 [/]"
-            else:
-                sched_badge = "[bold green on black] 🍃 常规（核显解码） [/]"
-
-            # 动态探测显存使用
-            vram_badge = ""
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
-                    tot_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-                    vram_badge = f" [dim]| VRAM {alloc_mb/1024:.1f}/{tot_mb/1024:.1f}G[/dim]"
-            except Exception:
-                pass
-
-            elapsed_s = int(time.monotonic() - self._start_time)
-            mins, secs = divmod(elapsed_s, 60)
-            time_str = f"{mins:02d}:{secs:02d}"
-
-            q_info = (
-                f"[dim]粗筛:[/] [cyan]{self.prescreen_queue_size}[/] | "
-                f"[dim]分析:[/] [yellow]{self.analysis_queue_size}[/] | "
-                f"[dim]渲染:[/] [magenta]{self.render_queue_size}[/]"
-            )
-
-            hw_table.add_row(
-                f"[bold cyan]日期:[/] {self.date}",
-                f"[bold cyan]运行模式:[/] {sched_badge}{vram_badge}",
-                f"[bold cyan]待办:[/] {q_info} [dim](已运行 {time_str})[/dim]",
-            )
-            hw_table.add_row(f"[bold cyan]机位:[/] {self.cam_name}", "", "")
-
-            # 2. 方案 A: 各工序切片分布 (文件级真实计数，守恒归一化)
-            total = max(1, self.total_files)
-
-            # (1) 已成片: 已完成渲染批次覆盖的真实文件数
-            done = min(total, max(0, self.render_done_files))
-
-            # (2) 压制中: 已投递未完成的渲染批次覆盖的真实文件数
-            rendering = min(total - done, max(0, self.render_inflight_files))
-
-            # (3) YOLO 精析中: 待析队列 + 分析在飞
-            yolo_pending = max(0, self.analysis_total - self.analysis_done)
-            yolo = min(total - done - rendering, yolo_pending)
-
-            # (4) 静态快进就绪: 已过筛/已分析但尚未进入渲染批次的文件
-            static_candidates = max(0, self.prescreen_done - yolo_pending - done - rendering)
-            static = max(0, min(total - done - rendering - yolo, static_candidates))
-
-            # (5) QSV 粗筛在飞: 总待筛 - 已完成 - 队列中等待
-            prescreen_inflight = max(0, self.prescreen_total - self.prescreen_done - self.prescreen_queue_size)
-            prescreen = min(total - done - rendering - yolo - static, prescreen_inflight)
-
-            # (6) 待输入: 守恒残差
-            pending = max(0, total - (done + rendering + yolo + static + prescreen))
-
-            # 3. 构造 48 字符等宽堆叠条 (针对 Windows Terminal 完美等宽对齐)
-            bar_len = 48
-            w_done = int(round(done / total * bar_len))
-            w_rend = int(round(rendering / total * bar_len))
-            w_yolo = int(round(yolo / total * bar_len))
-            w_stat = int(round(static / total * bar_len))
-            w_pres = int(round(prescreen / total * bar_len))
-            w_pend = max(0, bar_len - (w_done + w_rend + w_yolo + w_stat + w_pres))
-
-            t_bar = Text()
-            t_bar.append("  [", style="bold white")
-            if w_done > 0:
-                t_bar.append("█" * w_done, style="bold green")
-            if w_rend > 0:
-                t_bar.append("█" * w_rend, style="bold magenta")
-            if w_yolo > 0:
-                t_bar.append("█" * w_yolo, style="bold yellow")
-            if w_stat > 0:
-                t_bar.append("▒" * w_stat, style="cyan")
-            if w_pres > 0:
-                t_bar.append("░" * w_pres, style="bold blue")
-            if w_pend > 0:
-                t_bar.append("┈" * w_pend, style="dim white")
-            pct = (done / total) * 100
-            t_bar.append(f"]  {done}/{total} 已完成 ({pct:.1f}%)", style="bold white")
-
-            legend_text = Text.from_markup(
-                f"  [bold green]█ 已完成 {done}[/] │ "
-                f"[bold magenta]█ 渲染中 {rendering}[/] │ "
-                f"[bold yellow]█ AI 分析中 {yolo}[/] │ "
-                f"[cyan]▒ 待渲染 {static}[/] │ "
-                f"[bold blue]░ 粗筛中 {prescreen}[/] │ "
-                f"[dim white]┈ 待处理 {pending}[/]"
-            )
-
-            # 4. 微观阶段进展表 (极简紧凑 3 行)
-            p_pct = int(self.prescreen_done / max(1, self.prescreen_total) * 100)
-            a_pct = int(self.analysis_done / max(1, self.analysis_total) * 100) if self.analysis_total > 0 else 0
-            r_pct = int(self.render_done / max(1, self.render_total) * 100) if self.render_total > 0 else 0
-
-            micro_table = Table.grid(padding=(0, 2), expand=True)
-            micro_table.add_column("Stage", style="bold cyan", width=14)
-            micro_table.add_column("Progress", style="white", width=20)
-            micro_table.add_column("Detail", style="dim")
-
-            p_detail = self.last_prescreen_speed
-            if self.last_prescreen_file:
-                p_detail += f" ({Path(self.last_prescreen_file).name[:20]})"
-            micro_table.add_row(
-                "• ① 快速粗筛",
-                f"[{p_pct:>3}%] {self.prescreen_done}/{self.prescreen_total}",
-                p_detail or "[dim]准备就绪[/dim]",
-            )
-
-            a_detail = self.last_analysis_speed
-            if self.last_analysis_file:
-                a_detail += f" ({Path(self.last_analysis_file).name[:20]})"
-            micro_table.add_row(
-                "• ② AI 精析",
-                f"[{a_pct:>3}%] {self.analysis_done}/{self.analysis_total}" if self.analysis_total > 0 else "[  0%] 等待疑点",
-                a_detail or ("[dim]等待疑点入队[/dim]" if self.analysis_total == 0 else "[dim]推断中[/dim]"),
-            )
-
+            phase, counts, batches, detail = self._status()
+            wide = console.width >= 100
+            elapsed = int(time.monotonic() - self._start_time)
+            header = Text(f"日期: {self.date}   机位: {self.cam_name}   {phase}   {elapsed//60:02d}:{elapsed%60:02d}", style="bold cyan")
+            rows = Table.grid(padding=(0, 2))
+            rows.add_column(no_wrap=True)
+            rows.add_column()
+            rows.add_row("粗筛", f"{self.prescreen_done}/{self.prescreen_total} 个源文件")
+            analysis = f"已处理 {self.analysis_done}/{self.analysis_total} 个已发现文件" if self.analysis_total else "暂无待析文件"
+            if self.analysis_cached:
+                analysis += f" · 沿用 {self.analysis_cached} 个已有结果"
+            rows.add_row("精析", analysis)
             if self.render_enabled:
-                r_detail = self.last_render_speed
-                if self.last_render_batch:
-                    r_detail += f" ({self.last_render_batch})"
-                micro_table.add_row(
-                    "• ③ 视频渲染",
-                    f"[{r_pct:>3}%] {self.render_done}/{self.render_total} 批" if self.render_total > 0 else "[  0%] 准备批次",
-                    r_detail or "[dim]等待批次合成[/dim]",
-                )
-
-            # 组装整个面板
-            elements: List[Any] = [
-                hw_table,
-                Text(""),
-                Text("🎬 全天素材处理全景:", style="bold cyan"),
-                t_bar,
-                legend_text,
-                Text(""),
-                micro_table,
-            ]
-
-            # 5. 底部告警追踪 (如有)
-            if self.recent_alerts:
-                elements.append(Text(""))
-                alert_text = Text("⚠️ 实时告警追踪:\n", style="bold red")
-                for item in self.recent_alerts[-3:]:
-                    alert_text.append(f"  • {item}\n", style="yellow")
-                elements.append(alert_text)
-
-            return Panel(
-                Group(*elements),
-                title="[bold blue]🎛️ HomeVlog 流式管线实时监控[/bold blue]",
-                border_style="bright_blue",
-                padding=(0, 1),
-            )
+                rows.add_row("批次渲染", batches)
+                if phase in ("流水处理", "渲染收尾中"):
+                    rows.add_row("调度", f"排队 {counts.get('queued', 0) + counts.get('retry', 0)} · 执行 {counts.get('running', 0)}")
+                gates = ("最终拼接中", "时钟校验与元数据生成中", "交付提交中", "已交付")
+                if phase in gates:
+                    for i, label in enumerate(("最终拼接", "时钟与元数据", "交付提交")):
+                        rows.add_row(label, ("完成" if i < gates.index(phase) else "进行中" if i == gates.index(phase) else "待开始"))
+            elements = [header, rows]
+            if wide and phase in ("流水处理", "渲染收尾中"):
+                now = time.monotonic()
+                if now - self._memory_at >= 2:
+                    from src.hardware.scheduler import get_nv_vram_info
+                    self._memory = get_nv_vram_info()
+                    self._memory_at = now
+                memory = f"   NVIDIA 0 整卡显存 {self._memory['used_mb']}/{self._memory['total_mb']} MiB" if self._memory else ""
+                elements.append(Text(f"粗筛队列 {self.prescreen_queue_size}   精析队列 {self.analysis_queue_size}"
+                                     f"   NV 解码 {self.active_nv_decoders}/{self.max_nv_decoders}   {self.scheduler_state}{memory}", style="dim"))
+            if detail:
+                elements.append(Text(detail, style="bold"))
+            if self.observation and phase in ("已交付", "失败", "已取消", "分析完成"):
+                elements.append(Text("run_id=" + self.observation.identity["run_id"], style="dim"))
+            for alert in self.recent_alerts:
+                elements.append(Text(alert, style="yellow"))
+            return Panel(Group(*elements), title="HomeVlog", border_style="blue")

@@ -14,6 +14,7 @@
 import argparse
 import glob
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -252,13 +253,89 @@ def analyze_file(path: Path, top_n: int) -> None:
             print(f"   {st} Top{top_n}: {tops}")
 
 
+def trace_runs(files, args):
+    """Join exact run identities; historical perf remains usable without matching events."""
+    selected = {}
+    for file in files:
+        path = Path(file)
+        match = re.fullmatch(r"perf_(\d{8})_cam(\d+)_.+\.json", path.name)
+        if match and ((args.date and args.date != match[1]) or (args.cam is not None and args.cam != int(match[2]))):
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        run_id = data.get("run_context", {}).get("run_id")
+        if ((args.run_id and args.run_id != run_id) or (args.date and args.date != data["date"])
+                or (args.cam is not None and args.cam != data["cam"])):
+            continue
+        selected[run_id or str(path)] = (path, data)
+    events = {}
+    # A live run may not have written its perf yet. Read each rotated event file once.
+    for path in sorted(Path(args.events_dir).glob("events_*.jsonl*")):
+        with path.open(encoding="utf-8") as stream:
+            for number, line in enumerate(stream, 1):
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    print(f"{path.name}:{number} 事件不完整", file=sys.stderr)
+                    continue
+                rid = event.get("run_id")
+                if not rid or (args.run_id and args.run_id != rid):
+                    continue
+                if (args.date and event.get("date") != args.date) or (args.cam is not None and event.get("cam") != args.cam):
+                    continue
+                if args.batch is not None and event.get("batch") != args.batch and event.get("event") not in ("run_started", "run_finished"):
+                    continue
+                if event.get("event") or event.get("reason"):
+                    events.setdefault(rid, []).append(event)
+    found = False
+    for rid in dict.fromkeys([*selected, *events]):
+        path, data = selected.get(rid, (None, {}))
+        entries = sorted(events.get(rid, []), key=lambda e: e["timestamp"])
+        batch_records = []
+        for rec in data.get("records", []):
+            if rec["stage"] not in ("render", "render_enc", "render_fallback"):
+                continue
+            match = re.search(r"batch_?(\d+)", rec.get("file", ""))
+            if match and (args.batch is None or int(match[1]) == args.batch):
+                batch_records.append(rec)
+        if args.batch is not None and not batch_records and not any(e.get("batch") == args.batch for e in entries):
+            continue
+        found = True
+        identity = data or entries[0]
+        print(f"{identity['date']} cam{identity['cam']}  run_id={rid if entries or data.get('run_context', {}).get('run_id') else '历史记录未提供'}")
+        for e in entries:
+            print(e["timestamp"], e.get("event") or e.get("reason"), e.get("worker", ""), e["message"],
+                  e.get("reason", "") if e.get("event") else "",
+                  f"领取前等待 {e['queue_wait_s']:.3f}s" if "queue_wait_s" in e else "")
+        if not entries:
+            print("没有可按 run_id 关联的事件，以下来自历史 perf")
+        if path:
+            ctx = data.get("run_context", {})
+            print(path.name, ctx.get("status") or ("completed" if data.get("headline") else "unknown"))
+        if args.batch is not None:
+            for rec in batch_records:
+                extra = rec.get("extra", {})
+                print(rec["file"], rec["stage"], rec.get("worker") or rec.get("gpu"), _fmt_s(rec["duration"]),
+                      f"排队 {_fmt_s(extra['render_queue_wait_s'])}" if "render_queue_wait_s" in extra else "",
+                      f"首次尝试 {_fmt_s(extra['primary_attempt_s'])}" if "primary_attempt_s" in extra else "")
+    if not found:
+        print("没有匹配的运行或批次")
+
+
 def main():
     ap = argparse.ArgumentParser(description="HomeVlog perf 聚合瓶颈分析")
     ap.add_argument("--top", type=int, default=5, help="各阶段展示最慢记录数")
     ap.add_argument("--glob", default="logs/**/perf_*.json", help="perf JSON 匹配模式")
+    ap.add_argument("--date", help="素材日 YYYYMMDD")
+    ap.add_argument("--cam", type=int, help="机位编号")
+    ap.add_argument("--batch", type=int, help="批次编号")
+    ap.add_argument("--run-id", help="精确运行标识")
+    ap.add_argument("--events-dir", default="logs/events", help="结构化事件目录")
     args = ap.parse_args()
 
     files = sorted(glob.glob(args.glob, recursive=True))
+    if args.date or args.cam is not None or args.batch is not None or args.run_id:
+        trace_runs(files, args)
+        return
     if not files:
         print(f"未找到 perf 文件: {args.glob}")
         return
