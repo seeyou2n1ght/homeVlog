@@ -226,10 +226,6 @@ def analyze_file(path: Path, top_n: int) -> None:
         for item in rca:
             print(f"      • {item}")
 
-    # Top-N 最慢
-    for st in ("prescreen", "analysis", "render"):
-        recs = sorted(
-            (r for r in records if r.get("stage") == st),
     finished_batches = [r for r in records if r.get("stage") == "render" and r.get("end_time")]
     if finished_batches:
         last = max(finished_batches, key=lambda r: r["end_time"])
@@ -245,6 +241,10 @@ def analyze_file(path: Path, top_n: int) -> None:
         print(f"   {attempt['file']} · {info['primary_path']} 首次尝试 {_fmt_s(info['primary_attempt_s'])}"
               f" · 连续渲染 {_fmt_s(attempt['duration'])}")
 
+    # Top-N 最慢
+    for st in ("prescreen", "analysis", "render"):
+        recs = sorted(
+            (r for r in records if r.get("stage") == st),
             key=lambda r: r.get("duration", 0), reverse=True,
         )[:top_n]
         if recs:

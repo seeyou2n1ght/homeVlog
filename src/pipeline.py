@@ -1565,9 +1565,6 @@ class StreamingOrchestrator:
                             with self.batch_lock:
                                 self.batch_paths.append((b_idx, Path(res_path)))
                             get_perf().add(
-                            if self._is_source_dir_offline(files_to_batch):
-                                self._stop_for_storage_unavailable(f"render batch {b_idx}", InputStorageUnavailable("source directory offline"))
-                                break
                                 PerfRecord(
                                     stage="render",
                                     file=f"batch_{b_idx}.mp4",
@@ -1600,9 +1597,6 @@ class StreamingOrchestrator:
                                 avg_s = el_sec / max(1, n_done)
                                 enc_name = "NVENC" if gpu == "nv" else gpu.upper()
                                 self.dashboard.update_render(
-                    except InputStorageUnavailable as exc:
-                        self._stop_for_storage_unavailable(f"render batch {b_idx}", exc)
-                        break
                                     completed=n_done,
                                     latest_batch=f"批次 {b_idx}（{enc_name} 编码）",
                                     speed_str=f"上批 {r_dur:.1f}s │ 均速 {avg_s:.1f}s/批",
@@ -1610,6 +1604,9 @@ class StreamingOrchestrator:
                                 self._sync_queue_levels()
                         else:
                             if self.abort_event.is_set() or FFmpegProcessRegistry.is_interrupted():
+                                break
+                            if self._is_source_dir_offline(files_to_batch):
+                                self._stop_for_storage_unavailable(f"render batch {b_idx}", InputStorageUnavailable("source directory offline"))
                                 break
                             # Return QSV failures to an NV-only queue so retry
                             # scheduling and telemetry remain owned by NV.
@@ -1642,6 +1639,9 @@ class StreamingOrchestrator:
                     except MediaTerminationUnconfirmed as exc:
                         self._stop_for_unconfirmed_media(f"render batch {b_idx}", exc)
                         logger.error("Render cleanup unconfirmed; stopping without retries and preserving completed batches: %s", exc)
+                        break
+                    except InputStorageUnavailable as exc:
+                        self._stop_for_storage_unavailable(f"render batch {b_idx}", exc)
                         break
                     except RenderInterrupted as exc:
                         with self.batch_lock:
